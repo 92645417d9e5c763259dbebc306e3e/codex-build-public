@@ -1,0 +1,70 @@
+serve-tui-tools-without-http-sessions
+
+Lane: bugfix
+
+FlatPatch: serve-tui-tools-without-http-sessions
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -1441,6 +1441,41 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths()
+             .as_str()
+             .expect("MCP bearer token");
+     let client = codex_http_client::HttpClientBuilder::new().build_direct()?;
++    // Legacy clients must also remain sessionless: their daemon-side transport can
++    // survive the TUI, so it must not owe DELETE to the old listener after detach.
++    let initialized = client
++        .post(mcp_url)
++        .header("Authorization", authorization)
++        .header("Accept", "application/json, text/event-stream")
++        .json(&serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": 100,
++            "method": "initialize",
++            "params": {
++                "protocolVersion": "2025-06-18",
++                "capabilities": {},
++                "clientInfo": {"name": "tui-detach-test", "version": "1"}
++            }
++        }))
++        .send()
++        .await?;
++    assert!(initialized.status().is_success());
++    assert!(!initialized.headers().contains_key("mcp-session-id"));
++    let listed = client
++        .post(mcp_url)
++        .header("Authorization", authorization)
++        .header("Accept", "application/json, text/event-stream")
++        .header("MCP-Protocol-Version", "2025-06-18")
++        .json(&serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": 101,
++            "method": "tools/list"
++        }))
++        .send()
++        .await?;
++    assert!(listed.status().is_success());
++    assert!(!listed.headers().contains_key("mcp-session-id"));
++    assert!(listed.text().await?.contains("list_threads"));
+     let call_tool = |id: u32, tool: &'static str, arguments: serde_json::Value| {
+         client
+             .post(mcp_url)
+diff --git a/codex-rs/tui/src/dynamic_tools_mcp.rs b/codex-rs/tui/src/dynamic_tools_mcp.rs
+--- a/codex-rs/tui/src/dynamic_tools_mcp.rs
++++ b/codex-rs/tui/src/dynamic_tools_mcp.rs
+@@ -187,7 +187,9 @@ impl DynamicToolMcpServer {
+         let service = StreamableHttpService::new(
+             move || Ok(handler.clone()),
+             Arc::new(LocalSessionManager::default()),
+-            StreamableHttpServerConfig::default(),
++            // Tool state belongs to the app server. HTTP sessions would outlive this
++            // TUI listener in the daemon and try to delete a dead endpoint on resume.
++            StreamableHttpServerConfig::default().with_legacy_session_mode(false),
+         );
+         let router =
+             Router::new()

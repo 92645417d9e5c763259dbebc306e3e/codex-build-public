@@ -1,0 +1,582 @@
+render-live-response-timing
+
+Lane: draft
+
+Unit: consumer
+
+ChildPatch: render-live-response-timing
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -105,6 +105,12 @@ pub(crate) enum StatusLineItem {
+     )]
+     ResponsesStreamConnection,
+ 
++    /// TTFB and request-window TPS from the same last-ended generation attempt.
++    ResponsePerformance,
++
++    /// Transport payload received while the current response is running.
++    ResponseReceive,
++
+     /// RTT of the remote-control WebSocket.
+     #[strum(to_string = "remote-control-rtt", serialize = "remote-connection")]
+     RemoteControlStreamConnection,
+@@ -209,6 +215,12 @@ impl StatusLineItem {
+             StatusLineItem::ResponsesStreamConnection => {
+                 "Current Responses stream RTT or disconnect state (omitted when unavailable)"
+             }
++            StatusLineItem::ResponsePerformance => {
++                "Last ended request: TTFB and output tokens per send-to-usage second"
++            }
++            StatusLineItem::ResponseReceive => {
++                "Received payload in KiB, visible after the first data until the response ends"
++            }
+             StatusLineItem::RemoteControlStreamConnection => {
+                 "Current remote-control RTT or disconnect state (omitted when unavailable)"
+             }
+@@ -279,6 +291,8 @@ impl StatusLineItem {
+             StatusLineItem::ResponsesStreamConnection => {
+                 StatusSurfacePreviewItem::ResponsesStreamConnection
+             }
++            StatusLineItem::ResponsePerformance => StatusSurfacePreviewItem::ResponsePerformance,
++            StatusLineItem::ResponseReceive => StatusSurfacePreviewItem::ResponseReceive,
+             StatusLineItem::RemoteControlStreamConnection => {
+                 StatusSurfacePreviewItem::RemoteControlStreamConnection
+             }
+@@ -351,6 +365,13 @@ impl StatusLineSetupView {
+                 ))
+                 && (preview_data.app_server_clients_enabled
+                     || item != StatusLineItem::ActiveClients)
++                && (preview_data
++                    .value_for(StatusSurfacePreviewItem::ResponsePerformance)
++                    .is_some()
++                    || !matches!(
++                        item,
++                        StatusLineItem::ResponsePerformance | StatusLineItem::ResponseReceive
++                    ))
+         };
+         let mut used_ids = HashSet::new();
+         let mut items = vec![MultiSelectItem {
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -58,6 +58,7 @@ impl StatusLineAccent {
+             StatusLineItem::Status
+             | StatusLineItem::ActiveClients
+             | StatusLineItem::ResponsesStreamConnection
++            | StatusLineItem::ResponseReceive
+             | StatusLineItem::RemoteControlStreamConnection
+             | StatusLineItem::Proxy => Self::State,
+             StatusLineItem::ContextRemaining
+@@ -67,6 +68,7 @@ impl StatusLineAccent {
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens
+             | StatusLineItem::ThreadCredits
++            | StatusLineItem::ResponsePerformance
+             | StatusLineItem::EstimatedThreadCost => Self::Usage,
+             StatusLineItem::FiveHourLimit
+             | StatusLineItem::WeeklyLimit
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -25,6 +25,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     Permissions,
+     ApprovalMode,
+     ResponsesStreamConnection,
++    ResponsePerformance,
++    ResponseReceive,
+     RemoteControlStreamConnection,
+     Proxy,
+     ContextRemaining,
+@@ -69,6 +71,8 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
+             StatusSurfacePreviewItem::ResponsesStreamConnection
++            | StatusSurfacePreviewItem::ResponsePerformance
++            | StatusSurfacePreviewItem::ResponseReceive
+             | StatusSurfacePreviewItem::RemoteControlStreamConnection => return None,
+             StatusSurfacePreviewItem::Proxy => "proxy",
+             StatusSurfacePreviewItem::ContextRemaining => "Context unavailable",
+@@ -113,6 +117,8 @@ impl StatusSurfacePreviewItem {
+             Self::Permissions,
+             Self::ApprovalMode,
+             Self::ResponsesStreamConnection,
++            Self::ResponsePerformance,
++            Self::ResponseReceive,
+             Self::RemoteControlStreamConnection,
+             Self::Proxy,
+             Self::ContextRemaining,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -570,6 +570,7 @@ pub(crate) struct ChatWidget {
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     home_disk_available_bytes: Option<u64>,
+     responses_stream_connection_status: Option<StreamConnectionStatus>,
++    response_timing: crate::response_timing::ResponseTiming,
+     remote_control_connection_status: Option<StreamConnectionStatus>,
+     proxy_alias: Option<String>,
+     app_server_connected_client_count: Option<usize>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -149,6 +149,7 @@ impl ChatWidget {
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+             home_disk_available_bytes: None,
+             responses_stream_connection_status: None,
++            response_timing: Default::default(),
+             remote_control_connection_status: None,
+             proxy_alias: None,
+             app_server_connected_client_count: None,
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -167,6 +167,10 @@ impl ChatWidget {
+         self.refresh_status_line();
+     }
+ 
++    pub(super) fn response_timing_enabled(&self) -> bool {
++        self.local_settings.tui.fullscreen_transcript && self.response_timing.has_observations()
++    }
++
+     pub(crate) fn clear_remote_control_connection_status(&mut self) {
+         if !self.stream_rtt_enabled() {
+             return;
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -521,6 +521,9 @@ impl ChatWidget {
+                 if self.stream_rtt_enabled() {
+                     items.insert(1, "responses-rtt".to_string());
+                 }
++                if self.response_timing_enabled() {
++                    items.insert(1, "response-performance".to_string());
++                }
+                 items
+             })
+     }
+@@ -817,6 +820,12 @@ impl ChatWidget {
+                     .as_ref()
+                     .and_then(|status| format_stream_rtt("↓", status))
+             })?,
++            StatusLineItem::ResponsePerformance => self
++                .response_timing_enabled()
++                .then(|| self.response_timing.last_performance()),
++            StatusLineItem::ResponseReceive => self
++                .response_timing_enabled()
++                .then(|| self.response_timing.live_receive())?,
+             StatusLineItem::RemoteControlStreamConnection => {
+                 self.stream_rtt_enabled().then(|| {
+                     self.remote_control_connection_status
+@@ -1000,6 +1009,8 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::ResponsesStreamConnection => {
+                 StatusLineItem::ResponsesStreamConnection
+             }
++            StatusSurfacePreviewItem::ResponsePerformance => StatusLineItem::ResponsePerformance,
++            StatusSurfacePreviewItem::ResponseReceive => StatusLineItem::ResponseReceive,
+             StatusSurfacePreviewItem::RemoteControlStreamConnection => {
+                 StatusLineItem::RemoteControlStreamConnection
+             }
+diff --git a/codex-rs/tui/src/chatwidget/tests/permissions.rs b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+--- a/codex-rs/tui/src/chatwidget/tests/permissions.rs
++++ b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+@@ -757,7 +757,7 @@ async fn windows_sandbox_setup_starts_a_fresh_status_clock() {
+     chat.show_windows_sandbox_setup_status();
+     let setup = render_bottom_popup(&chat, /*width*/ 80);
+     assert!(setup.contains("Setting up sandbox"));
+-    assert!(setup.contains("(0s"));
++    assert!(setup.lines().any(|line| line.trim_end().ends_with(" · 0s")));
+     assert_chatwidget_snapshot!(
+         "windows_sandbox_setup_fresh_clock",
+         setup.replace(&chat.config.cwd.display().to_string(), "[CWD]")
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -12,6 +12,68 @@ fn line_text(line: Line<'static>) -> String {
+         .collect()
+ }
+ 
++#[tokio::test]
++async fn response_status_preview_matches_live_values_colors_and_absence() {
++    use crate::response_timing::tests::attempt;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    let items = [
++        StatusLineItem::ResponsePerformance,
++        StatusLineItem::ResponseReceive,
++    ];
++    assert!(
++        chat.status_surface_preview_data()
++            .status_line_for_items(items, true)
++            .is_none()
++    );
++    let mut failed = attempt(2, Some(ResponseAttemptEnd::ProgressTimeout));
++    failed.revision += 1;
++    failed.ttfb_ms = None;
++    failed.tps = None;
++    for (row, expected) in [
++        (
++            attempt(1, Some(ResponseAttemptEnd::Completed)),
++            "Last TTFB 0.30s TPS 50.0",
++        ),
++        (attempt(2, None), "Last TTFB 0.30s TPS 50.0"),
++        (failed, "Last TTFB -- TPS --"),
++    ] {
++        let receiving = row.end_reason.is_none();
++        chat.response_timing.update(row, true, Instant::now());
++        assert_eq!(
++            chat.status_line_value_for_item(items[0]).as_deref(),
++            Some(expected)
++        );
++        assert_eq!(
++            chat.status_line_value_for_item(items[1]).as_deref(),
++            receiving.then_some("Received 0.5KiB")
++        );
++        for colors in [false, true] {
++            let preview = chat
++                .status_surface_preview_data()
++                .status_line_for_items(items, colors);
++            let thread_id = chat.thread_id;
++            let live = crate::bottom_pane::status_line_from_segments(
++                items
++                    .into_iter()
++                    .filter_map(|item| chat.status_line_value(item).map(|value| (item, value))),
++                colors,
++                thread_id,
++                crate::bottom_pane::StatusLineDetails::default(),
++            );
++            assert_eq!(preview, live);
++        }
++    }
++    chat.local_settings.tui.fullscreen_transcript = false;
++    assert!(
++        chat.status_surface_preview_data()
++            .status_line_for_items(items, true)
++            .is_none()
++    );
++}
++
+ fn credit_balance_snapshot(
+     balance: Option<&str>,
+     has_credits: bool,
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -60,6 +60,7 @@ pub(crate) struct StatusIndicatorWidget {
+     details_max_lines: usize,
+     /// Optional suffix rendered after the elapsed/interrupt segment.
+     inline_message: Option<String>,
++    response_progress: Option<crate::response_timing::LiveResponseProgress>,
+     /// Hook activity may move below the status row when it cannot fit in full.
+     hook_status_message: Option<String>,
+     show_interrupt_hint: bool,
+@@ -101,6 +102,7 @@ impl StatusIndicatorWidget {
+             details: None,
+             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
+             inline_message: None,
++            response_progress: None,
+             hook_status_message: None,
+             show_interrupt_hint: true,
+             interrupt_binding: Some(key_hint::plain(KeyCode::Esc).into()),
+@@ -115,7 +117,7 @@ impl StatusIndicatorWidget {
+         self.app_event_tx.interrupt();
+     }
+ 
+-    /// Update the animated header label (left of the brackets).
++    /// Update the animated header label.
+     pub(crate) fn update_header(&mut self, header: String) {
+         if self.header != header {
+             self.header = header;
+@@ -161,6 +163,13 @@ impl StatusIndicatorWidget {
+         &self.header
+     }
+ 
++    pub(crate) fn set_response_progress(
++        &mut self,
++        progress: Option<crate::response_timing::LiveResponseProgress>,
++    ) {
++        self.response_progress = progress;
++    }
++
+     #[cfg(test)]
+     pub(crate) fn details(&self) -> Option<&str> {
+         self.details.as_deref()
+@@ -222,10 +231,7 @@ impl StatusIndicator<'_> {
+     fn lines(&self, width: u16) -> Vec<Line<'static>> {
+         let row = self.row;
+         let now = Instant::now();
+-        let elapsed_duration = self.timer.display_started_at.map_or_else(
+-            || self.timer.elapsed_at(now),
+-            |started_at| now.saturating_duration_since(started_at),
+-        );
++        let elapsed_duration = self.timer.display_elapsed_at(now);
+         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
+         let progress =
+             MotionMode::from_animations_enabled(row.animations_enabled && row.effects.progress);
+@@ -242,22 +248,30 @@ impl StatusIndicator<'_> {
+             spans.push(" ".into());
+         }
+         spans.extend(summary_shimmer(
+-            &row.header,
++            if row.response_progress.is_some() {
++                "Working"
++            } else {
++                &row.header
++            },
+             now.saturating_duration_since(row.header_started_at),
+             shimmer,
+         ));
+-        if !spans.is_empty() {
+-            spans.push(" ".into());
+-        }
+         if row.show_interrupt_hint
+             && let Some(interrupt_binding) = row.interrupt_binding
+         {
+-            spans.push(format!("({pretty_elapsed} • ").dim());
++            spans.push(" · ".dim());
+             spans.extend(interrupt_binding.spans());
+-            spans.push(" to interrupt)".dim());
+-        } else {
+-            spans.push(format!("({pretty_elapsed})").dim());
++            spans.push(" to interrupt".dim());
+         }
++        spans.push(" · ".dim());
++        if let Some(progress) = &row.response_progress {
++            let color = crate::terminal_palette::rgb_color((128, 128, 128));
++            spans.push(format!("{:.1}s", progress.elapsed_ms(now) as f64 / 1000.0).fg(color));
++            spans.push(" · ".dim());
++            spans.push(progress.receive_label().fg(color));
++            spans.push(" · ".dim());
++        }
++        spans.push(pretty_elapsed.cyan().bold());
+         if let Some(message) = &row.inline_message {
+             // Keep optional context after elapsed/interrupt text so that core
+             // interrupt affordances stay in a fixed visual location.
+@@ -285,7 +299,9 @@ impl StatusIndicator<'_> {
+             usize::from(width),
+         ));
+         lines.extend(hook_overflow);
+-        lines.extend(row.wrapped_details_lines(width));
++        if row.response_progress.is_none() {
++            lines.extend(row.wrapped_details_lines(width));
++        }
+         lines
+     }
+ }
+@@ -299,7 +315,10 @@ impl Renderable for StatusIndicator<'_> {
+         if area.is_empty() {
+             return;
+         }
+-        if self.row.animations_enabled || self.timer.display_started_at.is_some() {
++        if self.row.animations_enabled
++            || self.timer.has_wall_clock()
++            || self.row.response_progress.is_some()
++        {
+             let interval_ms = if self.row.animations_enabled
+                 && (self.row.effects.progress || self.row.effects.shimmer)
+             {
+@@ -449,7 +468,11 @@ mod tests {
+             .map(ratatui::buffer::Cell::symbol)
+             .collect::<String>();
+ 
+-        assert!(line.starts_with("Working (0s • esc to interrupt)"));
++        assert!(line.starts_with("Working · esc to interrupt · 0s"));
++        let elapsed_column = display_width(&line[..line.find("0s").unwrap()]) as u16;
++        let elapsed = &terminal.backend().buffer()[(elapsed_column, 0)];
++        assert_eq!(elapsed.fg, ratatui::style::Color::Cyan);
++        assert!(elapsed.modifier.contains(ratatui::style::Modifier::BOLD));
+     }
+ 
+     #[test]
+@@ -473,6 +496,77 @@ mod tests {
+         insta::assert_snapshot!(terminal.backend());
+     }
+ 
++    #[test]
++    fn response_progress_preserves_turn_clock_and_hook_controls() {
++        let (tx, _rx) = unbounded_channel();
++        let mut row = StatusIndicatorWidget::new(
++            AppEventSender::new(tx),
++            FrameRequester::test_dummy(),
++            false,
++            Default::default(),
++        );
++        let mut timer = StatusTimer::default();
++        timer.pause_at(timer.last_resume_at);
++        timer.reset(Duration::from_secs(42));
++        row.update_header("Thinking".into());
++        row.update_details(
++            Some("Earlier reasoning".into()),
++            StatusDetailsCapitalization::Preserve,
++            3,
++        );
++        row.update_inline_message(Some("1 background terminal running".into()));
++        row.update_hook_status_message(Some("checking policy".into()));
++        let mut response = crate::response_timing::tests::attempt(1, None);
++        response.received_payload_bytes = 32768;
++        let observed =
++            crate::response_timing::ObservedResponse::new(response, true, Instant::now());
++        row.set_response_progress(Some(observed.progress()));
++        let view = StatusIndicator {
++            row: &row,
++            timer: &timer,
++        };
++        let lines = view.lines(160);
++        assert_eq!(lines.len(), 1);
++        let text = lines[0].to_string();
++        assert!(text.starts_with("Working · esc to interrupt · "));
++        assert!(
++            text.ends_with(
++                "Received 32.0KiB · 42s · 1 background terminal running · checking policy"
++            )
++        );
++        for label in ["Received 32.0KiB", "42s"] {
++            let span = lines[0]
++                .spans
++                .iter()
++                .find(|span| span.content == label)
++                .unwrap();
++            assert_eq!(
++                span.style.fg,
++                Some(if label == "42s" {
++                    ratatui::style::Color::Cyan
++                } else {
++                    crate::terminal_palette::rgb_color((128, 128, 128))
++                })
++            );
++        }
++        let narrow = view.lines(55);
++        assert_eq!(narrow.len(), 2);
++        assert!(narrow[1].to_string().contains("checking policy"));
++        row.set_response_progress(None);
++        let ended = StatusIndicator {
++            row: &row,
++            timer: &timer,
++        }
++        .lines(160);
++        assert_eq!(ended.len(), 2);
++        assert!(
++            ended[0]
++                .to_string()
++                .starts_with("Thinking · esc to interrupt · 42s")
++        );
++        assert!(ended[1].to_string().contains("Earlier reasoning"));
++    }
++
+     #[test]
+     fn hook_status_reflows_without_displacing_controls_or_details() {
+         let (tx, _rx) = unbounded_channel::<AppEvent>();
+@@ -499,7 +593,7 @@ mod tests {
+             ),
+         ] {
+             w.update_inline_message(background.map(str::to_string));
+-            let mut expected = "Working (0s • esc to interrupt)".to_string();
++            let mut expected = "Working · esc to interrupt · 0s".to_string();
+             if let Some(background) = background {
+                 expected.push_str(&format!(" · {background}"));
+             }
+diff --git a/codex-rs/tui/src/status_indicator_widget/timer.rs b/codex-rs/tui/src/status_indicator_widget/timer.rs
+--- a/codex-rs/tui/src/status_indicator_widget/timer.rs
++++ b/codex-rs/tui/src/status_indicator_widget/timer.rs
+@@ -1,11 +1,13 @@
+-//! Pause-aware status time owned independently of the optional status row.
+-//! A phase can override the displayed clock without changing turn accounting.
++//! Status clocks owned independently of the optional status row.
++//! Active turns include navigation and approval waits; local activities retain
++//! their pause-aware accounting and optional phase clock.
+ 
+ use std::time::Duration;
+ use std::time::Instant;
+ 
+ #[derive(Debug)]
+ pub(crate) struct StatusTimer {
++    pub(super) turn_started_at: Option<Instant>,
+     /// Optional wall-clock origin for the displayed phase, without resetting turn accounting.
+     pub(crate) display_started_at: Option<Instant>,
+     pub(super) elapsed_running: Duration,
+@@ -16,6 +18,7 @@ pub(crate) struct StatusTimer {
+ impl Default for StatusTimer {
+     fn default() -> Self {
+         Self {
++            turn_started_at: None,
+             display_started_at: None,
+             elapsed_running: Duration::ZERO,
+             last_resume_at: Instant::now(),
+@@ -25,6 +28,30 @@ impl Default for StatusTimer {
+ }
+ 
+ impl StatusTimer {
++    pub(crate) fn set_turn_started_at(&mut self, timestamp: Option<i64>) {
++        let now = Instant::now();
++        self.turn_started_at = timestamp.and_then(|timestamp| {
++            let elapsed = chrono::Utc::now()
++                .timestamp()
++                .saturating_sub(timestamp)
++                .max(0);
++            now.checked_sub(Duration::from_secs(elapsed as u64))
++        });
++    }
++
++    pub(crate) fn display_elapsed_at(&self, now: Instant) -> Duration {
++        self.turn_started_at
++            .or(self.display_started_at)
++            .map_or_else(
++                || self.elapsed_at(now),
++                |start| now.saturating_duration_since(start),
++            )
++    }
++
++    pub(crate) fn has_wall_clock(&self) -> bool {
++        self.turn_started_at.is_some() || self.display_started_at.is_some()
++    }
++
+     pub(crate) fn reset(&mut self, elapsed: Duration) {
+         self.elapsed_running = elapsed;
+         self.last_resume_at = Instant::now();
+@@ -47,6 +74,9 @@ impl StatusTimer {
+     }
+ 
+     pub(crate) fn elapsed_at(&self, now: Instant) -> Duration {
++        if let Some(started_at) = self.turn_started_at {
++            return now.saturating_duration_since(started_at);
++        }
+         self.elapsed_running
+             + if self.is_paused {
+                 Duration::ZERO
+diff --git a/codex-rs/tui/src/status_indicator_widget/timer_tests.rs b/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
+--- a/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
++++ b/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
+@@ -1,6 +1,25 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
+ 
++#[test]
++fn active_turn_includes_waits_and_ignores_local_phase_restarts() {
++    let start = Instant::now();
++    let mut timer = StatusTimer {
++        turn_started_at: Some(start),
++        last_resume_at: start,
++        ..StatusTimer::default()
++    };
++    timer.pause_at(start + Duration::from_secs(5));
++    timer.display_started_at = Some(start + Duration::from_secs(8));
++    let now = start + Duration::from_secs(12);
++    assert_eq!(timer.elapsed_at(now), Duration::from_secs(12));
++    assert_eq!(timer.display_elapsed_at(now), Duration::from_secs(12));
++    assert!(timer.has_wall_clock());
++    timer.set_turn_started_at(None);
++    assert_eq!(timer.elapsed_at(now), Duration::from_secs(5));
++    assert_eq!(timer.display_elapsed_at(now), Duration::from_secs(4));
++}
++
+ #[test]
+ fn pauses_and_resumes_without_counting_wait_time() {
+     let baseline = Instant::now();

@@ -1,0 +1,566 @@
+reload-system-prompts-when-starting-new-context-windows
+
+Lane: backend
+
+Unit: expose-and-reload-local-system-prompts
+
+ChildPatch: reload-system-prompts-when-starting-new-context-windows
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -81,7 +81,11 @@ pub(crate) async fn build_compaction_initial_context(
+     world_state: &WorldState,
+ ) -> (Vec<ResponseItemEnvelope>, WorldStateSnapshot) {
+     let (items, snapshot) = sess
+-        .build_initial_context_with_world_state(step_context, world_state)
++        .build_initial_context_with_world_state(
++            step_context,
++            world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await;
+     (
+         items.into_iter().map(ResponseItemEnvelope::new).collect(),
+diff --git a/codex-rs/core/src/session/context_window.rs b/codex-rs/core/src/session/context_window.rs
+--- a/codex-rs/core/src/session/context_window.rs
++++ b/codex-rs/core/src/session/context_window.rs
+@@ -1,9 +1,38 @@
+ use super::session::Session;
++use super::step_context::StepContext;
+ use super::turn_context::TurnContext;
+ use crate::config::Config;
++use codex_prompts::render_model_instructions;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
++use codex_protocol::models::BaseInstructionsProvenance;
+ use codex_protocol::openai_models::ModelInfo;
+ 
++/// Resolve only the model prompt again; the captured step's other metadata stays pinned.
++pub(super) async fn model_instructions_for_new_window(
++    sess: &Session,
++    step_context: &StepContext,
++) -> Option<String> {
++    let config = {
++        let state = sess.state.lock().await;
++        if !matches!(
++            state.base_instructions_provenance,
++            Some(BaseInstructionsProvenance::Model { .. })
++        ) {
++            return None;
++        }
++        state
++            .session_configuration
++            .model_info_overrides
++            .models_manager_config(step_context.settings.personality())
++    };
++    let model = sess
++        .services
++        .models_manager
++        .get_model_info(&step_context.settings.model_info.slug, &config)
++        .await;
++    Some(render_model_instructions(&model))
++}
++
+ #[derive(Debug)]
+ pub(crate) struct ContextWindowTokenStatus {
+     // Full active context usage, independent of the configured auto-compact scope.
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -4188,6 +4188,7 @@ impl Session {
+         &self,
+         step_context: &StepContext,
+         world_state: &WorldState,
++        model_instructions_override: Option<&str>,
+     ) -> (Vec<ResponseItem>, WorldStateSnapshot) {
+         let turn_context = step_context.turn.as_ref();
+         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
+@@ -4353,7 +4354,14 @@ impl Session {
+                         if fragment.markers().0 == ModelSwitchInstructions::type_markers().0 =>
+                     {
+                         // New-model instructions must precede the rest of the developer context.
+-                        developer_sections.insert(0, fragment.render_fragment());
++                        let fragment = model_instructions_override.map_or_else(
++                            || fragment.render_fragment(),
++                            |instructions| {
++                                ModelSwitchInstructions::new(instructions.to_owned())
++                                    .render_fragment()
++                            },
++                        );
++                        developer_sections.insert(0, fragment);
+                     }
+                     "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
+                         initial_multi_agent_mode = Some(fragment);
+@@ -4538,13 +4546,31 @@ impl Session {
+             } else {
+                 Vec::new()
+             };
++        let instructions =
++            context_window::model_instructions_for_new_window(self, step_context).await;
++        let refreshed_instructions = instructions.is_some();
+         let window = {
+             let mut state = self.state.lock().await;
++            if let Some(instructions) = instructions {
++                state.session_configuration.base_instructions = instructions;
++                state.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
++                    model: step_context.settings.model_info.slug.clone(),
++                });
++            }
+             state.start_new_context_window()
+         };
+         let (window_number, window_ids) = window;
++        let model_instructions_override = if refreshed_instructions {
++            Some(self.get_prompt_base_instructions().await.text)
++        } else {
++            None
++        };
+         let (context_items, world_state_snapshot) = self
+-            .build_initial_context_with_world_state(step_context, world_state.as_ref())
++            .build_initial_context_with_world_state(
++                step_context,
++                world_state.as_ref(),
++                model_instructions_override.as_deref(),
++            )
+             .await;
+         let context_items = context_items
+             .into_iter()
+@@ -4606,7 +4632,11 @@ impl Session {
+         // Full initial context resets the baseline; later turns persist only its changes.
+         let (mut context_items, world_state_item) = if should_inject_full_context {
+             let (context_items, snapshot) = self
+-                .build_initial_context_with_world_state(step_context, world_state.as_ref())
++                .build_initial_context_with_world_state(
++                    step_context,
++                    world_state.as_ref(),
++                    /*model_instructions_override*/ None,
++                )
+                 .await;
+             self.state
+                 .lock()
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -3986,6 +3986,33 @@ async fn record_initial_history_reconstructs_forked_transcript() {
+     );
+ }
+ 
++#[tokio::test]
++async fn new_context_window_preserves_non_model_base_instructions() {
++    for provenance in [None, Some(BaseInstructionsProvenance::Custom)] {
++        let (session, turn_context) = make_session_and_context().await;
++        let expected = BaseInstructions {
++            text: "Keep the inherited or explicitly configured instructions.".to_string(),
++            provenance,
++        };
++        {
++            let mut state = session.state.lock().await;
++            state.session_configuration.base_instructions = expected.text.clone();
++            state.base_instructions_provenance = expected.provenance.clone();
++        }
++        let step_context = StepContext::for_test(Arc::new(turn_context));
++        let world_state = Arc::new(
++            session
++                .build_world_state_for_step(&step_context)
++                .await
++                .unwrap(),
++        );
++        session
++            .start_new_context_window(&step_context, world_state)
++            .await;
++        assert_eq!(session.get_base_instructions().await, expected);
++    }
++}
++
+ #[tokio::test]
+ async fn start_new_context_window_persists_checkpoint_state() {
+     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+@@ -6655,7 +6682,11 @@ async fn build_initial_context(
+         .await
+         .expect("world state should build");
+     session
+-        .build_initial_context_with_world_state(&step_context, &world_state)
++        .build_initial_context_with_world_state(
++            &step_context,
++            &world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await
+         .0
+ }
+@@ -10562,8 +10593,11 @@ async fn build_initial_context_reuses_in_flight_recommendation_prewarm() {
+     // This does not depend on how quickly the HTTP server returns its response.
+     let world_state = WorldState::default();
+     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+-    let initial_context =
+-        session.build_initial_context_with_world_state(&step_context, &world_state);
++    let initial_context = session.build_initial_context_with_world_state(
++        &step_context,
++        &world_state,
++        /*model_instructions_override*/ None,
++    );
+     tokio::pin!(initial_context);
+     assert!(futures::poll!(initial_context.as_mut()).is_pending());
+ 
+@@ -11256,15 +11290,21 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
+ 
+ #[tokio::test]
+ async fn build_initial_context_uses_retained_step_after_model_change() {
++    let codex_home = tempfile::tempdir().unwrap();
+     let (mut session, mut turn_context, _rx_event) =
+-        make_session_and_context_with_auth_and_config_and_rx(
++        make_session_and_context_with_auth_config_home_and_rx(
+             CodexAuth::from_api_key("Test API Key"),
+             Vec::new(),
++            codex_home.path(),
+             |config| {
+                 config.features.enable(Feature::TokenBudget).unwrap();
+             },
+         )
+         .await;
++    session.state.lock().await.base_instructions_provenance =
++        Some(BaseInstructionsProvenance::Model {
++            model: turn_context.model_info().slug.clone(),
++        });
+     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+     builder.prompt_contributor(Arc::new(TurnContextExtensionTestContributor));
+     Arc::get_mut(&mut session)
+@@ -11325,7 +11365,9 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
+         .unwrap();
+     let world_b = session.build_world_state_for_step(&step_b).await.unwrap();
+     let initial_b = session
+-        .build_initial_context_with_world_state(&step_b, &world_b)
++        .build_initial_context_with_world_state(
++            &step_b, &world_b, /*model_instructions_override*/ None,
++        )
+         .await
+         .0;
+     let turn_contributions_b = session.build_turn_context_contribution_items(&step_b).await;
+@@ -11360,6 +11402,31 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
+         step_a.environments.to_selections()
+     );
+     assert!(Arc::ptr_eq(&step_b.turn.config, &step_a.turn.config));
++
++    let prompt_dir = codex_home.path().join("instructions");
++    std::fs::create_dir_all(&prompt_dir).unwrap();
++    std::fs::write(prompt_dir.join("model-b.md"), "Reloaded B prompt.").unwrap();
++    session
++        .start_new_context_window(&step_b, Arc::new(world_b))
++        .await;
++    assert_eq!(
++        session.get_base_instructions().await,
++        BaseInstructions {
++            text: "Reloaded B prompt.".to_string(),
++            provenance: Some(BaseInstructionsProvenance::Model {
++                model: "model-b".to_string()
++            }),
++        }
++    );
++    let refreshed = raw_history_items(&session.clone_history().await);
++    let text = developer_input_texts(&refreshed).join("\n");
++    assert!(text.contains("<model_switch>") && text.contains("Reloaded B prompt."));
++    assert!(!text.contains("A instructions") && !text.contains("B instructions"));
++    assert!(text.contains("turn context extension enabled"));
++    assert_eq!(
++        render_model_instructions(&step_b.settings.model_info),
++        "B instructions"
++    );
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/core/src/session/world_state_item_tests.rs b/codex-rs/core/src/session/world_state_item_tests.rs
+--- a/codex-rs/core/src/session/world_state_item_tests.rs
++++ b/codex-rs/core/src/session/world_state_item_tests.rs
+@@ -86,7 +86,11 @@ async fn initial_context_preserves_world_state_items_and_snapshot() {
+     let mut world_state = WorldState::default();
+     world_state.add_section(ItemSection);
+     let (items, snapshot) = session
+-        .build_initial_context_with_world_state(&step_context, &world_state)
++        .build_initial_context_with_world_state(
++            &step_context,
++            &world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await;
+     assert_eq!(
+         strip_metadata_from_items(&items),
+diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
+--- a/codex-rs/core/src/thread_manager_tests.rs
++++ b/codex-rs/core/src/thread_manager_tests.rs
+@@ -840,7 +840,11 @@ async fn ignores_session_prefix_messages_when_truncating() {
+     let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+     let step_context = StepContext::for_test(turn_context);
+     let mut items = session
+-        .build_initial_context_with_world_state(&step_context, &world_state)
++        .build_initial_context_with_world_state(
++            &step_context,
++            &world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await
+         .0;
+     items.push(user_msg("feature request"));
+@@ -1456,7 +1460,11 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
+     let reviewer_context = reviewer
+         .thread
+         .session
+-        .build_initial_context_with_world_state(&reviewer_step, &reviewer_world_state)
++        .build_initial_context_with_world_state(
++            &reviewer_step,
++            &reviewer_world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await
+         .0;
+     assert!(
+diff --git a/codex-rs/core/src/thread_rollout_truncation_tests.rs b/codex-rs/core/src/thread_rollout_truncation_tests.rs
+--- a/codex-rs/core/src/thread_rollout_truncation_tests.rs
++++ b/codex-rs/core/src/thread_rollout_truncation_tests.rs
+@@ -368,7 +368,11 @@ async fn ignores_session_prefix_messages_when_truncating_rollout_from_start() {
+     let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
+     let step_context = StepContext::for_test(turn_context);
+     let mut items = session
+-        .build_initial_context_with_world_state(&step_context, &world_state)
++        .build_initial_context_with_world_state(
++            &step_context,
++            &world_state,
++            /*model_instructions_override*/ None,
++        )
+         .await
+         .0;
+     items.push(user_msg("feature request"));
+diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
+--- a/codex-rs/core/tests/suite/mod.rs
++++ b/codex-rs/core/tests/suite/mod.rs
+@@ -138,6 +138,7 @@ mod mcp_tool_cache;
+ mod mcp_tool_exposure;
+ mod mcp_turn_metadata;
+ mod mcp_user_verification;
++mod model_instruction_windows;
+ mod model_overrides;
+ #[path = "model_provider_requirements_tests.rs"]
+ mod model_provider_requirements;
+diff --git a/codex-rs/core/tests/suite/model_instruction_windows.rs b/codex-rs/core/tests/suite/model_instruction_windows.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/tests/suite/model_instruction_windows.rs
+@@ -0,0 +1,215 @@
++use anyhow::Result;
++use codex_core::TurnInputRequest;
++use codex_features::Feature;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::protocol::ThreadSettingsOverrides;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ResponsesRequest;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_function_call;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_once;
++use core_test_support::responses::mount_sse_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::sse_completed;
++use core_test_support::responses::sse_response;
++use core_test_support::responses::start_mock_server;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use std::path::Path;
++use test_case::test_case;
++use wiremock::Mock;
++use wiremock::matchers::body_partial_json;
++use wiremock::matchers::method;
++use wiremock::matchers::path_regex;
++
++fn write_prompt(home: &Path, model: &str, text: &str) {
++    let dir = home.join("instructions");
++    std::fs::create_dir_all(&dir).expect("create prompt directory");
++    std::fs::write(dir.join(format!("{model}.md")), text).expect("write prompt overlay");
++}
++
++#[test_case("gpt-5.5", "gpt-5", None; "catalog_model")]
++#[test_case("uncatalogued-model", "uncatalogued-model", None; "generic_fallback")]
++#[test_case("gpt-5.5", "gpt-5", Some("Explicit custom system prompt."); "custom_override")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn prompt_edits_apply_only_at_local_window_boundaries(
++    model: &'static str,
++    overlay: &'static str,
++    custom: Option<&'static str>,
++) -> Result<()> {
++    let server = start_mock_server().await;
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse_completed("response-1"),
++            sse_completed("response-2"),
++            sse_completed("response-3"),
++            sse_completed("response-4"),
++        ],
++    )
++    .await;
++    let test = test_codex()
++        .with_pre_build_hook(move |home| write_prompt(home, overlay, "Initial model prompt."))
++        .with_config(move |config| {
++            config.base_instructions = custom.map(str::to_owned);
++            config.model = Some(model.to_string());
++            config
++                .features
++                .enable(Feature::TokenBudget)
++                .expect("enable local context windows");
++        })
++        .build_with_auto_env(&server)
++        .await?;
++
++    test.submit_text_turn("First window").await?;
++    write_prompt(test.codex_home_path(), overlay, "Second model prompt.");
++    test.submit_text_turn("Keep the current window").await?;
++    test.codex.submit(Op::Compact).await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    test.submit_text_turn("Second window").await?;
++    write_prompt(test.codex_home_path(), overlay, "Third model prompt.");
++    test.codex.submit(Op::Compact).await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    test.submit_text_turn("Third window").await?;
++
++    let requests = responses.requests();
++    assert_eq!(
++        requests.len(),
++        4,
++        "local rollover sends no compaction request"
++    );
++    for (request, expected) in requests.iter().zip([
++        "Initial model prompt.",
++        "Initial model prompt.",
++        "Second model prompt.",
++        "Third model prompt.",
++    ]) {
++        assert_eq!(request.instructions_text(), custom.unwrap_or(expected));
++    }
++    let windows = requests
++        .iter()
++        .map(|request| {
++            let metadata: Value = serde_json::from_str(
++                &request
++                    .header("x-codex-turn-metadata")
++                    .expect("turn metadata"),
++            )
++            .expect("valid turn metadata");
++            metadata["context_window_id"].clone()
++        })
++        .collect::<Vec<_>>();
++    assert!(!windows[0].is_null());
++    assert_eq!(windows[0], windows[1]);
++    assert_ne!(windows[1], windows[2]);
++    assert_ne!(windows[2], windows[3]);
++    assert_eq!(
++        std::fs::read_to_string(
++            test.codex_home_path()
++                .join("instructions")
++                .join(format!("{overlay}.md"))
++        )?,
++        "Third model prompt."
++    );
++    Ok(())
++}
++
++async fn switch_model_then_start_new_window(model: &'static str) -> Result<ResponsesRequest> {
++    let server = start_mock_server().await;
++    let initial = mount_sse_once(&server, sse_completed("first-model")).await;
++    let test = test_codex()
++        .with_pre_build_hook(move |home| {
++            write_prompt(home, "gpt-5.5", "First model prompt.");
++            write_prompt(home, model, "Captured second-model prompt.");
++        })
++        .with_config(|config| {
++            config.model = Some("gpt-5.5".to_string());
++            config
++                .features
++                .enable(Feature::TokenBudget)
++                .expect("enable local context windows");
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    test.submit_text_turn("Begin with the first model").await?;
++    assert_eq!(
++        initial.single_request().instructions_text(),
++        "First model prompt."
++    );
++
++    let prompt_home = test.codex_home_path().to_path_buf();
++    Mock::given(method("POST"))
++        .and(path_regex(".*/responses$"))
++        .and(body_partial_json(json!({"model": model})))
++        .respond_with(move |_: &wiremock::Request| {
++            // This request has already captured the old model metadata. Edit
++            // its file before the model asks to leave that context window.
++            write_prompt(&prompt_home, model, "Refreshed second-model prompt.");
++            sse_response(sse(vec![
++                ev_response_created("second-model"),
++                ev_function_call("new-window", "new_context", "{}"),
++                ev_completed("second-model"),
++            ]))
++        })
++        .with_priority(1)
++        .up_to_n_times(1)
++        .expect(1)
++        .mount(&server)
++        .await;
++    let follow_up = mount_sse_once(&server, sse_completed("new-window-response")).await;
++    test.codex
++        .start_or_steer_turn(
++            TurnInputRequest::user_input(vec![UserInput::Text {
++                text: "Continue with the second model".to_string(),
++                text_elements: Vec::new(),
++            }])
++            .with_thread_settings(ThreadSettingsOverrides {
++                model: Some(model.to_string()),
++                ..Default::default()
++            }),
++        )
++        .await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++
++    let request = follow_up.single_request();
++    assert_eq!(request.body_json()["model"], model);
++    assert!(!request.body_contains_text("Captured second-model prompt."));
++    Ok(request)
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn new_context_reloads_catalog_prompt_in_responses_lite() -> Result<()> {
++    let request = switch_model_then_start_new_window("gpt-6.1-sol").await?;
++    // Responses Lite carries the base prompt as its first developer message.
++    assert_eq!(
++        request
++            .message_input_texts("developer")
++            .first()
++            .map(String::as_str),
++        Some("Refreshed second-model prompt.")
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn new_context_reloads_fallback_prompt_in_responses() -> Result<()> {
++    let request = switch_model_then_start_new_window("uncatalogued-model").await?;
++    assert_eq!(
++        request.instructions_text(),
++        "Refreshed second-model prompt."
++    );
++    Ok(())
++}

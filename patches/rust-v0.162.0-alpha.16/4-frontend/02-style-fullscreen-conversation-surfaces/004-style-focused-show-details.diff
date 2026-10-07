@@ -1,0 +1,159 @@
+style-focused-show-details
+
+Lane: frontend
+
+Unit: style-fullscreen-conversation-surfaces
+
+ChildPatch: style-focused-show-details
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/transcript_view/activity_tests.rs b/codex-rs/tui/src/transcript_view/activity_tests.rs
+--- a/codex-rs/tui/src/transcript_view/activity_tests.rs
++++ b/codex-rs/tui/src/transcript_view/activity_tests.rs
+@@ -7,6 +7,7 @@ use crossterm::event::KeyCode;
+ use crossterm::event::KeyEvent;
+ use crossterm::event::KeyModifiers;
+ use pretty_assertions::assert_eq;
++use ratatui::style::Modifier;
+ 
+ fn cell(text: &str) -> Arc<dyn HistoryCell> {
+     Arc::new(PlainHistoryCell::new(
+@@ -19,6 +20,101 @@ fn render(view: &mut TranscriptView, cells: &[Arc<dyn HistoryCell>], height: u16
+     view.render(area, &mut Buffer::empty(area), cells);
+ }
+ 
++#[test]
++fn focused_activity_command_uses_theme_muted_text_while_its_control_keeps_emphasis() {
++    let mut view = TranscriptView::default();
++    view.disclosure.focused = Some(vec!["tool".to_owned()]);
++    let layout = TextLayout::new(vec![HyperlinkLine::from("$ echo ready")], 32)
++        .with_disclosure_control("+ Show details".to_owned())
++        .with_leading_separator();
++    let area = Rect::new(
++        /*x*/ 0, /*y*/ 0, /*width*/ 32, /*height*/ 3,
++    );
++    let mut buffer = Buffer::empty(area);
++    layout.render(area, &mut buffer, /*start_row*/ 0);
++    for row in [1, 2] {
++        view.render_disclosure(
++            &["tool".to_owned()],
++            &layout,
++            row,
++            Rect::new(0, row as u16, 32, 1),
++            &mut buffer,
++        );
++    }
++    let command = &buffer[(0, 1)];
++    assert_eq!(command.fg, crate::style::theme_color_on(&["comment"], None));
++    assert_eq!(command.modifier, Modifier::ITALIC);
++    let control = &buffer[(4, 2)];
++    assert_eq!(
++        control.fg,
++        crate::style::theme_color_on(&["codex.accent", "keyword"], None)
++    );
++    assert_eq!(control.modifier, Modifier::BOLD);
++    insta::assert_snapshot!(format!("{buffer:?}"));
++}
++
++#[test]
++fn switching_theme_updates_focused_activity_without_changing_text_or_emphasis() {
++    use syntect::highlighting::Color;
++    use syntect::highlighting::StyleModifier;
++    use syntect::highlighting::Theme;
++    use syntect::highlighting::ThemeItem;
++
++    let original = crate::render::highlight::current_syntax_theme();
++    crate::terminal_palette::with_test_default_colors(
++        crate::terminal_probe::DefaultColors {
++            fg: (220, 220, 220),
++            bg: (0, 0, 0),
++        },
++        || {
++            let mut view = TranscriptView::default();
++            view.disclosure.focused = Some(vec!["tool".to_owned()]);
++            let layout = TextLayout::new(vec![HyperlinkLine::from("$ echo ready")], 32)
++                .with_disclosure_control("+ Show details".to_owned())
++                .with_leading_separator();
++            let area = Rect::new(0, 0, 32, 3);
++            for (muted, accent) in [
++                ((180, 180, 180), (100, 190, 255)),
++                ((200, 180, 160), (220, 170, 255)),
++            ] {
++                crate::render::highlight::set_syntax_theme(Theme {
++                    scopes: [("comment", muted), ("codex.accent", accent)]
++                        .into_iter()
++                        .map(|(scope, (r, g, b))| ThemeItem {
++                            scope: scope.parse().unwrap(),
++                            style: StyleModifier {
++                                foreground: Some(Color { r, g, b, a: 255 }),
++                                ..Default::default()
++                            },
++                        })
++                        .collect(),
++                    ..Default::default()
++                });
++                let mut buffer = Buffer::empty(area);
++                layout.render(area, &mut buffer, 0);
++                for row in [1, 2] {
++                    view.render_disclosure(
++                        &["tool".to_owned()],
++                        &layout,
++                        row,
++                        Rect::new(0, row as u16, 32, 1),
++                        &mut buffer,
++                    );
++                }
++                assert_eq!(buffer[(0, 1)].fg, crate::terminal_palette::rgb_color(muted));
++                assert_eq!(buffer[(0, 1)].modifier, Modifier::ITALIC);
++                assert_eq!(
++                    buffer[(4, 2)].fg,
++                    crate::terminal_palette::rgb_color(accent)
++                );
++                assert_eq!(buffer[(4, 2)].modifier, Modifier::BOLD);
++                assert_eq!(layout.text(), "$ echo ready");
++            }
++        },
++    );
++    crate::render::highlight::set_syntax_theme(original);
++}
++
+ #[test]
+ fn visible_updates_and_empty_tail_cells_do_not_report_activity() {
+     let mut cells = vec![cell("one\ntwo\nthree\nfour")];
+diff --git a/codex-rs/tui/src/transcript_view/disclosure.rs b/codex-rs/tui/src/transcript_view/disclosure.rs
+--- a/codex-rs/tui/src/transcript_view/disclosure.rs
++++ b/codex-rs/tui/src/transcript_view/disclosure.rs
+@@ -1,7 +1,7 @@
+ //! Local activity disclosure keyed by retained tool identities, independent of text selection.
+ //! Controls appear only while activity is focused; copied text and full-transcript search remain source based.
+ 
+-use crate::style::accent_color;
++use crate::style::theme_color_on;
+ use std::collections::HashSet;
+ 
+ use crate::bottom_pane::TranscriptFooter;
+@@ -124,12 +124,18 @@ impl TranscriptView {
+                     /*height*/ 1,
+                 ),
+                 Style::default()
+-                    .fg(accent_color())
++                    .fg(theme_color_on(&["codex.accent", "keyword"], None))
+                     .bold()
+                     .remove_modifier(Modifier::DIM),
+             );
+         } else if row == usize::from(layout.separated) {
+-            buf.set_style(area, Style::default().underlined());
++            buf.set_style(
++                area,
++                Style::default()
++                    .fg(theme_color_on(&["comment"], None))
++                    .italic()
++                    .remove_modifier(Modifier::UNDERLINED),
++            );
+         }
+     }
+ 

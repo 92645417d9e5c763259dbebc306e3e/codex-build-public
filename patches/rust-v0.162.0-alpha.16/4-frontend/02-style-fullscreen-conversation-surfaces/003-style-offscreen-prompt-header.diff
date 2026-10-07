@@ -1,0 +1,193 @@
+style-offscreen-prompt-header
+
+Lane: frontend
+
+Unit: style-fullscreen-conversation-surfaces
+
+ChildPatch: style-offscreen-prompt-header
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/transcript_view.rs b/codex-rs/tui/src/transcript_view.rs
+--- a/codex-rs/tui/src/transcript_view.rs
++++ b/codex-rs/tui/src/transcript_view.rs
+@@ -221,8 +221,8 @@ impl TranscriptView {
+         {
+             // Freezing follow must preserve a header that yielded to the next visible prompt.
+             self.suppressed_prompt_header = Some(header_position);
+-        } else if area.height >= 4 && prompt_header::line(cells, start.0, area.width).is_some() {
+-            body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
++        } else if area.height >= 7 && prompt_header::line(cells, start.0, area.width).is_some() {
++            body = Rect::new(area.x, area.y + 4, area.width, area.height - 4);
+             let resized = resized || previous_height != body.height;
+             self.area = body;
+             // Copy targets must also leave context after the prompt reserves its row.
+@@ -232,7 +232,12 @@ impl TranscriptView {
+             // Following may advance into the next turn after reserving the header row.
+             start = self.start(cells);
+             if let Some(header) = prompt_header::line(cells, start.0, area.width) {
+-                header.render(Rect::new(area.x, area.y, area.width, /*height*/ 1), buf);
++                // Match a prompt's top/body/bottom fill, then leave a default-background separator.
++                buf.set_style(
++                    Rect::new(area.x, area.y, area.width, /*height*/ 3),
++                    crate::style::history_prompt_style(),
++                );
++                header.render(Rect::new(area.x, area.y + 1, area.width, /*height*/ 1), buf);
+             } else {
+                 body = area;
+                 self.area = area;
+diff --git a/codex-rs/tui/src/transcript_view/prompt_header.rs b/codex-rs/tui/src/transcript_view/prompt_header.rs
+--- a/codex-rs/tui/src/transcript_view/prompt_header.rs
++++ b/codex-rs/tui/src/transcript_view/prompt_header.rs
+@@ -1,4 +1,4 @@
+-//! Keep the prompt associated with the first visible answer in a presentation-only top row.
++//! Keep the prompt associated with the first visible answer in a padded presentation-only header.
+ //! The header is never transcript content, so copying, searching and exporting stay exact.
+ //! A header that yields at a turn boundary stays hidden while that viewport and top row are held.
+ 
+@@ -55,7 +55,7 @@ pub(super) fn line(
+             message.into(),
+         ])
+         .style(crate::style::history_prompt_style()),
+-        usize::from(width.saturating_sub(1)),
++        usize::from(width.saturating_sub(2)),
+     ))
+ }
+ 
+diff --git a/codex-rs/tui/src/transcript_view/prompt_header_tests.rs b/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
+--- a/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
++++ b/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
+@@ -13,6 +13,7 @@ use crossterm::event::MouseButton;
+ use crossterm::event::MouseEvent;
+ use crossterm::event::MouseEventKind;
+ use pretty_assertions::assert_eq;
++use ratatui::style::Color;
+ use ratatui::style::Modifier;
+ 
+ fn user(message: &str) -> Arc<dyn HistoryCell> {
+@@ -31,22 +32,23 @@ fn prompt_header_tracks_reading_and_yields_to_visible_prompts_and_short_screens(
+         cell("one\ntwo\nthree\nfour\nfive"),
+         user("Second café\nquestion"),
+         user("\u{0007}"),
+-        cell("six\nseven\neight\nnine\nten"),
++        // Keep the latest answer taller than the viewport so its prompt is offscreen.
++        cell("six\nseven\neight\nnine\nten\neleven\ntwelve"),
+     ];
+     let mut view = TranscriptView::default();
+     let mut snapshots = Vec::new();
+     snapshots.push(format!(
+         "Latest\n{}",
+         text(&render(
+-            &mut view, &cells, /*width*/ 30, /*height*/ 5
++            &mut view, &cells, /*width*/ 30, /*height*/ 7
+         ))
+     ));
+-    assert_eq!(view.area.y, 1);
++    assert_eq!(view.area.y, 4);
+     view.jump_to_entry(&cells, /*index*/ 1);
+     snapshots.push(format!(
+         "Earlier answer\n{}",
+         text(&render(
+-            &mut view, &cells, /*width*/ 30, /*height*/ 5
++            &mut view, &cells, /*width*/ 30, /*height*/ 7
+         ))
+     ));
+     assert_eq!(view.visible[0].index, 1);
+@@ -55,14 +57,14 @@ fn prompt_header_tracks_reading_and_yields_to_visible_prompts_and_short_screens(
+     snapshots.push(format!(
+         "After prepend\n{}",
+         text(&render(
+-            &mut view, &cells, /*width*/ 30, /*height*/ 5
++            &mut view, &cells, /*width*/ 30, /*height*/ 7
+         ))
+     ));
+     view.jump_to_entry(&cells, /*index*/ 1);
+     snapshots.push(format!(
+         "Prompt visible\n{}",
+         text(&render(
+-            &mut view, &cells, /*width*/ 30, /*height*/ 5
++            &mut view, &cells, /*width*/ 30, /*height*/ 7
+         ))
+     ));
+     assert_eq!(view.area.y, 0);
+@@ -81,7 +83,7 @@ fn prompt_header_tracks_reading_and_yields_to_visible_prompts_and_short_screens(
+ fn header_sanitizes_controls_and_truncates_by_display_width() {
+     let cells = vec![user("\x1b[31m界 café\r\nnext question"), cell("answer")];
+     let line = line(&cells, /*first*/ 1, /*width*/ 18).unwrap();
+-    assert!(line.width() <= 18);
++    assert!(line.width() <= 16);
+     insta::assert_snapshot!(line.to_string());
+ }
+ 
+@@ -105,13 +107,10 @@ fn pinned_prompt_matches_the_original_prompt_style() {
+             cell("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"),
+         ];
+         let mut view = TranscriptView::default();
+-        let actual = render(&mut view, &cells, width, /*height*/ 7);
++        let actual = render(&mut view, &cells, width, /*height*/ 9);
+ 
+-        assert_eq!(
+-            &actual.content[..usize::from(width)],
+-            &expected.content[usize::from(width)..usize::from(width * 2)]
+-        );
+-        assert_eq!(view.area.y, 1);
++        assert_eq!(&actual.content[..usize::from(width * 3)], &expected.content);
++        assert_eq!(view.area.y, 4);
+     }
+ }
+ 
+@@ -207,6 +206,7 @@ fn paused_header_reservation_survives_copy_until_scroll_or_resize() {
+     ];
+     for scroll in [false, true] {
+         let mut view = TranscriptView::default();
++        // This height straddles the answer-to-prompt boundary before header reservation.
+         let before = render(&mut view, &cells, /*width*/ 40, /*height*/ 7);
+         view.begin_selection(&cells, /*column*/ 0, /*row*/ 6, /*clicks*/ 2);
+         assert_eq!(
+@@ -243,6 +243,42 @@ fn paused_header_reservation_survives_copy_until_scroll_or_resize() {
+             8
+         };
+         render(&mut view, &cells, /*width*/ 40, height);
+-        assert_eq!(view.area.y, 1);
++        assert_eq!(view.area.y, 4);
++    }
++}
++
++#[test]
++fn offscreen_prompt_has_gray_padding_right_margin_and_one_source_free_separator() {
++    let cells = vec![user("Previous question"), cell("answer continues")];
++    for width in [16, 30] {
++        for height in [7, 10] {
++            let mut view = TranscriptView::default();
++            view.jump_to_entry(&cells, /*index*/ 1);
++            let buffer = render(&mut view, &cells, width, height);
++            assert_eq!(view.area.y, 4);
++            let background = crate::style::history_prompt_style()
++                .bg
++                .unwrap_or(Color::Reset);
++            assert_eq!(buffer[(0, 1)].symbol(), "›");
++            for x in 0..width {
++                for y in 0..3 {
++                    assert_eq!(buffer[(x, y)].bg, background);
++                    assert_ne!(buffer[(x, y)].symbol(), "─");
++                }
++                for y in [0, 2, 3] {
++                    assert_eq!(buffer[(x, y)].symbol(), " ");
++                }
++                assert_eq!(buffer[(x, 3)].bg, Color::Reset);
++            }
++            for x in [width - 2, width - 1] {
++                assert_eq!(buffer[(x, 1)].symbol(), " ");
++            }
++            assert!(
++                view.visible
++                    .iter()
++                    .all(|row| row.layout.text() == "answer continues")
++            );
++            assert_eq!(view.visible[0].index, 1);
++        }
+     }
+ }

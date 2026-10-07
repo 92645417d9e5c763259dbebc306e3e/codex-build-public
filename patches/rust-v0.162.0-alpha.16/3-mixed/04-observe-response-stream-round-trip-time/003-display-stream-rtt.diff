@@ -1,0 +1,826 @@
+display-stream-rtt
+
+Lane: mixed
+
+Unit: observe-response-stream-round-trip-time
+
+ChildPatch: display-stream-rtt
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -145,6 +145,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::ResponsesStreamConnectionStatus(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::TurnModerationMetadata(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+@@ -242,6 +245,7 @@ mod tests {
+     use codex_app_server_protocol::GuardianWarningNotification;
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
++    use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadAttachmentOperation;
+     use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
+@@ -308,6 +312,23 @@ mod tests {
+         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+     }
+ 
++    #[test]
++    fn responses_stream_connection_notifications_route_to_threads() {
++        let thread_id = ThreadId::new();
++        let notification = ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected: true,
++                rtt_ms: Some(42),
++            },
++        );
++
++        assert_eq!(
++            server_notification_thread_target(&notification),
++            ServerNotificationThreadTarget::Thread(thread_id)
++        );
++    }
++
+     #[test]
+     fn guardian_warning_notifications_route_to_threads() {
+         let thread_id = ThreadId::new();
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -91,6 +91,19 @@ pub(crate) enum StatusLineItem {
+     #[strum(to_string = "run-state", serialize = "status")]
+     Status,
+ 
++    /// RTT of the Responses API WebSocket for the current thread.
++    #[strum(
++        to_string = "responses-rtt",
++        serialize = "stream-rtt",
++        serialize = "responses-stream-connection",
++        serialize = "websocket"
++    )]
++    ResponsesStreamConnection,
++
++    /// RTT of the remote-control WebSocket.
++    #[strum(to_string = "remote-control-rtt", serialize = "remote-connection")]
++    RemoteControlStreamConnection,
++
+     /// Active permission profile or sandbox summary.
+     Permissions,
+ 
+@@ -178,6 +191,12 @@ impl StatusLineItem {
+                 "Committed branch changes against the default branch (omitted when unavailable)"
+             }
+             StatusLineItem::Status => "Compact session run-state text (Ready, Working, Thinking)",
++            StatusLineItem::ResponsesStreamConnection => {
++                "Current Responses stream RTT or disconnect state (omitted when unavailable)"
++            }
++            StatusLineItem::RemoteControlStreamConnection => {
++                "Current remote-control RTT or disconnect state (omitted when unavailable)"
++            }
+             StatusLineItem::Permissions => "Active permission profile or sandbox mode",
+             StatusLineItem::ApprovalMode => "Active command approval mode",
+             StatusLineItem::ContextRemaining => {
+@@ -234,6 +253,12 @@ impl StatusLineItem {
+             StatusLineItem::PullRequestNumber => StatusSurfacePreviewItem::PullRequestNumber,
+             StatusLineItem::BranchChanges => StatusSurfacePreviewItem::BranchChanges,
+             StatusLineItem::Status => StatusSurfacePreviewItem::Status,
++            StatusLineItem::ResponsesStreamConnection => {
++                StatusSurfacePreviewItem::ResponsesStreamConnection
++            }
++            StatusLineItem::RemoteControlStreamConnection => {
++                StatusSurfacePreviewItem::RemoteControlStreamConnection
++            }
+             StatusLineItem::Permissions => StatusSurfacePreviewItem::Permissions,
+             StatusLineItem::ApprovalMode => StatusSurfacePreviewItem::ApprovalMode,
+             StatusLineItem::ContextRemaining => StatusSurfacePreviewItem::ContextRemaining,
+@@ -291,6 +316,14 @@ impl StatusLineSetupView {
+         app_event_tx: AppEventSender,
+         list_keymap: ListKeymap,
+     ) -> Self {
++        let available = |item| {
++            preview_data.stream_rtt_enabled
++                || !matches!(
++                    item,
++                    StatusLineItem::ResponsesStreamConnection
++                        | StatusLineItem::RemoteControlStreamConnection
++                )
++        };
+         let mut used_ids = HashSet::new();
+         let mut items = vec![MultiSelectItem {
+             id: STATUS_LINE_USE_THEME_COLORS_ITEM_ID.to_string(),
+@@ -306,6 +339,9 @@ impl StatusLineSetupView {
+                 let Ok(item) = id.parse::<StatusLineItem>() else {
+                     continue;
+                 };
++                if !available(item) {
++                    continue;
++                }
+                 let item_id = item.to_string();
+                 if !used_ids.insert(item_id.clone()) {
+                     continue;
+@@ -319,6 +355,9 @@ impl StatusLineSetupView {
+         }
+ 
+         for item in StatusLineItem::iter() {
++            if !available(item) {
++                continue;
++            }
+             let item_id = item.to_string();
+             if used_ids.contains(&item_id) {
+                 continue;
+@@ -518,6 +557,22 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn stream_rtt_items_are_independent() {
++        assert_eq!(
++            StatusLineItem::ResponsesStreamConnection.to_string(),
++            "responses-rtt"
++        );
++        assert_eq!(
++            StatusLineItem::RemoteControlStreamConnection.to_string(),
++            "remote-control-rtt"
++        );
++        assert_ne!(
++            StatusLineItem::ResponsesStreamConnection,
++            StatusLineItem::RemoteControlStreamConnection
++        );
++    }
++
+     #[test]
+     fn run_state_is_canonical_and_accepts_status_legacy_id() {
+         assert_eq!(StatusLineItem::Status.to_string(), "run-state");
+@@ -734,6 +789,41 @@ mod tests {
+         assert_snapshot!(render_lines(&view, /*width*/ 72));
+     }
+ 
++    #[test]
++    fn stream_rtt_setup_choices_follow_scope_without_placeholder_samples() {
++        for enabled in [false, true] {
++            let (tx, _rx) = unbounded_channel::<AppEvent>();
++            let mut preview = StatusSurfacePreviewData::default();
++            preview.stream_rtt_enabled = enabled;
++            assert!(
++                preview
++                    .status_line_for_items(
++                        [
++                            StatusLineItem::ResponsesStreamConnection,
++                            StatusLineItem::RemoteControlStreamConnection,
++                        ],
++                        /*use_theme_colors*/ true
++                    )
++                    .is_none()
++            );
++            let view = StatusLineSetupView::new(
++                Some(&[
++                    "responses-rtt".to_string(),
++                    "remote-control-rtt".to_string(),
++                ]),
++                /*use_theme_colors*/ true,
++                preview,
++                AppEventSender::new(tx),
++                crate::keymap::RuntimeKeymap::defaults().list,
++            );
++            let rendered = render_lines(&view, /*width*/ 100);
++            assert_eq!(rendered.contains("responses-rtt"), enabled);
++            assert_eq!(rendered.contains("remote-control-rtt"), enabled);
++            assert!(!rendered.contains("42ms"));
++            assert!(!rendered.contains("55ms"));
++        }
++    }
++
+     #[test]
+     fn setup_view_snapshot_includes_thread_usage_items() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -50,7 +50,9 @@ impl StatusLineAccent {
+             StatusLineItem::GitBranch
+             | StatusLineItem::PullRequestNumber
+             | StatusLineItem::BranchChanges => Self::Branch,
+-            StatusLineItem::Status => Self::State,
++            StatusLineItem::Status
++            | StatusLineItem::ResponsesStreamConnection
++            | StatusLineItem::RemoteControlStreamConnection => Self::State,
+             StatusLineItem::ContextRemaining
+             | StatusLineItem::ContextUsed
+             | StatusLineItem::ContextWindowSize
+@@ -157,6 +159,20 @@ where
+         } else {
+             style
+         };
++        let style = if use_theme_colors {
++            match item {
++                StatusLineItem::ResponsesStreamConnection if text.ends_with(" X") => {
++                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
++                }
++                StatusLineItem::ResponsesStreamConnection => Style::default().magenta(),
++                StatusLineItem::RemoteControlStreamConnection => {
++                    Style::default().fg(Color::LightYellow)
++                }
++                _ => style,
++            }
++        } else {
++            style
++        };
+         let style = if item == StatusLineItem::PullRequestNumber {
+             style.underlined()
+         } else {
+@@ -352,6 +368,38 @@ mod tests {
+             .collect::<String>()
+     }
+ 
++    #[test]
++    fn stream_rtt_colors_are_independent_and_disconnect_is_alerted() {
++        let line = status_line_from_segments(
++            [
++                (StatusLineItem::ResponsesStreamConnection, "↓ X".to_string()),
++                (
++                    StatusLineItem::RemoteControlStreamConnection,
++                    "↑ 55ms".to_string(),
++                ),
++            ],
++            /*use_theme_colors*/ true,
++            /*thread_id*/ None,
++            StatusLineDetails::default(),
++        )
++        .expect("RTT line");
++        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
++        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
++        assert_eq!(line.spans[2].style.fg, Some(Color::LightYellow));
++
++        let plain = status_line_from_segments(
++            [(
++                StatusLineItem::ResponsesStreamConnection,
++                "↓ 42ms".to_string(),
++            )],
++            /*use_theme_colors*/ false,
++            /*thread_id*/ None,
++            StatusLineDetails::default(),
++        )
++        .expect("monochrome RTT line");
++        assert_eq!(plain.spans[0].style, secondary_text_style());
++    }
++
+     #[test]
+     fn status_line_segments_preserve_order_and_plain_text() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -23,6 +23,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     BranchChanges,
+     Permissions,
+     ApprovalMode,
++    ResponsesStreamConnection,
++    RemoteControlStreamConnection,
+     ContextRemaining,
+     ContextUsed,
+     FiveHourLimit,
+@@ -46,8 +48,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+ }
+ 
+ impl StatusSurfacePreviewItem {
+-    fn placeholder(self) -> &'static str {
+-        match self {
++    fn placeholder(self) -> Option<&'static str> {
++        Some(match self {
+             StatusSurfacePreviewItem::AppName => "codex",
+             StatusSurfacePreviewItem::ProjectName => "my-project",
+             StatusSurfacePreviewItem::ProjectRoot => "my-project",
+@@ -61,6 +63,8 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::BranchChanges => "+12 -3",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
++            StatusSurfacePreviewItem::ResponsesStreamConnection
++            | StatusSurfacePreviewItem::RemoteControlStreamConnection => return None,
+             StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+@@ -81,7 +85,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
+             StatusSurfacePreviewItem::Reasoning => "medium",
+             StatusSurfacePreviewItem::TaskProgress => "Tasks 0/0",
+-        }
++        })
+     }
+ 
+     pub(crate) fn iter() -> impl Iterator<Item = Self> {
+@@ -99,6 +103,8 @@ impl StatusSurfacePreviewItem {
+             Self::BranchChanges,
+             Self::Permissions,
+             Self::ApprovalMode,
++            Self::ResponsesStreamConnection,
++            Self::RemoteControlStreamConnection,
+             Self::ContextRemaining,
+             Self::ContextUsed,
+             Self::FiveHourLimit,
+@@ -135,6 +141,7 @@ pub(crate) struct StatusSurfacePreviewData {
+     pub(crate) thread_id: Option<ThreadId>,
+     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+     pub(crate) fast_label: Option<String>,
++    pub(crate) stream_rtt_enabled: bool,
+     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
+ }
+ 
+@@ -144,10 +151,13 @@ impl Default for StatusSurfacePreviewData {
+             thread_id: None,
+             reasoning_effort: None,
+             fast_label: None,
++            stream_rtt_enabled: false,
+             values: BTreeMap::new(),
+         };
+         for item in StatusSurfacePreviewItem::iter() {
+-            data.set_placeholder(item, item.placeholder());
++            if let Some(placeholder) = item.placeholder() {
++                data.set_placeholder(item, placeholder);
++            }
+         }
+         data
+     }
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -383,6 +383,7 @@ mod status_state;
+ mod windows_sandbox_prompts;
+ use self::status_state::StatusIndicatorState;
+ use self::status_state::StatusState;
++use self::status_state::StreamConnectionStatus;
+ use self::status_state::TerminalTitleStatusKind;
+ mod status_controls;
+ mod status_surfaces;
+@@ -560,6 +561,8 @@ pub(crate) struct ChatWidget {
+     token_usage_pending: bool,
+     // Status and polling use account usage reads; response streams may identify meters differently.
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
++    responses_stream_connection_status: Option<StreamConnectionStatus>,
++    remote_control_connection_status: Option<StreamConnectionStatus>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+     next_status_refresh_request_id: u64,
+     pending_rate_limit_reset_request_id: Option<u64>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -147,6 +147,8 @@ impl ChatWidget {
+             token_info: None,
+             token_usage_pending: false,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
++            responses_stream_connection_status: None,
++            remote_control_connection_status: None,
+             refreshing_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
+             pending_rate_limit_reset_request_id: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -236,6 +236,30 @@ impl ChatWidget {
+             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+                 self.on_model_safety_buffering_updated(notification, replay_kind)
+             }
++            ServerNotification::ResponsesStreamConnectionStatus(notification) => self
++                .set_responses_stream_connection_status(
++                    notification.connected,
++                    notification.rtt_ms,
++                ),
++            ServerNotification::RemoteControlStatusChanged(notification) => {
++                match notification.status {
++                    codex_app_server_protocol::RemoteControlConnectionStatus::Disabled => {
++                        self.clear_remote_control_connection_status();
++                    }
++                    codex_app_server_protocol::RemoteControlConnectionStatus::Connected => {
++                        self.set_remote_control_connection_status(
++                            /*connected*/ true,
++                            notification.rtt_ms,
++                        );
++                    }
++                    codex_app_server_protocol::RemoteControlConnectionStatus::Connecting
++                    | codex_app_server_protocol::RemoteControlConnectionStatus::Errored => {
++                        self.set_remote_control_connection_status(
++                            /*connected*/ false, /*rtt_ms*/ None,
++                        );
++                    }
++                }
++            }
+             ServerNotification::AuthRecoveryStarted(notification) => {
+                 self.add_info_message(notification.message, /*hint*/ None)
+             }
+@@ -377,7 +401,6 @@ impl ChatWidget {
+             | ServerNotification::AppListUpdated(_)
+             | ServerNotification::EnvironmentConnected(_)
+             | ServerNotification::EnvironmentDisconnected(_)
+-            | ServerNotification::RemoteControlStatusChanged(_)
+             | ServerNotification::ExternalAgentConfigImportProgress(_)
+             | ServerNotification::ExternalAgentConfigImportCompleted(_)
+             | ServerNotification::FsChanged(_)
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -283,6 +283,10 @@ impl ChatWidget {
+                     });
+             }
+             self.plan_type = snapshot.plan_type.or(self.plan_type);
++            if !self.uses_personal_account_limits() {
++                self.responses_stream_connection_status = None;
++                self.remote_control_connection_status = None;
++            }
+ 
+             if is_codex_limit
+                 && (matches!(source, RateLimitSnapshotSource::AccountUsage)
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -242,6 +242,8 @@ impl ChatWidget {
+         // Account-update notifications are the identity boundary. The visible account fields can
+         // be identical across two accounts, so always invalidate account-scoped requests and data.
+         self.model_popup_request_id = None;
++        self.responses_stream_connection_status = None;
++        self.remote_control_connection_status = None;
+         self.invalidate_permission_discovery();
+         self.permission_discovery = None;
+         self.invalidate_connector_scope();
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -113,6 +113,51 @@ impl ChatWidget {
+         self.refresh_status_surfaces();
+     }
+ 
++    pub(crate) fn set_responses_stream_connection_status(
++        &mut self,
++        connected: bool,
++        rtt_ms: Option<u64>,
++    ) {
++        if !self.stream_rtt_enabled() {
++            return;
++        }
++        self.responses_stream_connection_status =
++            Some(StreamConnectionStatus { connected, rtt_ms });
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn set_remote_control_connection_status(
++        &mut self,
++        connected: bool,
++        rtt_ms: Option<u64>,
++    ) {
++        if !self.stream_rtt_enabled() {
++            return;
++        }
++        self.remote_control_connection_status = Some(StreamConnectionStatus { connected, rtt_ms });
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn clear_remote_control_connection_status(&mut self) {
++        if !self.stream_rtt_enabled() {
++            return;
++        }
++        self.remote_control_connection_status = None;
++        self.refresh_status_line();
++    }
++
++    pub(super) fn stream_rtt_enabled(&self) -> bool {
++        self.local_settings.tui.fullscreen_transcript && self.uses_personal_account_limits()
++    }
++
++    pub(super) fn uses_personal_account_limits(&self) -> bool {
++        self.has_chatgpt_account
++            && matches!(
++                self.plan_type,
++                Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++            )
++    }
++
+     /// Records that status-line setup was canceled.
+     ///
+     /// Cancellation is intentionally side-effect free for config state; the existing configuration
+@@ -365,6 +410,7 @@ impl ChatWidget {
+             }),
+         );
+         preview_data.thread_id = self.thread_id;
++        preview_data.stream_rtt_enabled = self.stream_rtt_enabled();
+         if self.local_settings.tui.fullscreen_transcript {
+             preview_data.reasoning_effort = self.effective_reasoning_effort();
+         }
+diff --git a/codex-rs/tui/src/chatwidget/status_state.rs b/codex-rs/tui/src/chatwidget/status_state.rs
+--- a/codex-rs/tui/src/chatwidget/status_state.rs
++++ b/codex-rs/tui/src/chatwidget/status_state.rs
+@@ -23,6 +23,12 @@ impl StatusIndicatorState {
+     }
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct StreamConnectionStatus {
++    pub(super) connected: bool,
++    pub(super) rtt_ms: Option<u64>,
++}
++
+ /// Compact runtime states that can be rendered into the terminal title.
+ ///
+ /// This is intentionally smaller than the full status-header vocabulary. The
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -474,10 +474,14 @@ impl ChatWidget {
+             .status_line
+             .clone()
+             .unwrap_or_else(|| {
+-                DEFAULT_STATUS_LINE_ITEMS
++                let mut items: Vec<String> = DEFAULT_STATUS_LINE_ITEMS
+                     .iter()
+                     .map(ToString::to_string)
+-                    .collect()
++                    .collect();
++                if self.stream_rtt_enabled() {
++                    items.insert(1, "responses-rtt".to_string());
++                }
++                items
+             })
+     }
+ 
+@@ -762,6 +766,18 @@ impl ChatWidget {
+                     }
+                 }),
+             StatusLineItem::Status => Some(self.run_state_status_text()),
++            StatusLineItem::ResponsesStreamConnection => self.stream_rtt_enabled().then(|| {
++                self.responses_stream_connection_status
++                    .as_ref()
++                    .and_then(|status| format_stream_rtt("↓", status))
++            })?,
++            StatusLineItem::RemoteControlStreamConnection => {
++                self.stream_rtt_enabled().then(|| {
++                    self.remote_control_connection_status
++                        .as_ref()
++                        .and_then(|status| format_stream_rtt("↑", status))
++                })?
++            }
+             StatusLineItem::Permissions => Some(permissions_display(&self.config)),
+             StatusLineItem::ApprovalMode => Some(approval_mode_display(&self.config)),
+             StatusLineItem::UsedTokens => {
+@@ -884,6 +900,12 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
+             StatusSurfacePreviewItem::Permissions => StatusLineItem::Permissions,
+             StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
++            StatusSurfacePreviewItem::ResponsesStreamConnection => {
++                StatusLineItem::ResponsesStreamConnection
++            }
++            StatusSurfacePreviewItem::RemoteControlStreamConnection => {
++                StatusLineItem::RemoteControlStreamConnection
++            }
+             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+@@ -1164,6 +1186,13 @@ impl ChatWidget {
+     }
+ }
+ 
++fn format_stream_rtt(label: &str, status: &StreamConnectionStatus) -> Option<String> {
++    if !status.connected {
++        return Some(format!("{label} X"));
++    }
++    status.rtt_ms.map(|rtt_ms| format!("{label} {rtt_ms}ms"))
++}
++
+ fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -12,6 +12,99 @@ use ratatui::Terminal;
+ use ratatui::backend::TestBackend;
+ use serial_test::serial;
+ 
++#[tokio::test]
++async fn fullscreen_status_line_keeps_response_and_remote_rtt_independent() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    chat.has_chatgpt_account = true;
++    chat.plan_type = Some(PlanType::Plus);
++
++    chat.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(
++            codex_app_server_protocol::ResponsesStreamConnectionStatusNotification {
++                thread_id: ThreadId::new().to_string(),
++                connected: true,
++                rtt_ms: Some(42),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::RemoteControlStatusChanged(
++            codex_app_server_protocol::RemoteControlStatusChangedNotification {
++                status: codex_app_server_protocol::RemoteControlConnectionStatus::Connected,
++                server_name: "server".to_string(),
++                installation_id: "installation".to_string(),
++                environment_id: Some("environment".to_string()),
++                rtt_ms: Some(55),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        Some("↓ 42ms".to_string())
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::RemoteControlStreamConnection
++        ),
++        Some("↑ 55ms".to_string())
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(
++            codex_app_server_protocol::ResponsesStreamConnectionStatusNotification {
++                thread_id: ThreadId::new().to_string(),
++                connected: false,
++                rtt_ms: None,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        Some("↓ X".to_string())
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::RemoteControlStreamConnection
++        ),
++        Some("↑ 55ms".to_string())
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::RemoteControlStatusChanged(
++            codex_app_server_protocol::RemoteControlStatusChangedNotification {
++                status: codex_app_server_protocol::RemoteControlConnectionStatus::Disabled,
++                server_name: "server".to_string(),
++                installation_id: "installation".to_string(),
++                environment_id: None,
++                rtt_ms: None,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::RemoteControlStreamConnection
++        ),
++        None
++    );
++
++    chat.local_settings.tui.fullscreen_transcript = false;
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        None
++    );
++}
++
+ #[tokio::test]
+ async fn finalized_voice_transcript_renders_beside_the_streamed_cell() {
+     let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -79,6 +79,120 @@ fn title_preview_line(chat: &mut ChatWidget, items: &[TerminalTitleItem]) -> Str
+     line_text(preview)
+ }
+ 
++#[tokio::test]
++async fn stream_rtt_scope_defaults_and_live_preview_are_consistent() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let items = [
++        StatusLineItem::ResponsesStreamConnection,
++        StatusLineItem::RemoteControlStreamConnection,
++    ];
++    let mut snapshot = Vec::new();
++    for (plan, signed_in, fullscreen, enabled) in [
++        (Some(PlanType::Plus), true, true, true),
++        (Some(PlanType::Pro), true, true, true),
++        (Some(PlanType::ProLite), true, true, true),
++        (Some(PlanType::ProMax), true, true, false),
++        (Some(PlanType::Business), true, true, false),
++        (Some(PlanType::Unknown), true, true, false),
++        (None, true, true, false),
++        (Some(PlanType::Plus), false, true, false),
++        (Some(PlanType::Plus), true, false, false),
++    ] {
++        chat.update_account_state(
++            /*status_account_display*/ None, plan, signed_in, signed_in,
++        );
++        chat.local_settings.tui.fullscreen_transcript = fullscreen;
++        chat.local_settings.tui.status_line = None;
++        assert_eq!(
++            chat.configured_status_line_items()
++                .contains(&"responses-rtt".to_string()),
++            enabled
++        );
++        chat.local_settings.tui.status_line = Some(items.iter().map(ToString::to_string).collect());
++        chat.refresh_status_line();
++        assert!(
++            chat.status_surface_preview_data()
++                .status_line_for_items(items, /*use_theme_colors*/ true)
++                .is_none()
++        );
++        for (connected, sample) in [(true, None), (true, Some(42)), (false, None)] {
++            chat.set_responses_stream_connection_status(connected, sample);
++            chat.set_remote_control_connection_status(connected, sample.map(|rtt| rtt + 13));
++            let preview = chat.status_surface_preview_data();
++            assert_eq!(preview.stream_rtt_enabled, enabled);
++            for colors in [false, true] {
++                let thread_id = chat.thread_id;
++                let live = crate::bottom_pane::status_line_from_segments(
++                    items.into_iter().filter_map(|item| {
++                        chat.status_line_value_for_item(item)
++                            .map(|value| (item, value))
++                    }),
++                    colors,
++                    thread_id,
++                    crate::bottom_pane::StatusLineDetails::default(),
++                );
++                assert_eq!(preview.status_line_for_items(items, colors), live);
++            }
++            assert_eq!(
++                preview
++                    .status_line_for_items(items, /*use_theme_colors*/ true)
++                    .map(line_text),
++                chat.bottom_pane.status_line_text()
++            );
++            snapshot.push(format!("{plan:?} signed_in={signed_in} fullscreen={fullscreen} connected={connected} rtt={sample:?}: {:?}", chat.bottom_pane.status_line_text()));
++        }
++    }
++    insta::assert_snapshot!(snapshot.join("\n"));
++}
++
++#[tokio::test]
++async fn account_and_plan_changes_clear_previous_stream_rtt_samples() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    chat.update_account_state(
++        /*status_account_display*/ None,
++        Some(PlanType::Plus),
++        /*has_chatgpt_account*/ true,
++        /*has_codex_backend_auth*/ true,
++    );
++    chat.set_responses_stream_connection_status(/*connected*/ true, Some(42));
++    chat.set_remote_control_connection_status(/*connected*/ true, Some(55));
++    chat.update_account_state(
++        /*status_account_display*/ None,
++        Some(PlanType::Plus),
++        /*has_chatgpt_account*/ true,
++        /*has_codex_backend_auth*/ true,
++    );
++    assert_eq!(
++        (
++            chat.responses_stream_connection_status,
++            chat.remote_control_connection_status
++        ),
++        (None, None)
++    );
++    chat.set_responses_stream_connection_status(/*connected*/ true, Some(42));
++    chat.set_remote_control_connection_status(/*connected*/ true, Some(55));
++    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
++        limit_id: Some("codex".to_string()),
++        limit_name: None,
++        normal_model_slug: None,
++        primary: None,
++        secondary: None,
++        credits: None,
++        individual_limit: None,
++        spend_control_reached: None,
++        plan_type: Some(PlanType::Business),
++        rate_limit_reached_type: None,
++    }));
++    assert_eq!(
++        (
++            chat.responses_stream_connection_status,
++            chat.remote_control_connection_status
++        ),
++        (None, None)
++    );
++}
++
+ fn combined_preview_snapshot(
+     chat: &mut ChatWidget,
+     status_items: &[StatusLineItem],

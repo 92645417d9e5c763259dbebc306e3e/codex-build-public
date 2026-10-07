@@ -1,0 +1,937 @@
+display-codex-home-capacity-in-statusline
+
+Lane: mixed
+
+Unit: publish-and-display-codex-home-capacity
+
+ChildPatch: display-codex-home-capacity-in-statusline
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -122,32 +122,63 @@ impl App {
+         else {
+             return;
+         };
+-        self.chat_widget.start_usage_notice_read(request_id);
++        let read_account = origin != RateLimitRefreshOrigin::Periodic
++            || self.chat_widget.rate_limit_refresh_interval().is_some();
++        if read_account {
++            self.chat_widget.start_usage_notice_read(request_id);
++        }
+         let request_handle = app_server.request_handle();
+         let app_event_tx = self.app_event_tx.clone();
+         tokio::spawn(async move {
+-            let request = fetch_account_rate_limits(request_handle, origin);
+-            let result = match origin {
+-                RateLimitRefreshOrigin::Recovery
+-                | RateLimitRefreshOrigin::Periodic
+-                | RateLimitRefreshOrigin::ResetConsume { .. }
+-                | RateLimitRefreshOrigin::ResetPicker { .. } => {
+-                    tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
+-                        .await
+-                        .map_err(|_| "account/rateLimits/read timed out in TUI".to_string())
+-                        .and_then(|result| result.map_err(|err| err.to_string()))
+-                }
+-                RateLimitRefreshOrigin::StartupPrefetch { .. }
+-                | RateLimitRefreshOrigin::StatusCommand { .. }
+-                | RateLimitRefreshOrigin::UsageMenu { .. } => {
+-                    request.await.map_err(|err| err.to_string())
++            let account_request = async {
++                if !read_account {
++                    return None;
+                 }
++                let request = fetch_account_rate_limits(request_handle.clone(), origin);
++                Some(match origin {
++                    RateLimitRefreshOrigin::Recovery
++                    | RateLimitRefreshOrigin::Periodic
++                    | RateLimitRefreshOrigin::ResetConsume { .. }
++                    | RateLimitRefreshOrigin::ResetPicker { .. } => {
++                        tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
++                            .await
++                            .map_err(|_| "account/rateLimits/read timed out in TUI".to_string())
++                            .and_then(|result| result.map_err(|err| err.to_string()))
++                    }
++                    RateLimitRefreshOrigin::StartupPrefetch { .. }
++                    | RateLimitRefreshOrigin::StatusCommand { .. }
++                    | RateLimitRefreshOrigin::UsageMenu { .. } => {
++                        request.await.map_err(|err| err.to_string())
++                    }
++                })
++            };
++            let home_request = async {
++                let request = request_handle
++                    .request_typed::<codex_app_server_protocol::GetCodexHomeDiskCapacityResponse>(
++                    ClientRequest::GetCodexHomeDiskCapacity {
++                        request_id: RequestId::String(format!(
++                            "codex-home-disk-capacity-{}",
++                            Uuid::new_v4()
++                        )),
++                        params: None,
++                    },
++                );
++                tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
++                    .await
++                    .map_err(|_| "codexHome/diskCapacity/read timed out in TUI".to_string())
++                    .and_then(|response| {
++                        response
++                            .map(|response| response.available_bytes)
++                            .map_err(|err| err.to_string())
++                    })
+             };
++            let (result, home_disk_capacity) = tokio::join!(account_request, home_request);
+             app_event_tx.send(AppEvent::RateLimitsLoaded {
+                 request_id,
+                 origin,
+                 hard_stop_generation,
+                 result,
++                home_disk_capacity,
+             });
+         });
+     }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -1878,12 +1878,21 @@ impl App {
+                 origin,
+                 hard_stop_generation,
+                 result,
++                home_disk_capacity,
+             } => {
++                let read_succeeded = result.as_ref().map_or(home_disk_capacity.is_ok(), Result::is_ok);
++                if self.rate_limit_refresh_state.home_read_is_current(
++                    request_id,
++                    hard_stop_generation,
++                    self.rate_limit_hard_stop_generation,
++                ) {
++                    self.chat_widget.on_home_disk_capacity(home_disk_capacity);
++                }
+                 let accepted = match self.rate_limit_refresh_state.finish(
+                     request_id,
+                     hard_stop_generation,
+                     self.rate_limit_hard_stop_generation,
+-                    if result.is_ok() {
++                    if read_succeeded {
+                         RateLimitReadStatus::Succeeded
+                     } else {
+                         RateLimitReadStatus::Failed
+@@ -1898,7 +1907,7 @@ impl App {
+                     }
+                 };
+                 match result {
+-                Ok(response) => {
++                Some(Ok(response)) => {
+                     let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
+                     let snapshots = if accepted
+                     {
+@@ -1967,7 +1976,7 @@ impl App {
+                         }
+                     }
+                 }
+-                Err(err) => {
++                Some(Err(err)) => {
+                     // A failed read is not authoritative recovery. Keep the last valid banner.
+                     tracing::warn!("account/rateLimits/read failed during TUI refresh: {err}");
+                     match origin {
+@@ -2012,6 +2021,7 @@ impl App {
+                         }
+                     }
+                 }
++                None => {}
+                 }
+                 if (accepted || matches!(
+                     origin,
+diff --git a/codex-rs/tui/src/app/rate_limit_refresh.rs b/codex-rs/tui/src/app/rate_limit_refresh.rs
+--- a/codex-rs/tui/src/app/rate_limit_refresh.rs
++++ b/codex-rs/tui/src/app/rate_limit_refresh.rs
+@@ -33,6 +33,15 @@ pub(super) enum RateLimitReadStatus {
+ }
+ 
+ impl RateLimitRefreshState {
++    pub(super) fn home_read_is_current(
++        &self,
++        request_id: u64,
++        generation: u64,
++        current_generation: u64,
++    ) -> bool {
++        generation == current_generation && request_id == self.next_id
++    }
++
+     pub(super) fn poll_deadline(&self, interval: Duration) -> Option<Instant> {
+         if self.periodic.is_some() || self.recovery.is_some() {
+             return None;
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -1127,6 +1127,9 @@ See the Codex keymap documentation for supported actions and examples."
+                     reset_hint_request_id,
+                 },
+             );
++        } else {
++            // Capacity is independent of account authentication and model provider.
++            app.refresh_rate_limits(&app_server, RateLimitRefreshOrigin::Periodic);
+         }
+ 
+         let mut listen_for_app_server_events = true;
+@@ -1235,6 +1238,7 @@ See the Codex keymap documentation for supported actions and examples."
+                 let rate_limit_poll_deadline = app
+                     .chat_widget
+                     .rate_limit_refresh_interval()
++                    .or(Some(std::time::Duration::from_secs(60)))
+                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
+                 let control = select! {
+                     Some(event) = app_event_rx.recv() => {
+diff --git a/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs b/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
+--- a/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
++++ b/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
+@@ -85,7 +85,8 @@ async fn backend_banner_fallback_updates_task_settings_and_keeps_notice() -> Res
+                 request_id: 1,
+                 origin: RateLimitRefreshOrigin::StatusCommand { request_id: 0 },
+                 hard_stop_generation: generation,
+-                result: Ok(response.clone()),
++                result: Some(Ok(response.clone())),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         )
+         .await?;
+@@ -203,7 +204,8 @@ async fn backend_banner_fallback_uses_current_task_and_accepted_generation() ->
+                 request_id: 1,
+                 origin: RateLimitRefreshOrigin::StatusCommand { request_id: 0 },
+                 hard_stop_generation: generation,
+-                result: Ok(fallback_response()),
++                result: Some(Ok(fallback_response())),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         )
+         .await?;
+diff --git a/codex-rs/tui/src/app/tests/backend_banner_recovery_tests.rs b/codex-rs/tui/src/app/tests/backend_banner_recovery_tests.rs
+--- a/codex-rs/tui/src/app/tests/backend_banner_recovery_tests.rs
++++ b/codex-rs/tui/src/app/tests/backend_banner_recovery_tests.rs
+@@ -42,6 +42,69 @@ async fn next_rate_limits_loaded(
+     )
+ }
+ 
++#[tokio::test]
++async fn home_capacity_refresh_works_without_account_and_rejects_stale_samples() -> Result<()> {
++    let home = tempdir()?;
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    app.config.codex_home = home.path().to_path_buf().abs();
++    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(home.path().abs());
++    let mut session = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    assert!(app.chat_widget.rate_limit_refresh_interval().is_none());
++    app.refresh_rate_limits(&session, RateLimitRefreshOrigin::Periodic);
++    app.refresh_rate_limits(&session, RateLimitRefreshOrigin::Periodic);
++    let loaded = next_rate_limits_loaded(&mut events).await?;
++    let (request_id, generation, available_bytes) = match &loaded {
++        AppEvent::RateLimitsLoaded {
++            request_id,
++            hard_stop_generation,
++            result: None,
++            home_disk_capacity: Ok(bytes),
++            ..
++        } => (*request_id, *hard_stop_generation, *bytes),
++        other => panic!("expected an unauthenticated home read, got {other:?}"),
++    };
++    app.handle_event(&mut tui, &mut session, loaded).await?;
++    assert_eq!(
++        app.chat_widget.home_disk_available_bytes(),
++        Some(available_bytes)
++    );
++    assert!(
++        app.rate_limit_refresh_state
++            .poll_deadline(Duration::from_secs(60))
++            .is_some()
++    );
++
++    let (new_id, new_generation) = app
++        .rate_limit_refresh_state
++        .start(
++            RateLimitRefreshOrigin::Periodic,
++            &mut app.rate_limit_hard_stop_generation,
++        )
++        .unwrap();
++    for (id, generation, result, expected) in [
++        (request_id, generation, Ok(1), Some(available_bytes)),
++        (new_id, new_generation, Err("unavailable".into()), None),
++        (request_id, generation, Ok(1), None),
++    ] {
++        app.handle_event(
++            &mut tui,
++            &mut session,
++            AppEvent::RateLimitsLoaded {
++                request_id: id,
++                origin: RateLimitRefreshOrigin::Periodic,
++                hard_stop_generation: generation,
++                result: None,
++                home_disk_capacity: result,
++            },
++        )
++        .await?;
++        assert_eq!(app.chat_widget.home_disk_available_bytes(), expected);
++    }
++    session.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn luna_reserve_periodic_refresh_adapts_without_an_experiment_banner() -> Result<()> {
+     let backend = MockServer::start().await;
+@@ -98,7 +161,13 @@ async fn luna_reserve_periodic_refresh_adapts_without_an_experiment_banner() ->
+                 .is_none()
+         );
+         let loaded = next_rate_limits_loaded(&mut events).await?;
+-        assert_matches!(&loaded, AppEvent::RateLimitsLoaded { result: Ok(_), .. });
++        assert_matches!(
++            &loaded,
++            AppEvent::RateLimitsLoaded {
++                result: Some(Ok(_)),
++                ..
++            }
++        );
+         let before = std::time::Instant::now();
+         app.handle_event(&mut tui, &mut session, loaded).await?;
+         let after = std::time::Instant::now();
+@@ -233,7 +302,13 @@ async fn backend_banner_limit_error_refreshes_again_after_intervening_rolling_ha
+     .await;
+     let loaded = next_rate_limits_loaded(&mut events).await?;
+     assert!(
+-        matches!(&loaded, AppEvent::RateLimitsLoaded { result: Ok(_), .. }),
++        matches!(
++            &loaded,
++            AppEvent::RateLimitsLoaded {
++                result: Some(Ok(_)),
++                ..
++            }
++        ),
+         "{loaded:?}"
+     );
+     app.handle_event(&mut tui, &mut session, loaded).await?;
+@@ -335,7 +410,8 @@ async fn backend_banner_rolling_only_recovery_holds_new_input() -> Result<()> {
+             request_id: 1,
+             origin: RateLimitRefreshOrigin::Recovery,
+             hard_stop_generation: app.rate_limit_hard_stop_generation,
+-            result: Ok(response_with_banner()),
++            result: Some(Ok(response_with_banner())),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+@@ -385,7 +461,8 @@ async fn backend_banner_account_changes_invalidate_pending_recovery() -> Result<
+             request_id: pending.0,
+             origin: RateLimitRefreshOrigin::Recovery,
+             hard_stop_generation: pending.1,
+-            result: Ok(current),
++            result: Some(Ok(current)),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+@@ -467,7 +544,8 @@ async fn backend_banner_reset_redemption_rejects_pre_reset_content() -> Result<(
+             request_id: 2,
+             origin: RateLimitRefreshOrigin::ResetConsume { request_id },
+             hard_stop_generation: app.rate_limit_hard_stop_generation,
+-            result: Ok(recovered),
++            result: Some(Ok(recovered)),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+@@ -484,7 +562,8 @@ async fn backend_banner_reset_redemption_rejects_pre_reset_content() -> Result<(
+             request_id: pending.0,
+             origin: RateLimitRefreshOrigin::Recovery,
+             hard_stop_generation: pending.1,
+-            result: Ok(banner),
++            result: Some(Ok(banner)),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+diff --git a/codex-rs/tui/src/app/tests/backend_banner_startup_tests.rs b/codex-rs/tui/src/app/tests/backend_banner_startup_tests.rs
+--- a/codex-rs/tui/src/app/tests/backend_banner_startup_tests.rs
++++ b/codex-rs/tui/src/app/tests/backend_banner_startup_tests.rs
+@@ -41,7 +41,8 @@ async fn backend_banner_fallback_applies_before_initial_and_queued_startup_promp
+                 reset_hint_request_id: 0,
+             },
+             hard_stop_generation: generation,
+-            result: Ok(fallback_response()),
++            result: Some(Ok(fallback_response())),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+diff --git a/codex-rs/tui/src/app/tests/luna_reserve_recovery_tests.rs b/codex-rs/tui/src/app/tests/luna_reserve_recovery_tests.rs
+--- a/codex-rs/tui/src/app/tests/luna_reserve_recovery_tests.rs
++++ b/codex-rs/tui/src/app/tests/luna_reserve_recovery_tests.rs
+@@ -145,7 +145,8 @@ async fn luna_reserve_entry_dispatches_an_already_queued_turn_with_accepted_sett
+                 request_id: 1,
+                 origin: RateLimitRefreshOrigin::Periodic,
+                 hard_stop_generation: generation,
+-                result: Ok(reserve_response()),
++                result: Some(Ok(reserve_response())),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         )
+         .await?;
+@@ -203,7 +204,8 @@ async fn luna_reserve_recovery_restores_task_and_pending_turn_after_fresh_backen
+                 request_id: 1,
+                 origin: RateLimitRefreshOrigin::Periodic,
+                 hard_stop_generation: generation,
+-                result: Ok(reserve_response()),
++                result: Some(Ok(reserve_response())),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         )
+         .await?;
+@@ -246,7 +248,8 @@ async fn luna_reserve_recovery_restores_task_and_pending_turn_after_fresh_backen
+                     request_id,
+                     origin: RateLimitRefreshOrigin::Periodic,
+                     hard_stop_generation,
+-                    result: Ok(recovered.clone()),
++                    result: Some(Ok(recovered.clone())),
++                    home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+                 },
+             )
+             .await?;
+diff --git a/codex-rs/tui/src/app/tests/rate_limits.rs b/codex-rs/tui/src/app/tests/rate_limits.rs
+--- a/codex-rs/tui/src/app/tests/rate_limits.rs
++++ b/codex-rs/tui/src/app/tests/rate_limits.rs
+@@ -291,11 +291,12 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
+                 request_id: 0,
+                 origin,
+                 hard_stop_generation: read_generation,
+-                result: Ok(account_rate_limits_response(rate_limit_snapshot(
++                result: Some(Ok(account_rate_limits_response(rate_limit_snapshot(
+                     /*used_percent*/ 0,
+                     /*rate_limit_reached_type*/ None,
+                     Some(false),
+-                ))),
++                )))),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         ))
+         .await?;
+@@ -374,11 +375,12 @@ async fn stale_rate_limit_read_does_not_dismiss_visible_workspace_advisory() ->
+             request_id: 0,
+             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+             hard_stop_generation: read_generation,
+-            result: Ok(account_rate_limits_response(rate_limit_snapshot(
++            result: Some(Ok(account_rate_limits_response(rate_limit_snapshot(
+                 /*used_percent*/ 0,
+                 /*rate_limit_reached_type*/ None,
+                 Some(false),
+-            ))),
++            )))),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     ))
+     .await?;
+@@ -421,11 +423,12 @@ async fn post_hard_stop_rate_limit_read_clears_recovered_workspace_limit() -> Re
+             request_id: 0,
+             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+             hard_stop_generation: read_generation,
+-            result: Ok(account_rate_limits_response(rate_limit_snapshot(
++            result: Some(Ok(account_rate_limits_response(rate_limit_snapshot(
+                 /*used_percent*/ 0,
+                 /*rate_limit_reached_type*/ None,
+                 Some(false),
+-            ))),
++            )))),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     ))
+     .await?;
+@@ -480,7 +483,8 @@ async fn failed_rate_limit_read_preserves_visible_backend_banner() -> Result<()>
+             request_id: 0,
+             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+             hard_stop_generation: generation,
+-            result: Err("transient test failure".into()),
++            result: Some(Err("transient test failure".into())),
++            home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+         },
+     )
+     .await?;
+@@ -543,7 +547,8 @@ async fn backend_banner_reads_ignore_older_completions() -> Result<()> {
+                 request_id: id,
+                 origin: RateLimitRefreshOrigin::StatusCommand { request_id: id },
+                 hard_stop_generation: generation,
+-                result,
++                result: Some(result),
++                home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+             },
+         )
+         .await?;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -767,12 +767,13 @@ pub(crate) enum AppEvent {
+         thread_id: ThreadId,
+     },
+ 
+-    /// Result of refreshing rate limits.
++    /// Results of the aligned account and Codex home reads.
+     RateLimitsLoaded {
+         request_id: u64,
+         origin: RateLimitRefreshOrigin,
+         hard_stop_generation: u64,
+-        result: Result<GetAccountRateLimitsResponse, String>,
++        result: Option<Result<GetAccountRateLimitsResponse, String>>,
++        home_disk_capacity: Result<u64, String>,
+     },
+ 
+     /// Open the authenticated account analytics dashboard.
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -17,6 +17,7 @@
+ //! - Approval mode
+ //! - Context usage (remaining %, used %, window size)
+ //! - Usage limits (primary, secondary)
++//! - CODEX_HOME free space (fullscreen)
+ //! - Session info (thread title, thread ID, tokens used)
+ //! - Application version
+ 
+@@ -132,6 +133,9 @@ pub(crate) enum StatusLineItem {
+     /// Remaining usage on the secondary rate limit.
+     WeeklyLimit,
+ 
++    /// Available space on the CODEX_HOME filesystem.
++    CodexHomeCapacity,
++
+     /// Codex application version.
+     CodexVersion,
+ 
+@@ -221,6 +225,7 @@ impl StatusLineItem {
+             StatusLineItem::WeeklyLimit => {
+                 "Remaining usage on the secondary usage limit (omitted when unavailable)"
+             }
++            StatusLineItem::CodexHomeCapacity => "Available space on the CODEX_HOME filesystem",
+             StatusLineItem::CodexVersion => "Codex application version",
+             StatusLineItem::ContextWindowSize => {
+                 "Total context window size in tokens (omitted when unknown)"
+@@ -277,6 +282,7 @@ impl StatusLineItem {
+             StatusLineItem::ContextUsed => StatusSurfacePreviewItem::ContextUsed,
+             StatusLineItem::FiveHourLimit => StatusSurfacePreviewItem::FiveHourLimit,
+             StatusLineItem::WeeklyLimit => StatusSurfacePreviewItem::WeeklyLimit,
++            StatusLineItem::CodexHomeCapacity => StatusSurfacePreviewItem::CodexHomeCapacity,
+             StatusLineItem::CodexVersion => StatusSurfacePreviewItem::CodexVersion,
+             StatusLineItem::ContextWindowSize => StatusSurfacePreviewItem::ContextWindowSize,
+             StatusLineItem::UsedTokens => StatusSurfacePreviewItem::UsedTokens,
+@@ -768,6 +774,31 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn preview_uses_live_codex_home_capacity_color() {
++        let mut preview_data = StatusSurfacePreviewData::from_iter([(
++            StatusSurfacePreviewItem::CodexHomeCapacity,
++            "512.00MiB",
++        )]);
++        preview_data.capacity_bytes = Some(512 * 1024 * 1024);
++        for use_colors in [true, false] {
++            let preview = preview_data
++                .status_line_for_items([StatusLineItem::CodexHomeCapacity], use_colors)
++                .expect("capacity status line preview");
++            let live = crate::bottom_pane::status_line_style::status_line_from_segments(
++                [(StatusLineItem::CodexHomeCapacity, "512.00MiB".to_string())],
++                use_colors,
++                None,
++                crate::bottom_pane::StatusLineDetails {
++                    capacity_bytes: Some(512 * 1024 * 1024),
++                    ..Default::default()
++                },
++            )
++            .expect("capacity status line");
++            assert_eq!(preview, live);
++        }
++    }
++
+     #[test]
+     fn setup_view_snapshot_uses_runtime_preview_values() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -24,6 +24,7 @@ const STATUS_LINE_COLOR_BRIGHTNESS_PERCENT: u16 = 100;
+ pub(crate) struct StatusLineDetails<'a> {
+     pub(crate) reasoning_effort: Option<&'a ReasoningEffort>,
+     pub(crate) fast_label: Option<&'a str>,
++    pub(crate) capacity_bytes: Option<u64>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -64,9 +65,10 @@ impl StatusLineAccent {
+             | StatusLineItem::ThreadCredits
+             | StatusLineItem::EstimatedThreadCost => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+-            StatusLineItem::CodexVersion | StatusLineItem::Hostname | StatusLineItem::SessionId => {
+-                Self::Metadata
+-            }
++            StatusLineItem::CodexVersion
++            | StatusLineItem::Hostname
++            | StatusLineItem::SessionId
++            | StatusLineItem::CodexHomeCapacity => Self::Metadata,
+             StatusLineItem::FastMode | StatusLineItem::Daybreak | StatusLineItem::RawOutput => {
+                 Self::Mode
+             }
+@@ -175,6 +177,14 @@ where
+         } else {
+             style
+         };
++        let style = if item == StatusLineItem::CodexHomeCapacity
++            && use_theme_colors
++            && let Some(bytes) = details.capacity_bytes
++        {
++            style.fg(readable_color_on(capacity_severity_color(bytes), None))
++        } else {
++            style
++        };
+         let style = if item == StatusLineItem::PullRequestNumber {
+             style.underlined()
+         } else {
+@@ -210,6 +220,19 @@ where
+     (!spans.is_empty()).then(|| Line::from(spans))
+ }
+ 
++fn capacity_severity_color(bytes: u64) -> Color {
++    const MIB: u64 = 1024 * 1024;
++    const CRITICAL: u64 = 512 * MIB;
++    const LOW: u64 = 1024 * MIB;
++    const COMFORTABLE: u64 = 5 * LOW;
++    match bytes {
++        ..CRITICAL => Color::Red,
++        CRITICAL..LOW => Color::Rgb(249, 115, 22),
++        LOW..COMFORTABLE => Color::Yellow,
++        COMFORTABLE.. => Color::Green,
++    }
++}
++
+ fn append_reasoning_strength_meter(
+     spans: &mut Vec<Span<'static>>,
+     effort: &ReasoningEffort,
+@@ -402,6 +425,43 @@ mod tests {
+         assert_eq!(plain.spans[0].style, secondary_text_style());
+     }
+ 
++    #[test]
++    fn codex_home_capacity_colors_preserve_display_severity() {
++        const MIB: u64 = 1024 * 1024;
++        for (bytes, color) in [
++            (512 * MIB - 1, Color::Red),
++            (512 * MIB, Color::Rgb(249, 115, 22)),
++            (1024 * MIB - 1, Color::Rgb(249, 115, 22)),
++            (1024 * MIB, Color::Yellow),
++            (5 * 1024 * MIB - 1, Color::Yellow),
++            (5 * 1024 * MIB, Color::Green),
++        ] {
++            let line = status_line_from_segments(
++                [(StatusLineItem::CodexHomeCapacity, "1.00GiB".to_string())],
++                true,
++                None,
++                StatusLineDetails {
++                    capacity_bytes: Some(bytes),
++                    ..Default::default()
++                },
++            )
++            .expect("status line");
++            assert_eq!(line_text(&line), "1.00GiB");
++            assert_eq!(line.spans[0].style.fg, Some(readable_color_on(color, None)));
++        }
++        let monochrome = status_line_from_segments(
++            [(StatusLineItem::CodexHomeCapacity, "512.00MiB".to_string())],
++            false,
++            None,
++            StatusLineDetails {
++                capacity_bytes: Some(512 * MIB),
++                ..Default::default()
++            },
++        )
++        .expect("status line");
++        assert_eq!(monochrome.spans[0].style, secondary_text_style());
++    }
++
+     #[test]
+     fn status_line_segments_preserve_order_and_plain_text() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -31,6 +31,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     ContextUsed,
+     FiveHourLimit,
+     WeeklyLimit,
++    CodexHomeCapacity,
+     CodexVersion,
+     ContextWindowSize,
+     UsedTokens,
+@@ -73,6 +74,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
++            StatusSurfacePreviewItem::CodexHomeCapacity => return None,
+             StatusSurfacePreviewItem::CodexVersion => "0.0.0",
+             StatusSurfacePreviewItem::ContextWindowSize => "0 window",
+             StatusSurfacePreviewItem::UsedTokens => "0 used",
+@@ -115,6 +117,7 @@ impl StatusSurfacePreviewItem {
+             Self::ContextUsed,
+             Self::FiveHourLimit,
+             Self::WeeklyLimit,
++            Self::CodexHomeCapacity,
+             Self::CodexVersion,
+             Self::ContextWindowSize,
+             Self::UsedTokens,
+@@ -147,6 +150,7 @@ pub(crate) struct StatusSurfacePreviewData {
+     pub(crate) thread_id: Option<ThreadId>,
+     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+     pub(crate) fast_label: Option<String>,
++    pub(crate) capacity_bytes: Option<u64>,
+     pub(crate) stream_rtt_enabled: bool,
+     pub(crate) app_server_clients_enabled: bool,
+     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
+@@ -158,6 +162,7 @@ impl Default for StatusSurfacePreviewData {
+             thread_id: None,
+             reasoning_effort: None,
+             fast_label: None,
++            capacity_bytes: None,
+             stream_rtt_enabled: false,
+             app_server_clients_enabled: false,
+             values: BTreeMap::new(),
+@@ -279,6 +284,7 @@ impl StatusSurfacePreviewData {
+             StatusLineDetails {
+                 reasoning_effort: self.reasoning_effort.as_ref(),
+                 fast_label: self.fast_label.as_deref(),
++                capacity_bytes: self.capacity_bytes,
+             },
+         )
+     }
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -563,6 +563,7 @@ pub(crate) struct ChatWidget {
+     token_usage_pending: bool,
+     // Status and polling use account usage reads; response streams may identify meters differently.
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
++    home_disk_available_bytes: Option<u64>,
+     responses_stream_connection_status: Option<StreamConnectionStatus>,
+     remote_control_connection_status: Option<StreamConnectionStatus>,
+     proxy_alias: Option<String>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -147,6 +147,7 @@ impl ChatWidget {
+             token_info: None,
+             token_usage_pending: false,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
++            home_disk_available_bytes: None,
+             responses_stream_connection_status: None,
+             remote_control_connection_status: None,
+             proxy_alias: None,
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -188,6 +188,22 @@ fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
+ }
+ 
+ impl ChatWidget {
++    pub(crate) fn on_home_disk_capacity(&mut self, result: Result<u64, String>) {
++        self.home_disk_available_bytes = match result {
++            Ok(available_bytes) => Some(available_bytes),
++            Err(error) => {
++                tracing::warn!("codexHome/diskCapacity/read failed during TUI refresh: {error}");
++                None
++            }
++        };
++        self.refresh_status_surfaces();
++    }
++
++    #[cfg(test)]
++    pub(crate) fn home_disk_available_bytes(&self) -> Option<u64> {
++        self.home_disk_available_bytes
++    }
++
+     /// Poll more often near exhaustion for every ChatGPT account, independently of experiments.
+     pub(crate) fn rate_limit_refresh_interval(&self) -> Option<std::time::Duration> {
+         if !self.should_prefetch_rate_limits() {
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -439,6 +439,12 @@ impl ChatWidget {
+             }),
+         );
+         preview_data.thread_id = self.thread_id;
++        preview_data.capacity_bytes = self
++            .local_settings
++            .tui
++            .fullscreen_transcript
++            .then_some(self.home_disk_available_bytes)
++            .flatten();
+         preview_data.stream_rtt_enabled = self.stream_rtt_enabled();
+         preview_data.app_server_clients_enabled = self.local_settings.tui.fullscreen_transcript;
+         if self.local_settings.tui.fullscreen_transcript {
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -229,6 +229,12 @@ impl ChatWidget {
+                     .flatten()
+                     .as_ref(),
+                 fast_label: self.status_line_fast_label().as_deref(),
++                capacity_bytes: self
++                    .local_settings
++                    .tui
++                    .fullscreen_transcript
++                    .then_some(self.home_disk_available_bytes)
++                    .flatten(),
+             },
+         ));
+         let hyperlink_url = selections
+@@ -819,6 +825,13 @@ impl ChatWidget {
+                 self.status_line_limit_display(Some(window), &label)
+             }
+             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
++            StatusLineItem::CodexHomeCapacity => self
++                .local_settings
++                .tui
++                .fullscreen_transcript
++                .then_some(self.home_disk_available_bytes)
++                .flatten()
++                .map(format_capacity_bytes),
+             StatusLineItem::ContextWindowSize => self
+                 .status_line_context_window_size()
+                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
+@@ -919,6 +932,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+             StatusSurfacePreviewItem::WeeklyLimit => StatusLineItem::WeeklyLimit,
++            StatusSurfacePreviewItem::CodexHomeCapacity => StatusLineItem::CodexHomeCapacity,
+             StatusSurfacePreviewItem::CodexVersion => StatusLineItem::CodexVersion,
+             StatusSurfacePreviewItem::ContextWindowSize => StatusLineItem::ContextWindowSize,
+             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
+@@ -1211,6 +1225,17 @@ fn five_hour_status_window(
+         .or_else(|| non_weekly_secondary_window_when_primary_is_weekly(snapshot))
+ }
+ 
++pub(super) fn format_capacity_bytes(bytes: u64) -> String {
++    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
++    let mut value = bytes as f64;
++    let mut unit = 0;
++    while value >= 1024.0 && unit + 1 < UNITS.len() {
++        value /= 1024.0;
++        unit += 1;
++    }
++    format!("{value:.2}{}", UNITS[unit])
++}
++
+ fn weekly_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -297,6 +297,7 @@ mod sparkle_submission_tests;
+ #[path = "tests/startup_submission_tests.rs"]
+ mod startup_submission_tests;
+ mod status_and_layout;
++mod status_capacity;
+ mod status_command_tests;
+ mod status_surface_previews;
+ #[path = "tests/subagent_activity_tests.rs"]
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_capacity.rs b/codex-rs/tui/src/chatwidget/tests/status_capacity.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/status_capacity.rs
+@@ -0,0 +1,74 @@
++use super::*;
++use crate::chatwidget::status_surfaces::format_capacity_bytes;
++
++#[test]
++fn formats_capacity_at_display_thresholds() {
++    assert_eq!(format_capacity_bytes(0), "0.00B");
++    assert_eq!(format_capacity_bytes(512 * 1024 * 1024), "512.00MiB");
++    assert_eq!(format_capacity_bytes(1024 * 1024 * 1024), "1.00GiB");
++}
++
++#[tokio::test]
++async fn cached_capacity_preview_preserves_live_value_and_unavailable_state_without_io() {
++    for fullscreen in [true, false] {
++        for bytes in [
++            Some(0),
++            Some(512 * 1024 * 1024),
++            Some(200 * 1024 * 1024 * 1024),
++            None,
++        ] {
++            let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++            // A path that cannot be stat'ed proves rendering consumes the RPC cache.
++            let home = tempfile::tempdir().expect("create home");
++            chat.config.codex_home =
++                AbsolutePathBuf::from_absolute_path(home.path().join("missing-home"))
++                    .expect("absolute fixture home");
++            chat.local_settings.tui.fullscreen_transcript = fullscreen;
++            chat.local_settings.tui.status_line = Some(vec!["codex-home-capacity".into()]);
++            chat.on_home_disk_capacity(bytes.ok_or_else(|| "unavailable".to_string()));
++            let preview = chat.status_surface_preview_data();
++            let value = preview.value_for(StatusSurfacePreviewItem::CodexHomeCapacity);
++            if let Some(bytes) = bytes.filter(|_| fullscreen) {
++                assert_eq!(preview.capacity_bytes, Some(bytes));
++                assert_eq!(value, Some(format_capacity_bytes(bytes).as_str()));
++                assert_eq!(
++                    chat.bottom_pane.status_line_text(),
++                    Some(format_capacity_bytes(bytes))
++                );
++                for use_colors in [true, false] {
++                    let preview_line = preview
++                        .status_line_for_items([StatusLineItem::CodexHomeCapacity], use_colors);
++                    let live_line = crate::bottom_pane::status_line_from_segments(
++                        [(
++                            StatusLineItem::CodexHomeCapacity,
++                            format_capacity_bytes(bytes),
++                        )],
++                        use_colors,
++                        chat.thread_id,
++                        crate::bottom_pane::StatusLineDetails {
++                            capacity_bytes: Some(bytes),
++                            ..Default::default()
++                        },
++                    );
++                    assert_eq!(preview_line, live_line);
++                }
++            } else {
++                assert!(preview.capacity_bytes.is_none());
++                assert!(
++                    value.is_none(),
++                    "unavailable capacity must not show a placeholder"
++                );
++                assert!(
++                    preview
++                        .status_line_for_items([StatusLineItem::CodexHomeCapacity], true)
++                        .is_none()
++                );
++                assert!(
++                    chat.status_line_value_for_item(StatusLineItem::CodexHomeCapacity)
++                        .is_none()
++                );
++                assert!(chat.bottom_pane.status_line_text().is_none());
++            }
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/usage_notice_tests.rs b/codex-rs/tui/src/chatwidget/usage_notice_tests.rs
+--- a/codex-rs/tui/src/chatwidget/usage_notice_tests.rs
++++ b/codex-rs/tui/src/chatwidget/usage_notice_tests.rs
+@@ -358,9 +358,10 @@ async fn overlapping_reads_keep_older_success_when_newer_read_fails() -> color_e
+                     request_id,
+                     origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+                     hard_stop_generation: 0,
+-                    result: result.map(|update| {
++                    result: Some(result.map(|update| {
+                         serde_json::from_value(serde_json::json!({"rateLimits": update})).unwrap()
+-                    }),
++                    })),
++                    home_disk_capacity: Ok(2 * 1024 * 1024 * 1024),
+                 },
+             )
+             .await?;

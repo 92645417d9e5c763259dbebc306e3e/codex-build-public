@@ -1,0 +1,290 @@
+activate-local-model-catalogs
+
+Lane: backend
+
+Unit: materialize-local-model-catalog-infrastructure
+
+ChildPatch: activate-local-model-catalogs
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+--- a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+@@ -617,6 +617,7 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
+         BTreeSet::from([
+             "config.toml".to_string(),
+             "installation_id".to_string(),
++            "models.json".to_string(),
+             "skills".to_string(),
+         ]),
+         "non-local thread persistence should not create unexpected files in codex_home"
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -3,6 +3,7 @@ use crate::cache::ModelsCache;
+ use crate::cache::ModelsCacheEntry;
+ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use crate::config::ModelsManagerConfig;
++use crate::model_catalog;
+ use crate::model_info;
+ use chrono::DateTime;
+ use chrono::Utc;
+@@ -164,6 +165,11 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
+     /// Returns an error if the internal lock cannot be acquired.
+     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError>;
+ 
++    /// Reload the local model catalog into the active in-memory view.
++    fn reload_local_catalog(&self) -> ModelsManagerFuture<'_, ()> {
++        Box::pin(std::future::ready(()))
++    }
++
+     /// Return the auth manager used for picker filtering.
+     fn auth_manager(&self) -> Option<&AuthManager>;
+ 
+@@ -285,14 +291,21 @@ impl CatalogSource {
+ /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
+ #[derive(Debug)]
+ pub struct OpenAiModelsManager {
+-    remote_models: RwLock<ModelsCacheEntry>,
++    remote_models: RwLock<ModelsCatalogState>,
+     cache: Option<Arc<dyn ModelsCache>>,
++    model_catalog_path: Option<PathBuf>,
+     endpoint_client: SharedModelsEndpointClient,
+     catalog_source: CatalogSource,
+     api_key_model_discovery_enabled: AtomicBool,
+     auth_manager: Option<Arc<AuthManager>>,
+ }
+ 
++#[derive(Debug)]
++struct ModelsCatalogState {
++    base: ModelsCacheEntry,
++    active_models: Vec<ModelInfo>,
++}
++
+ /// Static model manager backed by an authoritative in-process catalog.
+ #[derive(Debug)]
+ pub struct StaticModelsManager {
+@@ -308,11 +321,14 @@ impl OpenAiModelsManager {
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+         let cache_path = codex_home.join(MODEL_CACHE_FILE);
++        let model_catalog_path = model_catalog::path(&codex_home);
++        model_catalog::ensure_default(&model_catalog_path);
+         Self::new_with_optional_cache(
+             Some(Arc::new(FileModelsCache::new(
+                 cache_path,
+                 DEFAULT_MODEL_CACHE_TTL,
+             ))),
++            Some(model_catalog_path),
+             endpoint_client,
+             auth_manager,
+         )
+@@ -323,7 +339,12 @@ impl OpenAiModelsManager {
+         endpoint_client: Arc<dyn ModelsEndpointClient>,
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+-        Self::new_with_optional_cache(/*cache*/ None, endpoint_client, auth_manager)
++        Self::new_with_optional_cache(
++            /*cache*/ None,
++            /*model_catalog_path*/ None,
++            endpoint_client,
++            auth_manager,
++        )
+     }
+ 
+     /// Constructs an OpenAI-compatible model manager with a caller-provided cache.
+@@ -335,23 +356,38 @@ impl OpenAiModelsManager {
+         endpoint_client: Arc<dyn ModelsEndpointClient>,
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+-        Self::new_with_optional_cache(Some(cache), endpoint_client, auth_manager)
++        Self::new_with_optional_cache(
++            Some(cache),
++            /*model_catalog_path*/ None,
++            endpoint_client,
++            auth_manager,
++        )
+     }
+ 
+     fn new_with_optional_cache(
+         cache: Option<Arc<dyn ModelsCache>>,
++        model_catalog_path: Option<PathBuf>,
+         endpoint_client: Arc<dyn ModelsEndpointClient>,
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
++        let models = load_remote_models_from_file().unwrap_or_default();
++        let active_models = match model_catalog_path.as_ref() {
++            Some(path) => model_catalog::apply(path, models.clone()),
++            None => models.clone(),
++        };
+         Self {
+-            remote_models: RwLock::new(ModelsCacheEntry {
+-                fetched_at: Utc::now(),
+-                etag: None,
+-                client_version: Some(crate::client_version_to_whole()),
+-                identity: endpoint_client.identity(),
+-                models: load_remote_models_from_file().unwrap_or_default(),
++            remote_models: RwLock::new(ModelsCatalogState {
++                base: ModelsCacheEntry {
++                    fetched_at: Utc::now(),
++                    etag: None,
++                    client_version: Some(crate::client_version_to_whole()),
++                    identity: endpoint_client.identity(),
++                    models,
++                },
++                active_models,
+             }),
+             cache,
++            model_catalog_path,
+             api_key_model_discovery_enabled: AtomicBool::new(false),
+             endpoint_client,
+             catalog_source: CatalogSource::Default,
+@@ -363,7 +399,10 @@ impl OpenAiModelsManager {
+     /// Clear the bundled seed before sharing it; the existing auth identity must be retained.
+     pub fn with_provider_catalog(mut self) -> Self {
+         self.catalog_source = CatalogSource::ExplicitProvider(Mutex::new(()));
+-        self.remote_models.get_mut().models.clear();
++        self.model_catalog_path = None;
++        let state = self.remote_models.get_mut();
++        state.base.models.clear();
++        state.active_models.clear();
+         self
+     }
+ }
+@@ -407,7 +446,7 @@ impl ModelsManager for OpenAiModelsManager {
+                     return Ok(());
+                 }
+                 let identity = self.endpoint_client.identity();
+-                if identity.is_some() && self.remote_models.read().await.identity == identity {
++                if identity.is_some() && self.remote_models.read().await.base.identity == identity {
+                     return Ok(());
+                 }
+                 self.refresh_available_models(
+@@ -430,12 +469,14 @@ impl ModelsManager for OpenAiModelsManager {
+         Box::pin(async move {
+             let entry = self.remote_models.read().await;
+             if !self.api_key_discovery_disabled()
+-                && entry.identity.is_some()
+-                && entry.identity == self.endpoint_client.identity()
++                && entry.base.identity.is_some()
++                && entry.base.identity == self.endpoint_client.identity()
+             {
+-                entry.models.clone()
++                entry.active_models.clone()
+             } else {
+-                self.catalog_source.fallback_models().unwrap_or_default()
++                self.materialize_local_catalog(
++                    self.catalog_source.fallback_models().unwrap_or_default(),
++                )
+             }
+         })
+     }
+@@ -444,12 +485,14 @@ impl ModelsManager for OpenAiModelsManager {
+         let entry = self.remote_models.try_read()?;
+         Ok(
+             if !self.api_key_discovery_disabled()
+-                && entry.identity.is_some()
+-                && entry.identity == self.endpoint_client.identity()
++                && entry.base.identity.is_some()
++                && entry.base.identity == self.endpoint_client.identity()
+             {
+-                entry.models.clone()
++                entry.active_models.clone()
+             } else {
+-                self.catalog_source.fallback_models().unwrap_or_default()
++                self.materialize_local_catalog(
++                    self.catalog_source.fallback_models().unwrap_or_default(),
++                )
+             },
+         )
+     }
+@@ -458,6 +501,13 @@ impl ModelsManager for OpenAiModelsManager {
+         self.auth_manager.as_deref()
+     }
+ 
++    fn reload_local_catalog(&self) -> ModelsManagerFuture<'_, ()> {
++        Box::pin(async move {
++            let mut state = self.remote_models.write().await;
++            state.active_models = self.materialize_local_catalog(state.base.models.clone());
++        })
++    }
++
+     #[tracing::instrument(skip_all, fields(model))]
+     fn get_model_info<'a>(
+         &'a self,
+@@ -517,7 +567,7 @@ impl OpenAiModelsManager {
+         let refresh_guard = self.catalog_source.refresh_lock().await;
+         let (identity, current_etag) = {
+             let entry = self.remote_models.read().await;
+-            (entry.identity.clone(), entry.etag.clone())
++            (entry.base.identity.clone(), entry.base.etag.clone())
+         };
+         if let Some(identity) = identity
+             && Some(&identity) == self.endpoint_client.identity().as_ref()
+@@ -602,10 +652,11 @@ impl OpenAiModelsManager {
+                             return Err(error);
+                         }
+                         // Keep this failure in memory even if persistent invalidation fails.
+-                        current.fetched_at = DateTime::<Utc>::MIN_UTC;
+-                        current.models.clear();
+-                        current.etag = None;
+-                        current.identity.clone_from(&request_identity);
++                        current.base.fetched_at = DateTime::<Utc>::MIN_UTC;
++                        current.base.models.clear();
++                        current.active_models.clear();
++                        current.base.etag = None;
++                        current.base.identity.clone_from(&request_identity);
+                     }
+                     if let Some(identity) = request_identity
+                         && let Some(cache) = self.cache.as_ref()
+@@ -634,6 +685,12 @@ impl OpenAiModelsManager {
+         if Some(&identity) != self.endpoint_client.identity().as_ref() {
+             return Ok(());
+         }
++        if !models.is_empty()
++            && let Some(path) = self.model_catalog_path.as_ref()
++        {
++            let previous_models = self.remote_models.read().await.base.models.clone();
++            model_catalog::prune_stale_overlays(path, &previous_models, &models);
++        }
+         let entry = ModelsCacheEntry {
+             fetched_at: Utc::now(),
+             etag,
+@@ -707,10 +764,21 @@ impl OpenAiModelsManager {
+             }
+             entry.models = models;
+         }
+-        *current = entry;
++        let active_models = self.materialize_local_catalog(entry.models.clone());
++        *current = ModelsCatalogState {
++            base: entry,
++            active_models,
++        };
+         true
+     }
+ 
++    fn materialize_local_catalog(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
++        match self.model_catalog_path.as_ref() {
++            Some(path) => model_catalog::apply(path, models),
++            None => models,
++        }
++    }
++
+     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+     async fn try_load_cache(&self) -> bool {
+         let Some(cache) = self.cache.as_ref() else {
+@@ -726,8 +794,8 @@ impl OpenAiModelsManager {
+         {
+             let current = self.remote_models.read().await;
+             // A failed fetch must not be replaced by stale cache data even if invalidation failed.
+-            if current.fetched_at == DateTime::<Utc>::MIN_UTC
+-                && current.identity.as_ref() == Some(&identity)
++            if current.base.fetched_at == DateTime::<Utc>::MIN_UTC
++                && current.base.identity.as_ref() == Some(&identity)
+             {
+                 return false;
+             }

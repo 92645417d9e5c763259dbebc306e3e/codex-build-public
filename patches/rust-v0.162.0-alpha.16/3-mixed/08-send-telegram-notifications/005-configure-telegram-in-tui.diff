@@ -1,0 +1,889 @@
+configure-telegram-in-tui
+
+Lane: mixed
+
+Unit: send-telegram-notifications
+
+ChildPatch: configure-telegram-in-tui
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -155,6 +155,64 @@ impl App {
+                 }
+                 Err(error) => self.chat_widget.add_error_message(format!("Failed to save proxy settings: {error:#}")),
+             },
++            AppEvent::OpenTelegram => {
++                self.app_event_tx.send(AppEvent::TelegramCommand {
++                    params: codex_app_server_protocol::TelegramCommandParams::Read {},
++                });
++            }
++            AppEvent::OpenTelegramChat { draft } => self.chat_widget.open_telegram_chat(draft),
++            AppEvent::OpenTelegramGithubToken { draft } => {
++                self.chat_widget.open_telegram_github_token(draft);
++            }
++            AppEvent::OpenTelegramSetup { draft, notify_version_updates } => {
++                self.chat_widget.open_telegram_setup(draft, notify_version_updates);
++            }
++            AppEvent::OpenTelegramVersion { config } => {
++                self.chat_widget.open_telegram_version(config);
++            }
++            AppEvent::OpenTelegramInterval { config } => {
++                self.chat_widget.open_telegram_interval(config);
++            }
++            AppEvent::TelegramCommand { params } => {
++                let request_handle = app_server.request_handle();
++                let request_id = app_server.next_request_id();
++                let app_event_tx = self.app_event_tx.clone();
++                let kind = params.kind();
++                tokio::spawn(async move {
++                    let result = crate::app_server_session::telegram_command_with_request_handle(
++                        request_handle, request_id, params,
++                    ).await.map_err(|error| error.to_string());
++                    app_event_tx.send(AppEvent::TelegramCommandFinished { kind, result });
++                });
++            }
++            AppEvent::TelegramCommandFinished { kind, result } => match result {
++                Ok(response) => match kind {
++                    codex_app_server_protocol::TelegramCommandKind::Read
++                    | codex_app_server_protocol::TelegramCommandKind::Configure => {
++                        self.chat_widget.open_telegram_menu(response);
++                    }
++                    codex_app_server_protocol::TelegramCommandKind::SetVersionSettings => {
++                        self.chat_widget.open_telegram_version(response);
++                    }
++                    codex_app_server_protocol::TelegramCommandKind::Disable => {
++                        self.chat_widget.add_info_message("Telegram notifications disabled.".to_string(), None);
++                    }
++                    codex_app_server_protocol::TelegramCommandKind::ProbeGithub
++                    | codex_app_server_protocol::TelegramCommandKind::CheckVersion => {
++                        self.chat_widget.add_info_message(response.message.unwrap_or_else(|| "Check completed.".to_string()), None);
++                    }
++                    codex_app_server_protocol::TelegramCommandKind::Completion
++                    | codex_app_server_protocol::TelegramCommandKind::NeedsInput => {}
++                },
++                Err(error) => {
++                    if matches!(kind, codex_app_server_protocol::TelegramCommandKind::Completion
++                        | codex_app_server_protocol::TelegramCommandKind::NeedsInput) {
++                        tracing::warn!(%error, "Telegram notification failed");
++                    } else {
++                        self.chat_widget.add_error_message(format!("Telegram command failed: {error}"));
++                    }
++                }
++            },
+             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+             AppEvent::ConfirmDaemonUpdate(source) => self.confirm_daemon_update(source),
+             AppEvent::RunDaemonUpdate(source) => {
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1,5 +1,8 @@
+ //! App-level orchestration tests for the TUI.
+ 
++#[path = "tests/telegram.rs"]
++mod telegram;
++
+ #[path = "tests/copy_mode_tests.rs"]
+ mod copy_mode_tests;
+ #[path = "tests/mcp_login_tests.rs"]
+diff --git a/codex-rs/tui/src/app/tests/telegram.rs b/codex-rs/tui/src/app/tests/telegram.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/telegram.rs
+@@ -0,0 +1,119 @@
++use crate::app::App;
++use crate::app::test_support::make_test_app;
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use crate::app_server_session::AppServerSession;
++use crate::chatwidget::tests::helpers::render_bottom_popup;
++use codex_app_server_protocol::TelegramCommandKind;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use pretty_assertions::assert_eq;
++use std::time::Duration;
++use tokio::sync::mpsc::UnboundedReceiver;
++
++async fn finish_command(
++    app: &mut App,
++    tui: &mut crate::tui::Tui,
++    server: &mut AppServerSession,
++    rx: &mut UnboundedReceiver<AppEvent>,
++    expected: TelegramCommandKind,
++) -> color_eyre::Result<AppEvent> {
++    Ok(tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            tokio::select! {
++                Some(event) = rx.recv() => {
++                    if matches!(&event, AppEvent::TelegramCommandFinished { kind, .. } if *kind == expected) {
++                        break Ok::<_, color_eyre::eyre::Report>(event);
++                    }
++                    app.handle_event(tui, server, event).await?;
++                }
++                Some(event) = server.next_event() => app.handle_app_server_event(server, event).await,
++            }
++        }
++    }).await??)
++}
++
++#[tokio::test]
++async fn telegram_menu_round_trip_uses_embedded_server_and_saved_configuration()
++-> color_eyre::Result<()> {
++    let mut app = make_test_app().await;
++    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++    app.app_event_tx = AppEventSender::new(tx);
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    app.handle_event(&mut tui, &mut server, AppEvent::OpenTelegram)
++        .await?;
++    let event = finish_command(
++        &mut app,
++        &mut tui,
++        &mut server,
++        &mut rx,
++        TelegramCommandKind::Read,
++    )
++    .await?;
++    let AppEvent::TelegramCommandFinished { result, .. } = &event else {
++        panic!("expected result")
++    };
++    assert_eq!(
++        result.as_ref().expect("unconfigured read"),
++        &TelegramCommandResponse::default()
++    );
++    app.handle_event(&mut tui, &mut server, event).await?;
++    assert!(render_bottom_popup(&app.chat_widget, 80).contains("Bot token"));
++
++    let path = app.config.codex_home.join("telegram.json");
++    std::fs::write(
++        &path,
++        r#"{"bot_token":"bot-secret","chat_id":"chat-secret","github_token":"github-secret","notify_version_updates":false,"version_check_interval_hours":20}"#,
++    )?;
++    app.handle_event(&mut tui, &mut server, AppEvent::OpenTelegram)
++        .await?;
++    let event = finish_command(
++        &mut app,
++        &mut tui,
++        &mut server,
++        &mut rx,
++        TelegramCommandKind::Read,
++    )
++    .await?;
++    let AppEvent::TelegramCommandFinished { result, .. } = &event else {
++        panic!("expected result")
++    };
++    let response = result.as_ref().expect("configured read");
++    assert!(response.configured);
++    assert!(response.github_token_configured);
++    assert_eq!(response.version_check_interval_hours, 20);
++    app.handle_event(&mut tui, &mut server, event).await?;
++    let popup = render_bottom_popup(&app.chat_widget, 80);
++    assert!(popup.contains("Telegram notifications"));
++    assert!(popup.contains("GitHub release updates"));
++    for secret in ["bot-secret", "chat-secret", "github-secret"] {
++        assert!(!popup.contains(secret));
++    }
++    app.handle_event(
++        &mut tui,
++        &mut server,
++        AppEvent::TelegramCommand {
++            params: TelegramCommandParams::Disable {},
++        },
++    )
++    .await?;
++    let event = finish_command(
++        &mut app,
++        &mut tui,
++        &mut server,
++        &mut rx,
++        TelegramCommandKind::Disable,
++    )
++    .await?;
++    let AppEvent::TelegramCommandFinished { result, .. } = event else {
++        panic!("expected result")
++    };
++    assert_eq!(
++        result.expect("disabled"),
++        TelegramCommandResponse::default()
++    );
++    assert!(!path.exists());
++    server.shutdown().await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -297,6 +297,30 @@ pub(crate) enum AppEvent {
+         config: codex_app_server_protocol::ProxyConfig,
+         reopen_picker: bool,
+     },
++    OpenTelegram,
++    OpenTelegramChat {
++        draft: crate::chatwidget::telegram::TelegramSetupDraft,
++    },
++    OpenTelegramGithubToken {
++        draft: crate::chatwidget::telegram::TelegramSetupDraft,
++    },
++    OpenTelegramSetup {
++        draft: crate::chatwidget::telegram::TelegramSetupDraft,
++        notify_version_updates: bool,
++    },
++    OpenTelegramVersion {
++        config: codex_app_server_protocol::TelegramCommandResponse,
++    },
++    OpenTelegramInterval {
++        config: codex_app_server_protocol::TelegramCommandResponse,
++    },
++    TelegramCommand {
++        params: codex_app_server_protocol::TelegramCommandParams,
++    },
++    TelegramCommandFinished {
++        kind: codex_app_server_protocol::TelegramCommandKind,
++        result: Result<codex_app_server_protocol::TelegramCommandResponse, String>,
++    },
+     AccountEmailLoaded {
+         request_id: uuid::Uuid,
+         email: Option<String>,
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -72,6 +72,8 @@ use codex_app_server_protocol::ReviewTarget;
+ use codex_app_server_protocol::SessionSource;
+ use codex_app_server_protocol::SkillsListParams;
+ use codex_app_server_protocol::SkillsListResponse;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
+ use codex_app_server_protocol::Thread;
+ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
+ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
+@@ -1832,6 +1834,16 @@ impl AppServerSession {
+     }
+ }
+ 
++pub(crate) async fn telegram_command_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    request_id: RequestId,
++    params: TelegramCommandParams,
++) -> std::result::Result<TelegramCommandResponse, TypedRequestError> {
++    request_handle
++        .request_typed(ClientRequest::TelegramCommand { request_id, params })
++        .await
++}
++
+ pub(crate) async fn start_thread_with_request_handle(
+     request_handle: AppServerRequestHandle,
+     local_settings: &LocalSettings,
+diff --git a/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs b/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
+--- a/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
++++ b/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
+@@ -48,6 +48,7 @@ pub(crate) struct CustomPromptView {
+     title: String,
+     placeholder: String,
+     context_label: Option<String>,
++    masked: bool,
+     on_submit: PromptSubmitted,
+ 
+     // UI state
+@@ -77,6 +78,7 @@ impl CustomPromptView {
+             title,
+             placeholder,
+             context_label,
++            masked: false,
+             on_submit,
+             textarea,
+             textarea_state: RefCell::new(TextAreaState::default()),
+@@ -87,6 +89,17 @@ impl CustomPromptView {
+         }
+     }
+ 
++    pub(crate) fn new_masked(
++        title: String,
++        placeholder: String,
++        context_label: Option<String>,
++        on_submit: PromptSubmitted,
++    ) -> Self {
++        let mut prompt = Self::new(title, placeholder, String::new(), context_label, on_submit);
++        prompt.masked = true;
++        prompt
++    }
++
+     /// Apply the same editor and Vim bindings used by the main composer.
+     pub(crate) fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
+         self.textarea.set_keymap_bindings(keymap);
+diff --git a/codex-rs/tui/src/bottom_pane/custom_prompt_view/picker.rs b/codex-rs/tui/src/bottom_pane/custom_prompt_view/picker.rs
+--- a/codex-rs/tui/src/bottom_pane/custom_prompt_view/picker.rs
++++ b/codex-rs/tui/src/bottom_pane/custom_prompt_view/picker.rs
+@@ -78,7 +78,12 @@ impl CustomPromptView {
+         self.picker_header().render(areas.header, buf);
+         if !areas.input.is_empty() {
+             let mut state = self.textarea_state.borrow_mut();
+-            StatefulWidgetRef::render_ref(&(&self.textarea), areas.input, buf, &mut state);
++            if self.masked {
++                self.textarea
++                    .render_ref_masked(areas.input, buf, &mut state, '*');
++            } else {
++                StatefulWidgetRef::render_ref(&(&self.textarea), areas.input, buf, &mut state);
++            }
+             if self.textarea.text().is_empty() {
+                 Paragraph::new(self.placeholder.as_str().dim()).render(areas.input, buf);
+             }
+diff --git a/codex-rs/tui/src/bottom_pane/custom_prompt_view_tests.rs b/codex-rs/tui/src/bottom_pane/custom_prompt_view_tests.rs
+--- a/codex-rs/tui/src/bottom_pane/custom_prompt_view_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/custom_prompt_view_tests.rs
+@@ -5,6 +5,31 @@ use crate::keymap::RuntimeKeymap;
+ use pretty_assertions::assert_eq;
+ use std::sync::mpsc::Receiver;
+ 
++#[test]
++fn masked_prompt_does_not_render_secret_text_but_submits_original_input() {
++    let (submitted, receiver) = std::sync::mpsc::channel();
++    let mut view = CustomPromptView::new_masked(
++        "Token".to_string(),
++        "Enter token".to_string(),
++        None,
++        Box::new(move |text| submitted.send(text).expect("submit")),
++    );
++    assert!(view.handle_paste("super-secret".to_string()));
++    let area = Rect::new(0, 0, 40, view.desired_height(40));
++    let mut buffer = Buffer::empty(area);
++    view.render(area, &mut buffer);
++    let rendered = buffer
++        .content
++        .iter()
++        .map(|cell| cell.symbol())
++        .collect::<String>();
++    assert!(!rendered.contains("super-secret"));
++    assert!(rendered.contains("************"));
++    view.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    assert_eq!(receiver.try_recv(), Ok("super-secret".to_string()));
++    assert_eq!(view.completion(), Some(ViewCompletion::Accepted));
++}
++
+ #[test]
+ fn picker_prompt_keeps_multiline_cursor_and_escape_hint_visible_after_resize() {
+     let (mut view, submitted_rx) = custom_prompt_view();
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -326,6 +326,7 @@ mod model_shortcuts;
+ mod notifications;
+ mod proxy;
+ mod session_model_selection;
++pub(crate) mod telegram;
+ use self::notifications::Notification;
+ pub(crate) use self::session_model_selection::AstraModelPickerAction;
+ mod permission_discovery;
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -583,6 +583,7 @@ impl ChatWidget {
+                 self.open_status_line_setup();
+             }
+             SlashCommand::Proxy => self.app_event_tx.send(AppEvent::OpenProxy),
++            SlashCommand::Telegram => self.app_event_tx.send(AppEvent::OpenTelegram),
+             SlashCommand::Theme => {
+                 self.open_theme_picker();
+             }
+@@ -1332,6 +1333,7 @@ impl ChatWidget {
+             | SlashCommand::Title
+             | SlashCommand::Statusline
+             | SlashCommand::Proxy
++            | SlashCommand::Telegram
+             | SlashCommand::Theme
+             | SlashCommand::Tui
+             | SlashCommand::Pets => QueueDrain::Stop,
+diff --git a/codex-rs/tui/src/chatwidget/telegram.rs b/codex-rs/tui/src/chatwidget/telegram.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/telegram.rs
+@@ -0,0 +1,278 @@
++use super::*;
++use crate::bottom_pane::SelectionToggle;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use codex_app_server_protocol::TelegramSetup;
++
++const DEFAULT_VERSION_CHECK_INTERVAL_HOURS: u16 = 20;
++const VERSION_CHECK_INTERVALS: [u16; 7] = [1, 6, 12, 20, 24, 48, 168];
++const SETUP_VIEW_ID: &str = "telegram-setup";
++const VERSION_VIEW_ID: &str = "telegram-version";
++
++#[derive(Clone)]
++pub(crate) struct TelegramSetupDraft {
++    bot_token: String,
++    chat_id: Option<String>,
++    github_token: Option<String>,
++}
++
++impl std::fmt::Debug for TelegramSetupDraft {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("TelegramSetupDraft")
++            .field("bot_token", &"<redacted>")
++            .field("chat_id", &self.chat_id.as_ref().map(|_| "<redacted>"))
++            .field(
++                "github_token",
++                &self.github_token.as_ref().map(|_| "<redacted>"),
++            )
++            .finish()
++    }
++}
++
++impl ChatWidget {
++    fn show_or_replace_telegram_selection(
++        &mut self,
++        view_id: &'static str,
++        mut params: SelectionViewParams,
++    ) {
++        let selected = self.bottom_pane.selected_index_for_present_view(view_id);
++        params.view_id = Some(view_id);
++        params.initial_selected_idx = selected;
++        if selected.is_some() {
++            let _ = self
++                .bottom_pane
++                .replace_selection_view_if_present(view_id, params);
++        } else {
++            self.bottom_pane.show_selection_view(params);
++        }
++    }
++
++    pub(crate) fn open_telegram_menu(&mut self, config: TelegramCommandResponse) {
++        if !config.configured {
++            self.open_telegram_configure();
++            return;
++        }
++        let version_config = config;
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            title: Some("Telegram notifications".to_string()),
++            items: vec![
++                SelectionItem {
++                    name: "GitHub release updates".to_string(),
++                    description: Some("Change release-check settings.".to_string()),
++                    actions: vec![Box::new(move |tx| {
++                        tx.send(AppEvent::OpenTelegramVersion {
++                            config: version_config.clone(),
++                        });
++                    })],
++                    ..Default::default()
++                },
++                SelectionItem {
++                    name: "Disable".to_string(),
++                    description: Some("Clear saved Telegram credentials.".to_string()),
++                    actions: vec![Box::new(|tx| {
++                        tx.send(AppEvent::TelegramCommand {
++                            params: TelegramCommandParams::Disable {},
++                        });
++                    })],
++                    ..Default::default()
++                },
++            ],
++            ..Default::default()
++        });
++    }
++
++    pub(crate) fn open_telegram_configure(&mut self) {
++        let tx = self.app_event_tx.clone();
++        self.bottom_pane
++            .show_view(Box::new(CustomPromptView::new_masked(
++                "Bot token".to_string(),
++                "Enter the bot token".to_string(),
++                None,
++                Box::new(move |bot_token| {
++                    tx.send(AppEvent::OpenTelegramChat {
++                        draft: TelegramSetupDraft {
++                            bot_token,
++                            chat_id: None,
++                            github_token: None,
++                        },
++                    });
++                }),
++            )));
++    }
++
++    pub(crate) fn open_telegram_chat(&mut self, draft: TelegramSetupDraft) {
++        let tx = self.app_event_tx.clone();
++        self.bottom_pane.show_view(Box::new(CustomPromptView::new(
++            "Chat ID".to_string(),
++            "Enter the chat ID".to_string(),
++            String::new(),
++            None,
++            Box::new(move |chat_id| {
++                let mut draft = draft.clone();
++                draft.chat_id = Some(chat_id);
++                tx.send(AppEvent::OpenTelegramGithubToken { draft });
++            }),
++        )));
++    }
++
++    pub(crate) fn open_telegram_github_token(&mut self, draft: TelegramSetupDraft) {
++        let tx = self.app_event_tx.clone();
++        self.bottom_pane
++            .show_view(Box::new(CustomPromptView::new_masked(
++                "GitHub token".to_string(),
++                "Enter a GitHub API token".to_string(),
++                None,
++                Box::new(move |github_token| {
++                    let mut draft = draft.clone();
++                    draft.github_token = Some(github_token);
++                    tx.send(AppEvent::OpenTelegramSetup {
++                        draft,
++                        notify_version_updates: true,
++                    });
++                }),
++            )));
++    }
++
++    pub(crate) fn open_telegram_setup(
++        &mut self,
++        draft: TelegramSetupDraft,
++        notify_version_updates: bool,
++    ) {
++        let toggle_draft = draft.clone();
++        let submit_draft = draft;
++        self.show_or_replace_telegram_selection(
++            SETUP_VIEW_ID,
++            SelectionViewParams {
++                title: Some("Notifications setup".to_string()),
++                items: vec![
++                    SelectionItem {
++                        name: "Notify on new Codex releases".to_string(),
++                        toggle: Some(SelectionToggle {
++                            is_on: notify_version_updates,
++                            action: Box::new(move |enabled, tx| {
++                                tx.send(AppEvent::OpenTelegramSetup {
++                                    draft: toggle_draft.clone(),
++                                    notify_version_updates: enabled,
++                                });
++                            }),
++                        }),
++                        ..Default::default()
++                    },
++                    SelectionItem {
++                        name: "Finish setup".to_string(),
++                        description: Some(
++                            "Test bot delivery and GitHub access, then save.".to_string(),
++                        ),
++                        actions: vec![Box::new(move |tx| {
++                            if let (Some(chat_id), Some(github_token)) =
++                                (&submit_draft.chat_id, &submit_draft.github_token)
++                            {
++                                tx.send(AppEvent::TelegramCommand {
++                                    params: TelegramCommandParams::Configure {
++                                        setup: TelegramSetup {
++                                            bot_token: submit_draft.bot_token.clone(),
++                                            chat_id: chat_id.clone(),
++                                            github_token: github_token.clone(),
++                                            notify_version_updates,
++                                            version_check_interval_hours:
++                                                DEFAULT_VERSION_CHECK_INTERVAL_HOURS,
++                                        },
++                                    },
++                                });
++                            }
++                        })],
++                        ..Default::default()
++                    },
++                ],
++                ..Default::default()
++            },
++        );
++    }
++
++    pub(crate) fn open_telegram_version(&mut self, config: TelegramCommandResponse) {
++        let enabled = config.notify_version_updates;
++        let hours = config.version_check_interval_hours;
++        let toggle = SelectionToggle {
++            is_on: enabled,
++            action: Box::new(move |enabled, tx| {
++                tx.send(AppEvent::TelegramCommand {
++                    params: TelegramCommandParams::SetVersionSettings {
++                        notify_version_updates: enabled,
++                        version_check_interval_hours: hours,
++                    },
++                });
++            }),
++        };
++        let interval_config = config;
++        self.show_or_replace_telegram_selection(
++            VERSION_VIEW_ID,
++            SelectionViewParams {
++                title: Some("GitHub release updates".to_string()),
++                items: vec![
++                    SelectionItem {
++                        name: "Enable".to_string(),
++                        toggle: Some(toggle),
++                        ..Default::default()
++                    },
++                    SelectionItem {
++                        name: "Check interval".to_string(),
++                        description: Some(format!("Every {hours} hours")),
++                        actions: vec![Box::new(move |tx| {
++                            tx.send(AppEvent::OpenTelegramInterval {
++                                config: interval_config.clone(),
++                            });
++                        })],
++                        ..Default::default()
++                    },
++                    SelectionItem {
++                        name: "Check GitHub access".to_string(),
++                        actions: vec![Box::new(|tx| {
++                            tx.send(AppEvent::TelegramCommand {
++                                params: TelegramCommandParams::ProbeGithub {},
++                            });
++                        })],
++                        ..Default::default()
++                    },
++                    SelectionItem {
++                        name: "Check for updates now".to_string(),
++                        actions: vec![Box::new(|tx| {
++                            tx.send(AppEvent::TelegramCommand {
++                                params: TelegramCommandParams::CheckVersion {},
++                            });
++                        })],
++                        ..Default::default()
++                    },
++                ],
++                ..Default::default()
++            },
++        );
++    }
++
++    pub(crate) fn open_telegram_interval(&mut self, config: TelegramCommandResponse) {
++        let items = VERSION_CHECK_INTERVALS
++            .into_iter()
++            .map(|hours| {
++                let enabled = config.notify_version_updates;
++                SelectionItem {
++                    name: format!("Every {hours} hours"),
++                    is_current: config.version_check_interval_hours == hours,
++                    actions: vec![Box::new(move |tx| {
++                        tx.send(AppEvent::TelegramCommand {
++                            params: TelegramCommandParams::SetVersionSettings {
++                                notify_version_updates: enabled,
++                                version_check_interval_hours: hours,
++                            },
++                        });
++                    })],
++                    ..Default::default()
++                }
++            })
++            .collect();
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            title: Some("Release check interval".to_string()),
++            items,
++            ..Default::default()
++        });
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -5,6 +5,9 @@
+ //! reviewable diffs.
+ 
+ pub(super) use super::*;
++
++#[path = "tests/telegram.rs"]
++mod telegram;
+ pub(super) use crate::app_command::AppCommand as Op;
+ pub(super) use crate::app_event::AppEvent;
+ pub(super) use crate::app_event::ExitMode;
+diff --git a/codex-rs/tui/src/chatwidget/tests/telegram.rs b/codex-rs/tui/src/chatwidget/tests/telegram.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/telegram.rs
+@@ -0,0 +1,162 @@
++use super::*;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use codex_app_server_protocol::TelegramSetup;
++
++#[tokio::test]
++async fn slash_telegram_opens_configuration_without_publishing_setup() {
++    let (mut chat, mut rx, mut ops) = make_chatwidget_manual(None).await;
++    chat.dispatch_command(SlashCommand::Telegram);
++    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenTelegram));
++    assert!(rx.try_recv().is_err());
++    assert!(ops.try_recv().is_err());
++}
++
++#[tokio::test]
++async fn setup_masks_tokens_and_publishes_one_complete_configuration() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
++    chat.open_telegram_menu(TelegramCommandResponse::default());
++    chat.handle_paste("bot-secret".to_string());
++    let popup = render_bottom_popup(&chat, 80);
++    assert!(popup.contains("Bot token"));
++    assert!(!popup.contains("bot-secret"));
++    assert!(popup.contains("**********"));
++    assert!(rx.try_recv().is_err());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::OpenTelegramChat { draft } = rx.try_recv().expect("chat step") else {
++        panic!("expected chat step")
++    };
++    assert!(!format!("{draft:?}").contains("bot-secret"));
++    chat.open_telegram_chat(draft);
++    chat.handle_paste("chat-id".to_string());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::OpenTelegramGithubToken { draft } = rx.try_recv().expect("GitHub step") else {
++        panic!("expected GitHub step")
++    };
++    chat.open_telegram_github_token(draft);
++    chat.handle_paste("github-secret".to_string());
++    let popup = render_bottom_popup(&chat, 80);
++    assert!(popup.contains("GitHub token"));
++    assert!(!popup.contains("github-secret"));
++    assert!(popup.contains("*************"));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::OpenTelegramSetup {
++        draft,
++        notify_version_updates,
++    } = rx.try_recv().expect("setup step")
++    else {
++        panic!("expected setup step")
++    };
++    assert!(notify_version_updates);
++    let debug = format!("{draft:?}");
++    for secret in ["bot-secret", "chat-id", "github-secret"] {
++        assert!(!debug.contains(secret));
++    }
++    assert_eq!(debug.matches("<redacted>").count(), 3);
++    chat.open_telegram_setup(draft, notify_version_updates);
++    chat.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++    let AppEvent::OpenTelegramSetup {
++        draft,
++        notify_version_updates,
++    } = rx.try_recv().expect("toggle setup")
++    else {
++        panic!("expected setup toggle")
++    };
++    assert!(!notify_version_updates);
++    chat.open_telegram_setup(draft, notify_version_updates);
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("configure command") else {
++        panic!("expected configure")
++    };
++    assert_eq!(
++        params,
++        TelegramCommandParams::Configure {
++            setup: TelegramSetup {
++                bot_token: "bot-secret".to_string(),
++                chat_id: "chat-id".to_string(),
++                github_token: "github-secret".to_string(),
++                notify_version_updates: false,
++                version_check_interval_hours: 20,
++            },
++        }
++    );
++    assert!(rx.try_recv().is_err());
++}
++
++#[tokio::test]
++async fn cancelled_setup_does_not_publish_credentials_and_disable_has_no_extras() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
++    chat.open_telegram_configure();
++    chat.handle_paste("bot-secret".to_string());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
++    assert!(rx.try_recv().is_err());
++    chat.open_telegram_menu(TelegramCommandResponse {
++        configured: true,
++        ..Default::default()
++    });
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("disable") else {
++        panic!("expected disable")
++    };
++    assert_eq!(params, TelegramCommandParams::Disable {});
++    assert!(rx.try_recv().is_err());
++}
++
++#[tokio::test]
++async fn version_settings_keep_toggle_interval_and_probe_commands_distinct() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
++    let mut config = TelegramCommandResponse {
++        configured: true,
++        github_token_configured: true,
++        notify_version_updates: true,
++        version_check_interval_hours: 20,
++        message: None,
++    };
++    chat.open_telegram_version(config.clone());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("toggle version") else {
++        panic!("expected settings")
++    };
++    assert_eq!(
++        params,
++        TelegramCommandParams::SetVersionSettings {
++            notify_version_updates: false,
++            version_check_interval_hours: 20,
++        }
++    );
++    config.notify_version_updates = false;
++    chat.open_telegram_version(config.clone());
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::OpenTelegramInterval { config } = rx.try_recv().expect("interval picker") else {
++        panic!("expected interval picker")
++    };
++    chat.open_telegram_interval(config);
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("change interval") else {
++        panic!("expected settings")
++    };
++    assert_eq!(
++        params,
++        TelegramCommandParams::SetVersionSettings {
++            notify_version_updates: false,
++            version_check_interval_hours: 24,
++        }
++    );
++    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("GitHub probe") else {
++        panic!("expected probe")
++    };
++    assert_eq!(params, TelegramCommandParams::ProbeGithub {});
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let AppEvent::TelegramCommand { params } = rx.try_recv().expect("manual version check") else {
++        panic!("expected version check")
++    };
++    assert_eq!(params, TelegramCommandParams::CheckVersion {});
++}
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -62,6 +62,7 @@ pub enum SlashCommand {
+     Title,
+     Statusline,
+     Proxy,
++    Telegram,
+     Theme,
+     #[strum(to_string = "pets", serialize = "pet")]
+     Pets,
+@@ -127,6 +128,7 @@ impl SlashCommand {
+             SlashCommand::Title => "configure which items appear in the terminal title",
+             SlashCommand::Statusline => "configure which items appear in the status line",
+             SlashCommand::Proxy => "choose the application proxy without changing shell networking",
++            SlashCommand::Telegram => "configure Telegram notifications",
+             SlashCommand::Theme => "choose a syntax highlighting theme",
+             SlashCommand::Pets => "choose or hide the terminal pet",
+             SlashCommand::Ps => "list background terminals",
+@@ -295,6 +297,7 @@ impl SlashCommand {
+             | SlashCommand::Title
+             | SlashCommand::Statusline
+             | SlashCommand::Proxy
++            | SlashCommand::Telegram
+             | SlashCommand::AutoReview
+             | SlashCommand::Feedback
+             | SlashCommand::Ide

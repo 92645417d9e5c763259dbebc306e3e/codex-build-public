@@ -1,0 +1,890 @@
+present-response-table
+
+Lane: draft
+
+Unit: consumer
+
+ChildPatch: present-response-table
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -194,6 +194,7 @@ mod projectless;
+ pub(crate) mod public_widgets;
+ mod render;
+ mod resize_reflow_cap;
++mod response_table;
+ mod response_timing;
+ mod resume_permissions;
+ mod resume_picker;
+diff --git a/codex-rs/tui/src/local_usage/render.rs b/codex-rs/tui/src/local_usage/render.rs
+--- a/codex-rs/tui/src/local_usage/render.rs
++++ b/codex-rs/tui/src/local_usage/render.rs
+@@ -428,7 +428,7 @@ fn numeric_table(
+     if let Some(column) = model_column {
+         table::center_left_column(&mut rows, column, widths[column]);
+     }
+-    table::shade_columns(&mut rows);
++    table::shade_columns(&mut rows, table::intensity_style);
+     headers.extend(rows);
+     vec![table::render(&widths, &headers).into()]
+ }
+diff --git a/codex-rs/tui/src/local_usage/table.rs b/codex-rs/tui/src/local_usage/table.rs
+--- a/codex-rs/tui/src/local_usage/table.rs
++++ b/codex-rs/tui/src/local_usage/table.rs
+@@ -114,7 +114,7 @@ pub(crate) fn center_left_column(rows: &mut [Vec<Cell>], column: usize, width: u
+     }
+ }
+ 
+-pub(crate) fn shade_columns(rows: &mut [Vec<Cell>]) {
++pub(crate) fn shade_columns(rows: &mut [Vec<Cell>], intensity: impl Fn(usize) -> Style) {
+     for column in 0..rows.iter().map(Vec::len).max().unwrap_or(0) {
+         let scale = rows
+             .iter()
+@@ -126,7 +126,7 @@ pub(crate) fn shade_columns(rows: &mut [Vec<Cell>]) {
+         for cell in rows.iter_mut().filter_map(|row| row.get_mut(column)) {
+             if let Some(value) = cell.value.filter(|value| *value > 0.0) {
+                 let rank = scale.partition_point(|candidate| *candidate < value);
+-                cell.style = cell.style.patch(intensity_style(if scale.len() == 1 {
++                cell.style = cell.style.patch(intensity(if scale.len() == 1 {
+                     16
+                 } else {
+                     1 + rank * 15 / (scale.len() - 1)
+diff --git a/codex-rs/tui/src/response_table.rs b/codex-rs/tui/src/response_table.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_table.rs
+@@ -0,0 +1,424 @@
++//! Response facts projected into columns, with the session picker's row treatment.
++
++use crate::color::blend;
++use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
++use crate::local_usage::table::Cell;
++use crate::local_usage::table::shade_columns;
++use crate::response_timing::ObservedResponse;
++use crate::response_timing::seconds;
++use crate::response_timing::tps;
++use crate::resume_picker::dense_selected_style;
++use crate::resume_picker::dense_zebra_style;
++use crate::style::accent_style;
++use crate::style::readable_color_on;
++use crate::style::theme_color_on;
++use crate::terminal_palette::best_color;
++use crate::terminal_palette::default_bg;
++use codex_models_manager::model_pricing::Prices;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Color;
++use ratatui::style::Style;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
++use std::time::Instant;
++use unicode_width::UnicodeWidthStr;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, strum_macros::AsRefStr, strum_macros::EnumString)]
++#[strum(serialize_all = "kebab-case")]
++pub(crate) enum ResponseColumn {
++    Time,
++    Model,
++    ServedModel,
++    Duration,
++    Received,
++    Input,
++    Read,
++    Write,
++    Output,
++    Reasoning,
++    Hit,
++    Tps,
++    Cost,
++    Ttfb,
++    Ttfc,
++    Effort,
++    Status,
++    Id,
++    Session,
++    Sent,
++}
++
++impl ResponseColumn {
++    pub(crate) const ALL: &[Self] = &[
++        Self::Time,
++        Self::Model,
++        Self::ServedModel,
++        Self::Duration,
++        Self::Received,
++        Self::Sent,
++        Self::Input,
++        Self::Read,
++        Self::Write,
++        Self::Output,
++        Self::Reasoning,
++        Self::Hit,
++        Self::Tps,
++        Self::Cost,
++        Self::Ttfb,
++        Self::Ttfc,
++        Self::Effort,
++        Self::Status,
++        Self::Id,
++        Self::Session,
++    ];
++
++    pub(crate) const DEFAULT: &[Self] = &[
++        Self::Time,
++        Self::Model,
++        Self::Status,
++        Self::Duration,
++        Self::Received,
++        Self::Input,
++        Self::Read,
++        Self::Output,
++        Self::Hit,
++        Self::Tps,
++        Self::Cost,
++        Self::Ttfb,
++    ];
++
++    pub(crate) fn presentation(self) -> (&'static str, &'static str) {
++        match self {
++            Self::Time => ("Time", "Request start in local time"),
++            Self::Model => (
++                "Requested model",
++                "Requested model; red when the served model differs",
++            ),
++            Self::ServedModel => ("Served model", "Model reported by the upstream server"),
++            Self::Duration => (
++                "Duration",
++                "Setup plus receipt time; frozen when receipt ends",
++            ),
++            Self::Received => ("Received", "Transport payload received, in KiB"),
++            Self::Input => ("Input", "Uncached input tokens, excluding Read and Write"),
++            Self::Read => ("Read", "Provider-reported cache-read tokens"),
++            Self::Write => ("Write", "Provider-reported cache-write tokens"),
++            Self::Output => (
++                "Output",
++                "Provider-reported output tokens, including reasoning",
++            ),
++            Self::Reasoning => (
++                "Reasoning",
++                "Provider-reported reasoning tokens within Output",
++            ),
++            Self::Hit => ("Hit", "Cache-read percentage of total input tokens"),
++            Self::Tps => ("TPS", "Output tokens per send-to-usage second"),
++            Self::Cost => ("Cost", "USD estimate using the served model's local prices"),
++            Self::Ttfb => ("TTFB", "Send to first nonempty transport payload"),
++            Self::Ttfc => ("TTFC", "Send to first model content"),
++            Self::Effort => ("Effort", "Requested reasoning effort"),
++            Self::Status => ("Status", "Request lifecycle and outcome"),
++            Self::Id => ("ID", "Official response ID for looking up diagnostic logs"),
++            Self::Session => ("Session", "Conversation identity"),
++            Self::Sent => ("Sent", "Transport payload sent, in KiB"),
++        }
++    }
++
++    /// A column's geometry never depends on arriving values or the viewport.
++    /// Unbounded labels and exceptional numeric values use the native ellipsis.
++    fn width(self) -> usize {
++        let format_width = match self {
++            Self::Time => 19,
++            Self::Model | Self::ServedModel => 32,
++            Self::Status => 14,
++            Self::Id => 64,
++            Self::Session => 36,
++            Self::Effort => 8,
++            Self::Hit => 7,
++            Self::Duration | Self::Ttfb | Self::Ttfc | Self::Tps => 12,
++            Self::Received | Self::Sent | Self::Cost => 16,
++            Self::Input | Self::Read | Self::Write | Self::Output | Self::Reasoning => 10,
++        };
++        format_width.max(self.presentation().0.width())
++    }
++}
++
++/// Fixed column geometry with numeric shades ranked over all loaded matching rows.
++pub(crate) struct ResponseTable {
++    columns: Vec<ResponseColumn>,
++    rows: Vec<Vec<Cell>>,
++    failed: Vec<bool>,
++    widths: Vec<usize>,
++}
++
++impl ResponseTable {
++    pub(crate) fn new(
++        attempts: &[&ObservedResponse],
++        columns: &[ResponseColumn],
++        prices: Option<&Prices>,
++        now: Instant,
++    ) -> Self {
++        let failed = attempts
++            .iter()
++            .map(|attempt| {
++                attempt.row.end_reason.is_some()
++                    && attempt.row.end_reason != Some(ResponseAttemptEnd::Completed)
++            })
++            .collect();
++        let mut rows = attempts
++            .iter()
++            .map(|attempt| {
++                columns
++                    .iter()
++                    .map(|column| cell(*column, attempt, prices, now))
++                    .collect()
++            })
++            .collect::<Vec<Vec<Cell>>>();
++        shade_columns(&mut rows, intensity_style);
++        let widths = columns.iter().map(|column| column.width()).collect();
++        Self {
++            columns: columns.to_vec(),
++            rows,
++            failed,
++            widths,
++        }
++    }
++
++    pub(crate) fn max_offset(&self, width: u16) -> u16 {
++        self.widths
++            .iter()
++            .sum::<usize>()
++            .saturating_add(2 * self.columns.len().saturating_sub(1))
++            .saturating_sub(usize::from(width))
++            .try_into()
++            .unwrap_or(u16::MAX)
++    }
++
++    pub(crate) fn render_headers(&self, area: Rect, buffer: &mut Buffer, offset: u16) {
++        let headers = self
++            .columns
++            .iter()
++            .map(|column| Cell {
++                style: accent_style(),
++                ..Cell::text(column.presentation().0)
++            })
++            .collect::<Vec<_>>();
++        Paragraph::new(self.line(&headers, None))
++            .scroll((0, offset))
++            .render(area, buffer);
++    }
++
++    pub(crate) fn render_row(
++        &self,
++        index: usize,
++        selected: bool,
++        area: Rect,
++        buffer: &mut Buffer,
++        offset: u16,
++    ) {
++        let style = if selected {
++            dense_selected_style()
++        } else if index.is_multiple_of(2) {
++            dense_zebra_style()
++        } else {
++            Style::default()
++        };
++        buffer.set_style(area, style);
++        Paragraph::new(self.line(&self.rows[index], style.bg))
++            .scroll((0, offset))
++            .render(area, buffer);
++        if self.failed[index] {
++            // Apply to the painted row, including padding and selected spans.
++            buffer.set_style(area, Style::default().italic());
++        }
++    }
++
++    fn line(&self, cells: &[Cell], background: Option<Color>) -> Line<'static> {
++        let mut spans = Vec::new();
++        for (index, (cell, width)) in cells.iter().zip(&self.widths).enumerate() {
++            let mut line = truncate_line_with_ellipsis_if_overflow(cell.lines[0].clone(), *width);
++            let padding = width.saturating_sub(line.width());
++            let left = if cell.right { padding } else { padding / 2 };
++            spans.push(Span::raw(" ".repeat(left)));
++            for span in &mut line.spans {
++                span.style = cell.style.patch(line.style).patch(span.style);
++                if let Some(color) = span.style.fg {
++                    span.style = span.style.fg(readable_color_on(color, background));
++                }
++            }
++            spans.extend(line.spans);
++            spans.push(Span::raw(" ".repeat(padding - left)));
++            if index + 1 < cells.len() {
++                spans.push(Span::raw("  "));
++            }
++        }
++        Line::from(spans)
++    }
++}
++
++fn cell(
++    column: ResponseColumn,
++    attempt: &ObservedResponse,
++    prices: Option<&Prices>,
++    now: Instant,
++) -> Cell {
++    let row = &attempt.row;
++    match column {
++        ResponseColumn::Time => text(
++            chrono::DateTime::from_timestamp(row.started_at, 0)
++                .map(|time| {
++                    time.with_timezone(&chrono::Local)
++                        .format("%Y-%m-%d %H:%M:%S")
++                        .to_string()
++                })
++                .unwrap_or_else(|| "--".into()),
++        ),
++        ResponseColumn::Model => {
++            let mut cell = text(row.requested_model.as_str());
++            if row
++                .served_model
++                .as_ref()
++                .is_some_and(|model| model != &row.requested_model)
++            {
++                cell.style = cell.style.red();
++            }
++            cell
++        }
++        ResponseColumn::ServedModel => optional(row.served_model.as_deref()),
++        ResponseColumn::Status => text(state(attempt)),
++        ResponseColumn::Duration => duration(Some(attempt.elapsed_ms(now))),
++        ResponseColumn::Received => bytes(Some(row.received_payload_bytes)),
++        ResponseColumn::Input => count(
++            match (
++                row.tokens.input,
++                row.tokens.cache_read,
++                row.tokens.cache_write,
++            ) {
++                (Some(input), Some(read), Some(write)) => {
++                    Some(input.saturating_sub(read).saturating_sub(write))
++                }
++                _ => None,
++            },
++        ),
++        ResponseColumn::Read => count(row.tokens.cache_read),
++        ResponseColumn::Write => count(row.tokens.cache_write),
++        ResponseColumn::Output => count(row.tokens.output),
++        ResponseColumn::Reasoning => count(row.tokens.reasoning),
++        ResponseColumn::Hit => {
++            let value = match (row.tokens.input, row.tokens.cache_read) {
++                (Some(input), Some(read)) if input > 0 => Some(read as f64 * 100.0 / input as f64),
++                _ => None,
++            };
++            Cell::value(
++                value,
++                value.map_or_else(|| "--".into(), |value| format!("{value:.2}%")),
++            )
++        }
++        ResponseColumn::Tps => Cell::value(row.tps, tps(row.tps)),
++        ResponseColumn::Cost => {
++            let value = cost(row, prices);
++            Cell::value(
++                value,
++                value.map_or_else(|| "--".into(), |usd| format!("${usd:.4}")),
++            )
++        }
++        ResponseColumn::Ttfb => duration(row.ttfb_ms),
++        ResponseColumn::Ttfc => duration(row.ttfc_ms),
++        ResponseColumn::Effort => optional(row.reasoning_effort.as_deref()),
++        ResponseColumn::Id => optional(row.response_id.as_deref()),
++        ResponseColumn::Session => text(row.thread_id.to_string()),
++        ResponseColumn::Sent => bytes(row.sent_payload_bytes),
++    }
++}
++
++fn state(attempt: &ObservedResponse) -> &'static str {
++    match attempt.row.end_reason {
++        None if attempt.is_running() => "Working",
++        None if attempt.row.terminal_observed_offset_ms.is_some() => "Received",
++        None => "Unfinished",
++        Some(ResponseAttemptEnd::Completed) => "Done",
++        Some(ResponseAttemptEnd::Incomplete) => "Incomplete",
++        Some(ResponseAttemptEnd::Failed) => "Failed",
++        Some(ResponseAttemptEnd::Interrupted) => "Interrupted",
++        Some(ResponseAttemptEnd::Canceled) => "Canceled",
++        Some(ResponseAttemptEnd::SetupFailed) => "Setup failed",
++        Some(ResponseAttemptEnd::SendFailed) => "Send failed",
++        Some(ResponseAttemptEnd::TransportClosed) => "Disconnected",
++        Some(ResponseAttemptEnd::ProgressTimeout) => "Timeout",
++        Some(ResponseAttemptEnd::ProtocolError) => "Protocol error",
++    }
++}
++
++fn count(value: Option<u64>) -> Cell {
++    Cell::value(
++        value.map(|value| value as f64),
++        value.map_or_else(|| "--".into(), |value| value.to_string()),
++    )
++}
++
++fn duration(value: Option<u64>) -> Cell {
++    Cell::value(value.map(|value| value as f64 / 1000.0), seconds(value))
++}
++
++fn bytes(value: Option<u64>) -> Cell {
++    Cell::value(
++        value.map(|value| value as f64),
++        value.map_or_else(
++            || "--".into(),
++            |value| format!("{:.1} KiB", value as f64 / 1024.0),
++        ),
++    )
++}
++
++fn text(value: impl Into<String>) -> Cell {
++    Cell::text(value.into().replace(['\r', '\n'], " "))
++}
++
++fn optional(value: Option<&str>) -> Cell {
++    text(value.unwrap_or("--"))
++}
++
++fn cost(row: &ResponseAttempt, prices: Option<&Prices>) -> Option<f64> {
++    let price = prices?.get(row.served_model.as_deref().unwrap_or(&row.requested_model))?;
++    if price.is_zero() {
++        return None;
++    }
++    Some(
++        price
++            .quote(
++                row.tokens.input?,
++                row.tokens.cache_read?,
++                row.tokens.cache_write?,
++                row.tokens.output?,
++            )
++            .usd,
++    )
++}
++
++fn intensity_style(level: usize) -> Style {
++    let color = theme_color_on(&["constant.numeric"], None);
++    let color = if let Color::Rgb(r, g, b) = color
++        && let Some(background) = default_bg()
++    {
++        best_color(blend((r, g, b), background, 0.5 + level as f32 / 32.0))
++    } else {
++        color
++    };
++    let style = Style::default().fg(color);
++    if level <= 5 {
++        style.dim()
++    } else if level >= 12 {
++        style.bold()
++    } else {
++        style
++    }
++}
++
++#[cfg(test)]
++#[path = "response_table_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/response_table_tests.rs b/codex-rs/tui/src/response_table_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_table_tests.rs
+@@ -0,0 +1,399 @@
++use super::*;
++use crate::response_timing::tests::attempt;
++use pretty_assertions::assert_eq;
++use ratatui::style::Modifier;
++use serde_json::json;
++
++fn prices() -> Prices {
++    serde_json::from_value(json!({"served": {
++        "0": {"input": 2.0, "cache_read": 1.0, "cache_write": 3.0, "output": 4.0},
++        "1000": {"input": 4.0, "cache_read": 2.0, "cache_write": 6.0, "output": 8.0}
++    }}))
++    .unwrap()
++}
++
++fn buffer_text(buffer: &Buffer) -> String {
++    buffer.content.iter().map(|cell| cell.symbol()).collect()
++}
++
++fn value(table: &ResponseTable, row: usize, column: ResponseColumn) -> String {
++    table.rows[row][table
++        .columns
++        .iter()
++        .position(|candidate| *candidate == column)
++        .unwrap()]
++    .lines[0]
++        .to_string()
++}
++
++#[test]
++fn table_preserves_billing_units_unknowns_and_official_identity() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Completed));
++    row.served_model = Some("served".into());
++    row.sent_payload_bytes = Some(2048);
++    row.response_id = Some("resp_official".into());
++    let session = row.thread_id.to_string();
++    let mut observed = ObservedResponse::new(row, false, now);
++    let prices = prices();
++    let table = ResponseTable::new(&[&observed], ResponseColumn::ALL, Some(&prices), now);
++    assert_eq!(value(&table, 0, ResponseColumn::Model), "gpt-5.4");
++    assert_eq!(value(&table, 0, ResponseColumn::ServedModel), "served");
++    assert_eq!(
++        [
++            ResponseColumn::Input,
++            ResponseColumn::Read,
++            ResponseColumn::Write,
++            ResponseColumn::Output,
++            ResponseColumn::Reasoning,
++            ResponseColumn::Hit,
++            ResponseColumn::Tps,
++            ResponseColumn::Cost
++        ]
++        .map(|column| value(&table, 0, column)),
++        [
++            "500", "400", "100", "100", "50", "40.00%", "50.0", "$0.0042"
++        ]
++    );
++    assert_eq!(value(&table, 0, ResponseColumn::Received), "0.5 KiB");
++    assert_eq!(value(&table, 0, ResponseColumn::Sent), "2.0 KiB");
++    assert_eq!(value(&table, 0, ResponseColumn::Id), "resp_official");
++    assert_eq!(value(&table, 0, ResponseColumn::Session), session);
++    assert_eq!(value(&table, 0, ResponseColumn::Duration), "2.10s");
++    observed.row.tokens.cache_write = None;
++    observed.row.response_id = None;
++    let unknown = ResponseTable::new(&[&observed], ResponseColumn::ALL, Some(&prices), now);
++    assert_eq!(value(&unknown, 0, ResponseColumn::Write), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Input), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Cost), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Id), "--");
++    observed.row.tokens.cache_write = Some(0);
++    observed.row.tokens.input = Some(0);
++    observed.row.tokens.cache_read = Some(0);
++    observed.row.tokens.output = Some(0);
++    let zero = ResponseTable::new(&[&observed], ResponseColumn::ALL, Some(&prices), now);
++    assert_eq!(value(&zero, 0, ResponseColumn::Input), "0");
++    assert_eq!(value(&zero, 0, ResponseColumn::Hit), "--");
++    assert_eq!(value(&zero, 0, ResponseColumn::Cost), "$0.0000");
++    assert_eq!(
++        cell(ResponseColumn::Cost, &observed, None, now).lines[0].to_string(),
++        "--"
++    );
++    let placeholders = serde_json::from_value(json!({"served": {
++        "0": {"input": 0.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0}
++    }}))
++    .unwrap();
++    assert_eq!(
++        cell(ResponseColumn::Cost, &observed, Some(&placeholders), now).lines[0].to_string(),
++        "--"
++    );
++}
++
++#[test]
++fn horizontal_view_reaches_every_header_and_value_without_a_detail_panel() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Completed));
++    row.requested_model = "a-long-requested-model-name".into();
++    row.served_model = Some("a-different-served-model-name".into());
++    let observed = ObservedResponse::new(row, false, now);
++    let table = ResponseTable::new(&[&observed], ResponseColumn::ALL, None, now);
++    let area = Rect::new(0, 0, 40, 1);
++    let mut offset = 0;
++    for (index, width) in table.widths.iter().enumerate() {
++        let mut header = Buffer::empty(area);
++        let mut body = Buffer::empty(area);
++        table.render_headers(area, &mut header, offset);
++        table.render_row(0, false, area, &mut body, offset);
++        assert!(
++            buffer_text(&header)
++                .trim_start()
++                .starts_with(table.columns[index].presentation().0)
++        );
++        assert!(
++            buffer_text(&body)
++                .trim_start()
++                .starts_with(&table.rows[0][index].lines[0].to_string())
++        );
++        offset += (*width + 2) as u16;
++    }
++    let mut end = Buffer::empty(area);
++    table.render_row(0, false, area, &mut end, table.max_offset(area.width));
++    assert!(
++        buffer_text(&end)
++            .trim_end()
++            .ends_with(&observed.row.thread_id.to_string())
++    );
++}
++
++#[test]
++fn themed_rows_keep_native_selection_stripes_and_whole_row_failure_italics() {
++    let original = crate::render::highlight::current_syntax_theme();
++    let mut numeric_colors = Vec::new();
++    for (theme, bg, fg) in [
++        ("ada", (20, 35, 50), (220, 230, 240)),
++        ("github", (250, 241, 235), (30, 40, 50)),
++    ] {
++        crate::render::highlight::set_syntax_theme(
++            crate::render::highlight::resolve_theme_by_name(theme, None).unwrap(),
++        );
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors { fg, bg },
++            || numeric_colors.push(assert_themed_rows()),
++        );
++    }
++    crate::render::highlight::set_syntax_theme(original);
++    assert_ne!(numeric_colors[0], numeric_colors[1]);
++}
++
++fn assert_themed_rows() -> Color {
++    let now = Instant::now();
++    let working = ObservedResponse::new(attempt(1, None), true, now);
++    let completed =
++        ObservedResponse::new(attempt(2, Some(ResponseAttemptEnd::Completed)), false, now);
++    let failed = ObservedResponse::new(attempt(3, Some(ResponseAttemptEnd::Failed)), false, now);
++    let table = ResponseTable::new(
++        &[&working, &completed, &failed],
++        ResponseColumn::DEFAULT,
++        None,
++        now,
++    );
++    let area = Rect::new(0, 0, 80, 3);
++    let mut buffer = Buffer::empty(area);
++    for index in 0..3 {
++        table.render_row(
++            index,
++            false,
++            Rect::new(0, index as u16, 80, 1),
++            &mut buffer,
++            0,
++        );
++    }
++    assert_ne!(buffer[(0, 0)].bg, buffer[(0, 1)].bg);
++    for y in 0..3 {
++        for x in 0..80 {
++            let cell = &buffer[(x, y)];
++            assert_eq!(cell.modifier.contains(Modifier::ITALIC), y == 2);
++        }
++    }
++    let line = Rect::new(0, 0, 80, 1);
++    let mut selected = Buffer::empty(line);
++    table.render_row(2, true, line, &mut selected, table.max_offset(80));
++    assert!(
++        selected
++            .content
++            .iter()
++            .all(|cell| cell.modifier.contains(Modifier::ITALIC))
++    );
++    assert!(!selected[(0, 0)].modifier.contains(Modifier::REVERSED));
++    assert_eq!(selected[(0, 0)].bg, dense_selected_style().bg.unwrap());
++    assert_ne!(selected[(0, 0)].bg, buffer[(0, 0)].bg);
++    let numeric = ResponseTable::new(&[&completed], &[ResponseColumn::Input], None, now);
++    let mut numeric_buffer = Buffer::empty(line);
++    numeric.render_row(0, true, line, &mut numeric_buffer, 0);
++    let x = (numeric.widths[0] - 1) as u16;
++    assert_eq!(
++        numeric_buffer[(x, 0)].fg,
++        readable_color_on(intensity_style(16).fg.unwrap(), dense_selected_style().bg)
++    );
++    let numeric_color = numeric_buffer[(x, 0)].fg;
++    let mut header = Buffer::empty(line);
++    numeric.render_headers(line, &mut header, 0);
++    let x = (numeric.widths[0] - "Input".len()) as u16 / 2;
++    assert_eq!(
++        header[(x, 0)].fg,
++        readable_color_on(accent_style().fg.unwrap(), None)
++    );
++    numeric_color
++}
++
++#[test]
++fn column_shades_recalculate_with_loaded_rows_and_live_time() {
++    let now = Instant::now();
++    let mut first =
++        ObservedResponse::new(attempt(1, Some(ResponseAttemptEnd::Completed)), false, now);
++    first.row.tokens.input = Some(120);
++    first.row.tokens.cache_read = Some(20);
++    first.row.tokens.cache_write = Some(0);
++    let mut second =
++        ObservedResponse::new(attempt(2, Some(ResponseAttemptEnd::Completed)), false, now);
++    second.row.tokens.input = Some(210);
++    second.row.tokens.cache_read = Some(10);
++    second.row.tokens.cache_write = Some(0);
++    let mut third =
++        ObservedResponse::new(attempt(3, Some(ResponseAttemptEnd::Completed)), false, now);
++    third.row.tokens.input = Some(340);
++    third.row.tokens.cache_read = Some(40);
++    third.row.tokens.cache_write = Some(0);
++    third.row.elapsed_ms = 3100;
++    let working = ObservedResponse::new(attempt(5, None), true, now);
++    let columns = [
++        ResponseColumn::Input,
++        ResponseColumn::Read,
++        ResponseColumn::Duration,
++    ];
++    let table = ResponseTable::new(&[&first, &second, &third, &working], &columns, None, now);
++    for (row, levels) in [[1, 8, 1], [8, 1, 1], [16, 16, 16]].into_iter().enumerate() {
++        for (column, level) in levels.into_iter().enumerate() {
++            assert_eq!(table.rows[row][column].style, intensity_style(level));
++        }
++    }
++    assert_eq!(table.rows[3][0].style.fg, None);
++    assert_eq!(table.rows[3][2].style, intensity_style(1));
++    let mut fourth =
++        ObservedResponse::new(attempt(4, Some(ResponseAttemptEnd::Completed)), false, now);
++    fourth.row.tokens.input = Some(1400);
++    fourth.row.tokens.cache_write = Some(0);
++    let later = now + std::time::Duration::from_secs(2);
++    let updated = ResponseTable::new(
++        &[&first, &second, &third, &fourth, &working],
++        &columns,
++        None,
++        later,
++    );
++    assert_eq!(updated.rows[1][0].style, intensity_style(6));
++    assert_eq!(updated.rows[4][2].style, intensity_style(16));
++    assert_eq!(updated.rows[2][2].style, intensity_style(8));
++    let filtered = ResponseTable::new(&[&second, &third], &columns, None, later);
++    assert_eq!(filtered.rows[0][0].style, intensity_style(1));
++    assert_eq!(filtered.rows[1][0].style, intensity_style(16));
++}
++
++#[test]
++fn selected_columns_preserve_mismatch_red_and_hide_other_values() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Failed));
++    row.served_model = Some("different".into());
++    row.response_id = Some("resp_official".into());
++    let observed = ObservedResponse::new(row, false, now);
++    let columns = [
++        ResponseColumn::Model,
++        ResponseColumn::Input,
++        ResponseColumn::Id,
++    ];
++    let table = ResponseTable::new(&[&observed], &columns, None, now);
++    let area = Rect::new(0, 0, 140, 1);
++    let mut buffer = Buffer::empty(area);
++    table.render_row(0, true, area, &mut buffer, 0);
++    assert!(buffer_text(&buffer).contains("resp_official"));
++    assert!(!buffer_text(&buffer).contains("different"));
++    let model_x = (table.widths[0] - observed.row.requested_model.len()) / 2;
++    assert_eq!(buffer[(model_x as u16, 0)].fg, Color::Red);
++    let input_x =
++        table.widths[0] + 2 + table.widths[1] - value(&table, 0, ResponseColumn::Input).len();
++    assert_eq!(
++        buffer[(input_x as u16, 0)].fg,
++        intensity_style(16).fg.unwrap()
++    );
++    assert!(
++        buffer
++            .content
++            .iter()
++            .all(|cell| cell.modifier.contains(Modifier::ITALIC))
++    );
++    let empty = ResponseTable::new(&[&observed], &[], None, now);
++    assert_eq!(empty.max_offset(80), 0);
++    empty.render_headers(area, &mut Buffer::empty(area), 0);
++    empty.render_row(0, false, area, &mut Buffer::empty(area), 0);
++}
++
++#[test]
++fn every_column_keeps_its_geometry_across_lifecycle_pages_filters_and_scroll() {
++    let now = Instant::now();
++    let empty = ResponseTable::new(&[], ResponseColumn::ALL, None, now);
++    let width = empty.widths.iter().sum::<usize>() + 2 * (empty.columns.len() - 1);
++    let area = Rect::new(0, 0, width as u16, 1);
++    let mut initial_headers = Buffer::empty(area);
++    empty.render_headers(area, &mut initial_headers, 0);
++    let initial_headers = buffer_text(&initial_headers);
++    let mut rows = vec![ObservedResponse::new(attempt(1, None), true, now)];
++    let mut received = attempt(2, None);
++    received.terminal_observed_offset_ms = Some(1000);
++    rows.push(ObservedResponse::new(received, true, now));
++    rows.push(ObservedResponse::new(attempt(3, None), false, now));
++    for (index, end) in [
++        ResponseAttemptEnd::Completed,
++        ResponseAttemptEnd::Incomplete,
++        ResponseAttemptEnd::Failed,
++        ResponseAttemptEnd::Interrupted,
++        ResponseAttemptEnd::Canceled,
++        ResponseAttemptEnd::SetupFailed,
++        ResponseAttemptEnd::SendFailed,
++        ResponseAttemptEnd::TransportClosed,
++        ResponseAttemptEnd::ProgressTimeout,
++        ResponseAttemptEnd::ProtocolError,
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let mut row = attempt(index as u64 + 4, Some(end));
++        row.requested_model = "long-model-".repeat(20);
++        row.served_model = Some("long-served-model-".repeat(20));
++        row.response_id = Some("resp_".repeat(30));
++        row.reasoning_effort = Some("very-long-effort".into());
++        row.elapsed_ms = u64::MAX;
++        row.ttfb_ms = Some(u64::MAX);
++        row.ttfc_ms = Some(u64::MAX);
++        row.received_payload_bytes = u64::MAX;
++        row.sent_payload_bytes = Some(u64::MAX);
++        row.tokens.input = Some(u64::MAX);
++        row.tokens.cache_read = Some(0);
++        row.tokens.cache_write = Some(0);
++        row.tokens.output = Some(u64::MAX);
++        row.tokens.reasoning = Some(u64::MAX);
++        row.tps = Some(1e20);
++        rows.push(ObservedResponse::new(row, false, now));
++    }
++    let prices = prices();
++    for loaded in 1..=rows.len() {
++        for filtered in [false, true] {
++            let matching = if filtered {
++                &rows[loaded - 1..loaded]
++            } else {
++                &rows[..loaded]
++            };
++            let table = ResponseTable::new(
++                &matching.iter().collect::<Vec<_>>(),
++                ResponseColumn::ALL,
++                Some(&prices),
++                now + std::time::Duration::from_secs(1000),
++            );
++            let mut headers = Buffer::empty(area);
++            table.render_headers(area, &mut headers, 0);
++            assert_eq!(buffer_text(&headers), initial_headers);
++            assert_eq!(table.max_offset(37), empty.max_offset(37));
++            for row in 0..matching.len() {
++                let mut body = Buffer::empty(area);
++                table.render_row(row, false, area, &mut body, 0);
++                let mut start = 0;
++                for (column, width) in table.widths.iter().enumerate() {
++                    let text = &table.rows[row][column];
++                    let content =
++                        truncate_line_with_ellipsis_if_overflow(text.lines[0].clone(), *width)
++                            .to_string();
++                    let left = if text.right {
++                        width - content.width()
++                    } else {
++                        (width - content.width()) / 2
++                    };
++                    let rendered = (start..start + width)
++                        .map(|x| body[(x as u16, 0)].symbol())
++                        .collect::<String>();
++                    assert_eq!(rendered.trim(), content);
++                    assert_eq!(rendered.find(&content).unwrap(), left);
++                    let header = table.columns[column].presentation().0;
++                    let header_x = initial_headers[start..start + width].find(header).unwrap();
++                    assert_eq!(header_x, (width - header.width()) / 2);
++                    start += width + 2;
++                }
++                for offset in [0, 8, table.max_offset(37)] {
++                    let viewport = Rect::new(0, 0, 37, 1);
++                    let mut scrolled = Buffer::empty(viewport);
++                    table.render_row(row, false, viewport, &mut scrolled, offset);
++                    for x in 0..viewport.width {
++                        assert_eq!(scrolled[(x, 0)].symbol(), body[(x + offset, 0)].symbol());
++                    }
++                }
++            }
++        }
++    }
++}

@@ -1,0 +1,52 @@
+{
+  "ContractName": "SkillGoProfile",
+  "SchemaVersion": 1,
+  "Paths": {
+    "SourceRoot": "go",
+    "ModuleFile": "go/go.mod",
+    "ExecutableBoundaryFile": "go/main.go",
+    "InternalRoot": "go/internal",
+    "EmbeddedAssetRoot": "go/internal/assets/files",
+    "EndpointPath": "bin"
+  },
+  "FirstLevelPackages": {
+    "AssetsPackage": {
+      "PackageName": "assets",
+      "Presence": "SurfaceConditional",
+      "RequiredSurface": "EmbeddedAssets"
+    },
+    "CorePackage": {
+      "PackageName": "core",
+      "Presence": "Required"
+    },
+    "RuntimePackage": {
+      "PackageName": "runtime",
+      "Presence": "Required"
+    },
+    "ConfigPackage": {
+      "PackageName": "config",
+      "Presence": "SurfaceConditional",
+      "RequiredSurface": "ExternalSelfHealingConfiguration"
+    }
+  },
+  "Files": {
+    "RuntimeInterface": {
+      "ParentPackageID": "RuntimePackage",
+      "FileName": "cli.go",
+      "Presence": "Required"
+    },
+    "ConstantsFile": {
+      "FileName": "constants.go",
+      "Presence": "SurfaceConditional",
+      "RequiredSurface": "Constants",
+      "ParentRule": "ConfigWhenPresentOtherwiseCore"
+    }
+  },
+  "LayoutPolicy": {
+    "ClosedFirstLevelPackageSet": true,
+    "ProductionBasename": "OneLowercaseWord",
+    "OmitAbsentConditionalPackage": true,
+    "AllowEmptyPackage": false,
+    "AllowNestedModule": false
+  }
+}

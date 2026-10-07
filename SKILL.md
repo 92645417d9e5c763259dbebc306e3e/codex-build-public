@@ -1,0 +1,75 @@
+---
+name: codex-build
+description: Maintain Codex Rust CLI patch releases, product verification, builds, installation, and repository synchronization in one session.
+---
+
+# CodexBuild
+
+## Owners
+
+- Invoke `$SKILLS_ROOT/codex-build/bin`. Public roots default to cwd for working input, PROJECT_SCRATCH_ROOT for scratch, PROJECT_RUNTIME_ROOT for disposable runtime content, and `<effective scratch>/records` for records. Supply root flags only for deliberate overrides. PROJECT_PERSISTENT_ROOT is for permanent settings/data when needed, never Cleanup. PROJECT_WORKING_ROOT, RUNTIME_TMP_ROOT and RUNTIME_STATE_ROOT are retired without fallback; SKILLS_SCRATCH_ROOT owns skill repair data, not product data.
+- RouteEntry selects one effect set.
+- [LoadGraph](/codex/skills/codex-build/contracts/load-graph.md) owns bootstrap and fixed-point loading.
+- On entry, read LoadGraph to EOF, then Core, RouteEntry and selected command instructions before effects.
+- [TaskWorkspace](/codex/skills/codex-build/reference/task-workspace.md) owns task placement and continuation; Records owns encoding and lifecycle joins.
+- PatchFormat, PatchAcceptance, and ProtectedCoreAreas own product replay boundaries.
+- RunnerEnv owns a private build-attempt guest `/tmp`, including `TMPDIR`; callers select only payloads.
+- RepositoryFormatting owns repository-selected formatter execution and its writable source postimage.
+- RepositoryMaintenance owns the fixed workspace Cargo lock update and the separate repository-selected Bazel lock recipe, each with its exact writable source postimage.
+- FullSuiteAudit owns product verification.
+- ReleaseRollForward owns release convergence.
+- `bin` owns no policy.
+
+## Release Terms
+
+```
+TopLevelReleaseTerms
++-- Baseline: establish or align baseline then clean and stop
++-- Roll: automatically migrate the sole task's complete declared Patch set; ReleaseRollForward owns material decisions
++-- Install: commands/build-install.md selects the package and verifies its launch entry
++-- Sync: commands/sync.md publishes manually requested public snapshots
+`-- Cleanup: restore Attached main, retire drained helper temporaries, and optionally retire one explicitly selected task
+```
+
+- During a selected next-tag Baseline, a request to clean the predecessor means that Baseline's existing exact predecessor-worktree retirement before target preparation. It preserves exported patches, reusable cache/target, toolchains, and Established evidence; it is not standalone Cleanup or a disk-space investigation.
+- Explicit Cleanup restores its supplied Attached `main` worktree to the current `HEAD`, consumes all drained execution records and logs, and preserves only tasks/rust-suite-baselines.json as baseline comparison facts. It may additionally retire one separately named completely published tag.
+- Select one requested term.
+- Only an explicit current-user sync request selects public snapshot publication.
+- Roll, export, build, installation and skill maintenance never trigger sync automatically.
+
+## Invariants
+
+- Durable patches are product, upstream is fetch-only, and MainWorktree is the release line.
+- A Lane contains Units and Flat Patches. A Unit contains at least two ordered distinct Child Patches. Each Flat Patch and Child Patch is one named commit and GitDiff; Flat Patch is semantic, never a file.
+- Backend and mixed contain app-server responsibilities in PatchFormat's declared Segment order; mixed admits Units only and no independent app-server Lane exists.
+- One `export` publishes registered MainWorktree's ordered closed Git prefix, never a fork, isolated lane, or release-completion decision. It writes only `.diff`: one per Flat Patch or Unit Child Patch. `owner` is effect authority, not Patch structure.
+- Apply advances an unchanged declared Patch. Conflict keeps the successful prefix; reconstruct the rejected Patch on Current and publish final Patches through Commit or terminal Revise. ReleaseRollForward owns scope and cost decisions. Exports remain read-only purpose evidence.
+- Establish Baseline once as comparison evidence. During Roll, uncovered upstream packages join automatically and explicit user-requested coverage alignment may add or remove them at any registered frontier. Tests remain freely selected diagnostics; only the user requests a complete suite. No suite gates Patch closure, Fork, convergence, export, or install. A failed selected suite remains evidence for focused repair, not a rerun demand. An automatic Roll rewrite or non-idempotent fixup fold runs corresponding focused tests before advancing.
+- Finalize and Prepare own generated tail only when selected. Full-suite results come directly from Finalize; focused snapshots stay private.
+- Version-root notes own shared product constraints; lane notes add only lane-specific guards. PatchAcceptance consumes both scopes before each selected Unit or Flat Patch.
+- The helper owns baseline preparation, TaskIndex admission, fork ordinals, declared patch transport, mechanical generated-tail terminal synchronization, and task retirement. Product work owns responsibilities, source selection, topology, and judgment.
+- Exactly one unfinished release task may be indexed. Baseline interruption resumes that same tag, task, global worktree topology, and Plan/Stage/Result chain. Product work may replace that sole task with a user-selected newer tag after a clean closed frontier is canonically exported, or when an Established predecessor has zero private history and Main equals its official parent. The new Baseline validates that exact predecessor evidence, retires its Git roles, and creates the target roles at the same global paths. No second task or topology exists during that transition.
+- Every Roll entry reads TaskIndex and the sole ActiveTask through its trailing Additional Instructions, then consumes TaskWorkspace's reconciliation and handoff route before a response. LoadGraph expands this anchor, never replaces it.
+- Forward work stays on Current; editing an earlier committed Lane child forks and retains its parent.
+- The terminal Unit may revise a middle Child Patch on Current; failure or committed status alone selects no Fork.
+- Only a user-selected full Finalize Product failure after declared Patch completion and Main convergence starts temporary Main fixup, which later folds by Fork.
+- Apply copies one absent Flat Patch or whole Unit, or appends a declared Child Patch suffix; Commit records one Patch without collapsing a Unit.
+- A Unit or Flat Patch includes its approved behavior, exact structure, and complete producer seams required by approved dependents. Preserve them absent approved redistribution.
+- ReleaseRollForward selects rewrite triggers and complete Patch responsibility boundaries. The lang skill's [Rust language owner](/codex/skills/lang/references/rust.md) supplies `PurposeBoundRustChange` to construct and review code inside them before dependent edits and source publication.
+- Roll is one linear product-agent process with no subagents or delegation. PatchAcceptance owns cumulative source acceptance before publication and continuation.
+- Repository-wide discovery for purpose reconstruction is a reduction step, never a model-context payload. The command performing a broad search emits only aggregate counts and at most sixteen sorted unique exact path or commit identifiers; inspect only the minimum exact ranges needed for the current causal decision. If that set is insufficient, narrow the predicate outside model context before another bounded result. Raw broad matches and transport truncation never select evidence.
+- Verification refuting a candidate's completeness returns through ReleaseRollForward before any correction, including fixtures or settings. Rejection grants no feature withdrawal or Git effect; substantive contract or structure changes need new authority.
+- Before a rewrite, reconcile Main's complete Lane children and retained frontiers with the proposed start, deciding reuse or authorized withdrawal in the task.
+- A closed nonfinal Lane exports Main's ordered prefix and advances without a test gate. ReleaseRollForward owns successor-Lane scope and order reconciliation.
+- Clean unchanged Apply advances. Authored or reconstructed source selects tests from actual risk and prior findings after helper Commit. Results inform edits, not progress state. Semantic acceptance and selected review remain independent; changed contracts return to approval.
+- TaskWorkspace owns concise pending-work reduction. Closure and reentry consume GitCustody convergence before the next Patch or Fork: remove covered numbered parents independently of Main's remaining suffix, then promote when Main is covered. Retain only unconsumed content or readers.
+- A helper Pass or below-limit diff cannot supply semantic acceptance. The existing line ceiling is not a design budget and splitting compensation does not resolve its cause.
+- Commit as `nobody <nobody@nobody>` unless the user authorizes another identity for that exact commit.
+- Derive Lane-child order from source history and canonical metadata, never worktree names, helper state, export, or inferred lineage.
+- Admit only current canonical formats.
+- Skill maintenance has no test facility, fixture, or test-only schema.
+- Binary preparation required by admitted repository tests is production Runner behavior and remains required when skill self-test facilities are removed.
+- A selected full suite compares Established upstream outcomes with the actual registered Main or fork source. RunnerExec runs a selected frozen check. Neither requires a candidate tag, historical acceptance chain, or convergence prerequisite.
+- RepositoryFormatting owns writable `just fmt`, VerifyRequestedProduct sends exact `just test` to RunnerExec, RustSuite owns suites, and PatchReplay owns per-file `rustfmt`.
+- Dependency Units or Flat Patches update stale Cargo and Bazel locks through RepositoryMaintenance and include both postimages in the same Patch commit before locked verification.
+- Long public helpers emit immediate startup guidance and bounded event progress, each carrying the same-handle wait instruction. Request the longest permitted native wait capped at twenty-five minutes; every nonterminal yield continues that handle without commentary. Only terminal JSON completes. Explicit inspection follows RunnerEnv, then resumes that handle.

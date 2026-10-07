@@ -1,0 +1,84 @@
+publish-codex-home-env
+
+Lane: normalization
+
+Unit: normalize-process-base-roots
+
+ChildPatch: publish-codex-home-env
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -11,6 +11,7 @@ use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
+ use codex_exec_server::CODEX_FS_HELPER_ARG1;
+ use codex_install_context::InstallContext;
+ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
++use codex_utils_home_dir::ensure_codex_home;
+ use codex_utils_home_dir::find_codex_home;
+ #[cfg(target_os = "windows")]
+ use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
+@@ -230,6 +231,9 @@ where
+     // this executable. Admittedly, we could invoke `keep()` on it, but it
+     // would be nice to avoid leaving temporary directories behind, if possible.
+     let path_entry_guard = arg0_dispatch();
++    let codex_home = ensure_codex_home()?;
++    // SAFETY: this runs before creating worker threads.
++    unsafe { std::env::set_var("CODEX_HOME", codex_home.as_path()) };
+     let current_exe = std::env::current_exe().ok();
+ 
+     // Regular invocation. Run the async entry point on a thread with the same
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -18,6 +18,20 @@ pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
+     find_codex_home_from_env(codex_home_env.as_deref())
+ }
+ 
++/// Creates the selected Codex home and returns its canonical path.
++pub fn ensure_codex_home() -> std::io::Result<AbsolutePathBuf> {
++    let codex_home_env = std::env::var("CODEX_HOME")
++        .ok()
++        .filter(|val| !val.is_empty());
++    ensure_codex_home_from_env(codex_home_env.as_deref())
++}
++
++fn ensure_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
++    let path = codex_home_env.map_or_else(|| PathBuf::from(DEFAULT_CODEX_HOME), PathBuf::from);
++    std::fs::create_dir_all(&path)?;
++    AbsolutePathBuf::from_absolute_path(path.canonicalize()?)
++}
++
+ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
+     // Honor the `CODEX_HOME` environment variable when it is set to allow users
+     // (and tests) to override the default location.
+@@ -57,6 +71,7 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
+ #[cfg(test)]
+ mod tests {
+     use super::DEFAULT_CODEX_HOME;
++    use super::ensure_codex_home_from_env;
+     use super::find_codex_home_from_env;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+     use pretty_assertions::assert_eq;
+@@ -122,4 +137,17 @@ mod tests {
+             AbsolutePathBuf::from_absolute_path(DEFAULT_CODEX_HOME).expect("absolute home");
+         assert_eq!(resolved, expected);
+     }
++
++    #[test]
++    fn ensure_codex_home_creates_missing_selected_directory() {
++        let temp_home = TempDir::new().expect("temp home");
++        let selected = temp_home.path().join("missing-codex-home");
++
++        let resolved = ensure_codex_home_from_env(selected.to_str()).expect("ensure CODEX_HOME");
++
++        assert_eq!(
++            resolved.as_path(),
++            selected.canonicalize().expect("canonical CODEX_HOME")
++        );
++    }
+ }

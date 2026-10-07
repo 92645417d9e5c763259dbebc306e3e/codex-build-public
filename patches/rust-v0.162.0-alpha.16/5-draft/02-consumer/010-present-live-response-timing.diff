@@ -1,0 +1,835 @@
+present-live-response-timing
+
+Lane: draft
+
+Unit: consumer
+
+ChildPatch: present-live-response-timing
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -236,6 +236,7 @@ mod managed_worktree_creation;
+ mod misalignment_policy;
+ mod model_defaults;
+ mod new_session;
++mod response_timing;
+ mod turn_tips;
+ pub(crate) use new_session::has_launch_setting;
+ mod clipboard;
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -129,6 +129,10 @@ impl App {
+         app_server_client: &AppServerSession,
+         notification: ServerNotification,
+     ) {
++        if let ServerNotification::ResponseAttemptUpdated(update) = notification {
++            self.chat_widget.on_response_attempt_updated(update.attempt);
++            return;
++        }
+         if let ServerNotification::ConnectedClientCountChanged(notification) = &notification {
+             self.chat_widget
+                 .set_app_server_connected_client_count(notification.connected_client_count);
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2058,6 +2058,15 @@ impl App {
+             AppEvent::LocalUsageLoaded { request_id, result } => {
+                 self.finish_local_usage(tui, request_id, result);
+             }
++            AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
++            AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
++                if self.current_displayed_thread_id() == Some(thread_id) {
++                    match result {
++                        Ok(page) => self.chat_widget.on_response_attempts_loaded(page, requested_at),
++                        Err(error) => tracing::debug!(%thread_id, %error, "response timing unavailable"),
++                    }
++                }
++            }
+             AppEvent::OpenRateLimitResetCredits => {
+                 let request_id = self.chat_widget.show_rate_limit_reset_loading_popup();
+                 self.refresh_rate_limits(
+diff --git a/codex-rs/tui/src/app/response_timing.rs b/codex-rs/tui/src/app/response_timing.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/response_timing.rs
+@@ -0,0 +1,40 @@
++//! Restore the selected thread's response observations through the shared page API.
++
++use super::App;
++use crate::app_event::AppEvent;
++use crate::app_server_session::AppServerSession;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ResponseAttemptsReadParams;
++use codex_protocol::ThreadId;
++use std::time::Instant;
++use uuid::Uuid;
++
++impl App {
++    pub(super) fn refresh_response_timing(
++        &self,
++        app_server: &AppServerSession,
++        thread_id: ThreadId,
++    ) {
++        let handle = app_server.request_handle();
++        let events = self.app_event_tx.clone();
++        let requested_at = Instant::now();
++        tokio::spawn(async move {
++            let result = handle
++                .request_typed(ClientRequest::ResponseAttemptsRead {
++                    request_id: RequestId::String(Uuid::new_v4().to_string()),
++                    params: ResponseAttemptsReadParams {
++                        thread_id: Some(thread_id.to_string()),
++                        ..Default::default()
++                    },
++                })
++                .await
++                .map_err(|error| error.to_string());
++            events.send(AppEvent::ResponseTimingLoaded {
++                thread_id,
++                requested_at,
++                result,
++            });
++        });
++    }
++}
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -1814,6 +1814,70 @@ async fn connected_client_count_routes_globally_and_clears_on_disconnect() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn response_timing_routes_live_notifications_and_refreshes_each_selected_thread() -> Result<()>
++{
++    use crate::response_timing::tests::attempt;
++    use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    let server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let completed = attempt(1, Some(ResponseAttemptEnd::Completed));
++    let thread_id = completed.thread_id;
++    app.chat_widget
++        .handle_thread_session(test_thread_session(thread_id, app.config.cwd.to_path_buf()));
++    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event, AppEvent::RefreshResponseTiming { thread_id: id } if id == thread_id)));
++    app.chat_widget.setup_status_line(
++        vec![crate::bottom_pane::StatusLineItem::ResponsePerformance],
++        false,
++    );
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(ServerNotification::ResponseAttemptUpdated(
++            ResponseAttemptUpdatedNotification {
++                thread_id: thread_id.to_string(),
++                attempt: completed,
++                quota: None,
++            },
++        ))),
++    )
++    .await;
++    assert_eq!(
++        app.chat_widget.status_line_text(),
++        Some("Last TTFB 0.30s TPS 50.0".into())
++    );
++    let other = ThreadId::new();
++    app.chat_widget
++        .handle_thread_session(test_thread_session(other, app.config.cwd.to_path_buf()));
++    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(
++        |event| matches!(event, AppEvent::RefreshResponseTiming { thread_id: id } if id == other)
++    ));
++    assert_eq!(app.chat_widget.status_line_text(), None);
++    app.refresh_response_timing(&server, other);
++    let loaded = tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            if let Some(AppEvent::ResponseTimingLoaded {
++                thread_id, result, ..
++            }) = events.recv().await
++            {
++                break (thread_id, result);
++            }
++        }
++    })
++    .await?;
++    assert_eq!(loaded.0, other);
++    assert!(
++        loaded
++            .1
++            .map_err(color_eyre::eyre::Report::msg)?
++            .data
++            .is_empty()
++    );
++    server.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
+     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -831,6 +831,16 @@ pub(crate) enum AppEvent {
+         result: Result<Arc<crate::local_usage::UsageReport>, String>,
+     },
+ 
++    /// Restore response timing when the displayed thread changes.
++    RefreshResponseTiming {
++        thread_id: ThreadId,
++    },
++    ResponseTimingLoaded {
++        thread_id: ThreadId,
++        requested_at: std::time::Instant,
++        result: Result<codex_app_server_protocol::ResponseAttemptsReadResponse, String>,
++    },
++
+     /// Fetch workspace messages for the status-line headline item.
+     RefreshStatusLineWorkspaceHeadline {
+         request_id: u64,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -690,6 +690,20 @@ impl BottomPane {
+         self.status_timer.reset(elapsed);
+     }
+ 
++    pub(crate) fn set_turn_started_at(&mut self, timestamp: Option<i64>) {
++        self.status_timer.set_turn_started_at(timestamp);
++        self.request_redraw();
++    }
++
++    pub(crate) fn set_response_progress(
++        &mut self,
++        progress: Option<crate::response_timing::LiveResponseProgress>,
++    ) {
++        if let Some(status) = &mut self.status {
++            status.set_response_progress(progress);
++        }
++    }
++
+     pub(crate) fn set_status_timer_origin(&mut self, started_at: Option<Instant>) {
+         self.status_timer.display_started_at = started_at;
+         self.request_redraw();
+@@ -1349,6 +1363,7 @@ impl BottomPane {
+             }
+         } else {
+             // Hide the status indicator when a task completes, but keep other modal views.
++            self.status_timer.set_turn_started_at(None);
+             self.hide_status_indicator();
+         }
+     }
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -108,6 +108,12 @@ pub(crate) enum StatusLineItem {
+     /// TTFB and request-window TPS from the same last-ended generation attempt.
+     ResponsePerformance,
+ 
++    /// Send-to-first-content seconds from the last-ended generation attempt.
++    Ttfc,
++
++    /// Output tokens per send-to-usage second from the last-ended generation attempt.
++    Tps,
++
+     /// Transport payload received while the current response is running.
+     ResponseReceive,
+ 
+@@ -218,6 +224,10 @@ impl StatusLineItem {
+             StatusLineItem::ResponsePerformance => {
+                 "Last ended request: TTFB and output tokens per send-to-usage second"
+             }
++            StatusLineItem::Ttfc => "Last ended request TTFC, in seconds with two decimal places",
++            StatusLineItem::Tps => {
++                "Last ended request TPS, one decimal place without a unit suffix"
++            }
+             StatusLineItem::ResponseReceive => {
+                 "Received payload in KiB, visible after the first data until the response ends"
+             }
+@@ -292,6 +302,8 @@ impl StatusLineItem {
+                 StatusSurfacePreviewItem::ResponsesStreamConnection
+             }
+             StatusLineItem::ResponsePerformance => StatusSurfacePreviewItem::ResponsePerformance,
++            StatusLineItem::Ttfc => StatusSurfacePreviewItem::Ttfc,
++            StatusLineItem::Tps => StatusSurfacePreviewItem::Tps,
+             StatusLineItem::ResponseReceive => StatusSurfacePreviewItem::ResponseReceive,
+             StatusLineItem::RemoteControlStreamConnection => {
+                 StatusSurfacePreviewItem::RemoteControlStreamConnection
+@@ -555,6 +567,35 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn response_ttfc_and_tps_are_independently_selectable_with_numeric_previews() {
++        let (tx, mut rx) = unbounded_channel();
++        let mut view = StatusLineSetupView::new(
++            Some(&["ttfc".into(), "tps".into()]),
++            true,
++            StatusSurfacePreviewData::default(),
++            AppEventSender::new(tx),
++            crate::keymap::RuntimeKeymap::defaults().list,
++        );
++        let rendered = render_lines(&view, 100);
++        assert!(rendered.contains("0.01s"));
++        assert!(rendered.contains("0.1"));
++        view.handle_key_event(crossterm::event::KeyCode::Enter.into());
++        let AppEvent::StatusLineSetup {
++            items,
++            use_theme_colors,
++        } = rx.try_recv().unwrap()
++        else {
++            panic!("confirmed status-line items")
++        };
++        assert_eq!(items, vec![StatusLineItem::Ttfc, StatusLineItem::Tps]);
++        assert!(use_theme_colors);
++        assert_eq!(
++            items.iter().map(ToString::to_string).collect::<Vec<_>>(),
++            ["ttfc", "tps"]
++        );
++    }
++
+     #[test]
+     fn credit_balance_is_independently_selectable_without_placeholder() {
+         assert_eq!("credit-balance".parse(), Ok(StatusLineItem::CreditBalance));
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -69,6 +69,8 @@ impl StatusLineAccent {
+             | StatusLineItem::TotalOutputTokens
+             | StatusLineItem::ThreadCredits
+             | StatusLineItem::ResponsePerformance
++            | StatusLineItem::Ttfc
++            | StatusLineItem::Tps
+             | StatusLineItem::EstimatedThreadCost => Self::Usage,
+             StatusLineItem::FiveHourLimit
+             | StatusLineItem::WeeklyLimit
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -26,6 +26,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     ApprovalMode,
+     ResponsesStreamConnection,
+     ResponsePerformance,
++    Ttfc,
++    Tps,
+     ResponseReceive,
+     RemoteControlStreamConnection,
+     Proxy,
+@@ -70,6 +72,8 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::BranchChanges => "+12 -3",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
++            StatusSurfacePreviewItem::Ttfc => "0.01s",
++            StatusSurfacePreviewItem::Tps => "0.1",
+             StatusSurfacePreviewItem::ResponsesStreamConnection
+             | StatusSurfacePreviewItem::ResponsePerformance
+             | StatusSurfacePreviewItem::ResponseReceive
+@@ -118,6 +122,8 @@ impl StatusSurfacePreviewItem {
+             Self::ApprovalMode,
+             Self::ResponsesStreamConnection,
+             Self::ResponsePerformance,
++            Self::Ttfc,
++            Self::Tps,
+             Self::ResponseReceive,
+             Self::RemoteControlStreamConnection,
+             Self::Proxy,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1195,6 +1195,7 @@ impl ChatWidget {
+         }
+         self.refresh_status_line_if_workspace_headline_due();
+         self.refresh_thread_usage_if_settlement_due();
++        self.refresh_response_status();
+     }
+ 
+     fn flush_active_cell(&mut self) {
+diff --git a/codex-rs/tui/src/chatwidget/completion.rs b/codex-rs/tui/src/chatwidget/completion.rs
+--- a/codex-rs/tui/src/chatwidget/completion.rs
++++ b/codex-rs/tui/src/chatwidget/completion.rs
+@@ -20,6 +20,11 @@ impl ChatWidget {
+             .duration_ms
+             .and_then(|duration| u64::try_from(duration).ok())
+             .map(|duration| duration / 1_000)
++            .or_else(|| {
++                let started = turn.started_at?;
++                let completed = turn.completed_at?;
++                u64::try_from(completed.checked_sub(started)?).ok()
++            })
+             .or_else(|| {
+                 if replay_kind.is_none() {
+                     self.bottom_pane
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -103,6 +103,8 @@ impl ChatWidget {
+                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
+                     self.warning_display_state.startup_complete = true;
+                     self.on_task_started();
++                    self.bottom_pane
++                        .set_turn_started_at(notification.turn.started_at);
+                 }
+             }
+             ServerNotification::TurnCompleted(notification) => {
+@@ -230,7 +232,9 @@ impl ChatWidget {
+                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+             }
+             ServerNotification::ModelRerouted(_) => {}
+-            ServerNotification::ResponseAttemptUpdated(_) => {}
++            ServerNotification::ResponseAttemptUpdated(notification) => {
++                self.on_response_attempt_updated(notification.attempt);
++            }
+             ServerNotification::ModelVerification(notification) => {
+                 self.on_app_server_model_verification(&notification.verifications)
+             }
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -202,6 +202,7 @@ impl ChatWidget {
+                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
+                 self.last_non_retry_error = None;
+                 self.on_task_started();
++                self.bottom_pane.set_turn_started_at(started_at);
+             }
+             let trailing_reasoning_id = (status == TurnStatus::InProgress)
+                 .then(|| items.last())
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -72,6 +72,12 @@ impl ChatWidget {
+         let connector_scope_changed = previous_thread_id != Some(session.thread_id)
+             || self.config.cwd.as_path() != session.cwd.as_path();
+         self.thread_id = Some(session.thread_id);
++        if previous_thread_id != self.thread_id {
++            self.response_timing = Default::default();
++        }
++        self.app_event_tx.send(AppEvent::RefreshResponseTiming {
++            thread_id: session.thread_id,
++        });
+         self.daybreak_enabled = session.daybreak_enabled
+             && !matches!(display, SessionConfiguredDisplay::SideConversation);
+         #[cfg(target_os = "windows")]
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -171,6 +171,54 @@ impl ChatWidget {
+         self.local_settings.tui.fullscreen_transcript && self.response_timing.has_observations()
+     }
+ 
++    pub(crate) fn on_response_attempt_updated(
++        &mut self,
++        attempt: codex_protocol::response_metrics::ResponseAttempt,
++    ) {
++        if self.thread_id != Some(attempt.thread_id) {
++            return;
++        }
++        self.response_timing.update(attempt, true, Instant::now());
++        self.refresh_response_status();
++        self.refresh_status_line();
++        self.request_redraw();
++    }
++
++    pub(crate) fn on_response_attempts_loaded(
++        &mut self,
++        page: codex_app_server_protocol::ResponseAttemptsReadResponse,
++        requested_at: Instant,
++    ) {
++        if let Some(last) = page.last_generation
++            && self.thread_id == Some(last.thread_id)
++        {
++            self.response_timing.restore_performance(last);
++        }
++        let observed_at = Instant::now();
++        for row in page.data {
++            if self.thread_id == Some(row.thread_id) {
++                let active = page.active_attempt_ids.contains(&row.attempt_id);
++                self.response_timing
++                    .snapshot(row, active, requested_at, observed_at);
++            }
++        }
++        self.refresh_response_status();
++        self.refresh_status_line();
++        self.request_redraw();
++    }
++
++    pub(super) fn refresh_response_status(&mut self) {
++        let attempt = self.response_timing.latest().filter(|attempt| {
++            self.local_settings.tui.fullscreen_transcript
++                && self.turn_lifecycle.agent_turn_running
++                && attempt.is_receiving()
++                && (self.turn_lifecycle.last_turn_id.is_none()
++                    || attempt.row.turn_id == self.turn_lifecycle.last_turn_id)
++        });
++        self.bottom_pane
++            .set_response_progress(attempt.map(crate::response_timing::ObservedResponse::progress));
++    }
++
+     pub(crate) fn clear_remote_control_connection_status(&mut self) {
+         if !self.stream_rtt_enabled() {
+             return;
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -823,6 +823,12 @@ impl ChatWidget {
+             StatusLineItem::ResponsePerformance => self
+                 .response_timing_enabled()
+                 .then(|| self.response_timing.last_performance()),
++            StatusLineItem::Ttfc => self
++                .response_timing_enabled()
++                .then(|| self.response_timing.last_ttfc()),
++            StatusLineItem::Tps => self
++                .response_timing_enabled()
++                .then(|| self.response_timing.last_tps()),
+             StatusLineItem::ResponseReceive => self
+                 .response_timing_enabled()
+                 .then(|| self.response_timing.live_receive())?,
+@@ -1010,6 +1016,8 @@ impl ChatWidget {
+                 StatusLineItem::ResponsesStreamConnection
+             }
+             StatusSurfacePreviewItem::ResponsePerformance => StatusLineItem::ResponsePerformance,
++            StatusSurfacePreviewItem::Ttfc => StatusLineItem::Ttfc,
++            StatusSurfacePreviewItem::Tps => StatusLineItem::Tps,
+             StatusSurfacePreviewItem::ResponseReceive => StatusLineItem::ResponseReceive,
+             StatusSurfacePreviewItem::RemoteControlStreamConnection => {
+                 StatusLineItem::RemoteControlStreamConnection
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -285,6 +285,8 @@ mod rate_limit_recovery_tests;
+ mod reasoning_status_tests;
+ #[path = "tests/replay_render_tests.rs"]
+ mod replay_render_tests;
++#[path = "tests/response_timing_tests.rs"]
++mod response_timing_tests;
+ mod review_mode;
+ #[path = "tests/review_picker_tests.rs"]
+ mod review_picker_tests;
+diff --git a/codex-rs/tui/src/chatwidget/tests/completion_styling_tests.rs b/codex-rs/tui/src/chatwidget/tests/completion_styling_tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests/completion_styling_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/completion_styling_tests.rs
+@@ -8,6 +8,74 @@ use pretty_assertions::assert_eq;
+ 
+ const COMPLETED_AT: i64 = 1_700_000_000;
+ 
++#[tokio::test]
++async fn active_turn_clock_survives_parent_agent_replay_and_steer() {
++    let now = chrono::Utc::now().timestamp();
++    for (turn_id, started, live) in [
++        ("parent-turn", now - 125, true),
++        ("agent-turn", now - 30, false),
++        ("parent-turn", now - 125, false),
++    ] {
++        let (mut chat, _events, mut ops) = make_chatwidget_manual(None).await;
++        let thread_id = ThreadId::new();
++        chat.thread_id = Some(thread_id);
++        let mut turn = app_server_turn(turn_id, AppServerTurnStatus::InProgress, None, None);
++        turn.started_at = Some(started);
++        if live {
++            chat.handle_server_notification(
++                ServerNotification::TurnStarted(TurnStartedNotification {
++                    thread_id: thread_id.to_string(),
++                    turn: turn.clone(),
++                }),
++                None,
++            );
++        } else {
++            chat.replay_thread_turns(vec![turn.clone()], ReplayKind::ThreadSnapshot);
++        }
++        let minimum = u64::try_from(now - started).unwrap();
++        let elapsed = chat.bottom_pane.status_elapsed().expect("active clock");
++        assert!(elapsed.as_secs() >= minimum && elapsed.as_secs() < minimum + 10);
++        let status = render_bottom_popup(&chat, 100);
++        assert!(
++            status.contains(&crate::status_indicator_widget::fmt_elapsed_compact(
++                elapsed.as_secs()
++            )),
++            "{status}"
++        );
++        while ops.try_recv().is_ok() {}
++        chat.submit_user_message(UserMessage::from("Continue this same turn"));
++        assert!(matches!(next_submit_op(&mut ops), Op::UserTurn { .. }));
++        assert_eq!(chat.turn_lifecycle.last_turn_id.as_deref(), Some(turn_id));
++        assert!(!chat.input_queue.pending_steers.is_empty());
++        assert!(chat.bottom_pane.status_elapsed().unwrap() >= elapsed);
++        turn.status = AppServerTurnStatus::Completed;
++        turn.completed_at = Some(started + 150);
++        turn.duration_ms = Some(150_000);
++        complete_turn(&mut chat, turn);
++        assert!(chat.bottom_pane.status_elapsed().is_none());
++        handle_turn_started(&mut chat, "next-turn");
++        assert!(chat.bottom_pane.status_elapsed().unwrap().as_secs() < 10);
++    }
++}
++
++#[tokio::test]
++async fn completion_uses_saved_turn_boundaries_when_duration_is_missing() {
++    for replay in [false, true] {
++        let (mut chat, mut events, _ops) = make_chatwidget_manual(None).await;
++        let mut turn = completed_turn(None, Some(COMPLETED_AT));
++        turn.started_at = Some(COMPLETED_AT - 125);
++        if replay {
++            chat.replay_thread_turns(vec![turn], ReplayKind::ThreadSnapshot);
++        } else {
++            complete_turn(&mut chat, turn);
++        }
++        assert_eq!(
++            completion_labels(&mut events),
++            format!("Worked for 2m 5s • {}", saved_completion_label())
++        );
++    }
++}
++
+ fn completed_turn(duration_ms: Option<i64>, completed_at: Option<i64>) -> AppServerTurn {
+     AppServerTurn {
+         completed_at,
+diff --git a/codex-rs/tui/src/chatwidget/tests/response_timing_tests.rs b/codex-rs/tui/src/chatwidget/tests/response_timing_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/response_timing_tests.rs
+@@ -0,0 +1,155 @@
++use super::*;
++use crate::response_timing::tests::attempt;
++use crate::response_timing::tests::page;
++use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use pretty_assertions::assert_eq;
++
++fn notify(chat: &mut ChatWidget, attempt: ResponseAttempt) {
++    chat.handle_server_notification(
++        ServerNotification::ResponseAttemptUpdated(ResponseAttemptUpdatedNotification {
++            thread_id: attempt.thread_id.to_string(),
++            attempt,
++            quota: None,
++        }),
++        None,
++    );
++}
++
++#[tokio::test]
++async fn response_notifications_preserve_last_generation_and_filter_other_threads() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    let completed = attempt(1, Some(ResponseAttemptEnd::Completed));
++    chat.thread_id = Some(completed.thread_id);
++    notify(&mut chat, completed);
++    let expected = Some("Last TTFB 0.30s TPS 50.0".into());
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponsePerformance),
++        expected
++    );
++    notify(&mut chat, attempt(2, None));
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponsePerformance),
++        expected
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponseReceive),
++        Some("Received 0.5KiB".into())
++    );
++    let mut other = attempt(3, Some(ResponseAttemptEnd::Completed));
++    other.thread_id = ThreadId::new();
++    other.ttfb_ms = Some(9000);
++    notify(&mut chat, other);
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponsePerformance),
++        expected
++    );
++    let mut failed = attempt(2, Some(ResponseAttemptEnd::ProgressTimeout));
++    failed.revision += 1;
++    failed.ttfb_ms = None;
++    failed.tps = None;
++    notify(&mut chat, failed);
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponsePerformance),
++        Some("Last TTFB -- TPS --".into())
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::ResponseReceive),
++        None
++    );
++}
++
++#[tokio::test]
++async fn response_progress_ends_on_receipt_and_stays_stopped_after_status_recreation() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    chat.thread_id = Some(attempt(1, None).thread_id);
++    handle_turn_started(&mut chat, "turn-1");
++    let mut timer = crate::status_indicator_widget::StatusTimer::default();
++    timer.pause_at(Instant::now());
++    timer.reset(Duration::from_secs(42));
++    let render = |chat: &ChatWidget| {
++        let area = Rect::new(0, 0, 140, 1);
++        let mut buffer = Buffer::empty(area);
++        chat.bottom_pane
++            .status_widget()
++            .unwrap()
++            .with_timer(&timer)
++            .render(area, &mut buffer);
++        buffer
++            .content
++            .iter()
++            .map(|cell| cell.symbol())
++            .collect::<String>()
++            .trim_end()
++            .to_string()
++    };
++    let mut running = attempt(1, None);
++    running.received_payload_bytes = 0;
++    notify(&mut chat, running.clone());
++    assert!(!render(&chat).contains("Received"));
++    running.revision += 1;
++    running.received_payload_bytes = 32768;
++    notify(&mut chat, running.clone());
++    assert!(render(&chat).ends_with("Received 32.0KiB · 42s"));
++    running.revision += 1;
++    running.terminal_observed_offset_ms = Some(2400);
++    notify(&mut chat, running.clone());
++    assert!(!render(&chat).contains("Received"));
++    chat.bottom_pane.hide_status_indicator();
++    chat.bottom_pane.ensure_status_indicator();
++    chat.pre_draw_tick();
++    assert!(!render(&chat).contains("Received"));
++    running.revision += 1;
++    running.end_reason = Some(ResponseAttemptEnd::Completed);
++    notify(&mut chat, running);
++    let mut next = attempt(2, None);
++    next.elapsed_ms = 100;
++    next.received_payload_bytes = 1024;
++    notify(&mut chat, next.clone());
++    assert!(render(&chat).ends_with("Received 1.0KiB · 42s"));
++    let last = chat.response_timing.last_performance();
++    handle_turn_started(&mut chat, "turn-2");
++    chat.pre_draw_tick();
++    assert!(chat.response_timing.latest().is_none());
++    assert_eq!(chat.response_timing.last_performance(), last);
++    assert!(!render(&chat).contains("Received"));
++    notify(&mut chat, next);
++    assert!(!render(&chat).contains("Received"));
++    let mut current = attempt(3, None);
++    current.turn_id = Some("turn-2".into());
++    current.received_payload_bytes = 2048;
++    notify(&mut chat, current);
++    assert!(render(&chat).contains("Received 2.0KiB"));
++    chat.on_interrupted_turn(TurnAbortReason::Interrupted);
++    assert!(!chat.bottom_pane.status_indicator_visible());
++}
++
++#[tokio::test]
++async fn retained_page_restores_performance_without_reviving_unfinished_records() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.thread_id = Some(attempt(1, None).thread_id);
++    let mut running = attempt(2000, None);
++    running.request_kind = "memory".into();
++    let mut snapshot = page(vec![running.clone()]);
++    snapshot.active_attempt_ids.clear();
++    snapshot.last_generation = Some((&attempt(1, Some(ResponseAttemptEnd::Completed))).into());
++    let requested_at = Instant::now();
++    notify(&mut chat, running);
++    chat.on_response_attempts_loaded(snapshot.clone(), requested_at);
++    assert!(chat.response_timing.latest().unwrap().is_running());
++    assert_eq!(
++        chat.response_timing.last_performance(),
++        "Last TTFB 0.30s TPS 50.0"
++    );
++    chat.on_response_attempts_loaded(snapshot, Instant::now());
++    let historical = chat.response_timing.latest().unwrap();
++    assert!(!historical.is_running());
++    assert_eq!(historical.row.end_reason, None);
++    assert_eq!(
++        historical.elapsed_ms(Instant::now() + Duration::from_secs(60)),
++        2100
++    );
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -12,6 +12,68 @@ fn line_text(line: Line<'static>) -> String {
+         .collect()
+ }
+ 
++#[tokio::test]
++async fn independent_response_metrics_preserve_precision_preview_style_and_last_generation() {
++    use crate::response_timing::tests::attempt;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
++    let items = [StatusLineItem::Ttfc, StatusLineItem::Tps];
++    let preview = chat.status_surface_preview_data();
++    assert_eq!(
++        preview.value_for(StatusSurfacePreviewItem::Ttfc),
++        Some("0.01s")
++    );
++    assert_eq!(
++        preview.value_for(StatusSurfacePreviewItem::Tps),
++        Some("0.1")
++    );
++    assert_eq!(chat.status_line_value_for_item(items[0]), None);
++    assert_eq!(chat.status_line_value_for_item(items[1]), None);
++    for (index, (ttfc, tps, expected)) in [
++        (Some(10), Some(0.1), ["0.01s", "0.1"]),
++        (Some(1279), Some(123.456), ["1.28s", "123.5"]),
++        (Some(0), Some(0.0), ["0.00s", "0.0"]),
++        (None, None, ["--", "--"]),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let mut row = attempt(index as u64 + 1, Some(ResponseAttemptEnd::Completed));
++        row.revision += 1;
++        row.ttfc_ms = ttfc;
++        row.tps = tps;
++        chat.response_timing.update(row, true, Instant::now());
++        // A new in-flight request keeps the last-ended generation visible.
++        chat.response_timing
++            .update(attempt(index as u64 + 2, None), true, Instant::now());
++        assert_eq!(
++            chat.status_line_value_for_item(items[0]).as_deref(),
++            Some(expected[0])
++        );
++        assert_eq!(
++            chat.status_line_value_for_item(items[1]).as_deref(),
++            Some(expected[1])
++        );
++        for colors in [false, true] {
++            let preview = chat
++                .status_surface_preview_data()
++                .status_line_for_items(items, colors);
++            let thread_id = chat.thread_id;
++            let live = crate::bottom_pane::status_line_from_segments(
++                items
++                    .into_iter()
++                    .map(|item| (item, chat.status_line_value(item).unwrap())),
++                colors,
++                thread_id,
++                crate::bottom_pane::StatusLineDetails::default(),
++            );
++            assert_eq!(preview, live);
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn response_status_preview_matches_live_values_colors_and_absence() {
+     use crate::response_timing::tests::attempt;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -212,6 +212,8 @@ impl ChatWidget {
+     // Raw reasoning uses the same flow as summarized reasoning
+ 
+     pub(super) fn on_task_started(&mut self) {
++        self.response_timing.reset_turn();
++        self.bottom_pane.set_turn_started_at(None);
+         self.bottom_pane.dismiss_composer_sparkle();
+         self.clear_context_compaction();
+         self.input_queue.user_turn_pending_start = false;

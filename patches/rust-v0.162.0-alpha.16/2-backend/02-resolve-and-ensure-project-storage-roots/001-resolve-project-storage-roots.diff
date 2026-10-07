@@ -1,0 +1,286 @@
+resolve-project-storage-roots
+
+Lane: backend
+
+Unit: resolve-and-ensure-project-storage-roots
+
+ChildPatch: resolve-project-storage-roots
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -21,6 +21,8 @@ use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
+ use std::os::unix::fs::symlink;
+ use tempfile::TempDir;
+ 
++mod storage_roots;
++
+ const APPLY_PATCH_ARG0: &str = "apply_patch";
+ const MISSPELLED_APPLY_PATCH_ARG0: &str = "applypatch";
+ #[cfg(unix)]
+diff --git a/codex-rs/arg0/src/storage_roots.rs b/codex-rs/arg0/src/storage_roots.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/arg0/src/storage_roots.rs
+@@ -0,0 +1,128 @@
++use anyhow::Context;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use std::ffi::OsStr;
++use std::ffi::OsString;
++use std::path::Path;
++use std::path::PathBuf;
++
++pub(crate) struct StorageRoots {
++    pub(crate) project_scratch_root: AbsolutePathBuf,
++    pub(crate) project_runtime_root: AbsolutePathBuf,
++    pub(crate) project_persistent_root: AbsolutePathBuf,
++    pub(crate) repos_root: AbsolutePathBuf,
++    pub(crate) skills_root: AbsolutePathBuf,
++    pub(crate) skills_scratch_root: AbsolutePathBuf,
++}
++
++impl StorageRoots {
++    pub(crate) fn resolve(
++        cwd: &Path,
++        codex_home: &Path,
++        codex_harness: &Path,
++        mut variable: impl FnMut(&str) -> Option<OsString>,
++    ) -> anyhow::Result<Self> {
++        let relative = project_relative_directory(cwd);
++        let project_leaf = relative
++            .file_name()
++            .context("project-relative directory has no final component")?;
++
++        Ok(Self {
++            project_scratch_root: absolute_override(
++                "PROJECT_SCRATCH_ROOT",
++                codex_harness.join(&relative),
++                &mut variable,
++            )?,
++            project_runtime_root: project_root_from_base(
++                "PROJECT_RUNTIME_ROOT",
++                "TMPDIR",
++                project_leaf,
++                &mut variable,
++            )?,
++            project_persistent_root: project_root_from_base(
++                "PROJECT_PERSISTENT_ROOT",
++                "HOME",
++                project_leaf,
++                &mut variable,
++            )?,
++            repos_root: resolve_repos_root(&mut variable)?,
++            skills_root: absolute_override(
++                "SKILLS_ROOT",
++                codex_home.join("skills"),
++                &mut variable,
++            )?,
++            skills_scratch_root: absolute_override(
++                "SKILLS_SCRATCH_ROOT",
++                codex_harness.join("skills"),
++                &mut variable,
++            )?,
++        })
++    }
++}
++
++fn project_relative_directory(cwd: &Path) -> PathBuf {
++    let project = cwd
++        .file_name()
++        .filter(|name| !name.is_empty())
++        .unwrap_or_else(|| OsStr::new("workspace"));
++    let group = cwd
++        .parent()
++        .and_then(Path::file_name)
++        .filter(|name| !name.is_empty())
++        .unwrap_or_else(|| OsStr::new("root"));
++    PathBuf::from(group).join(project)
++}
++
++fn resolve_repos_root(
++    variable: &mut impl FnMut(&str) -> Option<OsString>,
++) -> anyhow::Result<AbsolutePathBuf> {
++    if let Some(override_path) = variable("REPOS_ROOT").filter(|value| !value.is_empty()) {
++        return absolute_path("REPOS_ROOT", PathBuf::from(override_path));
++    }
++    let user_home = variable("HOME")
++        .filter(|value| !value.is_empty())
++        .map(PathBuf::from)
++        .context("HOME is required for default REPOS_ROOT")?;
++    if !user_home.is_absolute() {
++        anyhow::bail!("HOME must be an absolute path");
++    }
++    absolute_path("REPOS_ROOT", user_home.join("repos"))
++}
++
++fn absolute_override(
++    name: &str,
++    default: PathBuf,
++    variable: &mut impl FnMut(&str) -> Option<OsString>,
++) -> anyhow::Result<AbsolutePathBuf> {
++    let path = variable(name)
++        .filter(|value| !value.is_empty())
++        .map_or(default, PathBuf::from);
++    absolute_path(name, path)
++}
++
++fn project_root_from_base(
++    name: &str,
++    base_name: &str,
++    project_leaf: &OsStr,
++    variable: &mut impl FnMut(&str) -> Option<OsString>,
++) -> anyhow::Result<AbsolutePathBuf> {
++    if let Some(override_path) = variable(name).filter(|value| !value.is_empty()) {
++        return absolute_path(name, PathBuf::from(override_path));
++    }
++    let base = variable(base_name)
++        .filter(|value| !value.is_empty())
++        .map(PathBuf::from)
++        .with_context(|| format!("{base_name} is required for default {name}"))?;
++    if !base.is_absolute() {
++        anyhow::bail!("{base_name} must be an absolute path");
++    }
++    absolute_path(name, base.join(project_leaf))
++}
++
++fn absolute_path(name: &str, path: PathBuf) -> anyhow::Result<AbsolutePathBuf> {
++    AbsolutePathBuf::from_absolute_path_checked(path)
++        .with_context(|| format!("{name} must be an absolute path"))
++}
++
++#[cfg(test)]
++#[path = "storage_roots_tests.rs"]
++mod tests;
+diff --git a/codex-rs/arg0/src/storage_roots_tests.rs b/codex-rs/arg0/src/storage_roots_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/arg0/src/storage_roots_tests.rs
+@@ -0,0 +1,123 @@
++use super::StorageRoots;
++use pretty_assertions::assert_eq;
++use std::path::Path;
++
++#[test]
++fn entered_cwd_maps_to_the_project_relative_directory() {
++    let roots = StorageRoots::resolve(
++        Path::new("/home/person/repos/codex"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "HOME" => Some("/home/person".into()),
++            "TMPDIR" => Some("/tmp".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/harness/repos/codex")
++    );
++    assert_eq!(
++        roots.project_runtime_root.as_path(),
++        Path::new("/tmp/codex")
++    );
++    assert_eq!(
++        roots.project_persistent_root.as_path(),
++        Path::new("/home/person/codex")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/home/person/repos"));
++    assert_eq!(roots.skills_root.as_path(), Path::new("/codex/skills"));
++    assert_eq!(
++        roots.skills_scratch_root.as_path(),
++        Path::new("/harness/skills")
++    );
++}
++
++#[test]
++fn repos_root_is_independent_of_the_entered_cwd() {
++    let roots = StorageRoots::resolve(
++        Path::new("/worktrees/group/project"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "HOME" => Some("/home/person".into()),
++            "TMPDIR" => Some("/tmp".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/harness/group/project")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/home/person/repos"));
++}
++
++#[test]
++fn explicit_absolute_roots_override_defaults_without_requiring_home() {
++    let roots = StorageRoots::resolve(
++        Path::new("/home/person/repos/codex"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "PROJECT_SCRATCH_ROOT" => Some("/work/scratch".into()),
++            "PROJECT_RUNTIME_ROOT" => Some("/work/runtime".into()),
++            "PROJECT_PERSISTENT_ROOT" => Some("/work/persistent".into()),
++            "REPOS_ROOT" => Some("/work/repos".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/work/scratch")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/work/repos"));
++    assert_eq!(
++        roots.project_runtime_root.as_path(),
++        Path::new("/work/runtime")
++    );
++    assert_eq!(
++        roots.project_persistent_root.as_path(),
++        Path::new("/work/persistent")
++    );
++}
++
++#[test]
++fn derived_roots_require_their_base_environment() {
++    let cwd = Path::new("/home/person/repos/codex");
++    let root = Path::new("/harness");
++    assert!(
++        StorageRoots::resolve(cwd, root, root, |name| {
++            (name == "HOME").then(|| "/home/person".into())
++        })
++        .is_err()
++    );
++    assert!(
++        StorageRoots::resolve(cwd, root, root, |name| match name {
++            "TMPDIR" => Some("/tmp".into()),
++            "REPOS_ROOT" => Some("/home/person/repos".into()),
++            _ => None,
++        })
++        .is_err()
++    );
++}
++
++#[test]
++fn relative_root_override_is_rejected() {
++    assert!(
++        StorageRoots::resolve(
++            Path::new("/home/person/repos/codex"),
++            Path::new("/codex"),
++            Path::new("/harness"),
++            |name| match name {
++                "HOME" => Some("/home/person".into()),
++                "PROJECT_SCRATCH_ROOT" => Some("relative".into()),
++                _ => None,
++            },
++        )
++        .is_err()
++    );
++}

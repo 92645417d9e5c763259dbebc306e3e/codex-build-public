@@ -1,0 +1,243 @@
+present-unmapped-api-errors-concisely
+
+Lane: frontend
+
+FlatPatch: present-unmapped-api-errors-concisely
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1877,6 +1877,62 @@ async fn live_app_server_rate_limit_error_renders_upstream_message() {
+     assert_chatwidget_snapshot!("rate_limit_exceeded_error", lines_to_single_string(&lines));
+ }
+ 
++#[tokio::test]
++async fn live_unmapped_http_error_is_concise_with_private_full_body() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let message = r#"{"status":400,"error":{"message":"private provider body"}}"#;
++    let log_path = chat.config.log_dir.join("api-errors.log");
++    std::fs::create_dir_all(&chat.config.log_dir).unwrap();
++    std::fs::write(&log_path, "previous private body\n").unwrap();
++
++    handle_error(&mut chat, message, Some(CodexErrorInfo::BadRequest));
++
++    let lines = drain_insert_history(&mut rx)
++        .into_iter()
++        .flatten()
++        .collect::<Vec<_>>();
++    assert_eq!(lines_to_single_string(&lines), "■ HTTP 400\n");
++    assert_eq!(
++        std::fs::read_to_string(&log_path).expect("read private API error log"),
++        format!("previous private body\n{message}\n")
++    );
++    {
++        use std::os::unix::fs::PermissionsExt;
++
++        assert_eq!(
++            std::fs::metadata(log_path)
++                .expect("private API error log metadata")
++                .permissions()
++                .mode()
++                & 0o777,
++            0o600
++        );
++    }
++}
++
++#[tokio::test]
++async fn live_unmapped_http_error_keeps_concise_presentation_when_logging_fails() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let invalid_log_dir = chat.config.codex_home.join("not-a-log-directory");
++    std::fs::write(&invalid_log_dir, "preserve this file").unwrap();
++    chat.config.log_dir = invalid_log_dir.to_path_buf();
++
++    handle_error(
++        &mut chat,
++        "unexpected status 502: private provider body",
++        None,
++    );
++
++    let cells = drain_insert_history(&mut rx);
++    assert_eq!(cells.len(), 1);
++    assert_eq!(lines_to_single_string(&cells[0]), "■ HTTP 502\n");
++    assert_eq!(
++        std::fs::read_to_string(invalid_log_dir).unwrap(),
++        "preserve this file"
++    );
++    assert!(!chat.bottom_pane.is_task_running());
++}
++
+ #[tokio::test]
+ async fn live_app_server_server_overloaded_error_renders_error() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -5,6 +5,12 @@
+ //! Terminal errors retain live question drafts across queued input delivery.
+ 
+ use super::*;
++use std::io::Write;
++use std::os::unix::fs::OpenOptionsExt;
++use std::os::unix::fs::PermissionsExt;
++use std::path::Path;
++
++const API_ERROR_LOG_FILE: &str = "api-errors.log";
+ 
+ const LEGACY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
+     "Invalid prompt: we've limited access to this content for safety reasons.";
+@@ -16,6 +22,137 @@ fn is_safety_access_block_message(message: &str) -> bool {
+         || message.starts_with(BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX)
+ }
+ 
++#[cfg(test)]
++mod unmapped_http_tests {
++    use super::*;
++
++    #[test]
++    fn shortens_only_identifiable_http_errors() {
++        assert_eq!(
++            unmapped_http_status(
++                "provider body",
++                Some(&AppServerCodexErrorInfo::HttpConnectionFailed {
++                    http_status_code: Some(502),
++                }),
++            ),
++            Some(502)
++        );
++        assert_eq!(
++            unmapped_http_status(
++                "unexpected status 503: provider body",
++                Some(&AppServerCodexErrorInfo::ResponseStreamDisconnected {
++                    http_status_code: None,
++                }),
++            ),
++            Some(503)
++        );
++        assert_eq!(
++            unmapped_http_status(
++                "unsupported operation",
++                Some(&AppServerCodexErrorInfo::BadRequest)
++            ),
++            None
++        );
++        assert_eq!(
++            unmapped_http_status(
++                "sandbox rejected HTTP 403 metadata",
++                Some(&AppServerCodexErrorInfo::SandboxError),
++            ),
++            None
++        );
++    }
++
++    #[test]
++    fn recognizes_explicit_status_formats_without_inventing_a_status() {
++        for (message, expected) in [
++            ("unexpected status 502: provider body", Some(502)),
++            ("request failed: HTTP 401 Unauthorized", Some(401)),
++            (
++                r#"{"status":400,"error":{"message":"private body"}}"#,
++                Some(400),
++            ),
++            (r#"{"status":"503","error":{}}"#, Some(503)),
++            (r#"{"status":400}"#, None),
++            ("unexpected status 600: provider body", None),
++            ("HTTP 99", None),
++            ("provider body", None),
++        ] {
++            assert_eq!(explicit_http_status(message), expected, "{message}");
++        }
++    }
++}
++
++fn leading_http_status(value: &str) -> Option<u16> {
++    let digits = value
++        .as_bytes()
++        .iter()
++        .take_while(|byte| byte.is_ascii_digit())
++        .count();
++    value
++        .get(..digits)?
++        .parse::<u16>()
++        .ok()
++        .filter(|status| (100..=599).contains(status))
++}
++
++fn explicit_http_status(message: &str) -> Option<u16> {
++    let message = message.trim();
++    if let Some(value) = message.strip_prefix("unexpected status ") {
++        return leading_http_status(value);
++    }
++    if let Some((_, value)) = message.split_once("HTTP ") {
++        return leading_http_status(value);
++    }
++    let response = serde_json::from_str::<serde_json::Value>(message).ok()?;
++    response.get("error")?;
++    let status = response.get("status")?;
++    status
++        .as_u64()
++        .and_then(|value| u16::try_from(value).ok())
++        .filter(|value| (100..=599).contains(value))
++        .or_else(|| status.as_str().and_then(leading_http_status))
++}
++
++fn unmapped_http_status(message: &str, info: Option<&AppServerCodexErrorInfo>) -> Option<u16> {
++    match info {
++        Some(
++            AppServerCodexErrorInfo::HttpConnectionFailed { http_status_code }
++            | AppServerCodexErrorInfo::ResponseStreamConnectionFailed { http_status_code }
++            | AppServerCodexErrorInfo::ResponseStreamDisconnected { http_status_code }
++            | AppServerCodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code },
++        ) => http_status_code
++            .filter(|status| (100..=599).contains(status))
++            .or_else(|| explicit_http_status(message)),
++        Some(AppServerCodexErrorInfo::Other)
++        | Some(AppServerCodexErrorInfo::BadRequest)
++        | Some(AppServerCodexErrorInfo::Unauthorized)
++        | Some(AppServerCodexErrorInfo::InternalServerError)
++        | None => explicit_http_status(message),
++        Some(AppServerCodexErrorInfo::ContextWindowExceeded)
++        | Some(AppServerCodexErrorInfo::SessionBudgetExceeded)
++        | Some(AppServerCodexErrorInfo::UsageLimitExceeded)
++        | Some(AppServerCodexErrorInfo::RateLimitExceeded)
++        | Some(AppServerCodexErrorInfo::ServerOverloaded)
++        | Some(AppServerCodexErrorInfo::CyberPolicy)
++        | Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
++        | Some(AppServerCodexErrorInfo::ThreadRollbackFailed)
++        | Some(AppServerCodexErrorInfo::SandboxError)
++        | Some(AppServerCodexErrorInfo::FlexUnavailable)
++        | Some(AppServerCodexErrorInfo::TooManyDenials)
++        | Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable { .. }) => None,
++    }
++}
++
++fn append_api_error(log_dir: &Path, message: &str) -> std::io::Result<()> {
++    std::fs::create_dir_all(log_dir)?;
++    let path = log_dir.join(API_ERROR_LOG_FILE);
++    let mut options = std::fs::OpenOptions::new();
++    options.create(true).append(true).mode(0o600);
++    let mut file = options.open(&path)?;
++    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
++    writeln!(file, "{message}")
++}
++
+ impl ChatWidget {
+     fn clear_guardian_review_status(&mut self) {
+         self.status_state.pending_guardian_review_status.clear();
+@@ -539,6 +676,11 @@ impl ChatWidget {
+                     self.on_rate_limit_error(info, message)
+                 }
+             }
++        } else if let Some(status) = unmapped_http_status(&message, codex_error_info.as_ref()) {
++            if let Err(error) = append_api_error(&self.config.log_dir, &message) {
++                tracing::warn!(error = %error, "failed to append unmapped API error details");
++            }
++            self.on_error(format!("HTTP {status}"));
+         } else {
+             self.on_error(message);
+         }

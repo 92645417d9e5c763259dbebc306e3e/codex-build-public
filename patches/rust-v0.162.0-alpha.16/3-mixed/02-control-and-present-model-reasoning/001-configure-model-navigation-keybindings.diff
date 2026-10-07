@@ -1,0 +1,102 @@
+configure-model-navigation-keybindings
+
+Lane: mixed
+
+Unit: control-and-present-model-reasoning
+
+ChildPatch: configure-model-navigation-keybindings
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/config/src/tui_keymap.rs b/codex-rs/config/src/tui_keymap.rs
+--- a/codex-rs/config/src/tui_keymap.rs
++++ b/codex-rs/config/src/tui_keymap.rs
+@@ -179,6 +179,10 @@ pub struct TuiChatKeymap {
+     pub decrease_reasoning_effort: Option<KeybindingsSpec>,
+     /// Increase the active reasoning effort.
+     pub increase_reasoning_effort: Option<KeybindingsSpec>,
++    /// Select the previous model in model-picker order.
++    pub previous_model: Option<KeybindingsSpec>,
++    /// Select the next model in model-picker order.
++    pub next_model: Option<KeybindingsSpec>,
+     /// Switch to the previous available permission mode.
+     pub previous_permission_mode: Option<KeybindingsSpec>,
+     /// Switch to the next available permission mode.
+@@ -740,6 +744,21 @@ mod tests {
+     use super::*;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn model_navigation_shortcuts_are_configurable() {
++        let keymap: TuiKeymap =
++            toml::from_str("[chat]\nprevious_model = 'alt-;'\nnext_model = \"alt-'\"\n")
++                .expect("model navigation bindings");
++        assert_eq!(
++            keymap.chat.previous_model,
++            Some(KeybindingsSpec::One(KeybindingSpec("alt-;".to_string())))
++        );
++        assert_eq!(
++            keymap.chat.next_model,
++            Some(KeybindingsSpec::One(KeybindingSpec("alt-'".to_string())))
++        );
++    }
++
+     #[test]
+     fn misplaced_action_at_keymap_root_is_rejected() {
+         // Actions placed directly under [tui.keymap] instead of a context
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4596,7 +4596,9 @@
+               "edit_queued_message": null,
+               "increase_reasoning_effort": null,
+               "interrupt_turn": null,
++              "next_model": null,
+               "next_permission_mode": null,
++              "previous_model": null,
+               "previous_permission_mode": null,
+               "prompt_stack_back": null,
+               "skip_question": null,
+@@ -5115,6 +5117,14 @@
+           ],
+           "description": "Interrupt the active turn."
+         },
++        "next_model": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/KeybindingsSpec"
++            }
++          ],
++          "description": "Select the next model in model-picker order."
++        },
+         "next_permission_mode": {
+           "allOf": [
+             {
+@@ -5123,6 +5133,14 @@
+           ],
+           "description": "Switch to the next available permission mode."
+         },
++        "previous_model": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/KeybindingsSpec"
++            }
++          ],
++          "description": "Select the previous model in model-picker order."
++        },
+         "previous_permission_mode": {
+           "allOf": [
+             {
+@@ -5564,7 +5582,9 @@
+             "edit_queued_message": null,
+             "increase_reasoning_effort": null,
+             "interrupt_turn": null,
++            "next_model": null,
+             "next_permission_mode": null,
++            "previous_model": null,
+             "previous_permission_mode": null,
+             "prompt_stack_back": null,
+             "skip_question": null,

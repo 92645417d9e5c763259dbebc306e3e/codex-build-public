@@ -1,0 +1,519 @@
+present-context-remaining-in-statusline
+
+Lane: frontend
+
+FlatPatch: present-context-remaining-in-statusline
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -218,7 +218,7 @@ impl StatusLineItem {
+             StatusLineItem::Permissions => "Active permission profile or sandbox mode",
+             StatusLineItem::ApprovalMode => "Active command approval mode",
+             StatusLineItem::ContextRemaining => {
+-                "Percentage of context window remaining (omitted when unknown)"
++                "Remaining and total context tokens (omitted when unknown)"
+             }
+             StatusLineItem::ContextUsed => {
+                 "Percentage of context window used (omitted when unknown)"
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -25,6 +25,7 @@ const STATUS_LINE_COLOR_BRIGHTNESS_PERCENT: u16 = 100;
+ pub(crate) struct StatusLineDetails<'a> {
+     pub(crate) reasoning_effort: Option<&'a ReasoningEffort>,
+     pub(crate) fast_label: Option<&'a str>,
++    pub(crate) context_remaining_percent: Option<i64>,
+     pub(crate) capacity_bytes: Option<u64>,
+     pub(crate) five_hour_limit_consumption: Option<RateLimitConsumption>,
+     pub(crate) weekly_limit_consumption: Option<RateLimitConsumption>,
+@@ -140,7 +141,7 @@ where
+     F: Fn(StatusLineAccent) -> Option<Style>,
+ {
+     let mut spans = Vec::new();
+-    for (item, text) in segments {
++    for (item, mut text) in segments {
+         if !spans.is_empty() {
+             spans.push(STATUS_LINE_SEPARATOR.set_style(secondary_text_style()));
+         }
+@@ -195,6 +196,19 @@ where
+         } else {
+             style
+         };
++        if use_theme_colors
++            && item == StatusLineItem::ContextRemaining
++            && let Some(percent) = details.context_remaining_percent
++            && let Some(index) = text.find(" of ")
++        {
++            let suffix = text.split_off(index);
++            spans.push(Span::styled(
++                text,
++                style.fg(readable_color_on(context_remaining_color(percent), None)),
++            ));
++            spans.push(Span::styled(suffix, style));
++            continue;
++        }
+         let limit_consumption = match item {
+             StatusLineItem::FiveHourLimit => details.five_hour_limit_consumption,
+             StatusLineItem::WeeklyLimit => details.weekly_limit_consumption,
+@@ -280,6 +294,15 @@ fn capacity_severity_color(bytes: u64) -> Color {
+     }
+ }
+ 
++fn context_remaining_color(percent: i64) -> Color {
++    match percent {
++        75.. => Color::Green,
++        50..=74 => Color::Yellow,
++        25..=49 => Color::Rgb(249, 115, 22),
++        ..25 => Color::Red,
++    }
++}
++
+ fn append_reasoning_strength_meter(
+     spans: &mut Vec<Span<'static>>,
+     effort: &ReasoningEffort,
+@@ -384,6 +407,125 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use ratatui::style::Modifier;
+ 
++    #[test]
++    fn context_count_colors_only_remaining_tokens_and_respects_monochrome() {
++        let base = status_line_from_segments(
++            [(
++                StatusLineItem::ContextRemaining,
++                "23K of 353K left".to_string(),
++            )],
++            true,
++            None,
++            StatusLineDetails::default(),
++        )
++        .expect("base line")
++        .spans[0]
++            .style;
++        for (percent, color) in [
++            (100, Color::Green),
++            (75, Color::Green),
++            (74, Color::Yellow),
++            (50, Color::Yellow),
++            (49, Color::Rgb(249, 115, 22)),
++            (25, Color::Rgb(249, 115, 22)),
++            (24, Color::Red),
++            (0, Color::Red),
++        ] {
++            for use_colors in [true, false] {
++                let line = status_line_from_segments(
++                    [(
++                        StatusLineItem::ContextRemaining,
++                        "23K of 353K left".to_string(),
++                    )],
++                    use_colors,
++                    None,
++                    StatusLineDetails {
++                        context_remaining_percent: Some(percent),
++                        ..Default::default()
++                    },
++                )
++                .expect("context line");
++                assert_eq!(line_text(&line), "23K of 353K left");
++                if use_colors {
++                    assert_eq!(line.spans.len(), 2);
++                    assert_eq!(line.spans[0].content, "23K");
++                    assert_eq!(line.spans[0].style.fg, Some(readable_color_on(color, None)));
++                    assert_eq!(line.spans[1].content, " of 353K left");
++                    assert_eq!(line.spans[1].style, base);
++                } else {
++                    assert_eq!(line.spans.len(), 1);
++                    assert_eq!(line.spans[0].style, secondary_text_style());
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn context_count_preserves_reasoning_fast_and_neighbors_in_every_order() {
++        use itertools::Itertools;
++        let segments = [
++            (StatusLineItem::ContextRemaining, "23K of 353K left"),
++            (StatusLineItem::WeeklyLimit, "7D 32% left"),
++            (StatusLineItem::ModelWithReasoning, "gpt-5"),
++            (StatusLineItem::TotalInputTokens, "100 in"),
++        ];
++        let rendered = [
++            "23K of 353K left",
++            "7D 32% left",
++            "gpt-5 ■■■■■■ fast",
++            "100 in",
++        ];
++        for order in (0..4).permutations(4) {
++            let line = status_line_from_segments(
++                order
++                    .iter()
++                    .map(|&index| (segments[index].0, segments[index].1.to_string())),
++                true,
++                None,
++                StatusLineDetails {
++                    reasoning_effort: Some(&ReasoningEffort::High),
++                    fast_label: Some("fast"),
++                    context_remaining_percent: Some(49),
++                    ..Default::default()
++                },
++            )
++            .expect("combined line");
++            assert_eq!(
++                line_text(&line),
++                order.iter().map(|&index| rendered[index]).join(" · ")
++            );
++            assert_eq!(
++                line.spans
++                    .iter()
++                    .find(|span| span.content == "23K")
++                    .expect("context count")
++                    .style
++                    .fg,
++                Some(readable_color_on(Color::Rgb(249, 115, 22), None))
++            );
++            assert_eq!(
++                line.spans
++                    .iter()
++                    .find(|span| span.content == " fast")
++                    .expect("fast suffix")
++                    .style
++                    .fg,
++                Some(Color::Red)
++            );
++            assert_eq!(
++                line.spans.iter().filter(|span| span.content == "■").count(),
++                6
++            );
++            assert_eq!(
++                line.spans
++                    .iter()
++                    .filter(|span| span.content == " · ")
++                    .count(),
++                3
++            );
++        }
++    }
++
+     #[test]
+     fn limit_consumption_colors_remaining_and_keeps_pace_and_rate_secondary() {
+         for (item, label) in [
+@@ -596,6 +738,64 @@ mod tests {
+         assert_eq!(monochrome.spans[0].style, secondary_text_style());
+     }
+ 
++    #[test]
++    fn capacity_color_stays_on_its_value_when_context_and_model_add_spans() {
++        use StatusLineItem::CodexHomeCapacity;
++        use StatusLineItem::ContextRemaining;
++        use StatusLineItem::ModelWithReasoning;
++        use StatusLineItem::WeeklyLimit;
++        let capacity = (CodexHomeCapacity, "511.00MiB");
++        let weekly = (WeeklyLimit, "7D 32% left");
++        let model = (ModelWithReasoning, "test-model");
++        let context = (ContextRemaining, "23K of 353K left");
++        for segments in [
++            [capacity, weekly, model, context],
++            [weekly, context, model, capacity],
++        ] {
++            let line = status_line_from_segments(
++                segments.map(|(item, value)| (item, value.to_string())),
++                true,
++                None,
++                StatusLineDetails {
++                    capacity_bytes: Some(511 * 1024 * 1024),
++                    context_remaining_percent: Some(49),
++                    reasoning_effort: Some(&ReasoningEffort::High),
++                    fast_label: Some("fast"),
++                    five_hour_limit_consumption: None,
++                    weekly_limit_consumption: None,
++                },
++            )
++            .expect("combined status line");
++            let capacity = line
++                .spans
++                .iter()
++                .find(|span| span.content == "511.00MiB")
++                .expect("capacity value");
++            assert_eq!(capacity.style.fg, Some(readable_color_on(Color::Red, None)));
++            assert!(line_text(&line).contains("7D 32% left"));
++            assert!(line_text(&line).contains("test-model"));
++            assert!(line_text(&line).contains("23K of 353K left"));
++            assert_eq!(
++                line.spans
++                    .iter()
++                    .find(|span| span.content == " fast")
++                    .expect("fast suffix")
++                    .style
++                    .fg,
++                Some(Color::Red)
++            );
++            assert_eq!(
++                line.spans
++                    .iter()
++                    .find(|span| span.content == "23K")
++                    .expect("context value")
++                    .style
++                    .fg,
++                Some(readable_color_on(Color::Rgb(249, 115, 22), None))
++            );
++        }
++    }
++
+     #[test]
+     fn status_line_segments_preserve_order_and_plain_text() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -71,7 +71,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::ResponsesStreamConnection
+             | StatusSurfacePreviewItem::RemoteControlStreamConnection => return None,
+             StatusSurfacePreviewItem::Proxy => "proxy",
+-            StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
++            StatusSurfacePreviewItem::ContextRemaining => "Context unavailable",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
+@@ -153,6 +153,7 @@ pub(crate) struct StatusSurfacePreviewData {
+     pub(crate) thread_id: Option<ThreadId>,
+     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+     pub(crate) fast_label: Option<String>,
++    pub(crate) context_remaining_percent: Option<i64>,
+     pub(crate) capacity_bytes: Option<u64>,
+     pub(crate) five_hour_limit_consumption: Option<crate::status::RateLimitConsumption>,
+     pub(crate) weekly_limit_consumption: Option<crate::status::RateLimitConsumption>,
+@@ -167,6 +168,7 @@ impl Default for StatusSurfacePreviewData {
+             thread_id: None,
+             reasoning_effort: None,
+             fast_label: None,
++            context_remaining_percent: None,
+             capacity_bytes: None,
+             five_hour_limit_consumption: None,
+             weekly_limit_consumption: None,
+@@ -291,6 +293,7 @@ impl StatusSurfacePreviewData {
+             StatusLineDetails {
+                 reasoning_effort: self.reasoning_effort.as_ref(),
+                 fast_label: self.fast_label.as_deref(),
++                context_remaining_percent: self.context_remaining_percent,
+                 capacity_bytes: self.capacity_bytes,
+                 five_hour_limit_consumption: self.five_hour_limit_consumption,
+                 weekly_limit_consumption: self.weekly_limit_consumption,
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -432,8 +432,12 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn status_surface_preview_data(&mut self) -> StatusSurfacePreviewData {
++        let context_remaining = self.context_remaining_count_value();
+         let mut preview_data = StatusSurfacePreviewData::from_iter(
+             StatusSurfacePreviewItem::iter().filter_map(|item| {
++                if item == StatusSurfacePreviewItem::ContextRemaining {
++                    return None;
++                }
+                 self.status_surface_preview_value_for_item(item)
+                     .map(|value| (item, value))
+             }),
+@@ -445,6 +449,9 @@ impl ChatWidget {
+             .fullscreen_transcript
+             .then_some(self.home_disk_available_bytes)
+             .flatten();
++        preview_data.context_remaining_percent = context_remaining
++            .as_ref()
++            .and_then(|_| self.status_line_context_remaining_percent());
+         for (preview_item, status_item) in [
+             (
+                 StatusSurfacePreviewItem::FiveHourLimit,
+@@ -463,6 +470,11 @@ impl ChatWidget {
+             self.fullscreen_status_line_limit_consumption(StatusLineItem::FiveHourLimit);
+         preview_data.weekly_limit_consumption =
+             self.fullscreen_status_line_limit_consumption(StatusLineItem::WeeklyLimit);
++        if let Some(value) = context_remaining {
++            preview_data.set_live(StatusSurfacePreviewItem::ContextRemaining, value);
++        } else {
++            preview_data.suppress_placeholder(StatusSurfacePreviewItem::ContextRemaining);
++        }
+         preview_data.stream_rtt_enabled = self.stream_rtt_enabled();
+         preview_data.app_server_clients_enabled = self.local_settings.tui.fullscreen_transcript;
+         if self.local_settings.tui.fullscreen_transcript {
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -212,9 +212,13 @@ impl ChatWidget {
+ 
+         let mut segments = Vec::new();
+         for item in &selections.status_line_items {
+-            let value = self
+-                .fullscreen_status_line_limit_value(*item)
+-                .or_else(|| self.status_line_value_for_item(*item));
++            let value = self.fullscreen_status_line_limit_value(*item).or_else(|| {
++                if *item == StatusLineItem::ContextRemaining {
++                    self.context_remaining_count_value()
++                } else {
++                    self.status_line_value_for_item(*item)
++                }
++            });
+             if let Some(value) = value {
+                 segments.push((*item, value));
+             }
+@@ -233,6 +237,7 @@ impl ChatWidget {
+                     .flatten()
+                     .as_ref(),
+                 fast_label: self.status_line_fast_label().as_deref(),
++                context_remaining_percent: self.status_line_context_remaining_percent(),
+                 capacity_bytes: self
+                     .local_settings
+                     .tui
+@@ -253,6 +258,27 @@ impl ChatWidget {
+         self.set_status_line_hyperlink(hyperlink_url);
+     }
+ 
++    pub(super) fn context_remaining_count_value(&self) -> Option<String> {
++        if self.token_usage_pending {
++            return None;
++        }
++        let window = self
++            .status_line_context_window_size()
++            .filter(|window| *window > 0)?;
++        let used = self
++            .token_info
++            .as_ref()?
++            .last_token_usage
++            .tokens_in_context_window()
++            .max(0);
++        let remaining = window.saturating_sub(used).max(0);
++        Some(format!(
++            "{} of {} left",
++            format_tokens_compact(remaining),
++            format_tokens_compact(window),
++        ))
++    }
++
+     /// Clears the terminal title Codex most recently wrote, if any.
+     ///
+     /// This does not attempt to restore the shell or terminal's previous title;
+@@ -978,7 +1004,9 @@ impl ChatWidget {
+                 StatusLineItem::RemoteControlStreamConnection
+             }
+             StatusSurfacePreviewItem::Proxy => StatusLineItem::Proxy,
+-            StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
++            StatusSurfacePreviewItem::ContextRemaining => {
++                return self.context_remaining_count_value();
++            }
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+             StatusSurfacePreviewItem::WeeklyLimit => StatusLineItem::WeeklyLimit,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -257,7 +257,7 @@ async fn resumed_session_hides_unknown_token_usage_until_an_update_arrives() {
+     chat.refresh_status_line();
+     assert_eq!(
+         status_line_text(&chat),
+-        Some("Context 30% left · Context 70% used · 0 in · 0 out".to_string())
++        Some("300 of 13K left · Context 70% used · 0 in · 0 out".to_string())
+     );
+ }
+ 
+@@ -3201,23 +3201,93 @@ async fn status_line_context_used_renders_labeled_percent() {
+ }
+ 
+ #[tokio::test]
+-async fn status_line_context_remaining_renders_labeled_percent() {
++async fn status_line_context_remaining_renders_token_counts_without_changing_title() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     chat.thread_id = Some(ThreadId::new());
+     chat.local_settings.tui.status_line = Some(vec!["context-remaining".to_string()]);
+ 
+     chat.refresh_status_line();
+ 
++    assert_eq!(status_line_text(&chat), None);
+     assert_eq!(
+-        status_line_text(&chat),
++        chat.terminal_title_value_for_item(TerminalTitleItem::ContextRemaining, Instant::now()),
+         Some("Context 100% left".to_string())
+     );
++    chat.token_info = Some(make_token_info(
++        /*total_tokens*/ 330_000, /*context_window*/ 353_000,
++    ));
++    chat.refresh_status_line();
++    assert_eq!(status_line_text(&chat).as_deref(), Some("23K of 353K left"));
++    let title = chat
++        .terminal_title_value_for_item(TerminalTitleItem::ContextRemaining, Instant::now())
++        .expect("native title");
++    assert!(title.starts_with("Context "));
++    assert!(title.ends_with("% left"));
+     assert!(
+         drain_insert_history(&mut rx).is_empty(),
+         "context-remaining should remain a valid status line item"
+     );
+ }
+ 
++#[tokio::test]
++async fn context_count_preview_matches_live_values_and_omits_unknown_usage() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.local_settings.tui.status_line = Some(vec!["context-remaining".into()]);
++    for (used, window, expected) in [
++        (330_000, 353_000, Some("23K of 353K left")),
++        (0, 353_000, Some("353K of 353K left")),
++        (-1, 353_000, Some("353K of 353K left")),
++        (353_000, 353_000, Some("0 of 353K left")),
++        (400_000, 353_000, Some("0 of 353K left")),
++        (0, 0, None),
++        (0, -1, None),
++    ] {
++        let mut info = make_token_info(used, window);
++        info.total_token_usage.total_tokens = 1_000_000;
++        handle_token_count(&mut chat, Some(info));
++        chat.refresh_status_line();
++        assert_eq!(status_line_text(&chat).as_deref(), expected);
++        let preview = chat.status_surface_preview_data();
++        assert_eq!(
++            preview.value_for(StatusSurfacePreviewItem::ContextRemaining),
++            expected
++        );
++        for use_colors in [true, false] {
++            let live = crate::bottom_pane::status_line_from_segments(
++                expected.map(|value| (StatusLineItem::ContextRemaining, value.to_string())),
++                use_colors,
++                chat.thread_id,
++                crate::bottom_pane::StatusLineDetails {
++                    context_remaining_percent: chat.status_line_context_remaining_percent(),
++                    ..Default::default()
++                },
++            );
++            assert_eq!(
++                preview.status_line_for_items([StatusLineItem::ContextRemaining], use_colors),
++                live
++            );
++        }
++    }
++    chat.set_token_info(None);
++    chat.refresh_status_line();
++    assert_eq!(status_line_text(&chat), None);
++    assert_eq!(
++        chat.status_surface_preview_data()
++            .value_for(StatusSurfacePreviewItem::ContextRemaining),
++        None
++    );
++    chat.config.model_context_window = None;
++    let mut unknown_window = make_token_info(100, 0);
++    unknown_window.model_context_window = None;
++    handle_token_count(&mut chat, Some(unknown_window));
++    assert_eq!(chat.context_remaining_count_value(), None);
++    assert_eq!(
++        chat.status_surface_preview_data()
++            .value_for(StatusSurfacePreviewItem::ContextRemaining),
++        None
++    );
++}
++
+ #[tokio::test]
+ async fn status_line_legacy_context_usage_renders_context_used_percent() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

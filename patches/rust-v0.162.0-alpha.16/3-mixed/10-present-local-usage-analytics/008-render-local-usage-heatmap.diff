@@ -1,0 +1,387 @@
+render-local-usage-heatmap
+
+Lane: mixed
+
+Unit: present-local-usage-analytics
+
+ChildPatch: render-local-usage-heatmap
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/local_usage/heatmap.rs b/codex-rs/tui/src/local_usage/heatmap.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/local_usage/heatmap.rs
+@@ -0,0 +1,194 @@
++//! Daily activity and selected-day accounting share the report's local calendar.
++
++use super::UsageRange;
++use super::UsageReport;
++use super::render::combined_models;
++use super::render::count;
++use super::render::usage_tables;
++use super::table::intensity_style;
++use crate::render::renderable::Renderable;
++use chrono::Datelike;
++use chrono::Duration;
++use chrono::NaiveDate;
++use itertools::Itertools;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use std::collections::BTreeMap;
++
++pub(crate) fn heatmap_bounds(report: &UsageReport, width: u16) -> (NaiveDate, NaiveDate) {
++    let today = report.refreshed_at.date_naive();
++    (start(today, width), today)
++}
++
++pub(crate) fn day_has_usage(report: &UsageReport, day: NaiveDate) -> bool {
++    report
++        .rows
++        .get(&day.to_string())
++        .is_some_and(|models| models.values().any(|usage| usage.tokens.total > 0))
++}
++
++pub(super) fn render(
++    report: &UsageReport,
++    width: u16,
++    selected: Option<NaiveDate>,
++) -> Vec<Box<dyn Renderable>> {
++    let daily = super::periods(report, UsageRange::Heatmap)
++        .filter_map(|(date, models)| {
++            Some((
++                NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?,
++                models.values().map(|usage| usage.tokens.total).sum(),
++            ))
++        })
++        .collect();
++    let mut lines: Vec<Box<dyn Renderable>> =
++        calendar(&daily, report.refreshed_at.date_naive(), width, selected)
++            .into_iter()
++            .map(Into::into)
++            .collect();
++    lines.push(Line::default().into());
++    let label = if let Some(day) = selected {
++        format!(" Selected day: {day}")
++    } else {
++        let first = report.rows.first_key_value().map_or("--", |(day, _)| day);
++        let last = report.rows.last_key_value().map_or("--", |(day, _)| day);
++        format!(" All dates: {first} to {last}")
++    };
++    lines.push(Line::from(label).bold().into());
++    let selected_key = selected.map(|day| day.to_string());
++    let models = combined_models(
++        report
++            .rows
++            .iter()
++            .filter(|(day, _)| {
++                selected_key
++                    .as_ref()
++                    .is_none_or(|selected| selected == *day)
++            })
++            .map(|(_, models)| models),
++    );
++    lines.extend(usage_tables(
++        report,
++        UsageRange::Heatmap,
++        &[("", &models)],
++        width,
++    ));
++    lines
++}
++
++fn start(today: NaiveDate, width: u16) -> NaiveDate {
++    let weeks = (usize::from(width).saturating_sub(5) / 2).clamp(1, 52);
++    let end = today + Duration::days(6 - i64::from(today.weekday().num_days_from_sunday()));
++    end - Duration::days((weeks * 7 - 1) as i64)
++}
++
++fn calendar(
++    daily: &BTreeMap<NaiveDate, u64>,
++    today: NaiveDate,
++    width: u16,
++    selected: Option<NaiveDate>,
++) -> Vec<Line<'static>> {
++    if width < 7 {
++        return vec![" Widen terminal to show the heatmap.".dim().into()];
++    }
++    let weeks = (usize::from(width).saturating_sub(5) / 2).clamp(1, 52);
++    let start = start(today, width);
++    let peak = daily.values().copied().max().unwrap_or(0);
++    let scale = daily
++        .values()
++        .copied()
++        .filter(|value| *value > 0)
++        .sorted()
++        .dedup()
++        .collect::<Vec<_>>();
++    let mut lines = vec![Line::from(" Activity - last 12 months").bold()];
++    let mut months = vec![' '; (weeks * 2 + 1).min(usize::from(width) - 5)];
++    for week in 0..weeks {
++        let date = start + Duration::days((week * 7) as i64);
++        let month = (date + Duration::days(6)).with_day(1).unwrap();
++        let current_partial_month = week == 0 && month == today.with_day(1).unwrap();
++        if months.len() >= 3 && month <= today && (month >= date || current_partial_month) {
++            let column = (week * 2).min(months.len() - 3);
++            for (cell, letter) in months[column..]
++                .iter_mut()
++                .zip(month.format("%b").to_string().chars())
++            {
++                *cell = letter;
++            }
++        }
++    }
++    lines.push(
++        format!("     {}", months.into_iter().collect::<String>())
++            .dim()
++            .into(),
++    );
++    for weekday in 0..7 {
++        let mut spans = vec![Span::from(match weekday {
++            0 => " Sun ",
++            2 => " Tue ",
++            4 => " Thu ",
++            _ => "     ",
++        })];
++        for week in 0..weeks {
++            let date = start + Duration::days((week * 7 + weekday) as i64);
++            if date > today {
++                spans.push("  ".into());
++                continue;
++            }
++            let style = intensity_style(level(daily.get(&date).copied().unwrap_or(0), &scale));
++            spans.push(if selected == Some(date) {
++                Span::styled("■ ", style.bold())
++            } else {
++                Span::styled("▪ ", style)
++            });
++        }
++        lines.push(spans.into());
++    }
++    let (current, longest) = streaks(daily, today);
++    lines.push(
++        format!(
++            " Current streak {} days   Longest {} days   Peak {} tokens",
++            count(current),
++            count(longest),
++            count(peak)
++        )
++        .into(),
++    );
++    lines
++}
++
++fn streaks(daily: &BTreeMap<NaiveDate, u64>, today: NaiveDate) -> (u64, u64) {
++    let mut current = 0;
++    let mut longest = 0;
++    let mut previous: Option<NaiveDate> = None;
++    for (date, tokens) in daily {
++        if *tokens == 0 || *date > today {
++            continue;
++        }
++        current = if previous.and_then(|date| date.succ_opt()) == Some(*date) {
++            current + 1
++        } else {
++            1
++        };
++        longest = longest.max(current);
++        previous = Some(*date);
++    }
++    if previous != Some(today) && previous != today.pred_opt() {
++        current = 0;
++    }
++    (current, longest)
++}
++
++fn level(value: u64, scale: &[u64]) -> usize {
++    if value == 0 {
++        0
++    } else if scale.len() == 1 {
++        16
++    } else {
++        1 + scale.partition_point(|candidate| *candidate < value) * 15 / (scale.len() - 1)
++    }
++}
++
++#[cfg(test)]
++#[path = "heatmap_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/local_usage/heatmap_tests.rs b/codex-rs/tui/src/local_usage/heatmap_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/local_usage/heatmap_tests.rs
+@@ -0,0 +1,155 @@
++use super::super::render::tests::report;
++use super::super::table::tests::render_lines;
++use super::*;
++use itertools::Itertools;
++use pretty_assertions::assert_eq;
++use ratatui::style::Color;
++
++fn render_selected(
++    report: &UsageReport,
++    range: UsageRange,
++    width: u16,
++    selected: Option<NaiveDate>,
++) -> Vec<Line<'static>> {
++    render_lines(
++        super::super::render::render_selected(report, range, width, selected),
++        width,
++    )
++}
++
++#[test]
++fn heatmap_keeps_activity_streaks_and_sixteen_positive_levels() {
++    let monday = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
++    let tuesday = monday.succ_opt().unwrap();
++    let daily = BTreeMap::from([(monday, 10), (tuesday, 20)]);
++    assert_eq!(streaks(&daily, tuesday), (2, 2));
++    assert_eq!(streaks(&daily, tuesday + Duration::days(1)), (2, 2));
++    assert_eq!(streaks(&daily, tuesday + Duration::days(2)), (0, 2));
++    assert_eq!(
++        (0..=16)
++            .map(|value| level(value, &(1..=16).collect::<Vec<_>>()))
++            .collect::<Vec<_>>(),
++        (0..=16).collect::<Vec<_>>()
++    );
++    let text = render_selected(&report(), UsageRange::Heatmap, 40, None)
++        .iter()
++        .join("\n");
++    assert!(text.contains("Current streak -- days   Longest 1 days"));
++    assert!(text.contains("Activity - last 12 months"));
++    assert!(!text.contains("Estimated weekly quota"));
++    insta::assert_snapshot!(text);
++}
++
++#[test]
++fn calendar_keeps_weekday_geometry_and_future_days_blank() {
++    let today = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
++    let daily = BTreeMap::from([(today - Duration::days(2), 100)]);
++    for width in [32, 40, 80, 120] {
++        let lines = calendar(&daily, today, width, None);
++        let weeks = (usize::from(width).saturating_sub(5) / 2).clamp(1, 52);
++        for row in &lines[2..=8] {
++            assert_eq!(row.width(), 5 + 2 * weeks);
++            assert!(row.width() <= usize::from(width));
++        }
++        for future in &lines[6..=8] {
++            assert_eq!(future.spans.last().unwrap().content, "  ");
++        }
++    }
++    for today in [
++        NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
++        NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
++    ] {
++        let lines = calendar(&daily, today, 109, Some(today));
++        let months = lines[1].to_string();
++        let names = months.split_whitespace().collect::<Vec<_>>();
++        assert_eq!(names.len(), 12);
++        assert_eq!(names.iter().copied().unique().count(), 12);
++        assert!(names.iter().all(|name| name.len() == 3));
++        assert!(lines[1].width() <= 109);
++        let selected = lines
++            .iter()
++            .flat_map(|line| &line.spans)
++            .find(|span| span.content == "■ ")
++            .unwrap();
++        assert!(
++            !selected
++                .style
++                .add_modifier
++                .contains(ratatui::style::Modifier::UNDERLINED)
++        );
++    }
++}
++
++#[test]
++fn selected_day_replaces_aggregate_tables_and_only_selection_enlarges() {
++    let mut report = report();
++    report.missing_prices.insert("older-model".into());
++    let selected = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
++    report.rows.insert(
++        "2025-01-01".into(),
++        BTreeMap::from([(
++            "older-model".into(),
++            codex_app_server_protocol::LocalUsageTotals {
++                tokens: codex_app_server_protocol::LocalUsageTokens {
++                    input: 10,
++                    total: 10,
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++        )]),
++    );
++    let overview = render_selected(&report, UsageRange::Heatmap, 200, None);
++    let text = overview.iter().join("\n");
++    assert!(!text.contains('■'));
++    assert!(text.contains("older-model"));
++    assert!(!text.contains("All days") && !text.contains("Period"));
++    assert!(text.contains("USD per 1M tokens"));
++    assert!(text.contains("All dates: 2025-01-01 to 2026-09-28"));
++    assert!(!text.contains("Estimated weekly quota"));
++    let detail = render_selected(&report, UsageRange::Heatmap, 200, Some(selected));
++    assert_eq!(
++        detail
++            .iter()
++            .flat_map(|line| &line.spans)
++            .filter(|span| span.content.contains('■'))
++            .count(),
++        1
++    );
++    let text = detail.iter().join("\n");
++    assert!(text.contains("Selected day: 2026-09-28"));
++    assert!(text.contains("gpt-5.4") && text.contains("USD per 1M tokens"));
++    assert!(!text.contains("older-model") && !text.contains("Period"));
++    assert!(!text.contains("Esc:") && !text.contains("WASD"));
++    assert!(!text.contains("Estimated weekly quota"));
++    assert_eq!(text.matches("2026-09-28").count(), 1);
++    let scope_row = |lines: &[Line<'_>], label: &str| {
++        lines
++            .iter()
++            .position(|line| line.to_string().contains(label))
++            .unwrap()
++    };
++    assert_eq!(
++        scope_row(&overview, "All dates:"),
++        scope_row(&detail, "Selected day:")
++    );
++    assert_eq!(scope_row(&overview, "Model"), scope_row(&detail, "Model"));
++    for span in overview.iter().chain(&detail).flat_map(|line| &line.spans) {
++        let grayscale = match span.style.fg {
++            None
++            | Some(Color::Black | Color::DarkGray | Color::Gray | Color::White | Color::Reset) => {
++                true
++            }
++            Some(Color::Rgb(red, green, blue)) => red == green && green == blue,
++            Some(Color::Indexed(232..=255)) => true,
++            _ => false,
++        };
++        let total_cost =
++            span.style.fg == Some(Color::LightYellow) && span.content.trim().starts_with('$');
++        assert!(
++            grayscale || total_cost,
++            "unexpected usage highlight: {span:?}"
++        );
++    }
++    insta::assert_snapshot!(text);
++}
+diff --git a/codex-rs/tui/src/local_usage/mod.rs b/codex-rs/tui/src/local_usage/mod.rs
+--- a/codex-rs/tui/src/local_usage/mod.rs
++++ b/codex-rs/tui/src/local_usage/mod.rs
+@@ -1,7 +1,11 @@
+ //! Presentation of the app-server's shared local accounting snapshot.
++mod heatmap;
+ mod render;
+ pub(crate) mod table;
+ 
++pub(crate) use heatmap::day_has_usage;
++pub(crate) use heatmap::heatmap_bounds;
++
+ pub(crate) use render::render;
+ pub(crate) use render::render_selected;
+ #[cfg(test)]

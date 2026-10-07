@@ -1,0 +1,711 @@
+select-protected-editor-process-roots
+
+Lane: normalization
+
+Unit: normalize-process-base-roots
+
+ChildPatch: select-protected-editor-process-roots
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -283,7 +283,7 @@ impl App {
+                 external_editor::run_editor(
+                     &seed,
+                     &editor_cmd,
+-                    config.codex_home.as_path(),
++                    config.codex_harness.as_path(),
+                     &file_system_policy,
+                     config.cwd.as_path(),
+                 )
+diff --git a/codex-rs/tui/src/external_editor.rs b/codex-rs/tui/src/external_editor.rs
+--- a/codex-rs/tui/src/external_editor.rs
++++ b/codex-rs/tui/src/external_editor.rs
+@@ -4,11 +4,7 @@ use std::path::Path;
+ use std::path::PathBuf;
+ use std::process::Stdio;
+ 
+-#[cfg(windows)]
+-use codex_protocol::permissions::FileSystemPath;
+ use codex_protocol::permissions::FileSystemSandboxPolicy;
+-#[cfg(windows)]
+-use codex_protocol::permissions::FileSystemSpecialPath;
+ use color_eyre::eyre::Report;
+ use color_eyre::eyre::Result;
+ use tempfile::Builder;
+@@ -58,123 +54,59 @@ pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, Edito
+ }
+ 
+ pub(super) fn editor_directory(
+-    candidate_homes: &[&Path],
++    codex_harness: &Path,
+     file_system_policy: &FileSystemSandboxPolicy,
+     cwd: &Path,
+ ) -> Result<PathBuf> {
+     let writable_roots = file_system_policy.get_writable_roots_with_cwd(cwd);
+-    #[cfg(windows)]
+-    let windows_temporary_roots = if !file_system_policy.has_full_disk_write_access()
+-        && file_system_policy.entries.iter().any(|entry| {
+-            matches!(
+-                &entry.path,
+-                FileSystemPath::Special {
+-                    value: FileSystemSpecialPath::Tmpdir
+-                }
+-            ) && entry.access.can_write()
+-        }) {
+-        ["TEMP", "TMP"]
+-            .into_iter()
+-            .filter_map(env::var_os)
+-            .map(PathBuf::from)
+-            .filter(|path| path.is_absolute())
+-            .flat_map(|path| {
+-                let canonical_path = dunce::canonicalize(&path).ok();
+-                std::iter::once(path).chain(canonical_path)
+-            })
+-            .collect::<Vec<_>>()
+-    } else {
+-        Vec::new()
++    let canonical_harness = match dunce::canonicalize(codex_harness) {
++        Ok(path) => path,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            let parent = codex_harness
++                .parent()
++                .ok_or_else(|| Report::msg("editor directory has no parent"))?;
++            let name = codex_harness
++                .file_name()
++                .ok_or_else(|| Report::msg("editor directory has no parent"))?;
++            dunce::canonicalize(parent)?.join(name)
++        }
++        Err(error) => return Err(error.into()),
+     };
+-    let mut error = Report::msg("editor directory must not be writable");
+-    let mut rejected_writable = false;
++    let editor_directory = canonical_harness.join("editor");
++    let logical_editor_directory = codex_harness.join("editor");
+ 
+-    for candidate_home in candidate_homes {
+-        let canonical_home = match dunce::canonicalize(candidate_home) {
+-            Ok(path) => path,
+-            Err(canonicalize_error)
+-                if canonicalize_error.kind() == std::io::ErrorKind::NotFound =>
+-            {
+-                let Some(parent) = candidate_home.parent() else {
+-                    error = Report::msg("editor directory has no parent");
+-                    continue;
+-                };
+-                let Some(name) = candidate_home.file_name() else {
+-                    error = Report::msg("editor directory has no parent");
+-                    continue;
++    if !file_system_policy.has_full_disk_write_access()
++        && [&logical_editor_directory, &editor_directory]
++            .into_iter()
++            .any(|directory| {
++                let Some(parent) = directory.parent() else {
++                    return true;
+                 };
+-                match dunce::canonicalize(parent) {
+-                    Ok(parent) => parent.join(name),
+-                    Err(canonicalize_error) => {
+-                        error = canonicalize_error.into();
+-                        continue;
+-                    }
+-                }
+-            }
+-            Err(canonicalize_error) => {
+-                error = canonicalize_error.into();
+-                continue;
+-            }
+-        };
+-        let editor_directory = canonical_home.join("editor");
+-        let logical_editor_directory = candidate_home.join("editor");
+-
+-        if !file_system_policy.has_full_disk_write_access()
+-            && [&logical_editor_directory, &editor_directory]
+-                .into_iter()
+-                .any(|directory| {
+-                    let Some(parent) = directory.parent() else {
+-                        return true;
+-                    };
+-                    let is_writable = file_system_policy
+-                        .can_write_local_path_with_cwd(directory, cwd)
+-                        || file_system_policy.can_write_local_path_with_cwd(parent, cwd)
+-                        || writable_roots.iter().any(|root| {
+-                            root.is_path_writable(directory)
+-                                || root.root.as_path().starts_with(directory)
+-                        });
+-                    #[cfg(windows)]
+-                    let is_writable = is_writable
+-                        || windows_temporary_roots.iter().any(|root| {
+-                            directory.starts_with(root)
+-                                || parent.starts_with(root)
+-                                || root.starts_with(directory)
+-                        });
+-                    is_writable
+-                })
+-        {
+-            error = Report::msg("editor directory must not be writable");
+-            rejected_writable = true;
+-            continue;
+-        }
+-
+-        if let Err(create_error) = fs::create_dir_all(&editor_directory) {
+-            error = create_error.into();
+-            continue;
+-        }
+-        match dunce::canonicalize(&editor_directory) {
+-            Ok(path) if path == editor_directory => return Ok(editor_directory),
+-            Ok(_) => {
+-                error = Report::msg("editor directory must not contain symbolic links");
+-            }
+-            Err(canonicalize_error) => {
+-                error = canonicalize_error.into();
+-            }
+-        }
++                file_system_policy.can_write_local_path_with_cwd(directory, cwd)
++                    || file_system_policy.can_write_local_path_with_cwd(parent, cwd)
++                    || writable_roots.iter().any(|root| {
++                        root.is_path_writable(directory)
++                            || root.root.as_path().starts_with(directory)
++                    })
++            })
++    {
++        return Err(Report::msg("editor directory must not be writable"));
+     }
+ 
+-    if rejected_writable {
+-        Err(Report::msg("editor directory must not be writable"))
+-    } else {
+-        Err(error)
++    fs::create_dir_all(&editor_directory)?;
++    if dunce::canonicalize(&editor_directory)? != editor_directory {
++        return Err(Report::msg(
++            "editor directory must not contain symbolic links",
++        ));
+     }
++    Ok(editor_directory)
+ }
+ 
+ /// Write `seed` to a temp file, launch the editor command, and return the updated content.
+ pub(crate) async fn run_editor(
+     seed: &str,
+     editor_cmd: &[String],
+-    codex_home: &Path,
++    codex_harness: &Path,
+     file_system_policy: &FileSystemSandboxPolicy,
+     cwd: &Path,
+ ) -> Result<String> {
+@@ -182,16 +114,7 @@ pub(crate) async fn run_editor(
+         return Err(Report::msg("editor command is empty"));
+     }
+ 
+-    let default_codex_home = dirs::home_dir().map(|home| home.join(".codex"));
+-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+-    let project_codex_home = cwd.join(".codex");
+-    let mut candidate_homes = vec![codex_home];
+-    if let Some(default_codex_home) = default_codex_home.as_deref() {
+-        candidate_homes.push(default_codex_home);
+-    }
+-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+-    candidate_homes.push(&project_codex_home);
+-    let editor_directory = editor_directory(&candidate_homes, file_system_policy, cwd)?;
++    let editor_directory = editor_directory(codex_harness, file_system_policy, cwd)?;
+     // Convert to TempPath immediately so no file handle stays open on Windows.
+     let temp_path = Builder::new()
+         .suffix(".md")
+@@ -234,7 +157,6 @@ mod tests {
+     use super::*;
+     use pretty_assertions::assert_eq;
+     use serial_test::serial;
+-    #[cfg(unix)]
+     use tempfile::tempdir;
+ 
+     struct EnvGuard {
+@@ -292,7 +214,6 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    #[cfg(unix)]
+     async fn run_editor_returns_updated_content() {
+         let dir = tempdir().unwrap();
+         let script_path = dir.path().join("edit.sh");
+diff --git a/codex-rs/tui/src/external_editor_tests.rs b/codex-rs/tui/src/external_editor_tests.rs
+--- a/codex-rs/tui/src/external_editor_tests.rs
++++ b/codex-rs/tui/src/external_editor_tests.rs
+@@ -1,5 +1,4 @@
+ use super::editor_directory;
+-#[cfg(unix)]
+ use super::run_editor;
+ use codex_protocol::permissions::FileSystemAccessMode;
+ use codex_protocol::permissions::FileSystemSandboxEntry;
+@@ -14,6 +13,7 @@ use tempfile::TempDir;
+ struct EditorPaths {
+     _root: TempDir,
+     codex_home: PathBuf,
++    codex_harness: PathBuf,
+     cwd: PathBuf,
+ }
+ 
+@@ -23,13 +23,16 @@ impl EditorPaths {
+         let canonical_root =
+             dunce::canonicalize(root.path()).expect("canonicalize editor test root");
+         let codex_home = canonical_root.join("codex-home");
++        let codex_harness = canonical_root.join("codex-harness");
+         let cwd = canonical_root.join("workspace");
+         fs::create_dir(&codex_home).expect("create Codex home");
++        fs::create_dir(&codex_harness).expect("create Codex harness");
+         fs::create_dir(&cwd).expect("create workspace");
+ 
+         Self {
+             _root: root,
+             codex_home,
++            codex_harness,
+             cwd,
+         }
+     }
+@@ -49,29 +52,29 @@ fn workspace_write_policy(writable_roots: &[&Path]) -> FileSystemSandboxPolicy {
+ }
+ 
+ #[test]
+-fn editor_directory_is_inside_isolated_codex_home() {
++fn editor_directory_is_inside_isolated_codex_harness() {
+     let paths = EditorPaths::new();
+     let policy = workspace_write_policy(&[]);
+ 
+-    let directory = editor_directory(&[&paths.codex_home], &policy, &paths.cwd)
++    let directory = editor_directory(&paths.codex_harness, &policy, &paths.cwd)
+         .expect("create isolated editor directory");
+ 
+-    assert_eq!(directory, paths.codex_home.join("editor"));
++    assert_eq!(directory, paths.codex_harness.join("editor"));
+     assert!(directory.is_dir());
+ }
+ 
+ #[test]
+-fn editor_directory_rejects_writable_home_editor_and_parent() {
++fn editor_directory_rejects_writable_harness_editor_and_parent() {
+     let paths = EditorPaths::new();
+-    let editor = paths.codex_home.join("editor");
++    let editor = paths.codex_harness.join("editor");
+     fs::create_dir(&editor).expect("create editor directory");
+-    let parent = paths.codex_home.parent().expect("Codex home parent");
++    let parent = paths.codex_harness.parent().expect("Codex harness parent");
+ 
+-    for writable_root in [paths.codex_home.as_path(), editor.as_path(), parent] {
++    for writable_root in [paths.codex_harness.as_path(), editor.as_path(), parent] {
+         let policy = workspace_write_policy(&[writable_root]);
+ 
+         assert!(
+-            editor_directory(&[&paths.codex_home], &policy, &paths.cwd).is_err(),
++            editor_directory(&paths.codex_harness, &policy, &paths.cwd).is_err(),
+             "writable root {} must not expose editor buffers",
+             writable_root.display()
+         );
+@@ -81,22 +84,22 @@ fn editor_directory_rejects_writable_home_editor_and_parent() {
+ #[test]
+ fn editor_directory_rejects_writable_descendant() {
+     let paths = EditorPaths::new();
+-    let writable_descendant = paths.codex_home.join("editor").join("nested");
++    let writable_descendant = paths.codex_harness.join("editor").join("nested");
+     fs::create_dir_all(&writable_descendant).expect("create writable editor descendant");
+     let policy = workspace_write_policy(&[&writable_descendant]);
+ 
+-    assert!(editor_directory(&[&paths.codex_home], &policy, &paths.cwd).is_err());
++    assert!(editor_directory(&paths.codex_harness, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+ fn editor_directory_rejects_read_only_carveout_with_writable_parent() {
+     let paths = EditorPaths::new();
+-    let editor = paths.codex_home.join("editor");
++    let editor = paths.codex_harness.join("editor");
+     fs::create_dir(&editor).expect("create editor directory");
+     let policy = FileSystemSandboxPolicy::restricted(vec![
+         FileSystemSandboxEntry::new(
+-            AbsolutePathBuf::from_absolute_path(&paths.codex_home)
+-                .expect("absolute Codex home")
++            AbsolutePathBuf::from_absolute_path(&paths.codex_harness)
++                .expect("absolute Codex harness")
+                 .into(),
+             FileSystemAccessMode::Write,
+         ),
+@@ -108,62 +111,58 @@ fn editor_directory_rejects_read_only_carveout_with_writable_parent() {
+         ),
+     ]);
+ 
+-    assert!(editor_directory(&[&paths.codex_home], &policy, &paths.cwd).is_err());
++    assert!(editor_directory(&paths.codex_harness, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+ fn editor_directory_rejects_preexisting_symlink() {
+     use std::os::unix::fs::symlink;
+ 
+     let paths = EditorPaths::new();
+     let outside = paths.cwd.join("outside");
+     fs::create_dir(&outside).expect("create editor symlink target");
+-    symlink(&outside, paths.codex_home.join("editor")).expect("create editor directory symlink");
++    symlink(&outside, paths.codex_harness.join("editor")).expect("create editor directory symlink");
+     let policy = FileSystemSandboxPolicy::read_only();
+ 
+-    assert!(editor_directory(&[&paths.codex_home], &policy, &paths.cwd).is_err());
++    assert!(editor_directory(&paths.codex_harness, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+-fn editor_directory_rejects_writable_codex_home_alias() {
++fn editor_directory_rejects_writable_codex_harness_alias() {
+     use std::os::unix::fs::symlink;
+ 
+     let paths = EditorPaths::new();
+-    let aliased_home = paths.cwd.join("codex-home-link");
+-    symlink(&paths.codex_home, &aliased_home).expect("create Codex home symlink");
++    let aliased_harness = paths.cwd.join("codex-harness-link");
++    symlink(&paths.codex_harness, &aliased_harness).expect("create Codex harness symlink");
+     let policy = workspace_write_policy(&[]);
+ 
+-    assert!(policy.can_write_local_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
+-    assert!(!policy.can_write_local_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
+-    assert!(editor_directory(&[&aliased_home], &policy, &paths.cwd).is_err());
++    assert!(policy.can_write_local_path_with_cwd(&aliased_harness.join("editor"), &paths.cwd));
++    assert!(!policy.can_write_local_path_with_cwd(&paths.codex_harness.join("editor"), &paths.cwd));
++    assert!(editor_directory(&aliased_harness, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+-fn editor_directory_rejects_writable_codex_home_alias_target() {
++fn editor_directory_rejects_writable_codex_harness_alias_target() {
+     use std::os::unix::fs::symlink;
+ 
+     let paths = EditorPaths::new();
+     let alias_parent = paths
+-        .codex_home
++        .codex_harness
+         .parent()
+-        .expect("Codex home parent")
++        .expect("Codex harness parent")
+         .join("aliases");
+     fs::create_dir(&alias_parent).expect("create protected alias parent");
+-    let aliased_home = alias_parent.join("codex-home-link");
+-    symlink(&paths.codex_home, &aliased_home).expect("create Codex home symlink");
+-    let policy = workspace_write_policy(&[&paths.codex_home]);
++    let aliased_harness = alias_parent.join("codex-harness-link");
++    symlink(&paths.codex_harness, &aliased_harness).expect("create Codex harness symlink");
++    let policy = workspace_write_policy(&[&paths.codex_harness]);
+ 
+-    assert!(!policy.can_write_local_path_with_cwd(&aliased_home.join("editor"), &paths.cwd));
+-    assert!(policy.can_write_local_path_with_cwd(&paths.codex_home.join("editor"), &paths.cwd));
+-    assert!(editor_directory(&[&aliased_home], &policy, &paths.cwd).is_err());
++    assert!(!policy.can_write_local_path_with_cwd(&aliased_harness.join("editor"), &paths.cwd));
++    assert!(policy.can_write_local_path_with_cwd(&paths.codex_harness.join("editor"), &paths.cwd));
++    assert!(editor_directory(&aliased_harness, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+-fn editor_directory_uses_protected_workspace_fallback_with_default_temporary_grants() {
++fn editor_directory_creates_selected_protected_root_with_default_temporary_grants() {
+     let root = tempfile::tempdir().expect("create editor test root");
+     let codex_home = root.path().join("codex-home");
+     let cwd = root.path().join("workspace");
+@@ -181,8 +180,8 @@ fn editor_directory_uses_protected_workspace_fallback_with_default_temporary_gra
+     assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
+     assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home.join("editor"), &cwd));
+ 
+-    let directory = editor_directory(&[&codex_home, &workspace_codex_home], &policy, &cwd)
+-        .expect("use protected workspace metadata directory");
++    let directory = editor_directory(&workspace_codex_home, &policy, &cwd)
++        .expect("create explicitly selected protected root");
+ 
+     assert_eq!(
+         directory,
+@@ -194,8 +193,7 @@ fn editor_directory_uses_protected_workspace_fallback_with_default_temporary_gra
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+-fn editor_directory_rejects_explicitly_writable_workspace_fallback() {
++fn editor_directory_rejects_explicitly_writable_metadata_root() {
+     let root = tempfile::tempdir().expect("create editor test root");
+     let codex_home = root.path().join("codex-home");
+     let cwd = root.path().join("workspace");
+@@ -213,15 +211,14 @@ fn editor_directory_rejects_explicitly_writable_workspace_fallback() {
+     assert!(policy.can_write_local_path_with_cwd(&codex_home, &cwd));
+     assert!(policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
+     assert!(
+-        editor_directory(&[&codex_home, &workspace_codex_home], &policy, &cwd).is_err(),
++        editor_directory(&workspace_codex_home, &policy, &cwd).is_err(),
+         "explicitly writable metadata must not be used for editor buffers"
+     );
+     assert!(!workspace_codex_home.exists());
+ }
+ 
+ #[test]
+-#[cfg(unix)]
+-fn editor_directory_rejects_workspace_fallback_symlink_to_writable_target() {
++fn editor_directory_rejects_metadata_root_symlink_to_writable_target() {
+     use std::os::unix::fs::symlink;
+ 
+     let paths = EditorPaths::new();
+@@ -231,18 +228,11 @@ fn editor_directory_rejects_workspace_fallback_symlink_to_writable_target() {
+ 
+     assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &paths.cwd));
+     assert!(policy.can_write_local_path_with_cwd(&paths.codex_home, &paths.cwd));
+-    assert!(
+-        editor_directory(
+-            &[&paths.codex_home, &workspace_codex_home],
+-            &policy,
+-            &paths.cwd,
+-        )
+-        .is_err()
+-    );
++    assert!(editor_directory(&workspace_codex_home, &policy, &paths.cwd).is_err());
+ }
+ 
+ #[test]
+-fn editor_directory_uses_next_protected_candidate_after_creation_error() {
++fn editor_directory_propagates_creation_error_without_using_codex_home() {
+     let paths = EditorPaths::new();
+     let unavailable_home = paths
+         .codex_home
+@@ -252,26 +242,7 @@ fn editor_directory_uses_next_protected_candidate_after_creation_error() {
+     fs::write(&unavailable_home, "not a directory").expect("create unavailable Codex home");
+     let policy = workspace_write_policy(&[]);
+ 
+-    let directory = editor_directory(&[&unavailable_home, &paths.codex_home], &policy, &paths.cwd)
+-        .expect("use next protected candidate after directory creation fails");
+-
+-    assert_eq!(directory, paths.codex_home.join("editor"));
+-}
+-
+-#[test]
+-#[cfg(windows)]
+-fn editor_directory_rejects_windows_temporary_directory_outside_tmpdir_policy_root() {
+-    let paths = EditorPaths::new();
+-    let policy = FileSystemSandboxPolicy::workspace_write(
+-        &[],
+-        /*exclude_tmpdir_env_var*/ false,
+-        /*exclude_slash_tmp*/ true,
+-    );
+-
+-    assert!(
+-        editor_directory(&[&paths.codex_home], &policy, &paths.cwd).is_err(),
+-        "effective Windows temporary directories must not contain editor buffers"
+-    );
++    assert!(editor_directory(&unavailable_home, &policy, &paths.cwd).is_err());
+     assert!(!paths.codex_home.join("editor").exists());
+ }
+ 
+@@ -283,19 +254,22 @@ fn editor_directory_allows_full_disk_write_policies() {
+         FileSystemSandboxPolicy::unrestricted(),
+         FileSystemSandboxPolicy::external_sandbox(),
+     ] {
+-        let directory = editor_directory(&[&paths.codex_home], &policy, &paths.cwd)
++        let directory = editor_directory(&paths.codex_harness, &policy, &paths.cwd)
+             .expect("full-disk-write policies should preserve external editor support");
+ 
+-        assert_eq!(directory, paths.codex_home.join("editor"));
++        assert_eq!(directory, paths.codex_harness.join("editor"));
+     }
+ }
+ 
+ #[tokio::test]
+-#[cfg(unix)]
+-async fn editor_process_receives_buffer_in_isolated_codex_home() {
++async fn editor_process_receives_buffer_in_isolated_harness_and_preserves_old_home_buffers() {
+     let paths = EditorPaths::new();
+     let policy = workspace_write_policy(&[]);
+-    let editor_directory = paths.codex_home.join("editor");
++    let old_editor_directory = paths.codex_home.join("editor");
++    fs::create_dir(&old_editor_directory).expect("create existing home editor directory");
++    let old_buffer = old_editor_directory.join("old-buffer.md");
++    fs::write(&old_buffer, "retained draft").expect("write existing home editor buffer");
++    let editor_directory = paths.codex_harness.join("editor");
+     let editor_command = vec![
+         "/bin/sh".to_string(),
+         "-c".to_string(),
+@@ -307,7 +281,7 @@ async fn editor_process_receives_buffer_in_isolated_codex_home() {
+     let content = run_editor(
+         "seed",
+         &editor_command,
+-        &paths.codex_home,
++        &paths.codex_harness,
+         &policy,
+         &paths.cwd,
+     )
+@@ -315,29 +289,23 @@ async fn editor_process_receives_buffer_in_isolated_codex_home() {
+     .expect("run editor with isolated buffer");
+ 
+     assert_eq!(content, "edited");
++    assert_eq!(
++        fs::read_to_string(old_buffer).expect("read old buffer"),
++        "retained draft"
++    );
++    assert_eq!(
++        fs::read_dir(editor_directory)
++            .expect("read harness editor directory")
++            .count(),
++        0
++    );
+ }
+ 
+ #[tokio::test]
+-#[cfg(any(target_os = "macos", target_os = "linux"))]
+-async fn editor_process_uses_protected_workspace_fallback_with_default_temporary_grants() {
+-    let root = tempfile::tempdir().expect("create editor test root");
+-    let codex_home = root.path().join("codex-home");
+-    let cwd = root.path().join("workspace");
+-    fs::create_dir(&codex_home).expect("create Codex home");
+-    fs::create_dir(&cwd).expect("create workspace");
+-    let default_codex_home = dirs::home_dir().expect("home directory").join(".codex");
+-    let writable_default_codex_home = AbsolutePathBuf::from_absolute_path(&default_codex_home)
+-        .expect("absolute default Codex home");
+-    let policy = FileSystemSandboxPolicy::workspace_write(
+-        &[writable_default_codex_home],
+-        /*exclude_tmpdir_env_var*/ false,
+-        /*exclude_slash_tmp*/ false,
+-    );
+-    let workspace_codex_home = cwd.join(".codex");
+-    let editor_directory = dunce::canonicalize(&cwd)
+-        .expect("canonicalize workspace")
+-        .join(".codex")
+-        .join("editor");
++async fn editor_process_uses_protected_harness_when_codex_home_is_writable() {
++    let paths = EditorPaths::new();
++    let policy = workspace_write_policy(&[&paths.codex_home]);
++    let editor_directory = paths.codex_harness.join("editor");
+     let editor_command = vec![
+         "/bin/sh".to_string(),
+         "-c".to_string(),
+@@ -346,15 +314,117 @@ async fn editor_process_uses_protected_workspace_fallback_with_default_temporary
+         editor_directory.to_string_lossy().into_owned(),
+     ];
+ 
+-    assert!(!workspace_codex_home.exists());
+-    assert!(policy.can_write_local_path_with_cwd(&codex_home, &cwd));
+-    assert!(policy.can_write_local_path_with_cwd(&default_codex_home, &cwd));
+-    assert!(!policy.can_write_local_path_with_cwd(&workspace_codex_home, &cwd));
++    assert!(policy.can_write_local_path_with_cwd(&paths.codex_home, &paths.cwd));
++    assert!(!policy.can_write_local_path_with_cwd(&paths.codex_harness, &paths.cwd));
+ 
+-    let content = run_editor("seed", &editor_command, &codex_home, &policy, &cwd)
+-        .await
+-        .expect("run editor with protected workspace fallback");
++    let content = run_editor(
++        "seed",
++        &editor_command,
++        &paths.codex_harness,
++        &policy,
++        &paths.cwd,
++    )
++    .await
++    .expect("run editor with protected harness buffer");
+ 
+     assert_eq!(content, "edited");
+     assert!(editor_directory.is_dir());
++    assert!(!paths.codex_home.join("editor").exists());
++    assert!(!paths.cwd.join(".codex").exists());
++}
++
++#[tokio::test]
++async fn editor_process_rejects_writable_harness_without_home_or_workspace_fallback() {
++    let paths = EditorPaths::new();
++    let policy = workspace_write_policy(&[&paths.codex_harness]);
++    let editor_command = vec!["/bin/true".to_string()];
++    assert!(!policy.can_write_local_path_with_cwd(&paths.codex_home, &paths.cwd));
++
++    assert!(
++        run_editor(
++            "seed",
++            &editor_command,
++            &paths.codex_harness,
++            &policy,
++            &paths.cwd,
++        )
++        .await
++        .is_err()
++    );
++    assert!(!paths.codex_home.join("editor").exists());
++    assert!(!paths.codex_harness.join("editor").exists());
++    assert!(!paths.cwd.join(".codex").exists());
++}
++
++#[tokio::test]
++async fn editor_process_creation_error_does_not_fall_back_to_home() {
++    let paths = EditorPaths::new();
++    let policy = workspace_write_policy(&[]);
++    let unavailable_harness = paths.codex_harness.join("not-a-directory");
++    fs::write(&unavailable_harness, "unavailable").expect("create unavailable harness");
++    assert!(
++        run_editor(
++            "seed",
++            &["/bin/true".into()],
++            &unavailable_harness,
++            &policy,
++            &paths.cwd
++        )
++        .await
++        .is_err()
++    );
++    assert!(!paths.codex_home.join("editor").exists());
++    assert!(!paths.cwd.join(".codex").exists());
++}
++
++#[tokio::test]
++async fn editor_process_rejects_harness_editor_symlink() {
++    use std::os::unix::fs::symlink;
++
++    let paths = EditorPaths::new();
++    let policy = FileSystemSandboxPolicy::read_only();
++    symlink(&paths.codex_home, paths.codex_harness.join("editor"))
++        .expect("create harness editor symlink");
++    let error = run_editor(
++        "seed",
++        &["/bin/true".into()],
++        &paths.codex_harness,
++        &policy,
++        &paths.cwd,
++    )
++    .await
++    .expect_err("reject symlink before invoking editor");
++    assert!(error.to_string().contains("symbolic links"), "{error}");
++    assert_eq!(
++        fs::read_dir(&paths.codex_home)
++            .expect("read untouched home")
++            .count(),
++        0
++    );
++}
++
++#[tokio::test]
++async fn editor_process_failure_cleans_harness_buffer() {
++    let paths = EditorPaths::new();
++    let policy = workspace_write_policy(&[]);
++    let error = run_editor(
++        "seed",
++        &["/bin/false".into()],
++        &paths.codex_harness,
++        &policy,
++        &paths.cwd,
++    )
++    .await
++    .expect_err("propagate editor exit failure");
++    assert!(
++        error.to_string().contains("editor exited with status"),
++        "{error}"
++    );
++    assert_eq!(
++        fs::read_dir(paths.codex_harness.join("editor"))
++            .expect("read cleaned buffer directory")
++            .count(),
++        0
++    );
++    assert!(!paths.codex_home.join("editor").exists());
+ }

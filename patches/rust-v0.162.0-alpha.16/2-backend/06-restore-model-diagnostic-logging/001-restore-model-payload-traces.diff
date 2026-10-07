@@ -1,0 +1,142 @@
+restore-model-payload-traces
+
+Lane: backend
+
+Unit: restore-model-diagnostic-logging
+
+ChildPatch: restore-model-payload-traces
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -42,6 +42,7 @@ use tracing::debug;
+ use tracing::error;
+ use tracing::info;
+ use tracing::instrument;
++use tracing::trace;
+ use tungstenite::extensions::ExtensionsConfig;
+ use tungstenite::extensions::compression::deflate::DeflateConfig;
+ use tungstenite::protocol::WebSocketConfig;
+@@ -729,6 +730,7 @@ async fn run_websocket_response_stream(
+ 
+         match message {
+             Message::Text(text) => {
++                trace!("websocket event: {text}");
+                 if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
+                     && let Some(error) =
+                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
+@@ -858,8 +860,6 @@ fn emit_responses_websocket_timing_event(
+         return;
+     }
+ 
+-    // This full payload is excluded from always-on sinks. Opt in with
+-    // `RUST_LOG='codex_api::responses_websocket_timing=trace'`.
+     tracing::event!(
+         name: RESPONSES_WEBSOCKET_TIMING_KIND,
+         target: RESPONSES_WEBSOCKET_TIMING_EVENT_TARGET,
+@@ -898,6 +898,8 @@ async fn send_websocket_request(
+     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+     connection_reused: bool,
+ ) -> Result<(), ApiError> {
++    trace!("websocket request: {request_text}");
++
+     let request_start = Instant::now();
+     let result = tokio::time::timeout(
+         idle_timeout,
+diff --git a/codex-rs/state/src/log_db.rs b/codex-rs/state/src/log_db.rs
+--- a/codex-rs/state/src/log_db.rs
++++ b/codex-rs/state/src/log_db.rs
+@@ -76,12 +76,7 @@ pub fn default_filter() -> Targets {
+         .with_target("rmcp", LevelFilter::INFO)
+         .with_target("tokio_graceful::guard", LevelFilter::DEBUG)
+         .with_target("tokio_graceful::trigger", LevelFilter::DEBUG)
+-        .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
+         .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
+-        // Full model request bodies and streamed response payloads overwhelm the
+-        // SQLite log database, but remain available to explicit TRACE subscribers.
+-        .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+-        .with_target("codex_api::sse", LevelFilter::DEBUG)
+         // Per-chunk streaming traces otherwise flood the bounded SQLite log queue.
+         .with_target("codex_tui::streaming::controller", LevelFilter::DEBUG)
+         .with_target("codex_tui::streaming::table_holdback", LevelFilter::DEBUG)
+diff --git a/codex-rs/state/src/log_db_filter_tests.rs b/codex-rs/state/src/log_db_filter_tests.rs
+--- a/codex-rs/state/src/log_db_filter_tests.rs
++++ b/codex-rs/state/src/log_db_filter_tests.rs
+@@ -62,11 +62,15 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
+         target: "codex_rmcp_client::oauth",
+         "retained-codex-rmcp-client-info"
+     );
+-    tracing::trace!(target: "codex_http_client::transport", "dropped-request-body");
++    tracing::trace!(target: "codex_http_client::transport", "retained-request-body");
+     tracing::debug!(target: "codex_http_client::transport", "retained-request-diagnostic");
+-    tracing::trace!(target: "codex_api::sse", "dropped-sse-parent");
+-    tracing::trace!(target: "codex_api::sse::responses", "dropped-sse-payload");
++    tracing::trace!(target: "codex_api::sse", "retained-sse-parent");
++    tracing::trace!(target: "codex_api::sse::responses", "retained-sse-payload");
+     tracing::debug!(target: "codex_api::sse::responses", "retained-sse-diagnostic");
++    tracing::trace!(
++        target: "codex_api::endpoint::responses_websocket",
++        "retained-websocket-payload"
++    );
+     tracing::trace!(target: "codex_state", "retained-trace");
+     tracing::trace!(
+         target: "codex_tui::streaming::controller",
+@@ -91,7 +95,7 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
+     tracing::trace!(
+         target: "codex_api::responses_websocket_timing",
+         payload = "complete timing payload",
+-        "dropped-websocket-timing"
++        "retained-websocket-timing"
+     );
+ 
+     layer.flush().await;
+@@ -143,16 +147,32 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
+                 "codex_rmcp_client::oauth",
+                 Some("retained-codex-rmcp-client-info")
+             ),
++            (
++                "TRACE",
++                "codex_http_client::transport",
++                Some("retained-request-body")
++            ),
+             (
+                 "DEBUG",
+                 "codex_http_client::transport",
+                 Some("retained-request-diagnostic")
+             ),
++            ("TRACE", "codex_api::sse", Some("retained-sse-parent")),
++            (
++                "TRACE",
++                "codex_api::sse::responses",
++                Some("retained-sse-payload")
++            ),
+             (
+                 "DEBUG",
+                 "codex_api::sse::responses",
+                 Some("retained-sse-diagnostic")
+             ),
++            (
++                "TRACE",
++                "codex_api::endpoint::responses_websocket",
++                Some("retained-websocket-payload")
++            ),
+             ("TRACE", "codex_state", Some("retained-trace")),
+             (
+                 "DEBUG",
+@@ -169,6 +189,11 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
+                 "codex_tui::streaming::commit_tick",
+                 Some("retained-commit-tick-trace"),
+             ),
++            (
++                "TRACE",
++                "codex_api::responses_websocket_timing",
++                Some("retained-websocket-timing payload=\"complete timing payload\""),
++            ),
+         ]
+     );
+ }

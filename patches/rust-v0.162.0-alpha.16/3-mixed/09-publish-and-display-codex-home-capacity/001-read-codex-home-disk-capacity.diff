@@ -1,0 +1,242 @@
+read-codex-home-disk-capacity
+
+Lane: mixed
+
+Unit: publish-and-display-codex-home-capacity
+
+ChildPatch: read-codex-home-disk-capacity
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1330,6 +1330,12 @@ client_request_definitions! {
+         response: v2::GetAccountRateLimitsResponse,
+     },
+ 
++    GetCodexHomeDiskCapacity => "codexHome/diskCapacity/read" {
++        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
++        serialization: None,
++        response: v2::GetCodexHomeDiskCapacityResponse,
++    },
++
+     ConsumeAccountRateLimitResetCredit => "account/rateLimitResetCredit/consume" {
+         params: v2::ConsumeAccountRateLimitResetCreditParams,
+         serialization: global("account-auth"),
+@@ -3165,6 +3171,26 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn serialize_get_codex_home_disk_capacity() -> Result<()> {
++        let request = ClientRequest::GetCodexHomeDiskCapacity {
++            request_id: RequestId::Integer(1),
++            params: None,
++        };
++        assert_eq!(
++            json!({"method": "codexHome/diskCapacity/read", "id": 1}),
++            serde_json::to_value(&request)?,
++        );
++        let response = v2::GetCodexHomeDiskCapacityResponse {
++            available_bytes: 536_870_912,
++        };
++        assert_eq!(
++            json!({"availableBytes": 536_870_912}),
++            serde_json::to_value(response)?
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn serialize_get_account_token_usage() -> Result<()> {
+         let request = ClientRequest::GetAccountTokenUsage {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/config.rs b/codex-rs/app-server-protocol/src/protocol/v2/config.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/config.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/config.rs
+@@ -26,6 +26,15 @@ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ 
++/// Available bytes on the app server's effective Codex home filesystem.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct GetCodexHomeDiskCapacityResponse {
++    #[ts(type = "number")]
++    pub available_bytes: u64,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+ #[serde(tag = "type", rename_all = "camelCase")]
+ #[ts(tag = "type")]
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1835,6 +1835,9 @@ impl MessageProcessor {
+             ClientRequest::GetAccountRateLimits { params, .. } => {
+                 self.account_processor.get_account_rate_limits(params).await
+             }
++            ClientRequest::GetCodexHomeDiskCapacity { .. } => {
++                self.account_processor.get_codex_home_disk_capacity()
++            }
+             ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
+                 self.account_processor
+                     .consume_account_rate_limit_reset_credit(params)
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -9,6 +9,7 @@ use crate::outgoing_message::AccountNotification;
+ use chrono::DateTime;
+ use codex_app_server_protocol::DesktopOnboardingEntrypoint;
+ use codex_app_server_protocol::GetAccountRateLimitsParams;
++use codex_app_server_protocol::GetCodexHomeDiskCapacityResponse;
+ use codex_login::LoginOnboardingEntrypoint;
+ use codex_login::login_with_bedrock_access_keys;
+ use codex_mcp::ema_auth_scope;
+@@ -205,6 +206,18 @@ impl AccountRequestProcessor {
+         Ok(Some(response.into()))
+     }
+ 
++    pub(crate) fn get_codex_home_disk_capacity(
++        &self,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let available_bytes = codex_core::disk_capacity::available_space(&self.config.codex_home)
++            .map_err(|err| {
++            internal_error(format!("failed to read Codex home disk capacity: {err}"))
++        })?;
++        Ok(Some(
++            GetCodexHomeDiskCapacityResponse { available_bytes }.into(),
++        ))
++    }
++
+     pub(crate) async fn get_account_token_usage(
+         &self,
+         params: Option<GetAccountTokenUsageParams>,
+diff --git a/codex-rs/app-server/tests/suite/v2/config_rpc.rs b/codex-rs/app-server/tests/suite/v2/config_rpc.rs
+--- a/codex-rs/app-server/tests/suite/v2/config_rpc.rs
++++ b/codex-rs/app-server/tests/suite/v2/config_rpc.rs
+@@ -66,6 +66,30 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
+     )?)
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn codex_home_disk_capacity_read_needs_no_account() -> Result<()> {
++    let home = TempDir::new()?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .without_auto_env()
++        .with_env_overrides(&[("OPENAI_API_KEY", None)])
++        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
++        .await?;
++    let response: codex_app_server_protocol::GetCodexHomeDiskCapacityResponse = server
++        .request(
++            |request_id| codex_app_server_protocol::ClientRequest::GetCodexHomeDiskCapacity {
++                request_id,
++                params: None,
++            },
++        )
++        .await?;
++    let measured = codex_core::disk_capacity::available_space(home.path())?;
++    // Server startup can create files, but both readings must refer to this filesystem.
++    assert!(response.available_bytes.abs_diff(measured) < 64 * 1024 * 1024);
++    assert!(!home.path().join("auth.json").exists());
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn managed_auth_settings_are_exposed_enforced_and_read_only() -> Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/cli/src/doctor/disk.rs b/codex-rs/cli/src/doctor/disk.rs
+--- a/codex-rs/cli/src/doctor/disk.rs
++++ b/codex-rs/cli/src/doctor/disk.rs
+@@ -121,22 +121,7 @@ fn format_capacity(bytes: u64) -> String {
+ 
+ #[cfg(unix)]
+ fn available_space(path: &Path) -> io::Result<u64> {
+-    use std::ffi::CString;
+-    use std::mem::MaybeUninit;
+-    use std::os::unix::ffi::OsStrExt;
+-
+-    let path = CString::new(path.as_os_str().as_bytes())
+-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+-    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+-        return Err(io::Error::last_os_error());
+-    }
+-    let stats = unsafe { stats.assume_init() };
+-    if stats.f_files > 0 && stats.f_favail == 0 {
+-        return Ok(0);
+-    }
+-    u64::try_from(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))
+-        .map_err(|_| io::Error::other("available disk space exceeds u64"))
++    codex_core::disk_capacity::available_space(path)
+ }
+ 
+ #[cfg(windows)]
+diff --git a/codex-rs/core/src/disk_capacity.rs b/codex-rs/core/src/disk_capacity.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/disk_capacity.rs
+@@ -0,0 +1,47 @@
++//! Doctor's usable-capacity measurement, shared with Codex home display consumers.
++
++use std::ffi::CString;
++use std::io;
++use std::mem::MaybeUninit;
++use std::os::unix::ffi::OsStrExt;
++use std::path::Path;
++
++pub fn available_space(path: &Path) -> io::Result<u64> {
++    let path = CString::new(path.as_os_str().as_bytes())
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
++    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
++    // The C path is NUL-terminated and stats points to writable, correctly aligned storage.
++    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    // A successful statvfs initialized the complete structure.
++    let stats = unsafe { stats.assume_init() };
++    if stats.f_files > 0 && stats.f_favail == 0 {
++        return Ok(0);
++    }
++    u64::try_from(u128::from(stats.f_bavail) * u128::from(stats.f_frsize))
++        .map_err(|_| io::Error::other("available disk space exceeds u64"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn reads_existing_home_and_preserves_unavailable_capacity() {
++        let home = tempfile::tempdir().unwrap();
++        assert!(available_space(home.path()).is_ok());
++        assert_eq!(
++            available_space(&home.path().join("missing"))
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::NotFound
++        );
++        assert_eq!(
++            available_space(Path::new("invalid\0path"))
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::InvalidInput
++        );
++    }
++}
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -87,6 +87,7 @@ pub mod context;
+ mod context_manager;
+ mod current_time;
+ mod cyber_access_program;
++pub mod disk_capacity;
+ mod elicitation;
+ mod environment_selection;
+ pub mod exec;

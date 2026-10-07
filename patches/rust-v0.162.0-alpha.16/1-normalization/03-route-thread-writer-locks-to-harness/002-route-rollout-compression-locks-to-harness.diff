@@ -1,0 +1,319 @@
+route-rollout-compression-locks-to-harness
+
+Lane: normalization
+
+Unit: route-thread-writer-locks-to-harness
+
+ChildPatch: route-rollout-compression-locks-to-harness
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/rollout/src/compression.rs b/codex-rs/rollout/src/compression.rs
+--- a/codex-rs/rollout/src/compression.rs
++++ b/codex-rs/rollout/src/compression.rs
+@@ -51,10 +51,14 @@ impl RolloutCompressionTrigger {
+ /// Starts a best-effort background job that compresses cold local rollout files.
+ ///
+ /// The worker is fire-and-forget: failures are logged, startup is not blocked,
+-/// and a run marker under `codex_home` prevents overlapping or too-frequent
++/// and a run marker under `codex_harness` prevents overlapping or too-frequent
+ /// compression runs from the same local store.
+-pub fn spawn_rollout_compression_worker(codex_home: PathBuf, trigger: RolloutCompressionTrigger) {
+-    worker::spawn(codex_home, trigger)
++pub fn spawn_rollout_compression_worker(
++    codex_home: PathBuf,
++    codex_harness: PathBuf,
++    trigger: RolloutCompressionTrigger,
++) {
++    worker::spawn(codex_home, codex_harness, trigger)
+ }
+ 
+ /// Returns the modified time for the existing plain or compressed rollout file.
+@@ -386,8 +390,8 @@ mod worker {
+     }
+ 
+     impl CompressionRunMarker {
+-        pub(super) fn try_claim(codex_home: &Path) -> io::Result<Option<Self>> {
+-            let marker_dir = codex_home.join(".tmp");
++        pub(super) fn try_claim(codex_harness: &Path) -> io::Result<Option<Self>> {
++            let marker_dir = codex_harness.join("thread-writer-locks");
+             std::fs::create_dir_all(marker_dir.as_path())?;
+             let path = marker_dir.join(RUN_MARKER_FILE_NAME);
+             match create_run_marker_file(path.as_path()) {
+@@ -436,7 +440,11 @@ mod worker {
+         }
+     }
+ 
+-    pub(super) fn spawn(codex_home: PathBuf, trigger: RolloutCompressionTrigger) {
++    pub(super) fn spawn(
++        codex_home: PathBuf,
++        codex_harness: PathBuf,
++        trigger: RolloutCompressionTrigger,
++    ) {
+         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+             metrics::run(trigger, "skipped_no_runtime");
+             warn!(
+@@ -446,7 +454,7 @@ mod worker {
+             return;
+         };
+         handle.spawn(async move {
+-            if let Err(err) = run(codex_home.clone(), trigger).await {
++            if let Err(err) = run(codex_home.clone(), codex_harness, trigger).await {
+                 warn!(
+                     "rollout compression worker failed for {}: {err}",
+                     codex_home.display()
+@@ -457,10 +465,11 @@ mod worker {
+ 
+     pub(super) async fn run(
+         codex_home: PathBuf,
++        codex_harness: PathBuf,
+         trigger: RolloutCompressionTrigger,
+     ) -> io::Result<()> {
+         let Some(_maintenance_guard) =
+-            crate::try_acquire_rollout_maintenance_lock(codex_home.as_path())
++            crate::try_acquire_rollout_maintenance_lock(codex_harness.as_path())
+                 .inspect_err(|err| FailureMetric::Run(trigger).record("maintenance_lock", err))?
+         else {
+             metrics::run(trigger, "skipped_maintenance");
+@@ -470,7 +479,7 @@ mod worker {
+             );
+             return Ok(());
+         };
+-        let marker = match CompressionRunMarker::try_claim(codex_home.as_path()) {
++        let marker = match CompressionRunMarker::try_claim(codex_harness.as_path()) {
+             Ok(Some(marker)) => marker,
+             Ok(None) => {
+                 metrics::run(trigger, "skipped_already_running");
+@@ -488,7 +497,7 @@ mod worker {
+ 
+         metrics::run(trigger, "started");
+         let started_at = Instant::now();
+-        let writer_locks = Arc::new(crate::WriterLockCoordinator::new(&codex_home));
++        let writer_locks = Arc::new(crate::WriterLockCoordinator::new(&codex_harness));
+         let mut stage = "temp_cleanup";
+         let result = async {
+             let mut stats = CompressionStats {
+diff --git a/codex-rs/rollout/src/compression_tests.rs b/codex-rs/rollout/src/compression_tests.rs
+--- a/codex-rs/rollout/src/compression_tests.rs
++++ b/codex-rs/rollout/src/compression_tests.rs
+@@ -402,7 +402,12 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
+     let fresh_temp = active_path.with_file_name("rollout-fresh.jsonl.zst.tmp");
+     fs::write(&fresh_temp, "fresh temp")?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     assert!(!active_path.exists());
+     assert!(compressed_rollout_path(&active_path).exists());
+@@ -414,7 +419,7 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
+     assert!(fresh_temp.exists());
+     assert!(
+         home.path()
+-            .join(".tmp")
++            .join("thread-writer-locks")
+             .join("rollout-compression.lock")
+             .exists()
+     );
+@@ -424,22 +429,40 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
+ #[tokio::test]
+ async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Result<()> {
+     let home = TempDir::new()?;
++    let harness = TempDir::new()?;
+     let uuid = Uuid::from_u128(26);
+     let thread_id = ThreadId::from_string(&uuid.to_string())?;
+     let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+     write_rollout(&path, thread_id, "migration in progress")?;
+     set_old_mtime(&path)?;
+-    let guard = crate::try_acquire_rollout_maintenance_lock(home.path())?
++    let guard = crate::try_acquire_rollout_maintenance_lock(harness.path())?
+         .expect("claim rollout maintenance lock");
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        harness.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+     assert!(path.exists());
+     assert!(!compressed_rollout_path(&path).exists());
+ 
+     drop(guard);
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        harness.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+     assert!(!path.exists());
+     assert!(compressed_rollout_path(&path).exists());
++    assert!(
++        harness
++            .path()
++            .join("thread-writer-locks/rollout-compression.lock")
++            .exists()
++    );
++    assert!(!home.path().join("thread-writer-locks").exists());
+     Ok(())
+ }
+ 
+@@ -468,7 +491,12 @@ async fn worker_compresses_archived_fork_chain() -> anyhow::Result<()> {
+     let original_source = fs::read(&source_path)?;
+     let original_child = fs::read(&child_path)?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     for (path, original) in [
+         (&source_path, original_source),
+@@ -495,7 +523,12 @@ async fn worker_skips_unreadable_metadata_without_blocking_other_compression() -
+     let unreadable_path = rollout_path(home.path(), "2025-01-03T12-00-01", Uuid::from_u128(21));
+     fs::write(unreadable_path.as_path(), "{not json}\n")?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     assert!(!source_path.exists());
+     assert!(compressed_rollout_path(&source_path).exists());
+@@ -508,6 +541,7 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
+     let home = TempDir::new()?;
+     let config = RolloutConfig {
+         codex_home: home.path().to_path_buf(),
++        codex_harness: home.path().to_path_buf(),
+         sqlite: codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+         cwd: home.path().to_path_buf(),
+         model_provider_id: "test-provider".to_string(),
+@@ -569,7 +603,12 @@ async fn compression_preserves_rollout_permissions() -> anyhow::Result<()> {
+     fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o600))?;
+     set_old_mtime(&rollout_path)?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     let compressed_path = compressed_rollout_path(&rollout_path);
+     assert!(!rollout_path.exists());
+@@ -651,7 +690,12 @@ async fn compression_preserves_read_only_rollout_permissions() -> anyhow::Result
+     fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o400))?;
+     let source_modified = fs::metadata(&rollout_path)?.modified()?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     let compressed_path = compressed_rollout_path(&rollout_path);
+     let compressed_metadata = fs::metadata(&compressed_path)?;
+@@ -672,7 +716,12 @@ async fn worker_skips_existing_compressed_archived_rollouts() -> anyhow::Result<
+     let compressed_path = compressed_rollout_path(&rollout_path);
+     set_old_mtime(&compressed_path)?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     assert!(!rollout_path.exists());
+     assert!(compressed_path.exists());
+@@ -692,11 +741,16 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
+     let rollout_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+     write_rollout(&rollout_path, thread_id, "throttled worker")?;
+     set_old_mtime(&rollout_path)?;
+-    let marker_dir = home.path().join(".tmp");
++    let marker_dir = home.path().join("thread-writer-locks");
+     fs::create_dir_all(marker_dir.as_path())?;
+     fs::write(marker_dir.join("rollout-compression.lock"), "recent run")?;
+ 
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+ 
+     assert!(rollout_path.exists());
+     assert!(!compressed_rollout_path(&rollout_path).exists());
+@@ -706,7 +760,9 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
+ #[test]
+ fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()> {
+     let home = TempDir::new()?;
+-    let marker_path = home.path().join(".tmp").join("rollout-compression.lock");
++    let marker_path = home
++        .path()
++        .join("thread-writer-locks/rollout-compression.lock");
+ 
+     {
+         let marker = worker::CompressionRunMarker::try_claim(home.path())?;
+@@ -896,7 +952,12 @@ async fn worker_compresses_parallel_cold_candidates_without_skipping_other_publi
+         set_old_mtime(&path)?;
+         paths.push(path);
+     }
+-    worker::run(home.path().to_path_buf(), Startup).await?;
++    worker::run(
++        home.path().to_path_buf(),
++        home.path().to_path_buf(),
++        Startup,
++    )
++    .await?;
+     let representations = paths
+         .iter()
+         .map(|path| (path.exists(), compressed_rollout_path(path).exists()))
+diff --git a/codex-rs/rollout/src/maintenance.rs b/codex-rs/rollout/src/maintenance.rs
+--- a/codex-rs/rollout/src/maintenance.rs
++++ b/codex-rs/rollout/src/maintenance.rs
+@@ -1,8 +1,8 @@
+ //! Coordinates maintenance jobs that replace local rollout files.
+ //!
+ //! Rollout compression and legacy rollout migration both publish by renaming a replacement over an
+-//! existing rollout path. They must not do that at the same time for one Codex home, so they share
+-//! this process-scoped, nonblocking file lock.
++//! existing rollout path. They must not do that at the same time for one Codex harness, so they
++//! share this process-scoped, nonblocking file lock.
+ //!
+ //! This is separate from per-thread writer locks, which protect live rollout appenders. It is also
+ //! separate from compression's durable run marker, which throttles how often compression scans.
+@@ -20,11 +20,11 @@ pub struct RolloutMaintenanceGuard {
+     _file: File,
+ }
+ 
+-/// Try to exclude rollout compression and migration for one Codex home.
++/// Try to exclude rollout compression and migration for one Codex harness.
+ pub fn try_acquire_rollout_maintenance_lock(
+-    codex_home: &Path,
++    codex_harness: &Path,
+ ) -> io::Result<Option<RolloutMaintenanceGuard>> {
+-    let directory = codex_home.join(".tmp");
++    let directory = codex_harness.join("thread-writer-locks");
+     fs::create_dir_all(&directory)?;
+     let file = OpenOptions::new()
+         .read(true)

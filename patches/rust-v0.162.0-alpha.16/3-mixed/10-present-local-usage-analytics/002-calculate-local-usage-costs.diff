@@ -1,0 +1,521 @@
+calculate-local-usage-costs
+
+Lane: mixed
+
+Unit: present-local-usage-analytics
+
+ChildPatch: calculate-local-usage-costs
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/local_usage/aggregate.rs b/codex-rs/app-server/src/local_usage/aggregate.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/local_usage/aggregate.rs
+@@ -0,0 +1,138 @@
++use super::Error;
++use super::Rows;
++use super::UsageRange;
++use super::UsageReport;
++use super::reader;
++use super::types::Tier;
++use super::types::Usage;
++use chrono::DateTime;
++use chrono::Datelike;
++use chrono::Duration;
++use chrono::FixedOffset;
++use chrono::NaiveDate;
++use chrono::Utc;
++use codex_models_manager::model_pricing::Prices;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::path::Path;
++
++fn period_date(date: NaiveDate, period: UsageRange) -> NaiveDate {
++    match period {
++        UsageRange::Today | UsageRange::Yesterday | UsageRange::Daily | UsageRange::Heatmap => date,
++        UsageRange::Weekly => {
++            date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
++        }
++        UsageRange::Monthly => date.with_day(1).unwrap_or(date),
++        UsageRange::Yearly => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date),
++    }
++}
++
++fn period_key(date: NaiveDate, period: UsageRange) -> String {
++    match period {
++        UsageRange::Today
++        | UsageRange::Yesterday
++        | UsageRange::Daily
++        | UsageRange::Weekly
++        | UsageRange::Heatmap => date.to_string(),
++        UsageRange::Monthly => date.format("%Y-%m").to_string(),
++        UsageRange::Yearly => date.format("%Y").to_string(),
++    }
++}
++
++pub(super) fn load(
++    home: &Path,
++    prices: Prices,
++    timezone: FixedOffset,
++    now: i64,
++) -> Result<UsageReport, Error> {
++    let refreshed_at = DateTime::<Utc>::from_timestamp_millis(now)
++        .ok_or("invalid report time")?
++        .with_timezone(&timezone);
++    let today = refreshed_at.date_naive();
++    let reader::Events {
++        mut events,
++        models,
++        observations: _,
++        mut diagnostics,
++    } = reader::load(home)?;
++    events.sort_unstable_by(|left, right| {
++        left.millis
++            .cmp(&right.millis)
++            .then_with(|| left.model.cmp(&right.model))
++            .then_with(|| left.tokens.cmp(&right.tokens))
++    });
++    let before = events.len();
++    events.dedup_by(|next, previous| {
++        if next.millis != previous.millis
++            || next.model != previous.model
++            || next.tokens != previous.tokens
++        {
++            return false;
++        }
++        previous.tier = Tier::merge(previous.tier, next.tier);
++        true
++    });
++    diagnostics.duplicate_events = before - events.len();
++    diagnostics.unique_events = events.len();
++    let mut groups = BTreeMap::<(NaiveDate, usize), Usage>::new();
++    let mut missing_prices = BTreeSet::new();
++    for event in events {
++        let Some(time) = DateTime::<Utc>::from_timestamp_millis(event.millis) else {
++            continue;
++        };
++        let date = time.with_timezone(&timezone).date_naive();
++        let model = &models[event.model];
++        let price = prices.get(model);
++        if price.is_none_or(|price| price.is_zero()) {
++            missing_prices.insert(model.clone());
++        }
++        let (cost, long) = price.map_or((0.0, false), |price| {
++            let tokens = event.tokens;
++            let quote = price.quote(
++                tokens.input,
++                tokens.cached,
++                tokens.cache_write,
++                tokens.output,
++            );
++            (quote.usd, quote.input_threshold != 0)
++        });
++        groups
++            .entry((date, event.model))
++            .or_default()
++            .add(event.tokens, cost, long);
++    }
++    let mut rows = Rows::new();
++    let mut weekly_rows = Rows::new();
++    let mut monthly_rows = Rows::new();
++    let mut yearly_rows = Rows::new();
++    for ((date, model), row) in groups {
++        for (period, rows) in [
++            (UsageRange::Daily, &mut rows),
++            (UsageRange::Weekly, &mut weekly_rows),
++            (UsageRange::Monthly, &mut monthly_rows),
++            (UsageRange::Yearly, &mut yearly_rows),
++        ] {
++            rows.entry(period_key(period_date(date, period), period))
++                .or_default()
++                .entry(models[model].clone())
++                .or_default()
++                .add_usage(&row);
++        }
++    }
++    Ok(UsageReport {
++        refreshed_at,
++        today,
++        timezone,
++        rows,
++        weekly_rows,
++        monthly_rows,
++        yearly_rows,
++        prices,
++        missing_prices,
++        diagnostics,
++    })
++}
++
++#[cfg(test)]
++#[path = "aggregate_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/local_usage/aggregate_tests.rs b/codex-rs/app-server/src/local_usage/aggregate_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/local_usage/aggregate_tests.rs
+@@ -0,0 +1,208 @@
++use super::*;
++use crate::local_usage::types::Tokens;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use std::fs;
++
++fn usage(input: u64, output: u64) -> Value {
++    json!({"input_tokens":input,"output_tokens":output,"total_tokens":input+output})
++}
++
++fn count(at: &str, last: Value, total: Value) -> Value {
++    json!({"type":"event_msg","timestamp":at,"payload":{"type":"token_count",
++        "info":{"last_token_usage":last,"total_token_usage":total}}})
++}
++
++fn write_rollout(root: &Path, relative: &str, id: &str, parent: Option<&str>, events: &[Value]) {
++    let path = root.join(relative);
++    fs::create_dir_all(path.parent().unwrap()).unwrap();
++    let header = json!({"type":"session_meta","timestamp":"2026-02-01T00:00:00Z",
++        "payload":{"id":id,"forked_from_id":parent,"history_mode":"paginated"}});
++    let context = json!({"type":"turn_context","payload":{"model":"gpt-5.4","effort":"high"}});
++    let mut text = format!("{header}\n{context}\n");
++    for event in events {
++        text.push_str(&format!("{event}\n"));
++    }
++    fs::write(path, text).unwrap();
++}
++
++fn prices() -> Prices {
++    serde_json::from_value(json!({"gpt-5.4":{
++        "0": {"input":2.0,"output":4.0,"cache_read":1.0,"cache_write":3.0},
++        "272000": {"input":4.0,"output":4.0,"cache_read":1.0,"cache_write":3.0}
++    }}))
++    .unwrap()
++}
++
++fn report(root: &Path) -> UsageReport {
++    let now = DateTime::parse_from_rfc3339("2026-02-01T04:00:00Z")
++        .unwrap()
++        .timestamp_millis();
++    load(
++        root,
++        prices(),
++        FixedOffset::east_opt(8 * 3600).unwrap(),
++        now,
++    )
++    .unwrap()
++}
++
++#[test]
++fn migrated_parent_replay_and_archive_copy_are_counted_once() {
++    let directory = tempfile::tempdir().unwrap();
++    let root = directory.path();
++    let parent = count(
++        "2026-01-31T16:00:00Z",
++        usage(/*input*/ 100, /*output*/ 10),
++        usage(/*input*/ 100, /*output*/ 10),
++    );
++    write_rollout(
++        root,
++        "sessions/2026/01/31/parent.jsonl",
++        "parent",
++        /*parent*/ None,
++        &[parent.clone()],
++    );
++    write_rollout(
++        root,
++        "archived_sessions/2026/01/31/parent.jsonl",
++        "parent",
++        /*parent*/ None,
++        &[count(
++            "2026-01-31T16:00:00Z",
++            usage(/*input*/ 999, /*output*/ 1),
++            usage(/*input*/ 999, /*output*/ 1),
++        )],
++    );
++    let replay = count(
++        "2026-02-01T00:00:00Z",
++        usage(/*input*/ 100, /*output*/ 10),
++        usage(/*input*/ 100, /*output*/ 10),
++    );
++    let own = count(
++        "2026-02-01T00:00:03Z",
++        usage(/*input*/ 200, /*output*/ 20),
++        usage(/*input*/ 300, /*output*/ 30),
++    );
++    write_rollout(
++        root,
++        "sessions/2026/02/01/child.jsonl",
++        "child",
++        Some("parent"),
++        &[replay, own.clone(), own],
++    );
++    fs::write(
++        root.join("sessions/ignored.jsonl"),
++        "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"linear\"}}\n",
++    )
++    .unwrap();
++    fs::write(
++        root.join("sessions/ignored.jsonl.zst"),
++        "not an admitted input",
++    )
++    .unwrap();
++    let daily = report(root);
++    assert_eq!(
++        daily.rows["2026-02-01"]["gpt-5.4"].tokens,
++        Tokens {
++            input: 300,
++            output: 30,
++            total: 330,
++            ..Tokens::default()
++        }
++    );
++    assert!((daily.rows["2026-02-01"]["gpt-5.4"].cost - 0.00072).abs() < 1e-12);
++    assert_eq!(daily.diagnostics.replayed_events, 1);
++    assert_eq!(daily.diagnostics.skipped_non_paginated, 1);
++    for (range, period) in [
++        (UsageRange::Today, "2026-02-01"),
++        (UsageRange::Weekly, "2026-01-26"),
++        (UsageRange::Monthly, "2026-02"),
++        (UsageRange::Yearly, "2026"),
++    ] {
++        assert_eq!(
++            daily
++                .periods(range)
++                .find(|(key, _)| key.as_str() == period)
++                .unwrap()
++                .1
++                .get("gpt-5.4"),
++            daily.rows["2026-02-01"].get("gpt-5.4")
++        );
++    }
++    assert!(daily.periods(UsageRange::Yesterday).next().is_none());
++}
++
++#[test]
++fn copied_metadata_merges_before_pricing() {
++    let directory = tempfile::tempdir().unwrap();
++    let event = count(
++        "2026-02-01T00:00:00Z",
++        usage(/*input*/ 280_000, /*output*/ 100),
++        usage(/*input*/ 280_000, /*output*/ 100),
++    );
++    for (file, effort, tier) in [("fast", "high", "fast"), ("standard", "low", "default")] {
++        let settings = json!({"type":"event_msg","timestamp":"2026-02-01T00:00:00Z",
++            "payload":{"type":"thread_settings_applied","thread_settings":{"service_tier":tier}}});
++        let context = json!({"type":"turn_context","payload":{"model":"gpt-5.4","effort":effort}});
++        write_rollout(
++            directory.path(),
++            &format!("sessions/{file}.jsonl"),
++            file,
++            /*parent*/ None,
++            &[context, settings, event.clone()],
++        );
++    }
++    let report = report(directory.path());
++    let usage = &report.rows["2026-02-01"]["gpt-5.4"];
++    assert_eq!(report.diagnostics.duplicate_events, 1);
++    assert_eq!(usage.tokens.total, 280_100);
++    assert_eq!(usage.long_tokens, usage.tokens);
++    assert_eq!(usage.short_cost, 0.0);
++    assert!((usage.long_cost - 1.1204).abs() < 1e-12);
++}
++
++#[test]
++fn mixed_context_totals_retain_token_partitions_and_the_prices_used() {
++    let directory = tempfile::tempdir().unwrap();
++    write_rollout(
++        directory.path(),
++        "sessions/mixed.jsonl",
++        "mixed",
++        None,
++        &[
++            count("2026-02-01T00:00:00Z", usage(100, 10), usage(100, 10)),
++            count(
++                "2026-02-01T00:01:00Z",
++                usage(280_000, 100),
++                usage(280_100, 110),
++            ),
++        ],
++    );
++    let report = report(directory.path());
++    let usage = &report.rows["2026-02-01"]["gpt-5.4"];
++    assert_eq!(usage.tokens.subtract(usage.long_tokens).input, 100);
++    assert_eq!(usage.long_tokens.input, 280_000);
++    assert_eq!(usage.long_tokens.output, 100);
++    let mut total = super::super::types::Usage::default();
++    total.add_usage(usage);
++    assert_eq!(&total, usage);
++    assert_eq!(
++        report.prices["gpt-5.4"]
++            .intervals()
++            .map(|(threshold, rates)| {
++                (
++                    threshold,
++                    [
++                        rates.input,
++                        rates.cache_read,
++                        rates.cache_write,
++                        rates.output,
++                    ],
++                )
++            })
++            .collect::<Vec<_>>(),
++        vec![(0, [2.0, 1.0, 3.0, 4.0]), (272_000, [4.0, 1.0, 3.0, 4.0]),]
++    );
++}
+diff --git a/codex-rs/app-server/src/local_usage/mod.rs b/codex-rs/app-server/src/local_usage/mod.rs
+--- a/codex-rs/app-server/src/local_usage/mod.rs
++++ b/codex-rs/app-server/src/local_usage/mod.rs
+@@ -1,6 +1,108 @@
+ //! Local paginated-rollout accounting, with no external process or network dependency.
++mod aggregate;
+ mod reader;
+ mod types;
+ mod wire;
+ 
++use chrono::FixedOffset;
++use chrono::Local;
++use chrono::NaiveDate;
++use codex_models_manager::model_pricing;
++use codex_models_manager::model_pricing::Prices;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::path::Path;
++use types::Diagnostics;
++use types::Usage;
++
+ type Error = Box<dyn std::error::Error + Send + Sync>;
++type Rows = BTreeMap<String, BTreeMap<String, Usage>>;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum UsageRange {
++    Today,
++    Yesterday,
++    Daily,
++    Weekly,
++    Monthly,
++    Yearly,
++    Heatmap,
++}
++
++impl UsageRange {
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::Today => "today",
++            Self::Yesterday => "yesterday",
++            Self::Daily => "daily",
++            Self::Weekly => "weekly",
++            Self::Monthly => "monthly",
++            Self::Yearly => "yearly",
++            Self::Heatmap => "heatmap",
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct UsageReport {
++    pub(crate) refreshed_at: chrono::DateTime<FixedOffset>,
++    rows: Rows,
++    weekly_rows: Rows,
++    monthly_rows: Rows,
++    yearly_rows: Rows,
++    prices: Prices,
++    missing_prices: BTreeSet<String>,
++    diagnostics: Diagnostics,
++    today: NaiveDate,
++    timezone: FixedOffset,
++}
++
++impl UsageReport {
++    fn periods(
++        &self,
++        range: UsageRange,
++    ) -> impl DoubleEndedIterator<Item = (&String, &BTreeMap<String, Usage>)> {
++        let rows = match range {
++            UsageRange::Weekly => &self.weekly_rows,
++            UsageRange::Monthly => &self.monthly_rows,
++            UsageRange::Yearly => &self.yearly_rows,
++            UsageRange::Today | UsageRange::Yesterday | UsageRange::Daily | UsageRange::Heatmap => {
++                &self.rows
++            }
++        };
++        let bounds = match range {
++            UsageRange::Today => Some((self.today, self.today)),
++            UsageRange::Yesterday => {
++                let yesterday = self.today - chrono::Duration::days(1);
++                Some((yesterday, yesterday))
++            }
++            UsageRange::Heatmap => Some((self.today - chrono::Duration::days(364), self.today)),
++            UsageRange::Daily | UsageRange::Weekly | UsageRange::Monthly | UsageRange::Yearly => {
++                None
++            }
++        }
++        .map(|(start, end)| (start.to_string(), end.to_string()));
++        rows.iter().filter(move |(date, _)| {
++            bounds
++                .as_ref()
++                .is_none_or(|(start, end)| *date >= start && *date <= end)
++        })
++    }
++}
++
++pub(crate) fn load(codex_home: &Path) -> Result<UsageReport, String> {
++    let now = Local::now();
++    let prices = model_pricing::read_prices(codex_home).map_err(|error| error.to_string())?;
++    let report = aggregate::load(codex_home, prices, *now.offset(), now.timestamp_millis())
++        .map_err(|error| format!("could not load local Codex usage: {error}"))?;
++    model_pricing::ensure_models(
++        codex_home,
++        report
++            .rows
++            .values()
++            .flat_map(BTreeMap::keys)
++            .map(String::as_str),
++    )
++    .map_err(|error| error.to_string())?;
++    Ok(report)
++}
+diff --git a/codex-rs/app-server/src/local_usage/types.rs b/codex-rs/app-server/src/local_usage/types.rs
+--- a/codex-rs/app-server/src/local_usage/types.rs
++++ b/codex-rs/app-server/src/local_usage/types.rs
+@@ -88,6 +88,36 @@ pub(super) struct Observation {
+     pub(super) used_percent: f64,
+     pub(super) resets_at: i64,
+ }
++
++#[derive(Clone, Debug, Default, PartialEq)]
++pub(super) struct Usage {
++    pub(super) tokens: Tokens,
++    pub(super) long_tokens: Tokens,
++    pub(super) cost: f64,
++    pub(super) short_cost: f64,
++    pub(super) long_cost: f64,
++}
++
++impl Usage {
++    pub(super) fn add(&mut self, tokens: Tokens, cost: f64, long: bool) {
++        self.tokens.add(tokens);
++        self.cost += cost;
++        if long {
++            self.long_tokens.add(tokens);
++            self.long_cost += cost;
++        } else {
++            self.short_cost += cost;
++        }
++    }
++
++    pub(super) fn add_usage(&mut self, other: &Self) {
++        self.tokens.add(other.tokens);
++        self.long_tokens.add(other.long_tokens);
++        self.cost += other.cost;
++        self.short_cost += other.short_cost;
++        self.long_cost += other.long_cost;
++    }
++}
+ #[cfg(test)]
+ #[path = "types_tests.rs"]
+ mod tests;

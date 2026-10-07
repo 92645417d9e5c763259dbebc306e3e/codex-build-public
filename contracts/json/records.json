@@ -1,0 +1,259 @@
+{
+  "RecordEncoding": {
+    "FinalLF": true,
+    "KeyOrder": "Sorted",
+    "UTF8": true
+  },
+  "LockGroupRecord": {
+    "AttemptID": "SemanticAttemptName",
+    "Observation": "AbsentForAddOrTerminalProcessObservation",
+    "Preparation": "ProcessCargoPreparationForAddOrAbsentForTerminal",
+    "ProcessGroupID": "PositiveOwnedProcessGroup",
+    "RecordType": "LockGroupRecord",
+    "Request": "ExactGenericRunnerRequestForAddOrAbsentForOtherAddAndTerminal",
+    "SchemaVersion": 3,
+    "Transition": "AddOrTerminal"
+  },
+  "RunnerRequest": {
+    "Arguments": "ExactOrderedArgv",
+    "AttemptID": "SemanticAttemptName",
+    "DeadlineMilliseconds": "PositiveDuration",
+    "ProjectScratchRoot": "ExactProjectScratchRoot",
+    "ProjectWorkingRoot": "ExactProjectWorkingRoot",
+    "RecordRoot": "ExactRecordRoot",
+    "Release": "ReleaseTag",
+    "RuntimeTemporaryRoot": "ExactRuntimeTemporaryRoot",
+    "Source": "ExactProductSourcePath",
+    "WorkingDirectory": "ExactRelativeWorkingDirectory"
+  },
+  "ProcessCargoPreparation": {
+    "Materialization": "RustSuiteMaterializationEvidence",
+    "SourceCommit": "ExactSnapshotRunnerSourceCommitOrAbsent"
+  },
+  "TerminalProcessObservation": {
+    "Canceled": "Boolean",
+    "DurationMilliseconds": "NonnegativeDuration",
+    "ExecutionStarted": "Boolean",
+    "ExitCode": "ProcessExitCode",
+    "FailureClass": "OptionalNonemptyString",
+    "LogsTruncated": "Boolean",
+    "SourceUnchanged": "Boolean",
+    "TimedOut": "Boolean"
+  },
+  "LockRecord": {
+    "AttemptID": "SemanticAttemptName",
+    "Lock": "CargoLock",
+    "Path": "FixedCargoLockPath",
+    "Phase": "OptionalCurrentRustSuitePhaseWithoutHistory",
+    "RecordType": "LockRecord",
+    "SchemaVersion": 3
+  },
+  "RecordIndex": [
+    "LockGroupRecord",
+    "LockRecord",
+    "RustSuitePlanRecord",
+    "RustSuiteResultRecord",
+    "RustSuiteStageResultRecord"
+  ],
+  "ReferenceIndex": [
+    {
+      "Field": "RustSuiteResultRecord.Tag",
+      "Target": "RustSuitePlanRecord.Tag"
+    },
+    {
+      "Field": "RustSuiteStageResultRecord.Tag",
+      "Target": "RustSuitePlanRecord.Tag"
+    }
+  ],
+  "PatchReplayRow": {
+    "Common": "KindLaneFormSegment",
+    "FlatPatch": "ExactlyFlatPatchName",
+    "Unit": "ExactlyUnitNameAndAtLeastTwoOrderedChildPatches",
+    "Transform": "ExactlyTransformNameAndTransformPatch"
+  },
+  "RunnerExecResult": {
+    "AttemptID": "ExactRunnerAttemptID",
+    "DeadlineMilliseconds": "PositiveRequestDeadline",
+    "ExecutionStarted": "Boolean",
+    "FailureClass": "OptionalTypedFailureClass",
+    "FailureDomain": "NoneProductOrHelper",
+    "FailureSummary": "AbsentForPassOtherwiseRunnerFailureSummary",
+    "GeneratedSnapshotUpdates": "ExactDeclaredNativeSnapshotUpdates",
+    "Observation": "AbsentWithoutEvidenceOtherwiseExactTerminalProcessObservation",
+    "PreExecutionFailure": "AbsentForDurableTerminals",
+    "Preparation": "ExactProcessAddPreparation",
+    "ProductEffect": "None",
+    "RecordType": "RunnerExecResult",
+    "Release": "ReleaseTag",
+    "Request": "ExactFrozenRunnerRequest",
+    "SchemaVersion": 3,
+    "SourcePostimagePath": "EmptyUnlessSourcePostimageFailure",
+    "Terminal": "PassFailOrStopped"
+  },
+  "RunnerFailureSummary": {
+    "Diagnostic": "AtMost2048BytesOfDiagnosticExcerptAndRequiredMarkers",
+    "Reason": "BoundedFailureReason",
+    "StderrBytes": "NonnegativeByteCountOrMinusOneWhenUnavailable",
+    "StdoutBytes": "NonnegativeByteCountOrMinusOneWhenUnavailable"
+  },
+  "RunnerTestPreparation": {
+    "Diagnostic": "AtMost2048UTF8BytesEmptyOnlyForReadyTestExecution",
+    "FailureDomain": "NoneProductOrHelper",
+    "Phase": "MetadataSelectedTestBuildBinaryContractBinaryBuildBinaryBindingsOrTestExecution"
+  },
+  "RustSuiteCargoIdentity": {
+    "CargoVersion": "ExactTypedCargoVersion",
+    "Generation": "PositiveCargoStateGeneration",
+    "SourceSelection": "ProjectRelativeAdmittedSourcePath",
+    "Target": "RustTargetTriple",
+    "ToolchainRoot": "ProjectRelativeNativeToolchainPath"
+  },
+  "RustSuiteMaterializationEvidence": {
+    "Action": "InitializedReusedWorkspaceOrInvalidatedWorkspace",
+    "Current": "RustSuiteCargoIdentity",
+    "EffectiveReuse": "CargoManagedForReusedWorkspaceOrRetainedCompatibleForPositiveCurrentStatsHitsOrNone",
+    "InvalidationCause": "IdentityAbsentNoneOrSourceChanged"
+  },
+  "RustSuiteBinaryBinding": {
+    "Environments": "ExactSortedCargoRawCargoNormalizedAndNextestNormalizedEnvironmentNames",
+    "Package": "CargoWorkspacePackageName",
+    "Path": "ExactCacheTargetDebugBinaryPath"
+  },
+  "RustSuiteDiscoveredTest": {
+    "BinaryID": "NextestBinaryID",
+    "BinaryName": "NextestBinaryName",
+    "ExpectationIdentity": "NormalizedPackageAndTestExpectationIdentity",
+    "Identity": "UniqueBinaryIDAndTestExecutionIdentity",
+    "Ignored": "BooleanNextestDiscoveryState",
+    "Package": "RustPackageName",
+    "ResultName": "ExactLibtestJSONResultName",
+    "TestName": "NextestTestName"
+  },
+  "RustSuitePlanRecord": {
+    "BaselineReanchor": "OptionalTrueOnlyForExplicitNonemptyBaselineAlignment",
+    "CacheRoot": "FixedCurrentProjectCacheRoot",
+    "CargoVersion": "ExactTypedCargoVersion",
+    "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
+    "ExcludedPackages": "SortedUniqueExcludedRustPackages",
+    "ExpectedFailures": "SortedUniqueNormalizedExpectedFailureIdentities",
+    "ExpectedTimeouts": "SortedUniqueNormalizedExpectedTimeoutIdentities",
+    "HelperBinaries": "SortedUniqueHelperBinaryRustPackages",
+    "NextestConcurrency": "PositiveInteger",
+    "RecordType": "RustSuitePlanRecord",
+    "SchemaVersion": 3,
+    "Scope": "BaselineOrFull",
+    "SourceRole": "FixedUpstreamBaselineOrExplicitProductWorktree",
+    "Tag": "ReleaseTag",
+    "TestTimeoutMilliseconds": "PositiveDerivedPerTestTimeoutBelowTotalDeadline",
+    "TestNetwork": "Shared",
+    "ToolchainRoot": "ProjectRelativeNativeToolchainPath",
+    "ToolchainTarget": "RustTargetTriple"
+  },
+  "RustSuiteBaselineFile": {
+    "<ReleaseTag>": "RustSuiteBaselineEntry"
+  },
+  "RustSuiteBaselineEntry": {
+    "Established": "PresentCurrentTagRustSuiteBaselineGeneration"
+  },
+  "RustSuiteBaselineExecutionProfile": {
+    "BaselineElapsedMilliseconds": "NullWhenUnknownOtherwiseExactPositiveCompleteBaselineCallMilliseconds",
+    "NextestConcurrency": "PositiveInteger",
+    "SuiteTimeoutMilliseconds": "PositiveFiveMinuteMultipleAtMostEightHoursEqualToKnownElapsedCeiling",
+    "TestNetwork": "Shared",
+    "TestTimeoutMilliseconds": "PositivePerTestTimeoutBelowTotalDeadline"
+  },
+  "RustSuiteBaselineGeneration": {
+    "Selection": "RustSuiteBaselineSelection"
+  },
+  "RustSuiteBaselineProposal": {
+    "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
+    "CoveredPackages": "SortedUniqueCoveredRustPackages",
+    "ExecutionProfile": "RustSuiteBaselineExecutionProfile",
+    "HelperBinaries": "SortedUniqueHelperBinaryRustPackages",
+    "Tag": "ReleaseTag",
+    "CargoVersion": "ExactTypedCargoVersion",
+    "ToolchainRoot": "ProjectRelativeNativeToolchainPath",
+    "ToolchainTarget": "RustTargetTriple"
+  },
+  "RustSuiteBaselineSelection": {
+    "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
+    "CoveredPackages": "SortedUniqueCoveredRustPackages",
+    "ExecutionProfile": "RustSuiteBaselineExecutionProfile",
+    "ExpectedFailures": "SortedUniqueObservedFailureIdentitiesWithAtMostSixtyFourCombinedOutcomes",
+    "ExpectedTimeouts": "SortedUniqueObservedTimeoutIdentitiesWithAtMostSixtyFourCombinedOutcomes",
+    "HelperBinaries": "SortedUniqueHelperBinaryRustPackages",
+    "Tag": "ReleaseTag",
+    "CargoVersion": "ExactTypedCargoVersion",
+    "ToolchainRoot": "ProjectRelativeNativeToolchainPath",
+    "ToolchainTarget": "RustTargetTriple"
+  },
+  "RustSuiteResultRecord": {
+    "Diagnostics": "OrderedBoundedOutcomeDeltaOrFailureDiagnostics",
+    "FailureDomain": "NoneProductOrHelper",
+    "ProductEffect": "None",
+    "RecordType": "RustSuiteResultRecord",
+    "SchemaVersion": 3,
+    "Scope": "BaselineOrFull",
+    "Tag": "ReleaseTag",
+    "Terminal": "PassFailOrStopped"
+  },
+  "RustSuitePreparation": {
+    "CompileOnlyPackages": "ExactPlanCompileOnlyPackages",
+    "Diagnostics": "EmptyForCompleteOrOrderedPreparationDiagnosticsForFail",
+    "HelperBinaries": "ExactPlanHelperBinaryPackages",
+    "BinaryBindings": "EmptyOrSortedUniqueRustSuiteBinaryBindings",
+    "SelectedPackages": "EmptyUntilDiscoveredOrSortedUniqueCurrentDiscoveryPackages",
+    "SelectedTests": "EmptyUntilDiscoveredOrSortedUniqueRustSuiteDiscoveredTests",
+    "Terminal": "CompleteOrFail"
+  },
+  "RustSuitePreparationSummary": {
+    "BinaryBindingCount": "NonnegativeValidatedTemporaryBinaryBindingCount",
+    "CompileOnlyPackages": "ExactPlanCompileOnlyPackages",
+    "Diagnostics": "BoundedPreparationDiagnostics",
+    "HelperBinaries": "ExactPlanHelperBinaryPackages",
+    "SelectedPackages": "SortedUniqueDiscoveredPackages",
+    "SelectedTestCount": "NonnegativeValidatedTemporaryDiscoveryCount",
+    "Terminal": "CompleteOrFail"
+  },
+  "RustSuiteExecutionSummary": {
+    "CompletedTests": "NonnegativeCountAtMostSelectedTestCount",
+    "FailureCount": "ExactUniqueFailureOutcomeCount",
+    "SkippedTests": "NonnegativeIgnoredTerminalCount",
+    "TimeoutCount": "ExactUniqueTimeoutOutcomeCount",
+    "Validated": "ExactTemporaryNativeOutcomeValidationCompleted"
+  },
+  "RustSuiteStageResultRecord": {
+    "AttemptCleanup": "ExactAttemptRootAbsentIncompleteAttemptCleanupCompleteOrOwnershipLostCleanupComplete",
+    "Canceled": "Boolean",
+    "Diagnostics": "EmptyForOrdinaryCompletionAndOwnershipLossOrOrderedFieldExpectedActualDiagnosticsForIncompleteOrPostReapCompletionFailure",
+    "ElapsedMilliseconds": "NonnegativeDuration",
+    "ExitCode": "ProcessExitCodeOrMinusOneForIncompleteOwnershipLostOrTerminalWithoutEvidence",
+    "Execution": "RustSuiteExecutionSummary",
+    "Failures": "SortedUniqueFailureSampleWithinCombined64OutcomeLimit",
+    "MaterializationEvidence": "AbsentOnlyForIncompleteOwnershipLostOrTerminalWithoutEvidenceOtherwiseRustSuiteMaterializationEvidence",
+    "Observation": "AbsentWithoutEvidenceOtherwiseExactTerminalProcessObservation",
+    "Scope": "BaselineOrFull",
+    "Preparation": "AbsentWithoutValidatedPreparationOtherwiseRustSuitePreparationSummary",
+    "ProcessState": "StartedReapedCanceledReapedIncompleteBeforeDurableRunnerEvidenceOrOwnershipLostBeforeDurableRunnerEvidence",
+    "RecordType": "RustSuiteStageResultRecord",
+    "SelectedPackages": "SortedUniqueCurrentWorkspaceMinusExcludedDiscoveryPackages",
+    "SchemaVersion": 3,
+    "SourcePostimagePath": "EmptyUnlessTheRunnerClassifiesOneNormalizedRelativeSourcePostimagePath",
+    "Stage": "ExactObservedProcessAttemptID",
+    "Tag": "ReleaseTag",
+    "Terminal": "PassFailOrStopped",
+    "TimedOut": "Boolean",
+    "Timeouts": "SortedUniqueTimeoutSampleWithinCombined64OutcomeLimit"
+  },
+  "RustSuiteTestOutcome": {
+    "ElapsedMilliseconds": "NonnegativeElapsedMilliseconds",
+    "Identity": "UniqueBinaryAwareExecutionIdentity",
+    "Terminal": "PassFailureTimeoutOrSkipped"
+  },
+  "SchemaVersion": 3,
+  "TaskIndex": {
+    "ActiveTask": "ZeroOrOneTaskMarkdownList",
+    "OtherTasks": "AlwaysEmptyListForSingleCurrentRelease",
+    "OverallTask": "ZeroOrOneTaskMarkdownList"
+  }
+}

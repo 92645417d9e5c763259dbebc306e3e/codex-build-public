@@ -1,0 +1,947 @@
+commit-complete-response-output
+
+Lane: draft
+
+Unit: producer
+
+ChildPatch: commit-complete-response-output
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/codex-api/src/atomic_response.rs b/codex-rs/codex-api/src/atomic_response.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/atomic_response.rs
+@@ -0,0 +1,41 @@
++//! Withhold native model-output events until the original successful terminal.
++
++use crate::common::ResponseEvent;
++
++#[derive(Default)]
++pub(crate) struct AtomicResponse {
++    events: Vec<ResponseEvent>,
++}
++
++impl AtomicResponse {
++    /// Controls remain immediate; model events retain their native order and payloads.
++    pub(crate) fn observe(&mut self, event: ResponseEvent) -> Option<ResponseEvent> {
++        match event {
++            ResponseEvent::OutputItemAdded(_)
++            | ResponseEvent::OutputItemDone(_)
++            | ResponseEvent::OutputTextDelta(_)
++            | ResponseEvent::ToolCallInputDelta { .. }
++            | ResponseEvent::ReasoningSummaryDelta { .. }
++            | ResponseEvent::ReasoningSummaryDone { .. }
++            | ResponseEvent::ReasoningContentDelta { .. }
++            | ResponseEvent::ReasoningSummaryPartAdded { .. } => {
++                self.events.push(event);
++                None
++            }
++            ResponseEvent::Created { .. }
++            | ResponseEvent::Completed { .. }
++            | ResponseEvent::Interrupted { .. }
++            | ResponseEvent::SafetyBuffering(_)
++            | ResponseEvent::ServerModel(_)
++            | ResponseEvent::ModelVerifications(_)
++            | ResponseEvent::TurnModerationMetadata(_)
++            | ResponseEvent::ServerReasoningIncluded(_)
++            | ResponseEvent::RateLimits(_)
++            | ResponseEvent::ModelsEtag(_) => Some(event),
++        }
++    }
++
++    pub(crate) fn commit(self) -> Vec<ResponseEvent> {
++        self.events
++    }
++}
+diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -105,6 +105,13 @@ pub enum ResponseEvent {
+         /// so we rely on fallback logic when this is `None`.
+         end_turn: Option<bool>,
+     },
++    /// An intentional interruption whose buffered output was discarded.
++    /// It ends sampling without admitting incremental server continuation.
++    Interrupted {
++        response_id: String,
++        token_usage: Option<TokenUsage>,
++        usage_metadata: Option<ResponseUsageMetadata>,
++    },
+     OutputTextDelta(String),
+     ToolCallInputDelta {
+         item_id: String,
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -1,3 +1,4 @@
++use crate::atomic_response::AtomicResponse;
+ use crate::auth::SharedAuthProvider;
+ use crate::common::ResponseEvent;
+ use crate::common::ResponseStream;
+@@ -7,6 +8,9 @@ use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
+ use crate::error::ApiError;
+ use crate::provider::Provider;
+ use crate::rate_limits::parse_rate_limit_event;
++use crate::response_observation::ResponseObservation;
++use crate::response_observation::ResponseObserver;
++use crate::response_progress::ResponseProgress;
+ use crate::responses_headers::json_headers_to_http_headers;
+ use crate::safety_buffering::treatment_from_headers;
+ use crate::sse::ResponsesStreamEvent;
+@@ -15,6 +19,7 @@ use crate::telemetry::WebsocketTelemetry;
+ use codex_client::TransportError;
+ use codex_http_client::HttpClientFactory;
+ use codex_http_client::RetryAfter;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_websocket_client::WebSocketConnection;
+ use codex_websocket_client::WebSocketConnector;
+ use futures::FutureExt;
+@@ -53,23 +58,30 @@ use url::Url;
+ 
+ struct WsStream {
+     tx_command: mpsc::Sender<WsCommand>,
+-    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
++    rx_message: mpsc::UnboundedReceiver<WsIncoming>,
+     pump_task: tokio::task::JoinHandle<()>,
+     status_telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     disconnected: Arc<AtomicBool>,
+ }
+ 
++enum WsIncoming {
++    Message(Result<Message, WsError>),
++    ResponseError(ApiError),
++}
++
+ enum WsCommand {
+     Send {
+         message: Message,
+-        tx_result: oneshot::Sender<Result<(), WsError>>,
++        begin_response: bool,
++        observer: Option<Arc<dyn ResponseObserver>>,
++        tx_result: oneshot::Sender<Result<(), ApiError>>,
+     },
+ }
+ 
+ impl WsStream {
+     fn new(inner: WebSocketConnection, telemetry: Option<Arc<dyn WebsocketTelemetry>>) -> Self {
+         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
+-        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
++        let (tx_message, rx_message) = mpsc::unbounded_channel();
+         let status_telemetry = telemetry;
+         let disconnected = Arc::new(AtomicBool::new(false));
+         let pump_telemetry = status_telemetry.clone();
+@@ -84,8 +96,18 @@ impl WsStream {
+             ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+             let mut next_ping_id = 0_u64;
+             let mut pending_ping: Option<([u8; 8], Instant)> = None;
++            let mut response_progress: Option<ResponseProgress> = None;
+             loop {
++                let deadline = response_progress.as_ref().map(|progress| progress.deadline);
+                 tokio::select! {
++                    biased;
++                    _ = wait_for_content_deadline(deadline) => {
++                        if let Some(progress) = &mut response_progress {
++                            progress.end(ResponseAttemptEnd::ProgressTimeout, Instant::now());
++                        }
++                        let _ = tx_message.send(WsIncoming::ResponseError(ApiError::ResponseProgressTimeout));
++                        break;
++                    }
+                     _ = ping_interval.tick(), if pump_telemetry.is_some() => {
+                         if !pump_telemetry.as_ref().is_some_and(|telemetry| telemetry.should_measure_ws_rtt()) {
+                             pending_ping = None;
+@@ -93,8 +115,15 @@ impl WsStream {
+                         }
+                         let payload = next_ping_id.to_be_bytes();
+                         next_ping_id = next_ping_id.wrapping_add(1);
+-                        if let Err(err) = inner.send(Message::Ping(payload.to_vec().into())).await {
+-                            let _ = tx_message.send(Err(err));
++                        if let Err(err) = send_frame(&mut inner, Message::Ping(payload.to_vec().into()), deadline).await {
++                            if let Some(progress) = &mut response_progress {
++                                progress.end(if matches!(err, ApiError::ResponseProgressTimeout) {
++                                    ResponseAttemptEnd::ProgressTimeout
++                                } else {
++                                    ResponseAttemptEnd::TransportClosed
++                                }, Instant::now());
++                            }
++                            let _ = tx_message.send(WsIncoming::ResponseError(err));
+                             break;
+                         }
+                         pending_ping = Some((payload, Instant::now()));
+@@ -104,9 +133,21 @@ impl WsStream {
+                             break;
+                         };
+                         match command {
+-                            WsCommand::Send { message, tx_result } => {
+-                                let result = inner.send(message).await;
++                            WsCommand::Send { message, begin_response, observer, tx_result } => {
++                                if begin_response {
++                                    response_progress = Some(ResponseProgress::sent(Instant::now(), observer));
++                                }
++                                let result = send_frame(&mut inner, message, response_progress.as_ref().map(|progress| progress.deadline)).await;
+                                 let should_break = result.is_err();
++                                if let Err(error) = &result
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    progress.end(if matches!(error, ApiError::ResponseProgressTimeout) {
++                                        ResponseAttemptEnd::ProgressTimeout
++                                    } else {
++                                        ResponseAttemptEnd::SendFailed
++                                    }, Instant::now());
++                                }
+                                 let _ = tx_result.send(result);
+                                 if should_break {
+                                     break;
+@@ -115,13 +156,24 @@ impl WsStream {
+                         }
+                     }
+                     message = inner.next() => {
++                        let received_at = Instant::now();
+                         let Some(message) = message else {
++                            if let Some(progress) = &mut response_progress {
++                                progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                            }
+                             break;
+                         };
+                         match message {
+                             Ok(Message::Ping(payload)) => {
+-                                if let Err(err) = inner.send(Message::Pong(payload)).await {
+-                                    let _ = tx_message.send(Err(err));
++                                if let Err(err) = send_frame(&mut inner, Message::Pong(payload), deadline).await {
++                                    if let Some(progress) = &mut response_progress {
++                                        progress.end(if matches!(err, ApiError::ResponseProgressTimeout) {
++                                            ResponseAttemptEnd::ProgressTimeout
++                                        } else {
++                                            ResponseAttemptEnd::TransportClosed
++                                        }, Instant::now());
++                                    }
++                                    let _ = tx_message.send(WsIncoming::ResponseError(err));
+                                     break;
+                                 }
+                             }
+@@ -140,8 +192,35 @@ impl WsStream {
+                             | Message::Binary(_)
+                             | Message::Close(_)
+                             | Message::Frame(_))) => {
++                                if let Message::Text(text) = &message
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    match progress.receive(text, received_at) {
++                                        Ok(true) => response_progress = None,
++                                        Ok(false) => {
++                                            // A mapped protocol error ends receipt before a later EOF
++                                            // can replace its outcome while the consumer is busy.
++                                            if let Some(wrapped) = parse_wrapped_websocket_error_event(text)
++                                                && let Some(error) = map_wrapped_websocket_error_event(wrapped, text.to_string())
++                                            {
++                                                progress.end(ResponseAttemptEnd::Failed, received_at);
++                                                let _ = tx_message.send(WsIncoming::ResponseError(error));
++                                                break;
++                                            }
++                                        },
++                                        Err(error) => {
++                                            let _ = tx_message.send(WsIncoming::ResponseError(error));
++                                            break;
++                                        }
++                                    }
++                                }
+                                 let is_close = matches!(message, Message::Close(_));
+-                                if tx_message.send(Ok(message)).is_err() {
++                                if is_close
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                                }
++                                if tx_message.send(WsIncoming::Message(Ok(message))).is_err() {
+                                     break;
+                                 }
+                                 if is_close {
+@@ -149,7 +228,10 @@ impl WsStream {
+                                 }
+                             }
+                             Err(err) => {
+-                                let _ = tx_message.send(Err(err));
++                                if let Some(progress) = &mut response_progress {
++                                    progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                                }
++                                let _ = tx_message.send(WsIncoming::Message(Err(err)));
+                                 break;
+                             }
+                         }
+@@ -170,8 +252,8 @@ impl WsStream {
+ 
+     async fn request(
+         &mut self,
+-        make_command: impl FnOnce(oneshot::Sender<Result<(), WsError>>) -> WsCommand,
+-    ) -> Result<(), WsError> {
++        make_command: impl FnOnce(oneshot::Sender<Result<(), ApiError>>) -> WsCommand,
++    ) -> Result<(), ApiError> {
+         let (tx_result, rx_result) = oneshot::channel();
+         if self.tx_command.send(make_command(tx_result)).await.is_ok()
+             && let Ok(result) = rx_result.await
+@@ -179,18 +261,56 @@ impl WsStream {
+             return result;
+         }
+         while let Some(message) = self.rx_message.recv().await {
+-            message?;
++            match message {
++                WsIncoming::Message(message) => {
++                    message.map_err(map_ws_stream_error)?;
++                }
++                WsIncoming::ResponseError(error) => return Err(error),
++            }
+         }
+-        Err(WsError::ConnectionClosed)
++        Err(map_ws_stream_error(WsError::ConnectionClosed))
+     }
+ 
+-    async fn send(&mut self, message: Message) -> Result<(), WsError> {
+-        self.request(|tx_result| WsCommand::Send { message, tx_result })
+-            .await
++    async fn send(
++        &mut self,
++        message: Message,
++        begin_response: bool,
++        observer: Option<Arc<dyn ResponseObserver>>,
++    ) -> Result<(), ApiError> {
++        self.request(|tx_result| WsCommand::Send {
++            message,
++            begin_response,
++            observer,
++            tx_result,
++        })
++        .await
++    }
++
++    async fn next(&mut self) -> Result<Option<Result<Message, WsError>>, ApiError> {
++        match self.rx_message.recv().await {
++            Some(WsIncoming::Message(message)) => Ok(Some(message)),
++            Some(WsIncoming::ResponseError(error)) => Err(error),
++            None => Ok(None),
++        }
++    }
++}
++
++async fn wait_for_content_deadline(deadline: Option<Instant>) {
++    match deadline {
++        Some(deadline) => tokio::time::sleep_until(deadline).await,
++        None => std::future::pending::<()>().await,
+     }
++}
+ 
+-    async fn next(&mut self) -> Option<Result<Message, WsError>> {
+-        self.rx_message.recv().await
++async fn send_frame(
++    inner: &mut WebSocketConnection,
++    message: Message,
++    deadline: Option<Instant>,
++) -> Result<(), ApiError> {
++    tokio::select! {
++        biased;
++        _ = wait_for_content_deadline(deadline) => Err(ApiError::ResponseProgressTimeout),
++        result = inner.send(message) => result.map_err(map_ws_stream_error),
+     }
+ }
+ 
+@@ -230,6 +350,12 @@ const X_MODELS_ETAG_HEADER: &str = "x-models-etag";
+ const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+ const OPENAI_MODEL_HEADER: &str = "openai-model";
+ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(5);
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum ResponseOutputMode {
++    Streaming,
++    Complete,
++}
+ const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
+ const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
+ const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
+@@ -300,17 +426,54 @@ impl ResponsesWebsocketConnection {
+             .is_none_or(|stream| stream.pump_task.is_finished())
+     }
+ 
++    pub async fn stream_request(
++        &self,
++        request: ResponsesWsRequest<'_>,
++        connection_reused: bool,
++        turn_state: Option<Arc<OnceLock<String>>>,
++    ) -> Result<ResponseStream, ApiError> {
++        self.stream_request_with_output(
++            request,
++            connection_reused,
++            turn_state,
++            ResponseOutputMode::Streaming,
++            None,
++        )
++        .await
++    }
++
++    /// Publishes model output only after the original successful terminal.
++    /// Observation is optional and does not control output or progress tracking.
++    pub async fn stream_complete_response(
++        &self,
++        request: ResponsesWsRequest<'_>,
++        connection_reused: bool,
++        turn_state: Option<Arc<OnceLock<String>>>,
++        observer: Option<Arc<dyn ResponseObserver>>,
++    ) -> Result<ResponseStream, ApiError> {
++        self.stream_request_with_output(
++            request,
++            connection_reused,
++            turn_state,
++            ResponseOutputMode::Complete,
++            observer,
++        )
++        .await
++    }
++
+     #[instrument(
+         name = "responses_websocket.stream_request",
+         level = "info",
+         skip_all,
+         fields(transport = "responses_websocket", api.path = "/responses")
+     )]
+-    pub async fn stream_request(
++    async fn stream_request_with_output(
+         &self,
+         request: ResponsesWsRequest<'_>,
+         connection_reused: bool,
+         turn_state: Option<Arc<OnceLock<String>>>,
++        output_mode: ResponseOutputMode,
++        observer: Option<Arc<dyn ResponseObserver>>,
+     ) -> Result<ResponseStream, ApiError> {
+         let (tx_event, rx_event) =
+             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
+@@ -346,6 +509,9 @@ impl ResponsesWebsocketConnection {
+             connection_reused,
+         };
+         let request_text = serialize_websocket_request(&request)?;
++        if let Some(observer) = &observer {
++            observer.prepared(request_text.len() as u64);
++        }
+ 
+         let current_span = Span::current();
+         tokio::spawn(
+@@ -355,6 +521,15 @@ impl ResponsesWebsocketConnection {
+             )]
+             async move {
+                 if let Some(model) = server_model {
++                    if let Some(observer) = &observer {
++                        observer.received(
++                            ResponseObservation {
++                                served_model: Some(model.clone()),
++                                ..Default::default()
++                            },
++                            Instant::now(),
++                        );
++                    }
+                     let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+                 }
+                 if server_reasoning_included {
+@@ -390,6 +565,8 @@ impl ResponsesWebsocketConnection {
+                             telemetry,
+                             turn_state.as_deref(),
+                             &timing_log_context,
++                            output_mode,
++                            observer.clone(),
+                             rx_interrupt,
+                         ) => result,
+                         _ = tx_event.closed() => Err(ApiError::Stream(
+@@ -399,6 +576,18 @@ impl ResponsesWebsocketConnection {
+                 };
+ 
+                 if let Err(err) = result {
++                    if let Some(observer) = &observer {
++                        observer.ended(
++                            if tx_event.is_closed() {
++                                ResponseAttemptEnd::Canceled
++                            } else if matches!(err, ApiError::ResponseProgressTimeout) {
++                                ResponseAttemptEnd::ProgressTimeout
++                            } else {
++                                ResponseAttemptEnd::Failed
++                            },
++                            Instant::now(),
++                        );
++                    }
+                     // A terminal stream error should reach the caller immediately. Waiting for a
+                     // graceful close handshake here can stall indefinitely and mask the error.
+                     let failed_stream = guard.take();
+@@ -528,6 +717,7 @@ impl ResponsesWebsocketClient {
+         let immediate_close = tokio::time::timeout(immediate_close_timeout, stream.next())
+             .await
+             .ok()
++            .transpose()?
+             .flatten()
+             .transpose()
+             .map_err(map_ws_stream_error)?
+@@ -748,16 +938,22 @@ async fn run_websocket_response_stream(
+     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     turn_state: Option<&OnceLock<String>>,
+     timing_log_context: &ResponsesWebsocketTimingLogContext,
++    output_mode: ResponseOutputMode,
++    observer: Option<Arc<dyn ResponseObserver>>,
+     interrupt: oneshot::Receiver<()>,
+ ) -> Result<(), ApiError> {
+     let mut last_server_model: Option<String> = None;
+     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
++    let mut pending_output =
++        (output_mode == ResponseOutputMode::Complete).then(AtomicResponse::default);
+     send_websocket_request(
+         ws_stream,
+         request_text,
+         idle_timeout,
+         telemetry.as_ref(),
+         timing_log_context.connection_reused,
++        output_mode == ResponseOutputMode::Complete,
++        observer.clone(),
+     )
+     .await?;
+ 
+@@ -767,9 +963,14 @@ async fn run_websocket_response_stream(
+     loop {
+         let poll_start = Instant::now();
+         let response = tokio::select! {
+-            response = tokio::time::timeout(idle_timeout, ws_stream.next()) => {
+-                response.map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))
+-            }
++            response = async {
++                if output_mode == ResponseOutputMode::Complete {
++                    ws_stream.next().await
++                } else {
++                    tokio::time::timeout(idle_timeout, ws_stream.next()).await
++                        .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))?
++                }
++            } => response,
+             Ok(()) = &mut interrupt, if response_id.is_some() => {
+                 send_websocket_request(
+                     ws_stream,
+@@ -781,6 +982,8 @@ async fn run_websocket_response_stream(
+                     idle_timeout,
+                     /*telemetry*/ None,
+                     timing_log_context.connection_reused,
++                    false,
++                    None,
+                 )
+                 .await?;
+                 continue;
+@@ -894,11 +1097,52 @@ async fn run_websocket_response_stream(
+                         "response event consumer dropped".to_string(),
+                     ));
+                 }
++                let original_completed = event.kind() == "response.completed";
+                 match process_responses_event(event) {
+                     Ok(Some(event)) => {
+                         if let ResponseEvent::Created { response_id: id } = &event {
+                             response_id.clone_from(id);
+                         }
++                        if pending_output.is_some()
++                            && matches!(event, ResponseEvent::Completed { .. })
++                        {
++                            if !original_completed {
++                                if let ResponseEvent::Completed {
++                                    response_id,
++                                    token_usage,
++                                    usage_metadata,
++                                    ..
++                                } = event
++                                {
++                                    let _ = tx_event
++                                        .send(Ok(ResponseEvent::Interrupted {
++                                            response_id,
++                                            token_usage,
++                                            usage_metadata,
++                                        }))
++                                        .await;
++                                }
++                                return Ok(());
++                            }
++                            if let Some(observer) = &observer {
++                                observer.ended(ResponseAttemptEnd::Completed, Instant::now());
++                            }
++                            if let Some(buffer) = pending_output.take() {
++                                for buffered in buffer.commit() {
++                                    tx_event.send(Ok(buffered)).await.map_err(|_| {
++                                        ApiError::Stream("response event consumer dropped".into())
++                                    })?;
++                                }
++                            }
++                        }
++                        let event = if let Some(buffer) = &mut pending_output {
++                            let Some(control) = buffer.observe(event) else {
++                                continue;
++                            };
++                            control
++                        } else {
++                            event
++                        };
+                         let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                         let _ = tx_event.send(Ok(event)).await;
+                         if is_completed {
+@@ -973,17 +1217,25 @@ async fn send_websocket_request(
+     idle_timeout: Duration,
+     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+     connection_reused: bool,
++    begin_response: bool,
++    observer: Option<Arc<dyn ResponseObserver>>,
+ ) -> Result<(), ApiError> {
+     trace!("websocket request: {request_text}");
+ 
+     let request_start = Instant::now();
+-    let result = tokio::time::timeout(
+-        idle_timeout,
+-        ws_stream.send(Message::Text(request_text.into())),
+-    )
+-    .await
+-    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+-    .and_then(|result| result.map_err(map_ws_stream_error));
++    let send = ws_stream.send(
++        Message::Text(request_text.into()),
++        begin_response,
++        observer.clone(),
++    );
++    let result = if begin_response {
++        send.await
++    } else {
++        tokio::time::timeout(idle_timeout, send)
++            .await
++            .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
++            .and_then(|result| result)
++    };
+ 
+     if let Some(t) = telemetry.as_ref() {
+         t.on_ws_request(
+@@ -993,9 +1245,12 @@ async fn send_websocket_request(
+         );
+     }
+ 
+-    result?;
+-
+-    Ok(())
++    if result.is_err()
++        && let Some(observer) = &observer
++    {
++        observer.ended(ResponseAttemptEnd::SendFailed, Instant::now());
++    }
++    result
+ }
+ 
+ fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod api_bridge;
++mod atomic_response;
+ pub(crate) mod auth;
+ pub(crate) mod common;
+ pub(crate) mod endpoint;
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -248,6 +248,7 @@ pub(crate) async fn handle_response_stream_error(
+         // In release builds, hide the first websocket retry notification to reduce noisy
+         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
+         let report_error = retry_count > 1
++            || matches!(err.details(), CodexErrorDetails::ResponseProgressTimeout)
+             || cfg!(debug_assertions)
+             || !sess.services.model_client.responses_websocket_enabled()
+             || client_session.personal_chatgpt_websocket_enabled();
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -130,6 +130,9 @@ async fn capacity_wait_emits_one_warning_and_remains_cancellable() {
+ 
+ #[test]
+ fn websocket_connection_cycle_requires_personal_account_after_five_retries() {
++    let stalled = CodexErr::new(CodexErrorDetails::ResponseProgressTimeout);
++    assert!(stalled.retry_delay(1).is_some());
++    assert!(!aligned_connection_cycle_eligible(5, 5, true, &stalled));
+     let disconnect = CodexErr::Stream("websocket closed".to_string());
+     for retries in 0..5 {
+         assert!(!aligned_connection_cycle_eligible(
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2658,6 +2658,34 @@ async fn try_run_sampling_request(
+         record_turn_ttft_metric(&turn_context, &event).await;
+ 
+         match event {
++            ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                usage_metadata,
++            } => {
++                sess.record_observed_response_completed(
++                    &turn_context,
++                    &response_id,
++                    token_usage.as_ref(),
++                    usage_metadata.as_ref(),
++                )
++                .await;
++                let budget_result = sess
++                    .record_token_usage_info(
++                        &turn_context,
++                        &step_context.settings,
++                        token_usage.as_ref(),
++                    )
++                    .await;
++                should_emit_token_count = true;
++                if let Err(error) = budget_result {
++                    break Err(error);
++                }
++                break Ok(SamplingRequestResult {
++                    needs_follow_up: true,
++                    last_agent_message,
++                });
++            }
+             ResponseEvent::Created { response_id } => {
+                 if let Some(response_id) = response_id {
+                     turn_context
+diff --git a/codex-rs/core/src/turn_timing.rs b/codex-rs/core/src/turn_timing.rs
+--- a/codex-rs/core/src/turn_timing.rs
++++ b/codex-rs/core/src/turn_timing.rs
+@@ -402,6 +402,7 @@ fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
+         | ResponseEvent::ServerReasoningIncluded(_)
+         | ResponseEvent::ToolCallInputDelta { .. }
+         | ResponseEvent::Completed { .. }
++        | ResponseEvent::Interrupted { .. }
+         | ResponseEvent::ReasoningSummaryPartAdded { .. }
+         | ResponseEvent::RateLimits(_)
+         | ResponseEvent::ModelsEtag(_) => false,
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -78,6 +78,10 @@ use tracing::Instrument;
+ use tracing_test::traced_test;
+ 
+ const MODEL: &str = "gpt-5.4";
++
++#[path = "client_websockets_complete_response_tests.rs"]
++mod complete_responses;
++
+ const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+ const USER_AGENT_HEADER: &str = "user-agent";
+ const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+diff --git a/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs b/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs
+@@ -0,0 +1,193 @@
++use super::*;
++use codex_api::AuthProvider;
++use codex_api::ResponseCreateWsRequest;
++use codex_api::ResponseObservation;
++use codex_api::ResponseObserver;
++use codex_api::ResponsesApiRequest;
++use codex_api::ResponsesWebsocketClient;
++use codex_api::ResponsesWsRequest;
++use codex_http_client::HttpClientFactory;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use core_test_support::responses::ev_output_text_delta;
++use http::HeaderMap;
++use pretty_assertions::assert_eq;
++use std::sync::Mutex;
++use tokio::time::Instant;
++
++struct NoAuth;
++
++impl AuthProvider for NoAuth {
++    fn add_auth_headers(&self, _: &mut HeaderMap) {}
++}
++
++#[derive(Default)]
++struct Observations(Mutex<Vec<ResponseObservation>>);
++
++impl ResponseObserver for Observations {
++    fn prepared(&self, _: u64) {}
++    fn sent(&self, _: Instant) {}
++    fn received(&self, observation: ResponseObservation, _: Instant) {
++        self.0.lock().unwrap().push(observation);
++    }
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant) {
++        self.received(
++            ResponseObservation {
++                terminal: Some(reason),
++                ..Default::default()
++            },
++            at,
++        );
++    }
++}
++
++#[test_case::test_case("completed", false; "unobserved_success")]
++#[test_case::test_case("closed", false; "unobserved_failure")]
++#[test_case::test_case("interrupted", false; "unobserved_interruption")]
++#[test_case::test_case("failed", true; "failed_usage")]
++#[test_case::test_case("error", true; "protocol_error_before_eof")]
++#[test_case::test_case("timeout", false; "unobserved_content_deadline")]
++#[test_case::test_case("timeout", true; "observed_content_deadline")]
++#[tokio::test]
++async fn complete_response_output_preserves_native_outcomes(ending: &str, observe: bool) {
++    skip_if_no_network!();
++    let mut events = vec![ev_response_created("r1")];
++    match ending {
++        "timeout" => events.push(json!({"type": "codex.response.metadata"})),
++        _ => events.extend([
++            ev_output_text_delta("Native output"),
++            ev_assistant_message("message", "Native output"),
++        ]),
++    }
++    let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80},
++        "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 112});
++    match ending {
++        "completed" => events.push(ev_completed("r1")),
++        "interrupted" => {
++            let mut terminal = ev_completed("r1");
++            terminal["type"] = json!("response.incomplete");
++            terminal["response"]["incomplete_details"] = json!({"reason": "interrupted"});
++            terminal["response"]["usage"] = usage.clone();
++            events.push(terminal);
++        }
++        "failed" => events.push(json!({"type": "response.failed", "response": {
++            "id": "r1", "usage": usage, "error": {"code": "failure", "message": "failed"}
++        }})),
++        "error" => events.push(json!({"type": "error", "status": 429,
++            "error": {"code": "rate_limit_exceeded", "message": "Try later"}})),
++        "closed" | "timeout" => {}
++        _ => unreachable!(),
++    }
++    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
++        requests: vec![events],
++        response_headers: Vec::new(),
++        accept_delay: None,
++        close_after_requests: ending != "timeout",
++    }])
++    .await;
++    let provider = websocket_provider(&server).to_api_provider(None).unwrap();
++    let client = ResponsesWebsocketClient::new(provider, Arc::new(NoAuth));
++    let connection = client
++        .connect(
++            &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++            HeaderMap::new(),
++            HeaderMap::new(),
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++    let request = ResponsesApiRequest {
++        model: MODEL.into(),
++        instructions: String::new(),
++        input: vec![message_item("hello")],
++        tools: None,
++        tool_choice: "auto".into(),
++        parallel_tool_calls: true,
++        reasoning: None,
++        store: false,
++        stream: true,
++        stream_options: None,
++        include: Vec::new(),
++        service_tier: None,
++        prompt_cache_key: None,
++        text: None,
++        client_metadata: None,
++        access_programs: None,
++    };
++    let observations = Arc::new(Observations::default());
++    let observer = observe.then(|| observations.clone() as Arc<dyn ResponseObserver>);
++    let mut stream = connection
++        .stream_complete_response(
++            ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest::from(&request)),
++            false,
++            None,
++            observer,
++        )
++        .await
++        .unwrap();
++    let mut output = Vec::new();
++    let mut did_complete = false;
++    let mut interrupted = false;
++    let mut failed = false;
++    while let Some(event) = stream.next().await {
++        match event {
++            Ok(ResponseEvent::Created { .. }) if ending == "timeout" => {
++                tokio::time::pause();
++                tokio::time::advance(Duration::from_secs(301)).await;
++            }
++            Ok(ResponseEvent::OutputTextDelta(text)) => output.push(text),
++            Ok(ResponseEvent::Completed { .. }) => did_complete = true,
++            Ok(ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                ..
++            }) => {
++                assert_eq!(response_id, "r1");
++                assert_eq!(token_usage.unwrap().output_tokens, 12);
++                interrupted = true;
++            }
++            Err(error) => {
++                failed = true;
++                if ending == "timeout" {
++                    assert!(matches!(
++                        error,
++                        codex_api::ApiError::ResponseProgressTimeout
++                    ));
++                }
++            }
++            _ => {}
++        }
++    }
++    assert_eq!(did_complete, ending == "completed");
++    assert_eq!(interrupted, ending == "interrupted");
++    assert_eq!(
++        failed,
++        matches!(ending, "closed" | "failed" | "error" | "timeout")
++    );
++    assert_eq!(
++        output,
++        if did_complete {
++            vec!["Native output".to_owned()]
++        } else {
++            Vec::new()
++        }
++    );
++    if observe {
++        let records = observations.0.lock().unwrap();
++        assert!(records.iter().any(|row| row.terminal
++            == Some(if ending == "timeout" {
++                ResponseAttemptEnd::ProgressTimeout
++            } else {
++                ResponseAttemptEnd::Failed
++            })));
++        assert!(
++            !records
++                .iter()
++                .any(|row| row.terminal == Some(ResponseAttemptEnd::TransportClosed))
++        );
++        if ending == "failed" {
++            assert!(records.iter().any(|row| row.usage.as_ref() == Some(&usage)));
++        }
++    }
++    server.shutdown().await;
++}
+diff --git a/codex-rs/otel/src/events/session_telemetry.rs b/codex-rs/otel/src/events/session_telemetry.rs
+--- a/codex-rs/otel/src/events/session_telemetry.rs
++++ b/codex-rs/otel/src/events/session_telemetry.rs
+@@ -626,6 +626,10 @@ impl SessionTelemetry {
+             ResponseEvent::Completed {
+                 token_usage: Some(token_usage),
+                 ..
++            }
++            | ResponseEvent::Interrupted {
++                token_usage: Some(token_usage),
++                ..
+             } => {
+                 handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
+                 handle_responses_span.record(
+@@ -1371,6 +1375,7 @@ impl SessionTelemetry {
+                 SessionTelemetry::responses_item_type(item)
+             }
+             ResponseEvent::Completed { .. } => "completed".into(),
++            ResponseEvent::Interrupted { .. } => "interrupted".into(),
+             ResponseEvent::OutputTextDelta(_) => "text_delta".into(),
+             ResponseEvent::ToolCallInputDelta { .. } => "tool_input_delta".into(),
+             ResponseEvent::ReasoningSummaryDelta { .. } => "reasoning_summary_delta".into(),

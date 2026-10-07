@@ -1,0 +1,1006 @@
+estimate-response-quota
+
+Lane: draft
+
+Unit: consumer
+
+ChildPatch: estimate-response-quota
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -801,19 +801,25 @@ impl MessageProcessor {
+             broadcast::error::RecvError,
+         >,
+     ) {
++        let metrics = self.thread_processor.response_metrics();
+         let attempts = match update {
+             Ok(attempt) => vec![attempt],
+-            Err(broadcast::error::RecvError::Lagged(_)) => self
+-                .thread_processor
+-                .response_metrics()
+-                .notification_snapshot(),
++            Err(broadcast::error::RecvError::Lagged(_)) => metrics.notification_snapshot(),
+             // The processor owns the sender for the lifetime of these receivers.
+             Err(broadcast::error::RecvError::Closed) => return,
+         };
++        let quota = attempts
++            .iter()
++            .any(|attempt| attempt.end_reason.is_some())
++            .then(|| metrics.quota_estimates());
+         for attempt in attempts {
+             let notification = codex_app_server_protocol::ResponseAttemptUpdatedNotification {
+                 thread_id: attempt.thread_id.to_string(),
+-                quota: attempt.end_reason.is_some().then(Vec::new),
++                quota: if attempt.end_reason.is_some() {
++                    quota.clone()
++                } else {
++                    None
++                },
+                 attempt,
+             };
+             self.outgoing
+diff --git a/codex-rs/app-server/tests/suite/v2/response_metrics.rs b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+--- a/codex-rs/app-server/tests/suite/v2/response_metrics.rs
++++ b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+@@ -74,6 +74,7 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+         .build_initialized_with_timeout(READ_TIMEOUT)
+         .await?;
+     let mut records = Vec::new();
++    let mut quota = Vec::new();
+     for text in ["first session", "second session"] {
+         let thread = app.start_thread(ThreadStartParams::default()).await?.thread;
+         let completed = timeout(
+@@ -134,7 +135,15 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+             update.attempt.rate_limits[0].sequence
+                 < update.attempt.usage_observed_sequence.unwrap()
+         );
+-        assert!(update.quota.is_some());
++        quota = update.quota.unwrap();
++        assert_eq!(quota.len(), 1);
++        assert_eq!(
++            quota[0].scope.account_id.as_deref(),
++            Some("metrics-account")
++        );
++        assert_eq!(quota[0].remaining_percent, 88);
++        assert_eq!(quota[0].observations, records.len() + 1);
++        assert_eq!(quota[0].value, None);
+         records.insert(0, update.attempt);
+ 
+         let _: ThreadUnsubscribeResponse = app
+@@ -160,6 +169,7 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+             })
+             .await?;
+         assert_eq!(snapshot.data, records);
++        assert_eq!(snapshot.quota, quota);
+         assert!(snapshot.active_attempt_ids.is_empty());
+         assert_eq!(
+             snapshot.last_generation.unwrap().attempt_id,
+@@ -223,6 +233,7 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+         })
+         .await?;
+     assert_eq!(persisted.data, records);
++    assert_eq!(persisted.quota, quota);
+     assert!(persisted.persistence_error.is_none());
+     assert!(persisted.active_attempt_ids.is_empty());
+     assert_eq!(
+diff --git a/codex-rs/core/src/response_metrics/backup.rs b/codex-rs/core/src/response_metrics/backup.rs
+--- a/codex-rs/core/src/response_metrics/backup.rs
++++ b/codex-rs/core/src/response_metrics/backup.rs
+@@ -1,6 +1,7 @@
+ //! One ordered writer keeps disk work outside response generation.
+ 
+ use super::ResponseMetrics;
++use super::quota::QuotaEstimator;
+ use codex_protocol::response_metrics::RECENT_RESPONSE_LIMIT;
+ use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_state::ResponseHistoryStore;
+@@ -111,8 +112,12 @@ async fn restore(
+     let page = store.page(None, None, None, RECENT_RESPONSE_LIMIT).await?;
+     let models = store.models().await?;
+     let last_generations = store.last_generations().await?;
++    let mut quota = QuotaEstimator::default();
++    store
++        .restore_accounting(|attempt| quota.observe(&attempt))
++        .await?;
+     if let Some(metrics) = metrics.upgrade() {
+-        metrics.restore(page, models, last_generations);
++        metrics.restore(page, models, last_generations, quota);
+     }
+     Ok(())
+ }
+diff --git a/codex-rs/core/src/response_metrics/backup_tests.rs b/codex-rs/core/src/response_metrics/backup_tests.rs
+--- a/codex-rs/core/src/response_metrics/backup_tests.rs
++++ b/codex-rs/core/src/response_metrics/backup_tests.rs
+@@ -52,11 +52,20 @@ async fn ordered_backup_preserves_final_tokens_and_freezes_unfinished_records()
+ #[tokio::test]
+ async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
+     let home = tempfile::tempdir().unwrap();
++    let price_path = home.path().join("models.json");
++    std::fs::write(
++        &price_path,
++        json!({"models": [], "prices": {"model": {"0": {
++            "input": 0, "cache_read": 0, "cache_write": 0, "output": 1
++        }}}})
++        .to_string(),
++    )
++    .unwrap();
+     let metrics = Arc::new(ResponseMetrics::new(home.path()));
+     let selected = context();
+     let thread_id = selected.thread_id;
+     let oldest = metrics.start(selected, Instant::now(), 1000);
+-    oldest.ended(ResponseAttemptEnd::Completed, Instant::now());
++    finish_with_quota(&oldest, 10, ResponseAttemptEnd::Completed);
+     let expected = metrics.snapshot()[0].clone();
+     for _ in 0..RECENT_RESPONSE_LIMIT {
+         let mut context = context();
+@@ -64,12 +73,17 @@ async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
+         let attempt = metrics.start(context, Instant::now(), 1000);
+         attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
+     }
++    let last = metrics.start(context(), Instant::now(), 1000);
++    finish_with_quota(&last, 20, ResponseAttemptEnd::Failed);
++    let quota = metrics.quota_estimates();
++    assert_eq!(quota[0].value.unwrap().center, 10.0);
+     metrics.flush().await.unwrap();
+     let reopened = Arc::new(ResponseMetrics::new(home.path()));
+     let first = reopened
+         .page(Some(thread_id), Some("model"), None, 100)
+         .await;
+     assert!(first.data.is_empty());
++    assert_eq!(first.quota, quota);
+     assert_eq!(first.models, vec!["model", "other-model"]);
+     assert_eq!(
+         first.last_generation.unwrap().attempt_id,
+@@ -82,9 +96,35 @@ async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
+         .await;
+     assert_eq!(older.data, vec![expected]);
+     assert_eq!(older.next_cursor, None);
++    assert_eq!(older.quota, quota);
+     assert_eq!(older.active_attempt_ids.len(), 1);
+     drop(new);
+     reopened.flush().await.unwrap();
++    std::fs::write(&price_path, "invalid JSON").unwrap();
++    let unpriced = reopened.page(None, None, None, 100).await;
++    assert_eq!(unpriced.quota[0].value, None);
++    assert!(unpriced.pricing_error.unwrap().contains("models.json"));
++}
++
++fn finish_with_quota(attempt: &ResponseAttemptTracker, used: u8, end: ResponseAttemptEnd) {
++    let sent = Instant::now();
++    attempt.sent(sent);
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 10,
++            usage: Some(json!({"input_tokens": 0, "output_tokens": 1_000_000})),
++            rate_limits: Some(
++                serde_json::from_value(json!({"limit_id": "codex", "secondary": {
++                    "used_percent": used, "window_minutes": 10080, "resets_at": 9000
++                }}))
++                .unwrap(),
++            ),
++            terminal: Some(end),
++            ..Default::default()
++        },
++        sent + Duration::from_secs(1),
++    );
++    attempt.ended(end, sent + Duration::from_secs(2));
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/core/src/response_metrics/quota.rs b/codex-rs/core/src/response_metrics/quota.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_metrics/quota.rs
+@@ -0,0 +1,285 @@
++//! Weekly quota estimates from ordered receipts, independent of browser retention.
++
++use codex_models_manager::model_pricing::Prices;
++use codex_protocol::protocol::RateLimitWindow;
++use codex_protocol::response_metrics::ResponseQuotaEstimate;
++use codex_protocol::response_metrics::ResponseQuotaEstimateRange;
++use codex_protocol::response_metrics::ResponseQuotaScope;
++use codex_protocol::response_metrics::ResponseTokenCounts;
++use codex_state::ResponseAccounting;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use uuid::Uuid;
++
++const WEEK_MINUTES: i64 = 7 * 24 * 60;
++const PERCENT_UNCERTAINTY: f64 = 0.99;
++
++#[derive(Debug, Default)]
++pub(super) struct QuotaEstimator {
++    scopes: BTreeMap<ResponseQuotaScope, ReceiptWindow>,
++}
++
++#[derive(Debug, Default)]
++struct ReceiptWindow {
++    since: Option<Uuid>,
++    events: BTreeMap<Uuid, Receipt>,
++}
++
++#[derive(Debug)]
++enum Receipt {
++    Usage {
++        model: String,
++        tokens: ResponseTokenCounts,
++    },
++    Quota(RateLimitWindow),
++}
++
++#[derive(Clone, Copy)]
++struct Point {
++    used_percent: u8,
++    cost: f64,
++}
++
++struct Plateau {
++    first: Point,
++    last: Point,
++}
++
++impl QuotaEstimator {
++    pub(super) fn observe(&mut self, attempt: &ResponseAccounting) {
++        let mut limits: BTreeSet<_> = attempt
++            .rate_limits
++            .iter()
++            .map(|quota| quota.limit_id.as_str())
++            .collect();
++        if limits.is_empty() {
++            limits.insert("codex");
++        }
++        for limit_id in limits {
++            let scope = ResponseQuotaScope {
++                provider: attempt.provider.clone(),
++                account_id: attempt.account_id.clone(),
++                limit_id: limit_id.to_owned(),
++            };
++            let history = self.scopes.entry(scope).or_default();
++            if let Some(sequence) = attempt.usage_observed_sequence {
++                history.events.insert(
++                    sequence,
++                    Receipt::Usage {
++                        model: attempt.model.clone(),
++                        tokens: attempt.tokens.clone(),
++                    },
++                );
++            }
++            for quota in &attempt.rate_limits {
++                if quota.limit_id != limit_id {
++                    continue;
++                }
++                if let Some(used_percent) = quota.used_percent {
++                    history.events.insert(
++                        quota.sequence,
++                        Receipt::Quota(RateLimitWindow {
++                            used_percent,
++                            window_minutes: Some(WEEK_MINUTES),
++                            resets_at: quota.resets_at,
++                        }),
++                    );
++                }
++            }
++            history.prune();
++        }
++    }
++
++    pub(super) fn merge(&mut self, restored: Self) {
++        for (scope, mut older) in restored.scopes {
++            let current = self.scopes.entry(scope).or_default();
++            current.since = current.since.max(older.since);
++            current.events.append(&mut older.events);
++            current.prune();
++        }
++    }
++
++    pub(super) fn estimates(&self, prices: Option<&Prices>) -> Vec<ResponseQuotaEstimate> {
++        self.scopes
++            .iter()
++            .filter_map(|(scope, history)| history.estimate(scope, prices))
++            .collect()
++    }
++}
++
++impl ReceiptWindow {
++    fn prune(&mut self) {
++        let mut previous: Option<&RateLimitWindow> = None;
++        let mut first = self.since;
++        for (sequence, receipt) in &self.events {
++            if let Receipt::Quota(window) = receipt {
++                if previous.is_some_and(|previous| starts_interval(previous, window)) {
++                    first = Some(first.map_or(*sequence, |first| first.max(*sequence)));
++                }
++                previous = Some(window);
++            }
++        }
++        if let Some(first) = first {
++            // Preserve the reset cutoff while merging older startup facts with
++            // concurrent live receipts; discarded intervals must not return.
++            self.since = Some(first);
++            self.events = self.events.split_off(&first);
++        }
++    }
++
++    fn estimate(
++        &self,
++        scope: &ResponseQuotaScope,
++        prices: Option<&Prices>,
++    ) -> Option<ResponseQuotaEstimate> {
++        let mut cost = 0.0;
++        let mut priced = true;
++        let mut plateaus: Vec<Plateau> = Vec::new();
++        let mut latest: Option<ResponseQuotaEstimate> = None;
++        for (sequence, receipt) in &self.events {
++            let window = match receipt {
++                Receipt::Usage { model, tokens } => {
++                    // Usage before the first quota observation is not an interval.
++                    if latest.is_some() {
++                        match quote_usage(prices, model, tokens) {
++                            Some(usd) => cost += usd,
++                            None => priced = false,
++                        }
++                    }
++                    continue;
++                }
++                Receipt::Quota(window) => window,
++            };
++            let point = Point {
++                used_percent: window.used_percent.round() as u8,
++                cost,
++            };
++            if let Some(plateau) = plateaus.last_mut()
++                && plateau.last.used_percent == point.used_percent
++            {
++                plateau.last = point;
++            } else {
++                plateaus.push(Plateau {
++                    first: point,
++                    last: point,
++                });
++            }
++            let latest = latest.get_or_insert_with(|| ResponseQuotaEstimate {
++                scope: scope.clone(),
++                resets_at: window.resets_at,
++                remaining_percent: 100 - point.used_percent,
++                last_sequence: *sequence,
++                observations: 0,
++                intervals: 0,
++                value: None,
++            });
++            latest.observations += 1;
++            latest.remaining_percent = 100 - point.used_percent;
++            latest.last_sequence = *sequence;
++        }
++        let mut latest = latest?;
++        // Only the endpoints extend a flat percentage's observed cost range.
++        // The single continuous interval contains at most 202 such points.
++        let points: Vec<_> = plateaus
++            .into_iter()
++            .flat_map(|plateau| {
++                std::iter::once(plateau.first)
++                    .chain((plateau.last.cost != plateau.first.cost).then_some(plateau.last))
++            })
++            .collect();
++        if priced {
++            (latest.value, latest.intervals) = estimate_points(&points);
++        }
++        Some(latest)
++    }
++}
++
++fn starts_interval(previous: &RateLimitWindow, current: &RateLimitWindow) -> bool {
++    // Upstream can round the same reset time to adjacent whole seconds.
++    let reset_changed = match (previous.resets_at, current.resets_at) {
++        (Some(previous), Some(current)) => previous.abs_diff(current) > 1,
++        (previous, current) => previous != current,
++    };
++    reset_changed || current.used_percent.round() < previous.used_percent.round()
++}
++
++fn quote_usage(prices: Option<&Prices>, model: &str, tokens: &ResponseTokenCounts) -> Option<f64> {
++    let price = prices?.get(model).filter(|price| !price.is_zero())?;
++    Some(
++        price
++            .quote(
++                tokens.input?,
++                tokens.cache_read?,
++                tokens.cache_write?,
++                tokens.output?,
++            )
++            .usd,
++    )
++}
++
++fn estimate_points(points: &[Point]) -> (Option<ResponseQuotaEstimateRange>, usize) {
++    let mut spans: BTreeMap<u8, Vec<ResponseQuotaEstimateRange>> = BTreeMap::new();
++    let mut intervals = 0;
++    for (index, start) in points.iter().enumerate() {
++        for end in &points[index + 1..] {
++            let span = end.used_percent - start.used_percent;
++            if span == 0 {
++                continue;
++            }
++            let cost = (end.cost - start.cost) * 100.0;
++            let percent = f64::from(span);
++            spans
++                .entry(span)
++                .or_default()
++                .push(ResponseQuotaEstimateRange {
++                    center: cost / percent,
++                    low: cost / (percent + PERCENT_UNCERTAINTY),
++                    high: cost / (percent - PERCENT_UNCERTAINTY),
++                });
++            intervals += 1;
++        }
++    }
++    if spans.is_empty() {
++        return (None, intervals);
++    }
++    // Overlapping samples are not independent: give each distinct percentage
++    // span one median so repeated receipts cannot manufacture precision.
++    let mut centers = Vec::new();
++    let mut lows = Vec::new();
++    let mut highs = Vec::new();
++    for samples in spans.values() {
++        centers.push(quantile(
++            samples.iter().map(|sample| sample.center).collect(),
++            0.5,
++        ));
++        lows.push(quantile(
++            samples.iter().map(|sample| sample.low).collect(),
++            0.5,
++        ));
++        highs.push(quantile(
++            samples.iter().map(|sample| sample.high).collect(),
++            0.5,
++        ));
++    }
++    let center = quantile(centers.clone(), 0.5);
++    let low = quantile(lows, 0.5).min(quantile(centers.clone(), 0.25));
++    let high = quantile(highs, 0.5).max(quantile(centers, 0.75));
++    let value = (center > 0.0 && high.is_finite()).then_some(ResponseQuotaEstimateRange {
++        center,
++        low,
++        high,
++    });
++    (value, intervals)
++}
++
++fn quantile(mut values: Vec<f64>, fraction: f64) -> f64 {
++    values.sort_by(f64::total_cmp);
++    let position = (values.len() - 1) as f64 * fraction;
++    let lower = position.floor() as usize;
++    let upper = position.ceil() as usize;
++    values[lower] + (values[upper] - values[lower]) * position.fract()
++}
++
++#[cfg(test)]
++#[path = "quota_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/response_metrics/quota_tests.rs b/codex-rs/core/src/response_metrics/quota_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_metrics/quota_tests.rs
+@@ -0,0 +1,259 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn scope() -> ResponseQuotaScope {
++    ResponseQuotaScope {
++        provider: "OpenAI".into(),
++        account_id: Some("account".into()),
++        limit_id: "codex".into(),
++    }
++}
++
++fn window(used: f64, reset: i64) -> RateLimitWindow {
++    RateLimitWindow {
++        used_percent: used,
++        window_minutes: Some(WEEK_MINUTES),
++        resets_at: Some(reset),
++    }
++}
++
++fn usage(output: u64) -> Receipt {
++    Receipt::Usage {
++        model: "model".into(),
++        tokens: ResponseTokenCounts {
++            input: Some(0),
++            cache_read: Some(0),
++            cache_write: Some(0),
++            output: Some(output),
++            reasoning: None,
++        },
++    }
++}
++
++fn prices() -> Prices {
++    serde_json::from_value(json!({"model": {"0": {
++        "input": 2, "cache_read": 1, "cache_write": 3, "output": 1
++    }}}))
++    .unwrap()
++}
++
++fn estimate(events: Vec<(u128, Receipt)>) -> ResponseQuotaEstimate {
++    let mut history = ReceiptWindow {
++        since: None,
++        events: events
++            .into_iter()
++            .map(|(sequence, receipt)| (Uuid::from_u128(sequence), receipt))
++            .collect(),
++    };
++    history.prune();
++    history.estimate(&scope(), Some(&prices())).unwrap()
++}
++
++#[test]
++fn longer_direct_spans_reduce_rounding_spread_without_exact_endpoints() {
++    for start in [0, 90] {
++        let short = [
++            Point {
++                used_percent: start,
++                cost: 0.0,
++            },
++            Point {
++                used_percent: start + 1,
++                cost: 1.0,
++            },
++        ];
++        let short = estimate_points(&short).0.unwrap();
++        let points: Vec<_> = (0..=10)
++            .map(|step| Point {
++                used_percent: start + step,
++                cost: f64::from(step),
++            })
++            .collect();
++        let (long, count) = estimate_points(&points);
++        let long = long.unwrap();
++        assert_eq!(long.center, 100.0);
++        assert_eq!(count, 55);
++        assert!(long.low < long.center && long.high > long.center);
++        assert!(long.high - long.low < short.high - short.low);
++    }
++}
++
++#[test]
++fn flat_steps_keep_both_endpoints_and_repeated_receipts_do_not_add_precision() {
++    let result = estimate(vec![
++        (1, Receipt::Quota(window(0.0, 100))),
++        (2, usage(600_000)),
++        (3, Receipt::Quota(window(0.0, 100))),
++        (4, usage(700_000)),
++        (5, Receipt::Quota(window(1.0, 100))),
++        (6, usage(900_000)),
++        (7, Receipt::Quota(window(2.0, 100))),
++    ]);
++    assert_eq!(result.observations, 4);
++    assert_eq!(result.intervals, 5);
++    let value = result.value.unwrap();
++    assert!(value.low < value.center && value.high > value.center);
++    assert!(value.low < 100.0 && value.high > 100.0);
++    let repeated = estimate(vec![
++        (1, Receipt::Quota(window(10.0, 100))),
++        (2, usage(1_000_000)),
++        (3, Receipt::Quota(window(20.0, 100))),
++        (4, Receipt::Quota(window(20.0, 100))),
++    ]);
++    assert_eq!(repeated.intervals, 1);
++    assert_eq!(repeated.value.unwrap().center, 10.0);
++}
++
++#[test]
++fn resets_and_remaining_increases_keep_only_the_latest_continuous_interval() {
++    for reset in [100, 200] {
++        let result = estimate(vec![
++            (1, Receipt::Quota(window(50.0, 100))),
++            (2, usage(100_000_000)),
++            (3, Receipt::Quota(window(60.0, 100))),
++            (4, Receipt::Quota(window(5.0, reset))),
++            (5, usage(2_000_000)),
++            (6, Receipt::Quota(window(15.0, reset))),
++        ]);
++        assert_eq!(result.observations, 2);
++        assert_eq!(result.intervals, 1);
++        assert_eq!(result.value.unwrap().center, 20.0);
++    }
++    let next_week = estimate(vec![
++        (1, Receipt::Quota(window(39.0, 10_000))),
++        (2, usage(1_000_000)),
++        (3, Receipt::Quota(window(40.0, 10_001))),
++        (4, Receipt::Quota(window(40.0, 10_000 + WEEK_MINUTES * 60))),
++    ]);
++    assert_eq!(next_week.observations, 1);
++    assert_eq!(next_week.remaining_percent, 60);
++    assert_eq!(next_week.value, None);
++}
++
++#[test]
++fn adjacent_reset_seconds_preserve_priced_one_percent_changes() {
++    let result = estimate(vec![
++        (1, Receipt::Quota(window(38.0, 10_000))),
++        (2, usage(500_000)),
++        (3, Receipt::Quota(window(38.0, 10_001))),
++        (4, usage(500_000)),
++        (5, Receipt::Quota(window(39.0, 10_000))),
++        (6, usage(1_000_000)),
++        (7, Receipt::Quota(window(39.0, 10_001))),
++    ]);
++    assert_eq!(result.observations, 4);
++    assert_eq!(result.remaining_percent, 61);
++    assert_eq!(result.intervals, 4);
++    assert_eq!(result.value.unwrap().center, 125.0);
++}
++
++#[test]
++fn inconsistent_consumption_is_descriptive_and_missing_consumption_is_not_invented() {
++    let points = [(10, 0.0), (11, 1.0), (20, 1.1), (25, 6.1), (30, 11.1)]
++        .map(|(used_percent, cost)| Point { used_percent, cost });
++    let (estimate, count) = estimate_points(&points);
++    assert_eq!(count, 10);
++    let estimate = estimate.unwrap();
++    assert!(estimate.low < estimate.center && estimate.high > estimate.center);
++    assert!(estimate.center < 100.0);
++    let empty = [
++        Point {
++            used_percent: 20,
++            cost: 0.0,
++        },
++        Point {
++            used_percent: 30,
++            cost: 0.0,
++        },
++    ];
++    assert_eq!(estimate_points(&empty).0, None);
++}
++
++#[test]
++fn flat_percentages_and_unpriced_usage_cannot_establish_a_value() {
++    let flat = estimate(vec![
++        (1, Receipt::Quota(window(100.0, 100))),
++        (2, usage(2_000_000)),
++        (3, Receipt::Quota(window(100.0, 100))),
++    ]);
++    assert_eq!(flat.remaining_percent, 0);
++    assert_eq!(flat.value, None);
++    let unknown = estimate(vec![
++        (1, Receipt::Quota(window(10.0, 100))),
++        (2, usage(1_000_000)),
++        (
++            3,
++            Receipt::Usage {
++                model: "unknown".into(),
++                tokens: ResponseTokenCounts::default(),
++            },
++        ),
++        (4, Receipt::Quota(window(20.0, 100))),
++    ]);
++    assert_eq!(unknown.remaining_percent, 80);
++    assert_eq!(unknown.value, None);
++    let tokens = ResponseTokenCounts {
++        input: Some(100),
++        cache_read: Some(20),
++        cache_write: Some(10),
++        output: Some(50),
++        reasoning: Some(40),
++    };
++    assert!((quote_usage(Some(&prices()), "model", &tokens).unwrap() - 0.00024).abs() < 1e-12);
++    assert_eq!(quote_usage(Some(&prices()), "absent", &tokens), None);
++    assert_eq!(
++        quote_usage(Some(&prices()), "model", &ResponseTokenCounts::default()),
++        None
++    );
++    let zero: Prices = serde_json::from_value(json!({"model": {"0": {
++        "input": 0, "cache_read": 0, "cache_write": 0, "output": 0
++    }}}))
++    .unwrap();
++    assert_eq!(quote_usage(Some(&zero), "model", &tokens), None);
++}
++
++fn accounting(
++    sequence: u128,
++    used: f64,
++    reset: i64,
++    account: &str,
++    limit: &str,
++) -> ResponseAccounting {
++    ResponseAccounting {
++        provider: "OpenAI".into(),
++        account_id: Some(account.into()),
++        model: "model".into(),
++        tokens: ResponseTokenCounts::default(),
++        usage_observed_sequence: None,
++        rate_limits: vec![codex_protocol::response_metrics::ResponseQuotaObservation {
++            sequence: Uuid::from_u128(sequence),
++            limit_id: limit.into(),
++            used_percent: Some(used),
++            resets_at: Some(reset),
++        }],
++    }
++}
++
++#[test]
++fn startup_merge_keeps_the_live_reset_cutoff_and_scopes_are_independent() {
++    let mut current = QuotaEstimator::default();
++    current.observe(&accounting(3, 70.0, 100, "account", "codex"));
++    current.observe(&accounting(4, 5.0, 200, "account", "codex"));
++    let expected = current.estimates(None);
++    let mut old = QuotaEstimator::default();
++    old.observe(&accounting(1, 50.0, 100, "account", "codex"));
++    old.observe(&accounting(2, 60.0, 100, "account", "codex"));
++    current.merge(old);
++    assert_eq!(current.estimates(None), expected);
++    // The same receipt arriving again must not create an additional observation.
++    current.observe(&accounting(4, 5.0, 200, "account", "codex"));
++    assert_eq!(current.estimates(None), expected);
++    current.observe(&accounting(5, 80.0, 100, "other", "codex"));
++    current.observe(&accounting(6, 90.0, 100, "account", "separate"));
++    let estimates = current.estimates(None);
++    assert_eq!(estimates.len(), 3);
++    assert_eq!(estimates[0], expected[0]);
++    assert_eq!(estimates[1].remaining_percent, 10);
++    assert_eq!(estimates[2].remaining_percent, 20);
++}
+diff --git a/codex-rs/core/src/response_metrics/recording.rs b/codex-rs/core/src/response_metrics/recording.rs
+--- a/codex-rs/core/src/response_metrics/recording.rs
++++ b/codex-rs/core/src/response_metrics/recording.rs
+@@ -2,6 +2,8 @@
+ 
+ #[path = "backup.rs"]
+ mod backup;
++#[path = "quota.rs"]
++mod quota;
+ 
+ use super::AttemptState;
+ use super::ResponseAttemptContext;
+@@ -9,11 +11,16 @@ use super::ResponseAttemptTracker;
+ use super::millis;
+ use backup::Backup;
+ use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_models_manager::model_pricing::Prices;
++use codex_models_manager::model_pricing::read_prices;
+ use codex_protocol::ThreadId;
+ use codex_protocol::response_metrics::RECENT_RESPONSE_LIMIT;
+ use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_protocol::response_metrics::ResponsePerformance;
++use codex_protocol::response_metrics::ResponseQuotaEstimate;
++use codex_state::ResponseAccounting;
+ use codex_state::ResponseHistoryPage;
++use quota::QuotaEstimator;
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+ use std::collections::HashMap;
+@@ -33,12 +40,14 @@ pub struct ResponseMetrics {
+     backup: OnceLock<Backup>,
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ struct ResponseHistory {
+     recent: BTreeMap<Uuid, PublishedAttempt>,
+     has_older: bool,
+     models: BTreeSet<String>,
+     last_generations: HashMap<ThreadId, ResponsePerformance>,
++    quota: QuotaEstimator,
++    prices: Result<Prices, String>,
+ }
+ 
+ #[derive(Debug)]
+@@ -59,9 +68,18 @@ impl PublishedAttempt {
+ 
+ impl ResponseMetrics {
+     pub fn new(codex_home: impl Into<PathBuf>) -> Self {
++        let codex_home = codex_home.into();
++        let prices = read_prices(&codex_home).map_err(|error| error.to_string());
+         Self {
+-            codex_home: codex_home.into(),
+-            history: Mutex::new(ResponseHistory::default()),
++            codex_home,
++            history: Mutex::new(ResponseHistory {
++                recent: BTreeMap::new(),
++                has_older: false,
++                models: BTreeSet::new(),
++                last_generations: HashMap::new(),
++                quota: QuotaEstimator::default(),
++                prices,
++            }),
+             updates: broadcast::channel(1024).0,
+             backup: OnceLock::new(),
+         }
+@@ -136,6 +154,15 @@ impl ResponseMetrics {
+             }
+         }
+         page.persistence_error = page.persistence_error.or_else(|| self.backup().error());
++        let home = self.codex_home.clone();
++        let prices = tokio::task::spawn_blocking(move || read_prices(&home))
++            .await
++            .map_err(|error| format!("pricing task failed: {error}"))
++            .and_then(|prices| prices.map_err(|error| error.to_string()));
++        let mut history = self.history.lock().expect("response history lock");
++        history.prices = prices;
++        page.quota = history.quota.estimates(history.prices.as_ref().ok());
++        page.pricing_error = history.prices.as_ref().err().cloned();
+         page
+     }
+ 
+@@ -206,6 +233,11 @@ impl ResponseMetrics {
+             .get_or_init(|| Backup::start(self.codex_home.clone(), Arc::downgrade(self)))
+     }
+ 
++    pub fn quota_estimates(&self) -> Vec<ResponseQuotaEstimate> {
++        let history = self.history.lock().expect("response history lock");
++        history.quota.estimates(history.prices.as_ref().ok())
++    }
++
+     /// Drain already-published snapshots without taking another live observation.
+     pub async fn flush(&self) -> Result<(), String> {
+         if let Some(backup) = self.backup.get() {
+@@ -214,15 +246,17 @@ impl ResponseMetrics {
+         Ok(())
+     }
+ 
+-    pub(super) fn restore(
++    fn restore(
+         &self,
+         page: ResponseHistoryPage,
+         models: Vec<String>,
+         last_generations: Vec<ResponsePerformance>,
++        quota: QuotaEstimator,
+     ) {
+         let mut history = self.history.lock().expect("response history lock");
+         history.has_older |= page.next_cursor.is_some();
+         history.models.extend(models);
++        history.quota.merge(quota);
+         for last in last_generations {
+             history.record_generation(last);
+         }
+@@ -256,8 +290,11 @@ impl ResponseMetrics {
+         let record = state.snapshot();
+         let mut history = self.history.lock().expect("response history lock");
+         history.models.insert(record.requested_model.clone());
+-        if record.end_reason.is_some() && record.request_kind == "generation" {
+-            history.record_generation(ResponsePerformance::from(&record));
++        if record.end_reason.is_some() {
++            history.quota.observe(&ResponseAccounting::from(&record));
++            if record.request_kind == "generation" {
++                history.record_generation(ResponsePerformance::from(&record));
++            }
+         }
+         history.recent.insert(
+             record.attempt_id,
+diff --git a/codex-rs/state/src/lib.rs b/codex-rs/state/src/lib.rs
+--- a/codex-rs/state/src/lib.rs
++++ b/codex-rs/state/src/lib.rs
+@@ -35,6 +35,7 @@ pub use model::QueuedUserSubmissionRecord;
+ pub use model::RolloutMigrationCursor;
+ pub use model::RolloutMigrationSkippedRollout;
+ pub use model::RolloutMigrationState;
++pub use response_history::ResponseAccounting;
+ pub use response_history::ResponseHistoryPage;
+ pub use response_history::ResponseHistoryStore;
+ /// Preferred entrypoint: owns configuration and metrics.
+diff --git a/codex-rs/state/src/response_history.rs b/codex-rs/state/src/response_history.rs
+--- a/codex-rs/state/src/response_history.rs
++++ b/codex-rs/state/src/response_history.rs
+@@ -30,6 +30,34 @@ pub struct ResponseHistoryPage {
+     pub next_cursor: Option<Uuid>,
+ }
+ 
++/// Compact accounting facts retained independently of browser pages and raw usage.
++#[derive(Debug)]
++pub struct ResponseAccounting {
++    pub provider: String,
++    pub account_id: Option<String>,
++    pub model: String,
++    pub tokens: ResponseTokenCounts,
++    pub usage_observed_sequence: Option<Uuid>,
++    pub rate_limits: Vec<ResponseQuotaObservation>,
++}
++
++impl From<&ResponseAttempt> for ResponseAccounting {
++    fn from(record: &ResponseAttempt) -> Self {
++        Self {
++            provider: record.provider.clone(),
++            account_id: record.account_id.clone(),
++            model: record
++                .served_model
++                .as_ref()
++                .unwrap_or(&record.requested_model)
++                .clone(),
++            tokens: record.tokens.clone(),
++            usage_observed_sequence: record.usage_observed_sequence,
++            rate_limits: record.rate_limits.clone(),
++        }
++    }
++}
++
+ impl ResponseHistoryStore {
+     pub async fn open(codex_home: &Path) -> anyhow::Result<Self> {
+         let sqlite = SqliteConfig::from_sqlite_home(AbsolutePathBuf::try_from(codex_home)?);
+@@ -194,6 +222,61 @@ impl ResponseHistoryStore {
+             })
+             .collect()
+     }
++
++    /// Stream complete accounting once at startup, independently of browser pages.
++    pub async fn restore_accounting(
++        &self,
++        mut consume: impl FnMut(ResponseAccounting),
++    ) -> anyhow::Result<()> {
++        let mut rows = sqlx::query(
++            "SELECT responses.id, provider, account_id, \
++                COALESCE(served_model, requested_model) AS model, \
++                input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, \
++                usage_sequence, quota.sequence AS quota_sequence, \
++                quota.limit_id, quota.used_percent, quota.resets_at \
++             FROM responses LEFT JOIN response_quota_observations AS quota \
++                ON quota.attempt_id = responses.id \
++             WHERE usage_sequence IS NOT NULL OR quota.sequence IS NOT NULL \
++             ORDER BY responses.id, quota.sequence",
++        )
++        .fetch(&self.pool);
++        let mut pending: Option<(Uuid, ResponseAccounting)> = None;
++        while let Some(row) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
++            let row = row?;
++            let id = Uuid::parse_str(row.try_get("id")?)?;
++            if pending.as_ref().is_none_or(|(previous, _)| *previous != id) {
++                if let Some((_, previous)) = pending.take() {
++                    consume(previous);
++                }
++                pending = Some((
++                    id,
++                    ResponseAccounting {
++                        provider: row.try_get("provider")?,
++                        account_id: row.try_get("account_id")?,
++                        model: row.try_get("model")?,
++                        tokens: read_tokens(&row)?,
++                        usage_observed_sequence: row
++                            .try_get::<Option<&str>, _>("usage_sequence")?
++                            .map(Uuid::parse_str)
++                            .transpose()?,
++                        rate_limits: Vec::new(),
++                    },
++                ));
++            }
++            if let Some(quota) = read_quota(&row)? {
++                pending
++                    .as_mut()
++                    .expect("accounting for quota")
++                    .1
++                    .rate_limits
++                    .push(quota);
++            }
++        }
++        if let Some((_, previous)) = pending {
++            consume(previous);
++        }
++        Ok(())
++    }
+ }
+ 
+ fn sql_count(value: Option<u64>) -> Result<Option<i64>, TryFromIntError> {
+@@ -358,6 +441,18 @@ mod tests {
+                 .fetch_one(&store.pool)
+                 .await?;
+         assert_eq!(stored, (Some("resp-official".into()), Some(0), None));
++        let mut accounting = Vec::new();
++        reopened
++            .restore_accounting(|row| accounting.push(row))
++            .await?;
++        assert_eq!(accounting.len(), 1);
++        assert_eq!(accounting[0].model, "served");
++        assert_eq!(accounting[0].tokens, record.tokens);
++        assert_eq!(
++            accounting[0].usage_observed_sequence,
++            record.usage_observed_sequence
++        );
++        assert_eq!(accounting[0].rate_limits, record.rate_limits);
+         Ok(())
+     }
+ 

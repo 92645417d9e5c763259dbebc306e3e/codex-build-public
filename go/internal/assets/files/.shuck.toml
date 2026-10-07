@@ -1,0 +1,10 @@
+[lint.rule-options.s078]
+allowed-shells = ["zsh"]
+
+[lint.rule-options.s080]
+max-lines = 1300
+count = "physical"
+
+[lint.rule-options.s085]
+non-trivial-line-threshold = 1300
+non-trivial-function-count = 128

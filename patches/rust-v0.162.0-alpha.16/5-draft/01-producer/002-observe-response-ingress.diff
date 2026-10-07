@@ -1,0 +1,656 @@
+observe-response-ingress
+
+Lane: draft
+
+Unit: producer
+
+ChildPatch: observe-response-ingress
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -2438,7 +2438,8 @@ fn websocket_error_detail(err: &ApiError) -> String {
+             format!("handshake API error: {status} {message}")
+         }
+         ApiError::Stream(message) => format!("handshake stream error: {message}"),
+-        ApiError::ContentFilter
++        ApiError::ResponseProgressTimeout
++        | ApiError::ContentFilter
+         | ApiError::ContextWindowExceeded
+         | ApiError::QuotaExceeded
+         | ApiError::UsageNotIncluded
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -28,6 +28,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
+         ApiError::Transport(_)
+         | ApiError::Api { .. }
+         | ApiError::Stream(_)
++        | ApiError::ResponseProgressTimeout
+         | ApiError::ContentFilter
+         | ApiError::ContextWindowExceeded
+         | ApiError::QuotaExceeded
+@@ -57,6 +58,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
+             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
+         }
+         ApiError::Stream(msg) => CodexErr::Stream(msg),
++        ApiError::ResponseProgressTimeout => CodexErrorDetails::ResponseProgressTimeout.into(),
+         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
+         ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+         ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
+diff --git a/codex-rs/codex-api/src/error.rs b/codex-rs/codex-api/src/error.rs
+--- a/codex-rs/codex-api/src/error.rs
++++ b/codex-rs/codex-api/src/error.rs
+@@ -14,6 +14,8 @@ pub enum ApiError {
+     Api { status: StatusCode, message: String },
+     #[error("stream error: {0}")]
+     Stream(String),
++    #[error("response made no content progress for 300 seconds")]
++    ResponseProgressTimeout,
+     #[error("stream error: Incomplete response returned, reason: content_filter")]
+     ContentFilter,
+     #[error("context window exceeded")]
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -8,6 +8,8 @@ pub(crate) mod images;
+ pub(crate) mod provider;
+ pub(crate) mod rate_limits;
+ pub(crate) mod requests;
++mod response_observation;
++mod response_progress;
+ mod responses_headers;
+ pub(crate) mod safety_buffering;
+ pub(crate) mod search;
+@@ -88,6 +90,8 @@ pub use crate::provider::Provider;
+ pub use crate::provider::RetryConfig;
+ pub use crate::provider::is_azure_responses_provider;
+ pub use crate::requests::Compression;
++pub use crate::response_observation::ResponseObservation;
++pub use crate::response_observation::ResponseObserver;
+ pub use crate::search::AllowedCaller;
+ pub use crate::search::ApproximateLocation;
+ pub use crate::search::ClickOperation;
+diff --git a/codex-rs/codex-api/src/response_observation.rs b/codex-rs/codex-api/src/response_observation.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_observation.rs
+@@ -0,0 +1,160 @@
++//! Request-scoped observations taken at wire receipt, before output publication.
++
++use crate::rate_limits::parse_rate_limit_event;
++use crate::sse::ResponsesStreamEvent;
++use codex_protocol::protocol::RateLimitSnapshot;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use serde_json::Value;
++use tokio::time::Instant;
++
++/// Records facts synchronously without waiting on storage or UI consumers.
++/// Implementations do not control buffering or content-progress deadlines.
++pub trait ResponseObserver: Send + Sync {
++    /// Counts serialized model-protocol UTF-8 bytes without retaining the request.
++    fn prepared(&self, payload_bytes: u64);
++    /// Marks the socket pump's actual request-send origin.
++    fn sent(&self, at: Instant);
++    /// The served model may precede `sent` without timing or byte observations.
++    fn received(&self, observation: ResponseObservation, at: Instant);
++    /// Ends the attempt without replacing an already observed protocol ending.
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant);
++}
++
++#[derive(Debug, Default)]
++pub struct ResponseObservation {
++    pub payload_bytes: u64,
++    pub has_content: bool,
++    pub response_id: Option<String>,
++    pub served_model: Option<String>,
++    pub usage: Option<Value>,
++    pub rate_limits: Option<RateLimitSnapshot>,
++    pub terminal: Option<ResponseAttemptEnd>,
++}
++
++impl ResponseObservation {
++    pub(crate) fn from_event(event: &ResponsesStreamEvent, payload: &str) -> Self {
++        let response = event.response.as_ref();
++        let text_field = |field: &str| {
++            response
++                .and_then(|response| response.get(field))
++                .and_then(Value::as_str)
++                .map(str::to_owned)
++        };
++        let terminal = match event.kind() {
++            "response.completed" => Some(ResponseAttemptEnd::Completed),
++            "response.failed" => Some(ResponseAttemptEnd::Failed),
++            "response.incomplete" => Some(
++                if response
++                    .and_then(|response| response.pointer("/incomplete_details/reason"))
++                    .and_then(Value::as_str)
++                    == Some("interrupted")
++                {
++                    ResponseAttemptEnd::Interrupted
++                } else {
++                    ResponseAttemptEnd::Incomplete
++                },
++            ),
++            _ => None,
++        };
++        Self {
++            payload_bytes: payload.len() as u64,
++            has_content: has_content(event),
++            response_id: text_field("id").or_else(|| {
++                event
++                    .response_id
++                    .as_ref()
++                    .and_then(Value::as_str)
++                    .map(str::to_owned)
++            }),
++            served_model: event.response_model().or_else(|| text_field("model")),
++            usage: response
++                .and_then(|response| response.get("usage"))
++                .filter(|value| value.is_object())
++                .cloned(),
++            rate_limits: (event.kind() == "codex.rate_limits")
++                .then(|| parse_rate_limit_event(payload))
++                .flatten(),
++            terminal,
++        }
++    }
++}
++
++/// Detects actual model fields without retaining or counting their contents.
++fn has_content(event: &ResponsesStreamEvent) -> bool {
++    match event.kind() {
++        "response.completed" | "response.incomplete" | "response.failed" => event
++            .response
++            .as_ref()
++            .and_then(|response| response.get("output"))
++            .and_then(Value::as_array)
++            .is_some_and(|items| items.iter().any(item_has_content)),
++        "response.output_item.added" | "response.output_item.done" => {
++            event.item.as_ref().is_some_and(item_has_content)
++        }
++        "response.output_text.delta"
++        | "response.refusal.delta"
++        | "response.reasoning_text.delta"
++        | "response.reasoning_summary_text.delta"
++        | "response.function_call_arguments.delta"
++        | "response.custom_tool_call_input.delta" => {
++            event.delta.as_ref().is_some_and(|text| !text.is_empty())
++        }
++        "response.output_text.done"
++        | "response.reasoning_text.done"
++        | "response.reasoning_summary_text.done" => {
++            event.text.as_ref().is_some_and(|text| !text.is_empty())
++        }
++        "response.refusal.done" => nonempty(event.refusal.as_ref()),
++        "response.function_call_arguments.done" => nonempty(event.arguments.as_ref()),
++        "response.custom_tool_call_input.done" => nonempty(event.input.as_ref()),
++        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
++            nonempty(event.part.as_ref().and_then(|part| part.get("text")))
++        }
++        "response.content_part.added" | "response.content_part.done" => {
++            event.part.as_ref().is_some_and(part_has_content)
++        }
++        _ => false,
++    }
++}
++
++fn nonempty(value: Option<&Value>) -> bool {
++    value
++        .and_then(Value::as_str)
++        .is_some_and(|text| !text.is_empty())
++}
++
++fn part_has_content(part: &Value) -> bool {
++    matches!(
++        part.get("type").and_then(Value::as_str),
++        Some("output_text" | "refusal" | "summary_text" | "reasoning_text" | "text")
++    ) && (nonempty(part.get("text")) || nonempty(part.get("refusal")))
++}
++
++fn item_has_content(item: &Value) -> bool {
++    let kind = item.get("type").and_then(Value::as_str);
++    let content = match kind {
++        Some("message" | "reasoning") => ["content", "summary"].iter().any(|field| {
++            item.get(field)
++                .and_then(Value::as_array)
++                .is_some_and(|parts| parts.iter().any(part_has_content))
++        }),
++        Some("function_call") => {
++            nonempty(item.get("arguments"))
++                || item
++                    .get("encrypted_function_args")
++                    .and_then(Value::as_array)
++                    .is_some_and(|args| args.iter().any(|value| nonempty(Some(value))))
++        }
++        Some("custom_tool_call") => nonempty(item.get("input")),
++        _ => false,
++    };
++    content
++        || (matches!(
++            kind,
++            Some("reasoning" | "compaction" | "compaction_summary" | "context_compaction")
++        ) && nonempty(item.get("encrypted_content")))
++}
++
++#[cfg(test)]
++#[path = "response_observation_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/response_observation_tests.rs b/codex-rs/codex-api/src/response_observation_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_observation_tests.rs
+@@ -0,0 +1,76 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn observe(payload: Value) -> ResponseObservation {
++    let payload = payload.to_string();
++    ResponseObservation::from_event(&serde_json::from_str(&payload).unwrap(), &payload)
++}
++
++#[test]
++fn failed_response_retains_usage_without_treating_error_text_as_content() {
++    let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80},
++        "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 5}});
++    let observation = observe(json!({"type": "response.failed", "response": {
++        "id": "r1", "status": "failed", "model": "served-model", "usage": usage,
++        "error": {"code": "failure", "message": "not model output"}
++    }}));
++    assert_eq!(observation.terminal, Some(ResponseAttemptEnd::Failed));
++    assert!(!observation.has_content);
++    assert_eq!(observation.usage, Some(usage));
++    assert_eq!(observation.served_model.as_deref(), Some("served-model"));
++}
++
++#[test]
++fn quota_ingress_preserves_window_precision_without_model_content() {
++    let observation = observe(
++        json!({"type": "codex.rate_limits", "metered_limit_name": "codex",
++        "rate_limits": {"secondary": {"used_percent": 12.5,
++            "window_minutes": 10080, "reset_at": 1704074400}}}),
++    );
++    assert!(!observation.has_content);
++    assert_eq!(observation.terminal, None);
++    let quota = observation.rate_limits.unwrap();
++    assert_eq!(quota.limit_id.as_deref(), Some("codex"));
++    let weekly = quota.secondary.unwrap();
++    assert_eq!(weekly.used_percent, 12.5);
++    assert_eq!(weekly.window_minutes, Some(10080));
++    assert_eq!(weekly.resets_at, Some(1704074400));
++}
++
++#[test]
++fn model_progress_recognizes_native_content_without_counting_control_fields() {
++    for item in [
++        json!({"type": "message", "content": [{"type": "output_text", "text": "answer"}]}),
++        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "reason"}]}),
++        json!({"type": "reasoning", "encrypted_content": "opaque"}),
++        json!({"type": "function_call", "arguments": "{}"}),
++        json!({"type": "function_call", "encrypted_function_args": ["opaque"]}),
++        json!({"type": "custom_tool_call", "input": "command"}),
++        json!({"type": "compaction", "encrypted_content": "opaque"}),
++    ] {
++        assert!(observe(json!({"type": "response.output_item.done", "item": item})).has_content);
++        assert!(
++            observe(json!({"type": "response.completed", "response": {"output": [item]}}))
++                .has_content
++        );
++    }
++    for payload in [
++        json!({"type": "response.created", "response": {"id": "r1"}}),
++        json!({"type": "codex.response.metadata", "headers": {"openai-model": "model"}}),
++        json!({"type": "response.output_item.added", "item": {"type": "function_call", "name": "tool", "arguments": ""}}),
++        json!({"type": "response.output_text.delta", "delta": ""}),
++        json!({"type": "error", "error": {"message": "failure"}}),
++    ] {
++        assert!(!observe(payload).has_content);
++    }
++    for payload in [
++        json!({"type": "response.output_text.delta", "delta": "a"}),
++        json!({"type": "response.reasoning_summary_text.delta", "delta": "b"}),
++        json!({"type": "response.function_call_arguments.delta", "delta": "{"}),
++        json!({"type": "response.custom_tool_call_input.done", "input": "command"}),
++        json!({"type": "response.content_part.done", "part": {"type": "refusal", "refusal": "declined"}}),
++    ] {
++        assert!(observe(payload).has_content);
++    }
++}
+diff --git a/codex-rs/codex-api/src/response_progress.rs b/codex-rs/codex-api/src/response_progress.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_progress.rs
+@@ -0,0 +1,95 @@
++//! The socket pump owns the unfinished response's content deadline.
++
++use crate::ApiError;
++use crate::response_observation::ResponseObservation;
++use crate::response_observation::ResponseObserver;
++use crate::sse::ResponsesStreamEvent;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::time::Instant;
++
++const CONTENT_TIMEOUT: Duration = Duration::from_secs(300);
++
++pub(crate) struct ResponseProgress {
++    pub(crate) deadline: Instant,
++    response_id: Option<String>,
++    observer: Option<Arc<dyn ResponseObserver>>,
++}
++
++impl ResponseProgress {
++    pub(crate) fn sent(at: Instant, observer: Option<Arc<dyn ResponseObserver>>) -> Self {
++        if let Some(observer) = &observer {
++            observer.sent(at);
++        }
++        Self {
++            deadline: at + CONTENT_TIMEOUT,
++            response_id: None,
++            observer,
++        }
++    }
++
++    /// A terminal receipt stops the watchdog before downstream publication.
++    pub(crate) fn receive(&mut self, payload: &str, at: Instant) -> Result<bool, ApiError> {
++        if at > self.deadline {
++            self.end(ResponseAttemptEnd::ProgressTimeout, at);
++            return Err(ApiError::ResponseProgressTimeout);
++        }
++        let event = match serde_json::from_str::<ResponsesStreamEvent>(payload) {
++            Ok(event) => event,
++            Err(_) => {
++                if let Some(observer) = &self.observer {
++                    observer.received(
++                        ResponseObservation {
++                            payload_bytes: payload.len() as u64,
++                            ..Default::default()
++                        },
++                        at,
++                    );
++                }
++                return Ok(false);
++            }
++        };
++        let observation = ResponseObservation::from_event(&event, payload);
++        if let Some(id) = &observation.response_id {
++            if self
++                .response_id
++                .as_ref()
++                .is_some_and(|current| current != id)
++            {
++                self.end(ResponseAttemptEnd::ProtocolError, at);
++                return Err(ApiError::Stream(
++                    "response ID differs from the active response".into(),
++                ));
++            }
++            self.response_id.clone_from(&observation.response_id);
++        }
++        if observation.has_content {
++            self.deadline = at + CONTENT_TIMEOUT;
++        }
++        let terminal = observation.terminal.is_some();
++        if let Some(observer) = &self.observer {
++            observer.received(observation, at);
++        }
++        if terminal {
++            self.observer = None;
++        }
++        Ok(terminal)
++    }
++
++    pub(crate) fn end(&mut self, reason: ResponseAttemptEnd, at: Instant) {
++        if let Some(observer) = self.observer.take() {
++            observer.ended(reason, at);
++        }
++    }
++}
++
++impl Drop for ResponseProgress {
++    fn drop(&mut self) {
++        self.end(ResponseAttemptEnd::Canceled, Instant::now());
++    }
++}
++
++#[cfg(test)]
++#[path = "response_progress_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/response_progress_tests.rs b/codex-rs/codex-api/src/response_progress_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_progress_tests.rs
+@@ -0,0 +1,146 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::sync::Mutex;
++
++#[derive(Default)]
++struct Observations(Mutex<Vec<ResponseObservation>>);
++
++impl ResponseObserver for Observations {
++    fn prepared(&self, _: u64) {}
++    fn sent(&self, _: Instant) {}
++    fn received(&self, observation: ResponseObservation, _: Instant) {
++        self.0.lock().unwrap().push(observation);
++    }
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant) {
++        self.received(
++            ResponseObservation {
++                terminal: Some(reason),
++                ..Default::default()
++            },
++            at,
++        );
++    }
++}
++
++#[test]
++fn transport_close_ends_observation_once() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()));
++    progress
++        .receive(
++            r#"{"type":"response.output_text.delta","delta":"partial answer"}"#,
++            now,
++        )
++        .unwrap();
++    progress.end(ResponseAttemptEnd::TransportClosed, now);
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(records.len(), 2);
++    assert!(records[0].has_content);
++    assert_eq!(
++        records[1].terminal,
++        Some(ResponseAttemptEnd::TransportClosed)
++    );
++}
++
++#[test]
++fn controls_do_not_extend_the_content_deadline_without_an_observer() {
++    let now = Instant::now();
++    let mut progress = ResponseProgress::sent(now, None);
++    for payload in [
++        r#"{"type":"response.created","response":{"id":"r1"}}"#,
++        r#"{"type":"codex.response.metadata"}"#,
++        r#"{"type":"response.output_text.delta","delta":""}"#,
++    ] {
++        assert!(
++            !progress
++                .receive(payload, now + Duration::from_secs(299))
++                .unwrap()
++        );
++        assert_eq!(progress.deadline, now + CONTENT_TIMEOUT);
++    }
++    assert!(matches!(
++        progress.receive(
++            r#"{"type":"response.completed","response":{"id":"r1"}}"#,
++            now + Duration::from_secs(301),
++        ),
++        Err(ApiError::ResponseProgressTimeout)
++    ));
++}
++
++#[test]
++fn content_extends_progress_until_a_matching_terminal() {
++    let now = Instant::now();
++    let mut progress = ResponseProgress::sent(now, None);
++    assert!(
++        !progress
++            .receive(r#"{"type":"response.created","response":{"id":"r1"}}"#, now)
++            .unwrap()
++    );
++    assert!(!progress.receive(
++        r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque"}}"#,
++        now + Duration::from_secs(299),
++    ).unwrap());
++    assert_eq!(progress.deadline, now + Duration::from_secs(599));
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.completed","response":{"id":"r1"}}"#,
++                now + Duration::from_secs(598)
++            )
++            .unwrap()
++    );
++}
++
++#[test]
++fn a_foreign_terminal_cannot_end_the_active_response() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()));
++    progress
++        .receive(r#"{"type":"response.created","response":{"id":"r1"}}"#, now)
++        .unwrap();
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.completed","response":{"id":"r2"}}"#,
++                now
++            )
++            .is_err()
++    );
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(
++        records.last().unwrap().terminal,
++        Some(ResponseAttemptEnd::ProtocolError)
++    );
++    assert!(
++        !records
++            .iter()
++            .any(|row| row.terminal == Some(ResponseAttemptEnd::Completed))
++    );
++}
++
++#[test]
++fn terminal_usage_is_observed_before_cancellation_can_overwrite_it() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()));
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.failed","response":{"id":"r1","usage":{"output_tokens":0}}}"#,
++                now
++            )
++            .unwrap()
++    );
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(records.len(), 1);
++    assert_eq!(records[0].terminal, Some(ResponseAttemptEnd::Failed));
++    assert_eq!(
++        records[0].usage,
++        Some(serde_json::json!({"output_tokens": 0}))
++    );
++}
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -161,13 +161,18 @@ pub struct ResponsesStreamEvent {
+     pub(crate) kind: String,
+     pub(crate) headers: Option<Value>,
+     metadata: Option<Value>,
+-    response: Option<Value>,
+-    error: Option<Value>,
+-    item: Option<Value>,
++    pub(crate) response: Option<Value>,
++    pub(crate) response_id: Option<Value>,
++    pub(crate) error: Option<Value>,
++    pub(crate) item: Option<Value>,
+     item_id: Option<String>,
+     call_id: Option<String>,
+-    delta: Option<String>,
+-    text: Option<String>,
++    pub(crate) delta: Option<String>,
++    pub(crate) text: Option<String>,
++    pub(crate) part: Option<Value>,
++    pub(crate) arguments: Option<Value>,
++    pub(crate) input: Option<Value>,
++    pub(crate) refusal: Option<Value>,
+     summary_index: Option<i64>,
+     content_index: Option<i64>,
+     #[serde(default, deserialize_with = "deserialize_present_value")]
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
+@@ -47,6 +47,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
+             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
+             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
+             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
++            ApiError::ResponseProgressTimeout => "response_progress_timeout",
+             ApiError::ContextWindowExceeded => "context_window_exceeded",
+             ApiError::QuotaExceeded => "quota_exceeded",
+             ApiError::UsageNotIncluded => "usage_not_included",
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+@@ -130,6 +130,7 @@ impl SamplingExecution {
+                 ApiError::Retryable { .. }
+                 | ApiError::RateLimitExceeded { .. }
+                 | ApiError::Stream(_)
++                | ApiError::ResponseProgressTimeout
+                 | ApiError::ContentFilter
+                 | ApiError::ServerOverloaded { .. }
+                 | ApiError::FlexUnavailable,
+diff --git a/codex-rs/protocol/src/error.rs b/codex-rs/protocol/src/error.rs
+--- a/codex-rs/protocol/src/error.rs
++++ b/codex-rs/protocol/src/error.rs
+@@ -94,6 +94,9 @@ pub enum CodexErrorDetails {
+     /// The Session loop treats this as a transient error and will automatically retry the turn.
+     #[error("stream disconnected before completion: {0}")]
+     Stream(String),
++    /// A connected generation stopped delivering content; use the bounded response retry budget.
++    #[error("response made no content progress for 300 seconds")]
++    ResponseProgressTimeout,
+     /// A response stopped by the content filter. Sampling retries need developer guidance.
+     #[error(
+         "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+@@ -417,6 +420,7 @@ impl CodexErr {
+                 self.server_retry_delay()
+             }
+             CodexErrorDetails::Stream(..)
++            | CodexErrorDetails::ResponseProgressTimeout
+             | CodexErrorDetails::ContentFilter
+             | CodexErrorDetails::RateLimitExceeded(_)
+             | CodexErrorDetails::Timeout
+diff --git a/codex-rs/response-debug-context/src/lib.rs b/codex-rs/response-debug-context/src/lib.rs
+--- a/codex-rs/response-debug-context/src/lib.rs
++++ b/codex-rs/response-debug-context/src/lib.rs
+@@ -75,6 +75,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
+         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
+         ApiError::Stream(err) => err.to_string(),
++        ApiError::ResponseProgressTimeout => "response progress timeout".to_string(),
+         ApiError::ContentFilter => {
+             "Incomplete response returned, reason: content_filter".to_string()
+         }

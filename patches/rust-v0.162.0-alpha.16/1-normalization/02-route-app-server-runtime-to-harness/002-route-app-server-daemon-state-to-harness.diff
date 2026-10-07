@@ -1,0 +1,775 @@
+route-app-server-daemon-state-to-harness
+
+Lane: normalization
+
+Unit: route-app-server-runtime-to-harness
+
+ChildPatch: route-app-server-daemon-state-to-harness
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -188,13 +188,15 @@ impl PidBackend {
+                 }
+                 match self.command_kind {
+                     PidCommandKind::AppServer { .. } => {
+-                        let codex_home = self
++                        let codex_harness = self
+                             .pid_file
+                             .parent()
+                             .and_then(Path::parent)
+-                            .context("daemon pid path has no Codex home")?;
++                            .context("daemon pid path has no Codex harness")?;
+                         let socket_path =
+-                            codex_app_server_transport::app_server_control_socket_path(codex_home)?;
++                            codex_app_server_transport::app_server_control_socket_path(
++                                codex_harness,
++                            )?;
+                         if let Err(err) =
+                             crate::client::request_shutdown(socket_path.as_path(), pid).await
+                         {
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_start.rs b/codex-rs/app-server-daemon/src/backend/pid_start.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid_start.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_start.rs
+@@ -132,12 +132,13 @@ impl PidBackend {
+         {
+             command.arg("--managed-daemon");
+         } else if managed_app_server {
+-            let codex_home = self
++            let codex_harness = self
+                 .pid_file
+                 .parent()
+                 .and_then(std::path::Path::parent)
+-                .context("daemon pid path has no Codex home")?;
+-            let recovery_file = codex_app_server_transport::daemon_recovery_file_path(codex_home);
++                .context("daemon pid path has no Codex harness")?;
++            let recovery_file =
++                codex_app_server_transport::daemon_recovery_file_path(codex_harness);
+             match fs::remove_file(&recovery_file).await {
+                 Ok(()) => {}
+                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid_tests.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+@@ -159,10 +159,11 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
+ #[tokio::test]
+ async fn legacy_launch_clears_recovery_best_effort() {
+     for snapshot_is_directory in [false, true] {
+-        let home = TempDir::new().expect("temp dir");
+-        let state_dir = home.path().join("app-server-daemon");
++        let home = TempDir::new().expect("home");
++        let harness = TempDir::new().expect("harness");
++        let state_dir = harness.path().join("app-server-daemon");
+         std::fs::create_dir_all(&state_dir).expect("state dir");
+-        let recovery_file = codex_app_server_transport::daemon_recovery_file_path(home.path());
++        let recovery_file = codex_app_server_transport::daemon_recovery_file_path(harness.path());
+         if snapshot_is_directory {
+             std::fs::create_dir(&recovery_file).expect("invalid snapshot directory");
+         } else {
+diff --git a/codex-rs/app-server-daemon/src/launch.rs b/codex-rs/app-server-daemon/src/launch.rs
+--- a/codex-rs/app-server-daemon/src/launch.rs
++++ b/codex-rs/app-server-daemon/src/launch.rs
+@@ -19,7 +19,7 @@ pub async fn start_with_features(features: &BTreeMap<String, bool>) -> Result<Li
+     let mut daemon = Daemon::from_environment()?;
+     daemon.log_diagnostics = true;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+-    let selected = daemon.current_installation()?;
++    let selected = daemon.current_installation();
+     let mut overrides = selected.load_settings().await?.feature_overrides;
+     overrides.extend(features.clone());
+     Box::pin(selected.start(&overrides)).await
+@@ -34,7 +34,7 @@ pub async fn restart_with_features(features: &BTreeMap<String, bool>) -> Result<
+     crate::backend::windows::ensure_not_elevated()?;
+     let daemon = Daemon::from_environment()?;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+-    let selected = daemon.current_installation()?;
++    let selected = daemon.current_installation();
+     Box::pin(selected.restart_with_features_locked(features)).await
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -37,6 +37,7 @@ use backend::BackendPaths;
+ use codex_app_server_protocol::RemoteControlConnectionStatus;
+ use codex_app_server_protocol::RemoteControlPairingStartResponse;
+ use codex_app_server_transport::app_server_control_socket_path;
++use codex_utils_home_dir::find_codex_harness;
+ use codex_utils_home_dir::find_codex_home;
+ use managed_install::managed_codex_bin;
+ #[cfg(any(unix, windows))]
+@@ -310,6 +311,7 @@ fn ensure_supported_platform() -> Result<()> {
+ 
+ #[derive(Clone)]
+ struct Daemon {
++    codex_home: PathBuf,
+     // Feature-aware TUI startup owns a live terminal. Direct lifecycle commands
+     // must still report their diagnostics to stderr.
+     log_diagnostics: bool,
+@@ -324,19 +326,25 @@ struct Daemon {
+ impl Daemon {
+     fn from_environment() -> Result<Self> {
+         let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+-        let socket_path = app_server_control_socket_path(codex_home.as_path())?
++        let codex_harness = find_codex_harness().context("failed to resolve CODEX_HARNESS")?;
++        Self::from_roots(codex_home.as_path(), codex_harness.as_path())
++    }
++
++    fn from_roots(codex_home: &Path, codex_harness: &Path) -> Result<Self> {
++        let socket_path = app_server_control_socket_path(codex_harness)?
+             .as_path()
+             .to_path_buf();
+-        let state_dir = codex_home.as_path().join(STATE_DIR_NAME);
+-        let managed_codex_bin = managed_codex_bin(codex_home.as_path());
++        let state_dir = codex_harness.join(STATE_DIR_NAME);
++        let managed_codex_bin = managed_codex_bin(codex_home);
+         // Old CLIs must not mistake a daemon-owned installation for their backend.
+         let (pid_file, update_pid_file) =
+-            if managed_codex_bin.starts_with(codex_home.as_path().join("packages/standalone")) {
++            if managed_codex_bin.starts_with(codex_home.join("packages/standalone")) {
+                 (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
+             } else {
+                 (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
+             };
+         Ok(Self {
++            codex_home: codex_home.to_path_buf(),
+             log_diagnostics: false,
+             socket_path,
+             pid_file: state_dir.join(pid_file),
+@@ -360,30 +368,26 @@ impl Daemon {
+             self.settings_file
+                 .parent()
+                 .and_then(Path::parent)
+-                .context("daemon settings path has no Codex home")?,
++                .context("daemon settings path has no Codex harness")?,
+         ))
+     }
+ 
+     // Call only after taking the operation lock: an explicit update may have
+     // migrated the package and PID namespace while this command was waiting.
+-    fn current_installation(&self) -> Result<Self> {
+-        let managed_codex_bin = self.current_managed_codex_bin()?;
+-        let home = self
+-            .settings_file
+-            .parent()
+-            .and_then(Path::parent)
+-            .context("daemon settings path has no Codex home")?;
+-        let (pid, updater) = if managed_codex_bin.starts_with(home.join("packages/standalone")) {
+-            (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
+-        } else {
+-            (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
+-        };
+-        Ok(Self {
++    fn current_installation(&self) -> Self {
++        let managed_codex_bin = self.current_managed_codex_bin();
++        let (pid, updater) =
++            if managed_codex_bin.starts_with(self.codex_home.join("packages/standalone")) {
++                (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
++            } else {
++                (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
++            };
++        Self {
+             managed_codex_bin,
+             pid_file: self.pid_file.with_file_name(pid),
+             update_pid_file: self.update_pid_file.with_file_name(updater),
+             ..self.clone()
+-        })
++        }
+     }
+ 
+     async fn run(&self, command: LifecycleCommand) -> Result<LifecycleOutput> {
+@@ -391,7 +395,7 @@ impl Daemon {
+             return self.version().await;
+         }
+         let _operation_lock = self.acquire_operation_lock().await?;
+-        let selected = self.current_installation()?;
++        let selected = self.current_installation();
+         match command {
+             LifecycleCommand::Start => selected.start(&BTreeMap::new()).await,
+             LifecycleCommand::Restart => selected.restart().await,
+@@ -432,7 +436,7 @@ impl Daemon {
+                 ));
+             }
+             prepare_install::prepare(self, &settings).await?;
+-            managed.managed_codex_bin = self.current_managed_codex_bin()?;
++            managed.managed_codex_bin = self.current_managed_codex_bin();
+             managed.ensure_managed_codex_bin()?;
+             // Only a fresh launch may replace these settings. Keep them for restarts
+             // and updates, without changing the user's config or a running daemon.
+@@ -470,7 +474,7 @@ impl Daemon {
+         }
+         prepare_install::prepare(self, &settings).await?;
+         let mut managed = self.clone();
+-        managed.managed_codex_bin = self.current_managed_codex_bin()?;
++        managed.managed_codex_bin = self.current_managed_codex_bin();
+         if !settings.auto_update_enabled {
+             backend::pid_update_loop_backend(self.backend_paths(&settings))
+                 .stop()
+@@ -530,8 +534,8 @@ impl Daemon {
+             // The installer can retarget `current` while the updater waits for
+             // this lock or probes the running server. Never restart from a
+             // release that is no longer the selected latest-channel binary.
+-            if !self.is_stable_standalone_release()?
+-                || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin()?)
++            if !self.is_stable_standalone_release()
++                || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin())
+                     .await
+                     .ok()
+                     .as_deref()
+@@ -600,8 +604,8 @@ impl Daemon {
+             RestartIfRunningOutcome::NotRunning
+         };
+ 
+-        if !self.is_stable_standalone_release()?
+-            || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin()?)
++        if !self.is_stable_standalone_release()
++            || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin())
+                 .await
+                 .ok()
+                 .as_deref()
+@@ -697,12 +701,12 @@ impl Daemon {
+ 
+     async fn bootstrap(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
+         let _operation_lock = self.acquire_operation_lock().await?;
+-        self.current_installation()?.bootstrap_locked(options).await
++        self.current_installation().bootstrap_locked(options).await
+     }
+ 
+     async fn ensure_remote_control_started(&self) -> Result<RemoteControlStartOutput> {
+         let _operation_lock = self.acquire_operation_lock().await?;
+-        let selected = self.current_installation()?;
++        let selected = self.current_installation();
+         let settings = selected.load_settings().await?;
+         if selected.is_bootstrapped(&settings).await? {
+             let _ = selected
+@@ -732,7 +736,7 @@ impl Daemon {
+ 
+     async fn set_remote_control(&self, mode: RemoteControlMode) -> Result<RemoteControlOutput> {
+         let _operation_lock = self.acquire_operation_lock().await?;
+-        self.current_installation()?
++        self.current_installation()
+             .set_remote_control_locked(mode)
+             .await
+     }
+@@ -823,7 +827,7 @@ impl Daemon {
+         }
+         prepare_install::prepare(self, &settings).await?;
+         let mut managed = self.clone();
+-        managed.managed_codex_bin = self.current_managed_codex_bin()?;
++        managed.managed_codex_bin = self.current_managed_codex_bin();
+         managed.ensure_managed_codex_bin()?;
+         settings.save(&self.settings_file).await?;
+ 
+@@ -896,7 +900,7 @@ impl Daemon {
+             updater.stop().await?;
+             return Ok(false);
+         }
+-        if !self.is_stable_standalone_release()? {
++        if !self.is_stable_standalone_release() {
+             // An installer publishes current and the latest marker separately.
+             // Keep its updater alive while that publication may be in progress.
+             if !self.has_latest_selection_marker() {
+@@ -913,7 +917,7 @@ impl Daemon {
+             return Ok(false);
+         };
+         if !managed_install::supports_daemon_update_loop(&codex_bin).await
+-            || !self.is_stable_standalone_release()?
++            || !self.is_stable_standalone_release()
+             || !managed_install::resolved_managed_codex_bin(&self.managed_codex_bin)
+                 .await
+                 .is_ok_and(|selected| selected == codex_bin)
+@@ -929,42 +933,27 @@ impl Daemon {
+         Ok(true)
+     }
+ 
+-    fn is_stable_standalone_release(&self) -> Result<bool> {
+-        let codex_home = self
+-            .settings_file
+-            .parent()
+-            .and_then(Path::parent)
+-            .context("daemon settings path has no Codex home")?;
+-        Ok(managed_install::is_stable_standalone_release(
+-            codex_home,
+-            &self.current_managed_codex_bin()?,
+-        ))
++    fn is_stable_standalone_release(&self) -> bool {
++        managed_install::is_stable_standalone_release(
++            &self.codex_home,
++            &self.current_managed_codex_bin(),
++        )
+     }
+ 
+-    fn current_managed_codex_bin(&self) -> Result<PathBuf> {
++    fn current_managed_codex_bin(&self) -> PathBuf {
+         // An installer can move a legacy binary into bin/ while this updater runs.
+-        let home = self
+-            .settings_file
+-            .parent()
+-            .and_then(Path::parent)
+-            .context("daemon settings path has no Codex home")?;
+-        Ok(managed_install::managed_codex_bin(home))
++        managed_install::managed_codex_bin(&self.codex_home)
+     }
+ 
+     fn has_latest_selection_marker(&self) -> bool {
+-        self.settings_file
+-            .parent()
+-            .and_then(Path::parent)
+-            .is_some_and(|home| {
+-                managed_install::package_root(home)
+-                    .join("auto-update-version")
+-                    .is_file()
+-            })
++        managed_install::package_root(&self.codex_home)
++            .join("auto-update-version")
++            .is_file()
+     }
+ 
+     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
+         if !settings.auto_update_enabled
+-            || !self.is_stable_standalone_release()?
++            || !self.is_stable_standalone_release()
+             || !managed_install::supports_daemon_update_loop(&self.managed_codex_bin).await
+         {
+             return Ok(self.running_backend_instance(settings).await?.is_some());
+@@ -1288,18 +1277,10 @@ mod tests {
+     #[tokio::test]
+     async fn waiting_lifecycle_command_uses_migrated_installation() {
+         let home = TempDir::new().expect("home");
+-        let state = home.path().join("app-server-daemon");
++        let harness = TempDir::new().expect("harness");
+         let legacy = home.path().join("packages/standalone/current");
+         std::fs::create_dir_all(&legacy).expect("legacy selection");
+-        let daemon = Daemon {
+-            log_diagnostics: false,
+-            socket_path: home.path().join("server.sock"),
+-            pid_file: state.join(super::LEGACY_PID_FILE_NAME),
+-            update_pid_file: state.join(super::LEGACY_UPDATE_PID_FILE_NAME),
+-            operation_lock_file: state.join("daemon.lock"),
+-            settings_file: state.join("settings.json"),
+-            managed_codex_bin: super::managed_codex_bin(home.path()),
+-        };
++        let daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
+         let lock = daemon.acquire_operation_lock().await.expect("lock");
+         let stop = daemon.run(super::LifecycleCommand::Stop);
+         tokio::pin!(stop);
+@@ -1322,23 +1303,16 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn stop_creates_missing_home_parent() {
++    async fn stop_creates_missing_harness_parent() {
+         let temp = TempDir::new().expect("temp dir");
+-        let state = temp.path().join("missing-home").join("daemon-state");
+-        let daemon = Daemon {
+-            log_diagnostics: false,
+-            socket_path: state.join("server.sock"),
+-            pid_file: state.join("server.pid"),
+-            update_pid_file: state.join("updater.pid"),
+-            operation_lock_file: state.join("daemon.lock"),
+-            settings_file: state.join("settings.json"),
+-            managed_codex_bin: state.join("missing-codex"),
+-        };
++        let home = temp.path().join("home");
++        let harness = temp.path().join("missing-harness");
++        let daemon = Daemon::from_roots(&home, &harness).expect("daemon roots");
+         assert_eq!(
+             daemon
+                 .run(super::LifecycleCommand::Stop)
+                 .await
+-                .expect("stop on fresh home")
++                .expect("stop on fresh harness")
+                 .status,
+             LifecycleStatus::NotRunning,
+         );
+@@ -1347,19 +1321,12 @@ mod tests {
+     #[tokio::test]
+     async fn stop_and_fresh_start_discard_pending_thread_restore() {
+         let home = TempDir::new().expect("home");
+-        let state = home.path().join("app-server-daemon");
++        let harness = TempDir::new().expect("harness");
++        let state = harness.path().join("app-server-daemon");
+         codex_uds::prepare_private_socket_directory(&state)
+             .await
+             .expect("private state directory");
+-        let daemon = Daemon {
+-            log_diagnostics: false,
+-            socket_path: home.path().join("server.sock"),
+-            pid_file: state.join("server.pid"),
+-            update_pid_file: state.join("updater.pid"),
+-            operation_lock_file: state.join("daemon.lock"),
+-            settings_file: state.join("settings.json"),
+-            managed_codex_bin: home.path().join("codex"),
+-        };
++        let daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
+         codex_app_server_transport::daemon_recovery::write_candidates(
+             &daemon.recovery_file().expect("recovery path"),
+             &["thread".to_string()].into_iter().collect(),
+@@ -1391,6 +1358,7 @@ mod tests {
+     #[tokio::test]
+     async fn managed_local_backend_counts_as_bootstrapped_without_updater() {
+         let home = TempDir::new().expect("home");
++        let harness = TempDir::new().expect("harness");
+         let standalone = home.path().join("packages/standalone");
+         let local_bin = standalone.join("local-main/bin/codex");
+         tokio::fs::create_dir_all(local_bin.parent().expect("bin parent"))
+@@ -1400,18 +1368,8 @@ mod tests {
+             .expect("local bin");
+         std::os::unix::fs::symlink("local-main", standalone.join("current"))
+             .expect("current local build");
+-        let state = home.path().join("app-server-daemon");
+-        let daemon = Daemon {
+-            log_diagnostics: false,
+-            socket_path: home
+-                .path()
+-                .join("app-server-control/app-server-control.sock"),
+-            pid_file: state.join("app-server.pid"),
+-            update_pid_file: state.join("app-server-updater.pid"),
+-            operation_lock_file: state.join("daemon.lock"),
+-            settings_file: state.join("settings.json"),
+-            managed_codex_bin: standalone.join("current/bin/codex"),
+-        };
++        let mut daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
++        daemon.managed_codex_bin = standalone.join("current/bin/codex");
+         let settings = DaemonSettings::default();
+         assert!(
+             !daemon
+@@ -1428,17 +1386,13 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn not_ready_context_reports_daemon_app_server_before_stderr() {
+-        let temp_dir = TempDir::new().expect("temp dir");
+-        let daemon = Daemon {
+-            log_diagnostics: false,
+-            socket_path: temp_dir.path().join("app-server-control.sock"),
+-            pid_file: temp_dir.path().join("app-server.pid"),
+-            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
+-            operation_lock_file: temp_dir.path().join("daemon.lock"),
+-            settings_file: temp_dir.path().join("settings.json"),
+-            managed_codex_bin: temp_dir.path().join("missing-codex"),
+-        };
++        let home = TempDir::new().expect("home");
++        let harness = TempDir::new().expect("harness");
++        let daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
+         let stderr_log = daemon.pid_file.with_extension("stderr.log");
++        tokio::fs::create_dir_all(stderr_log.parent().expect("stderr log parent"))
++            .await
++            .expect("stderr log directory");
+         tokio::fs::write(&stderr_log, "unexpected argument")
+             .await
+             .expect("write stderr log");
+@@ -1455,4 +1409,30 @@ mod tests {
+             )
+         );
+     }
++
++    #[test]
++    fn daemon_roots_keep_runtime_state_and_managed_install_separate() {
++        let temp = TempDir::new().expect("temp dir");
++        let home = temp.path().join("home");
++        let harness = temp.path().join("harness");
++        let daemon = Daemon::from_roots(&home, &harness).expect("daemon roots");
++
++        assert_eq!(daemon.codex_home, home);
++        assert_eq!(
++            daemon.socket_path,
++            harness.join("app-server-control/app-server-control.sock")
++        );
++        assert_eq!(
++            daemon.settings_file,
++            harness.join("app-server-daemon/settings.json")
++        );
++        assert_eq!(
++            daemon.managed_codex_bin,
++            home.join("packages/app-server-daemon/current/bin/codex")
++        );
++        assert_eq!(
++            daemon.pid_file.with_extension("stderr.log"),
++            harness.join("app-server-daemon/daemon.stderr.log")
++        );
++    }
+ }
+diff --git a/codex-rs/app-server-daemon/src/manual_update.rs b/codex-rs/app-server-daemon/src/manual_update.rs
+--- a/codex-rs/app-server-daemon/src/manual_update.rs
++++ b/codex-rs/app-server-daemon/src/manual_update.rs
+@@ -73,7 +73,7 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
+                             .await?;
+                         let current_exe = std::env::current_exe()?;
+                         let paths = daemon.backend_paths_with_bin(&settings, &current_exe);
+-                        let restore_release = if daemon.is_stable_standalone_release()? {
++                        let restore_release = if daemon.is_stable_standalone_release() {
+                             None
+                         } else {
+                             Some(selected_release(daemon)?.2)
+@@ -137,7 +137,7 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
+             let _operation_lock = daemon.acquire_operation_lock().await?;
+             let settings = daemon.load_settings().await?;
+             let worker = crate::backend::pid_update_loop_backend(daemon.backend_paths(&settings));
+-            if !daemon.is_stable_standalone_release()? {
++            if !daemon.is_stable_standalone_release() {
+                 worker.stop().await?;
+                 continue 'request;
+             }
+@@ -147,13 +147,13 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
+ }
+ 
+ pub(super) fn supported(daemon: &Daemon) -> Result<bool> {
+-    if daemon.is_stable_standalone_release()? {
++    if daemon.is_stable_standalone_release() {
+         return Ok(true);
+     }
+     let Ok((root, release, _)) = selected_release(daemon) else {
+         return Ok(false);
+     };
+-    let bin = daemon.current_managed_codex_bin()?;
++    let bin = daemon.current_managed_codex_bin();
+     Ok(std::fs::canonicalize(root.join("releases"))
+         .is_ok_and(|releases| release.parent() == Some(releases.as_path()))
+         && bin.is_file()
+@@ -164,7 +164,7 @@ const UNSUPPORTED_MESSAGE: &str =
+     "This command requires a daemon package selected from its managed releases directory.";
+ 
+ pub(super) async fn unsupported(daemon: &Daemon) -> Result<UpdateOutput> {
+-    let managed_codex_path = daemon.current_managed_codex_bin()?;
++    let managed_codex_path = daemon.current_managed_codex_bin();
+     Ok(UpdateOutput {
+         status: UpdateStatus::Unsupported,
+         installed_version: managed_codex_version(&managed_codex_path).await.ok(),
+@@ -234,14 +234,14 @@ pub(super) async fn run(
+ ) -> Result<UpdateOutput> {
+     let settings = daemon.load_settings().await?;
+     let managed_running = daemon.running_backend_instance(&settings).await?.is_some();
+-    if !(daemon.is_stable_standalone_release()?
++    if !(daemon.is_stable_standalone_release()
+         || matches!(trigger, UpdateTrigger::RestoreProduction(_)) && supported(daemon)?)
+         || (!managed_running && client::probe(&daemon.socket_path).await.is_ok())
+     {
+         return unsupported(daemon).await;
+     }
+ 
+-    let managed_codex_path = daemon.current_managed_codex_bin()?;
++    let managed_codex_path = daemon.current_managed_codex_bin();
+     let (_, previous_release, _) = selected_release(daemon)?;
+     let previous_identity = executable_identity(&managed_codex_path).await?;
+     let (control, restart) =
+@@ -249,7 +249,7 @@ pub(super) async fn run(
+     if matches!(control, UpdateLoopControl::Stop) {
+         return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+     }
+-    let current_managed_codex_path = daemon.current_managed_codex_bin()?;
++    let current_managed_codex_path = daemon.current_managed_codex_bin();
+     let installed_version = Some(managed_codex_version(&current_managed_codex_path).await?);
+     let updated = previous_release != selected_release(daemon)?.1
+         || !previous_identity
+diff --git a/codex-rs/app-server-daemon/src/migration.rs b/codex-rs/app-server-daemon/src/migration.rs
+--- a/codex-rs/app-server-daemon/src/migration.rs
++++ b/codex-rs/app-server-daemon/src/migration.rs
+@@ -144,7 +144,7 @@ pub(super) async fn run(http: &impl InstallerHttp, legacy: &Daemon) -> Result<Up
+     if let Err(error) = cutover {
+         if let Err(restore_error) = async {
+             legacy
+-                .current_installation()?
++                .current_installation()
+                 .ensure_managed_updater(&settings)
+                 .await
+         }
+diff --git a/codex-rs/app-server-daemon/src/prepare_install.rs b/codex-rs/app-server-daemon/src/prepare_install.rs
+--- a/codex-rs/app-server-daemon/src/prepare_install.rs
++++ b/codex-rs/app-server-daemon/src/prepare_install.rs
+@@ -63,7 +63,7 @@ pub async fn update_from_cli(
+     {
+         return Ok(None);
+     }
+-    let managed_codex_path = daemon.current_managed_codex_bin()?;
++    let managed_codex_path = daemon.current_managed_codex_bin();
+     Ok(Some(crate::UpdateOutput {
+         status: crate::UpdateStatus::Updated,
+         installed_version: Some(managed_install::managed_codex_version(&managed_codex_path).await?),
+@@ -90,11 +90,7 @@ async fn prepare_from_package(
+     running_exe: &Path,
+     confirm: impl FnOnce(&InstallRequest) -> Result<bool>,
+ ) -> Result<bool> {
+-    let home = daemon
+-        .settings_file
+-        .parent()
+-        .and_then(Path::parent)
+-        .context("daemon settings path has no Codex home")?;
++    let home = daemon.codex_home.as_path();
+     let previous_root = managed_install::package_root(home);
+     let root = home.join("packages/app-server-daemon");
+     anyhow::ensure!(
+@@ -316,7 +312,7 @@ async fn prepare_from_package(
+         if let Err(error) = stopped {
+             if let Err(restore_error) = async {
+                 daemon
+-                    .current_installation()?
++                    .current_installation()
+                     .ensure_managed_updater(settings)
+                     .await
+             }
+diff --git a/codex-rs/app-server-daemon/src/prepare_install_tests.rs b/codex-rs/app-server-daemon/src/prepare_install_tests.rs
+--- a/codex-rs/app-server-daemon/src/prepare_install_tests.rs
++++ b/codex-rs/app-server-daemon/src/prepare_install_tests.rs
+@@ -11,6 +11,7 @@ use std::path::PathBuf;
+ fn daemon(home: &std::path::Path) -> crate::Daemon {
+     let state = home.join("app-server-daemon");
+     crate::Daemon {
++        codex_home: home.to_path_buf(),
+         log_diagnostics: false,
+         socket_path: state.join("app-server.sock"),
+         pid_file: state.join("app-server.pid"),
+diff --git a/codex-rs/app-server-daemon/src/telemetry.rs b/codex-rs/app-server-daemon/src/telemetry.rs
+--- a/codex-rs/app-server-daemon/src/telemetry.rs
++++ b/codex-rs/app-server-daemon/src/telemetry.rs
+@@ -8,8 +8,8 @@ pub const HANDOFF_ENV: &str = "CODEX_DAEMON_TELEMETRY_HANDOFF";
+ 
+ /// Only presence and enabled state leave the settings reader, never values or contents.
+ /// Missing files mean defaults; unreadable or invalid settings remain unknown.
+-pub async fn settings_tags(codex_home: &Path) -> [(&'static str, &'static str); 4] {
+-    let path = codex_home
++pub async fn settings_tags(codex_harness: &Path) -> [(&'static str, &'static str); 4] {
++    let path = codex_harness
+         .join(crate::STATE_DIR_NAME)
+         .join(crate::SETTINGS_FILE_NAME);
+     crate::settings::telemetry_tags(&path).await.unwrap_or([
+diff --git a/codex-rs/app-server-daemon/src/update_loop.rs b/codex-rs/app-server-daemon/src/update_loop.rs
+--- a/codex-rs/app-server-daemon/src/update_loop.rs
++++ b/codex-rs/app-server-daemon/src/update_loop.rs
+@@ -137,7 +137,7 @@ async fn run_with_http(
+     #[cfg(windows)]
+     updater.mark_ready().await?;
+     let needs_managed_handoff =
+-        match resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await {
++        match resolved_managed_codex_bin(&daemon.current_managed_codex_bin()).await {
+             Ok(managed_bin) => executable_identity(&managed_bin)
+                 .await
+                 .map_or(true, |identity| identity != *running_updater_identity),
+@@ -201,7 +201,7 @@ async fn run_with_http(
+                 #[cfg(windows)]
+                 updater.wait_for_ownership().await?;
+                 if manual_handoff_pending {
+-                    if !daemon.is_stable_standalone_release()? {
++                    if !daemon.is_stable_standalone_release() {
+                         if !daemon.has_latest_selection_marker() {
+                             return Ok(());
+                         }
+@@ -262,7 +262,7 @@ async fn adopt_managed_updater(
+     running_identity: &ExecutableIdentity,
+     listener: &mut Option<codex_uds::UnixListener>,
+ ) -> Result<UpdateLoopControl> {
+-    let managed_bin = resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await?;
++    let managed_bin = resolved_managed_codex_bin(&daemon.current_managed_codex_bin()).await?;
+     if executable_identity(&managed_bin).await? == *running_identity {
+         return Ok(UpdateLoopControl::Continue);
+     }
+@@ -412,15 +412,14 @@ async fn update_once(
+         _ = terminate.recv() => return Ok((UpdateLoopControl::Stop, None)),
+     }
+     anyhow::ensure!(
+-        trigger == UpdateTrigger::Scheduled || daemon.is_stable_standalone_release()?,
++        trigger == UpdateTrigger::Scheduled || daemon.is_stable_standalone_release(),
+         "installer did not select a stable latest release; retry the update"
+     );
+     if release_selection_unstable(daemon, trigger)? {
+         return Ok((UpdateLoopControl::Continue, None));
+     }
+ 
+-    let managed_codex_bin =
+-        resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await?;
++    let managed_codex_bin = resolved_managed_codex_bin(&daemon.current_managed_codex_bin()).await?;
+     crate::diagnostics::event(
+         "package_selected",
+         serde_json::json!({
+@@ -470,8 +469,8 @@ async fn update_once(
+                 if restart_mode == RestartMode::IfBinaryOrVersionChanged =>
+             {
+                 anyhow::ensure!(
+-                    daemon.is_stable_standalone_release()?
+-                        && resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await?
++                    daemon.is_stable_standalone_release()
++                        && resolved_managed_codex_bin(&daemon.current_managed_codex_bin()).await?
+                             == managed_codex_bin,
+                     "managed daemon changed during the update; retry"
+                 );
+@@ -495,7 +494,7 @@ async fn update_once(
+                     "managed daemon could not restart; retry when it is ready"
+                 );
+                 return Ok((
+-                    if daemon.is_stable_standalone_release()? {
++                    if daemon.is_stable_standalone_release() {
+                         UpdateLoopControl::Continue
+                     } else {
+                         UpdateLoopControl::Stop
+@@ -508,7 +507,7 @@ async fn update_once(
+ }
+ 
+ fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger<'_>) -> Result<bool> {
+-    if daemon.is_stable_standalone_release()?
++    if daemon.is_stable_standalone_release()
+         || matches!(trigger, UpdateTrigger::RestoreProduction(_))
+             && manual_update::supported(daemon)?
+     {
+@@ -522,12 +521,7 @@ fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger<'_>) -> Re
+ }
+ 
+ fn selected_release(daemon: &Daemon) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+-    let home = daemon
+-        .settings_file
+-        .parent()
+-        .and_then(Path::parent)
+-        .context("daemon settings path has no Codex home")?;
+-    let root = crate::managed_install::package_root(home);
++    let root = crate::managed_install::package_root(&daemon.codex_home);
+     let release = std::fs::canonicalize(root.join("current"))?;
+     let name = release
+         .file_name()
+diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+--- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
++++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+@@ -436,13 +436,17 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
+     std::os::unix::fs::symlink(format!("releases/{release}"), standalone.join("current"))
+         .expect("current release");
+     std::fs::write(standalone.join("auto-update-version"), &release).expect("latest marker");
+-    let state = home.path().join("app-server-daemon");
+-    std::fs::create_dir(&state).unwrap();
+-    std::fs::write(state.join("app-server.stderr.log"), b"").unwrap();
++    let legacy_state = home.path().join("app-server-daemon");
++    std::fs::create_dir(&legacy_state).unwrap();
++    std::fs::write(legacy_state.join("app-server.stderr.log"), b"").unwrap();
++    let harness = home.path().join("harness");
++    let state = harness.join("app-server-daemon");
++    std::fs::create_dir_all(&state).unwrap();
+     (
+         Daemon {
++            codex_home: home.path().to_path_buf(),
+             log_diagnostics: false,
+-            socket_path: home.path().join("app-server-control/server.sock"),
++            socket_path: harness.join("app-server-control/server.sock"),
+             pid_file: state.join("app-server.pid"),
+             update_pid_file: state.join("app-server-updater.pid"),
+             operation_lock_file: state.join("daemon.lock"),
+@@ -1102,9 +1106,7 @@ async fn check_manual_update_restart(package_directory: &str) {
+     let no_op = FakeInstallerHttp::new(InstallerResponse::Success(
+         b"#!/bin/sh\n# CODEX_INSTALL_IF_LATEST CODEX_INSTALL_DAEMON_ONLY\nexit 0\n".to_vec(),
+     ));
+-    let bin = daemon
+-        .current_managed_codex_bin()
+-        .expect("current executable");
++    let bin = daemon.current_managed_codex_bin();
+     let contents = std::fs::read_to_string(&bin).expect("managed executable");
+     codex_utils_cargo_bin::write_executable(
+         &bin,
+@@ -1331,7 +1333,7 @@ printf '%s' '{release}' > '{marker}'
+         // Restoring eligibility for the same package still reports noUpdate.
+         assert_eq!(restored, output);
+         assert!(!daemon.pid_file.exists());
+-        assert!(daemon.is_stable_standalone_release().unwrap());
++        assert!(daemon.is_stable_standalone_release());
+         assert_eq!(
+             std::fs::read_to_string(&daemon.settings_file).unwrap(),
+             settings

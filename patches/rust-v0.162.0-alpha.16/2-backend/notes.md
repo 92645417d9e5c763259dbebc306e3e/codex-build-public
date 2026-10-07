@@ -1,0 +1,4 @@
+- For project entry points, ensure and publish `REPOS_ROOT`, `PROJECT_SCRATCH_ROOT`, `PROJECT_PERSISTENT_ROOT`, `PROJECT_RUNTIME_ROOT`, `SKILLS_ROOT` and `SKILLS_SCRATCH_ROOT`.
+- Daemon management commands do not initialize project storage directories.
+- Permission profile `workspace` makes the entered cwd and the six published storage directories fully writable with no exceptions; every path outside those seven directory trees, including `TMPDIR`, is read-only.
+- Keep Workspace filesystem-root changes independent of approval and network settings.

@@ -1,0 +1,512 @@
+configure-external-editor-for-local-runtime
+
+Lane: frontend
+
+FlatPatch: configure-external-editor-for-local-runtime
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -825,6 +825,9 @@ pub struct Tui {
+     #[serde(default, flatten)]
+     pub notification_settings: TuiNotificationSettings,
+ 
++    /// External editor command used by the TUI. Defaults to VISUAL, then EDITOR.
++    pub external_editor: Option<String>,
++
+     /// Enable animations (welcome screen, shimmer effects, spinners).
+     /// Defaults to `true`.
+     #[serde(default = "default_true")]
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4556,6 +4556,10 @@
+           },
+           "description": "Individual visual effects. Each also requires animations to be enabled."
+         },
++        "external_editor": {
++          "description": "External editor command used by the TUI. Defaults to VISUAL, then EDITOR.",
++          "type": "string"
++        },
+         "fullscreen_transcript": {
+           "default": true,
+           "description": "Own the fullscreen transcript, including scrolling, selection, and search. Defaults to `true`; alternate-screen restrictions take precedence.",
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1270,6 +1270,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             raw_output_mode: false,
+             fullscreen_transcript: true,
+             mouse_scroll_speed: None,
++            external_editor: None,
+             copy_on_select: Default::default(),
+             right_click_paste: Default::default(),
+             alternate_screen: AltScreenMode::default(),
+@@ -4584,6 +4585,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             raw_output_mode: false,
+             fullscreen_transcript: true,
+             mouse_scroll_speed: None,
++            external_editor: None,
+             copy_on_select: Default::default(),
+             right_click_paste: Default::default(),
+             alternate_screen: AltScreenMode::Auto,
+@@ -4631,6 +4633,27 @@ async fn runtime_config_resolves_disable_paste_burst() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn runtime_config_resolves_external_editor() -> anyhow::Result<()> {
++    let codex_home = tempdir()?;
++    for (input, expected) in [
++        ("", None),
++        (
++            "[tui]\nexternal_editor = 'nano --nowrap'",
++            Some("nano --nowrap"),
++        ),
++    ] {
++        let config = Config::load_from_base_config_with_overrides(
++            toml::from_str(input)?,
++            ConfigOverrides::default(),
++            codex_home.path().abs(),
++        )
++        .await?;
++        assert_eq!(config.tui_external_editor.as_deref(), expected);
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn disable_paste_burst_preserves_layering_and_new_key_precedence() -> anyhow::Result<()> {
+     for (toml, key, value, expected) in [
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -807,6 +807,9 @@ pub struct Config {
+     /// Own the fullscreen transcript when the alternate screen is enabled.
+     pub tui_fullscreen_transcript: bool,
+ 
++    /// External editor command selected in the TUI config, if any.
++    pub tui_external_editor: Option<String>,
++
+     /// Mouse wheel speed multiplier for transcript scrolling; defaults to one row per event.
+     pub tui_mouse_scroll_speed: Option<f64>,
+ 
+@@ -4585,6 +4588,7 @@ impl Config {
+                 .as_ref()
+                 .is_none_or(|tui| tui.fullscreen_transcript),
+             tui_mouse_scroll_speed: cfg.tui.as_ref().and_then(|tui| tui.mouse_scroll_speed),
++            tui_external_editor: cfg.tui.as_ref().and_then(|tui| tui.external_editor.clone()),
+             tui_copy_on_select: cfg
+                 .tui
+                 .as_ref()
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -292,6 +292,7 @@ async fn new_config(
+         tui_auto_recap: true,
+         model_availability_nux: ModelAvailabilityNuxConfig::default(),
+         tui_fullscreen_transcript: false,
++        tui_external_editor: None,
+         tui_mouse_scroll_speed: None,
+         tui_copy_on_select: Default::default(),
+         tui_right_click_paste: Default::default(),
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -52,6 +52,7 @@ impl App {
+             && !matches!(
+                 &event,
+                 AppEvent::OpenDaemonMenu
++                    | AppEvent::ConfigureExternalEditor { .. }
+                     | AppEvent::OpenWarnings
+                     | AppEvent::CopyWarning(_)
+                     | AppEvent::UpdateWarnings { .. }
+@@ -2424,6 +2425,33 @@ impl App {
+                     self.launch_external_editor(tui).await;
+                 }
+             }
++            AppEvent::ConfigureExternalEditor { command } => {
++                if let Err(err) = external_editor::resolve_editor_command(Some(&command)) {
++                    self.chat_widget
++                        .add_error_message(format!("Invalid external editor command: {err}"));
++                } else {
++                    let result = ConfigEditsBuilder::for_config_path(self.local_settings.user_config_path.as_path())
++                        .with_edits([crate::legacy_core::config::edit::ConfigEdit::SetPath {
++                            segments: vec!["tui".to_string(), "external_editor".to_string()],
++                            value: command.clone().into(),
++                        }])
++                        .apply()
++                        .await;
++                    match result {
++                        Ok(()) => {
++                            self.local_settings.tui.external_editor = Some(command);
++                            self.chat_widget.add_info_message(
++                                "External editor saved to config.toml.".to_string(),
++                                /*hint*/ None,
++                            );
++                        }
++                        Err(err) => self.chat_widget.add_error_message(format!(
++                            "Failed to save external editor: {}",
++                            format_config_error(&err)
++                        )),
++                    }
++                }
++            }
+             AppEvent::RefreshWindowsSandbox { thread_id } => {
+                 #[cfg(any(target_os = "windows", test))]
+                 self.refresh_windows_sandbox_for_thread(app_server, thread_id).await;
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -279,7 +279,9 @@ impl App {
+             .empty_state_animation
+             .borrow_mut()
+             .pause_clock();
+-        let editor_cmd = match external_editor::resolve_editor_command() {
++        let editor_cmd = match external_editor::resolve_editor_command(
++            self.local_settings.tui.external_editor.as_deref(),
++        ) {
+             Ok(cmd) => cmd,
+             Err(external_editor::EditorError::MissingEditor) => {
+                 self.chat_widget
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -10006,6 +10006,74 @@ async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSessio
+     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
+ }
+ 
++#[tokio::test]
++async fn external_editor_setting_uses_local_path_and_preserves_command_on_rejection() -> Result<()>
++{
++    let mut app = make_test_app().await;
++    let mut app_server = start_config_write_test_app_server(&app).await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let local_directory = tempdir()?;
++    let other_home = tempdir()?;
++    let local_path = local_directory.path().join("client-config.toml");
++    app.local_settings.user_config_path = local_path.abs();
++    app.config.codex_home = other_home.path().to_path_buf().abs();
++    app.reconnect.offline = true;
++
++    Box::pin(app.handle_event(
++        &mut tui,
++        &mut app_server,
++        AppEvent::ConfigureExternalEditor {
++            command: "nano --nowrap".to_string(),
++        },
++    ))
++    .await?;
++
++    assert_eq!(
++        app.local_settings.tui.external_editor.as_deref(),
++        Some("nano --nowrap")
++    );
++    let persisted = std::fs::read_to_string(&local_path)?;
++    let value: TomlValue = toml::from_str(&persisted)?;
++    assert_eq!(
++        value["tui"]["external_editor"].as_str(),
++        Some("nano --nowrap")
++    );
++    assert!(!other_home.path().join("config.toml").exists());
++    for command in ["", "'unterminated"] {
++        Box::pin(app.handle_event(
++            &mut tui,
++            &mut app_server,
++            AppEvent::ConfigureExternalEditor {
++                command: command.to_string(),
++            },
++        ))
++        .await?;
++        assert_eq!(
++            app.local_settings.tui.external_editor.as_deref(),
++            Some("nano --nowrap")
++        );
++        assert_eq!(std::fs::read_to_string(&local_path)?, persisted);
++    }
++    let blocked_path = local_directory.path().join("not-a-directory");
++    std::fs::write(&blocked_path, "preserve this file")?;
++    app.local_settings.user_config_path = blocked_path.join("config.toml").abs();
++    Box::pin(app.handle_event(
++        &mut tui,
++        &mut app_server,
++        AppEvent::ConfigureExternalEditor {
++            command: "other-editor".to_string(),
++        },
++    ))
++    .await?;
++    assert_eq!(
++        app.local_settings.tui.external_editor.as_deref(),
++        Some("nano --nowrap")
++    );
++    assert_eq!(std::fs::read_to_string(blocked_path)?, "preserve this file");
++    app_server.shutdown().await?;
++    Ok(())
++}
++
+ #[path = "tests/active_reconnect_tests.rs"]
+ mod active_reconnect;
+ 
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -1611,6 +1611,11 @@ pub(crate) enum AppEvent {
+     /// Launch the external editor after a normal draw has completed.
+     LaunchExternalEditor,
+ 
++    /// Persist the TUI external editor command in the selected user config.
++    ConfigureExternalEditor {
++        command: String,
++    },
++
+     /// Async update of the current git branch for status line rendering.
+     StatusLineBranchUpdated {
+         cwd: PathBuf,
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -426,6 +426,9 @@ impl ChatWidget {
+             SlashCommand::Keymap => {
+                 self.open_keymap_picker();
+             }
++            SlashCommand::Editor => {
++                self.add_info_message("Usage: /editor <command>".to_string(), /*hint*/ None);
++            }
+             SlashCommand::ElevateSandbox => {
+                 #[cfg(target_os = "windows")]
+                 {
+@@ -876,6 +879,15 @@ impl ChatWidget {
+                 }
+                 _ => self.add_error_message("Usage: /keymap [debug]".to_string()),
+             },
++            SlashCommand::Editor => {
++                if trimmed.is_empty() {
++                    self.add_error_message("Usage: /editor <command>".to_string());
++                } else {
++                    self.app_event_tx.send(AppEvent::ConfigureExternalEditor {
++                        command: trimmed.to_string(),
++                    });
++                }
++            }
+             SlashCommand::Raw => match trimmed.to_ascii_lowercase().as_str() {
+                 "on" => {
+                     self.set_raw_output_mode_and_notify(/*enabled*/ true);
+@@ -1316,6 +1328,7 @@ impl ChatWidget {
+             | SlashCommand::Side
+             | SlashCommand::Btw
+             | SlashCommand::Keymap
++            | SlashCommand::Editor
+             | SlashCommand::Agents
+             | SlashCommand::MultiAgents
+             | SlashCommand::Permissions
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -2403,6 +2403,22 @@ async fn slash_keymap_debug_opens_keypress_inspector() {
+     assert!(op_rx.try_recv().is_err(), "expected no core op to be sent");
+ }
+ 
++#[tokio::test]
++async fn slash_editor_sends_configured_command() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.dispatch_command_with_args(
++        SlashCommand::Editor,
++        "nano --nowrap".to_string(),
++        Vec::new(),
++    );
++
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::ConfigureExternalEditor { command }) if command == "nano --nowrap"
++    ));
++}
++
+ #[tokio::test]
+ async fn slash_keymap_debug_can_inspect_app_shortcuts() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/external_editor.rs b/codex-rs/tui/src/external_editor.rs
+--- a/codex-rs/tui/src/external_editor.rs
++++ b/codex-rs/tui/src/external_editor.rs
+@@ -15,38 +15,27 @@ use tokio::process::Command;
+ pub(crate) enum EditorError {
+     #[error("neither VISUAL nor EDITOR is set")]
+     MissingEditor,
+-    #[cfg(not(windows))]
+     #[error("failed to parse editor command")]
+     ParseFailed,
+     #[error("editor command is empty")]
+     EmptyCommand,
+ }
+ 
+-/// Tries to resolve the full path to a Windows program, respecting PATH + PATHEXT.
+-/// Falls back to the original program name if resolution fails.
+-#[cfg(windows)]
+-fn resolve_windows_program(program: &str) -> std::path::PathBuf {
+-    // On Windows, `Command::new("code")` will not resolve `code.cmd` shims on PATH.
+-    // Use `which` so we respect PATH + PATHEXT (e.g., `code` -> `code.cmd`).
+-    which::which(program).unwrap_or_else(|_| std::path::PathBuf::from(program))
+-}
+-
+-/// Resolve the editor command from environment variables.
+-/// Prefers `VISUAL` over `EDITOR`.
+-pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, EditorError> {
+-    let raw = env::var("VISUAL")
+-        .or_else(|_| env::var("EDITOR"))
+-        .map_err(|_| EditorError::MissingEditor)?;
+-    let parts = {
+-        #[cfg(windows)]
+-        {
+-            winsplit::split(&raw)
+-        }
+-        #[cfg(not(windows))]
+-        {
+-            shlex::split(&raw).ok_or(EditorError::ParseFailed)?
++/// Resolve the configured editor command, falling back to `VISUAL` then `EDITOR`.
++pub(crate) fn resolve_editor_command(
++    configured: Option<&str>,
++) -> std::result::Result<Vec<String>, EditorError> {
++    let environment_command;
++    let raw = match configured {
++        Some(raw) => raw,
++        None => {
++            environment_command = env::var("VISUAL")
++                .or_else(|_| env::var("EDITOR"))
++                .map_err(|_| EditorError::MissingEditor)?;
++            environment_command.as_str()
+         }
+     };
++    let parts = shlex::split(raw).ok_or(EditorError::ParseFailed)?;
+     if parts.is_empty() {
+         return Err(EditorError::EmptyCommand);
+     }
+@@ -115,24 +104,14 @@ pub(crate) async fn run_editor(
+     }
+ 
+     let editor_directory = editor_directory(codex_harness, file_system_policy, cwd)?;
+-    // Convert to TempPath immediately so no file handle stays open on Windows.
++    // Retain cleanup ownership without holding a file handle during the editor process.
+     let temp_path = Builder::new()
+         .suffix(".md")
+         .tempfile_in(editor_directory)?
+         .into_temp_path();
+     fs::write(&temp_path, seed)?;
+ 
+-    let mut cmd = {
+-        #[cfg(windows)]
+-        {
+-            // handles .cmd/.bat shims
+-            Command::new(resolve_windows_program(&editor_cmd[0]))
+-        }
+-        #[cfg(not(windows))]
+-        {
+-            Command::new(&editor_cmd[0])
+-        }
+-    };
++    let mut cmd = Command::new(&editor_cmd[0]);
+     if editor_cmd.len() > 1 {
+         cmd.args(&editor_cmd[1..]);
+     }
+@@ -195,7 +174,7 @@ mod tests {
+             env::set_var("VISUAL", "vis");
+             env::set_var("EDITOR", "ed");
+         }
+-        let cmd = resolve_editor_command().unwrap();
++        let cmd = resolve_editor_command(/*configured*/ None).unwrap();
+         assert_eq!(cmd, vec!["vis".to_string()]);
+     }
+ 
+@@ -208,11 +187,41 @@ mod tests {
+             env::remove_var("EDITOR");
+         }
+         assert!(matches!(
+-            resolve_editor_command(),
++            resolve_editor_command(/*configured*/ None),
+             Err(EditorError::MissingEditor)
+         ));
+     }
+ 
++    #[test]
++    #[serial]
++    fn configured_editor_preserves_precedence_quotes_and_invalid_values() {
++        let _guard = EnvGuard::new();
++        unsafe { env::set_var("VISUAL", "fallback-editor") };
++        assert_eq!(
++            resolve_editor_command(Some("'/path with spaces/editor' --flag 'two words'")).unwrap(),
++            vec!["/path with spaces/editor", "--flag", "two words"]
++        );
++        assert!(matches!(
++            resolve_editor_command(Some(" ")),
++            Err(EditorError::EmptyCommand)
++        ));
++        assert!(matches!(
++            resolve_editor_command(Some("'unterminated")),
++            Err(EditorError::ParseFailed)
++        ));
++    }
++
++    #[test]
++    #[serial]
++    fn resolve_editor_uses_editor_when_visual_is_unset() {
++        let _guard = EnvGuard::new();
++        unsafe {
++            env::remove_var("VISUAL");
++            env::set_var("EDITOR", "ed --flag");
++        }
++        assert_eq!(resolve_editor_command(None).unwrap(), vec!["ed", "--flag"]);
++    }
++
+     #[tokio::test]
+     async fn run_editor_returns_updated_content() {
+         let dir = tempdir().unwrap();
+diff --git a/codex-rs/tui/src/local_settings.rs b/codex-rs/tui/src/local_settings.rs
+--- a/codex-rs/tui/src/local_settings.rs
++++ b/codex-rs/tui/src/local_settings.rs
+@@ -56,6 +56,7 @@ impl LocalSettings {
+             ),
+             tui: Tui {
+                 notification_settings: config.tui_notifications.clone(),
++                external_editor: config.tui_external_editor.clone(),
+                 animations: config.animations,
+                 screen_reader_detection_done: None,
+                 effects: config.tui_effects,
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -17,6 +17,7 @@ pub enum SlashCommand {
+     Ide,
+     Permissions,
+     Keymap,
++    Editor,
+     Vim,
+     #[strum(serialize = "setup-default-sandbox")]
+     ElevateSandbox,
+@@ -150,6 +151,7 @@ impl SlashCommand {
+             }
+             SlashCommand::Permissions => "choose what Codex is allowed to do",
+             SlashCommand::Keymap => "remap TUI shortcuts",
++            SlashCommand::Editor => "set the external editor command",
+             SlashCommand::Vim => "toggle Vim mode for the composer",
+             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
+             SlashCommand::Experimental => "toggle experimental features",
+@@ -184,6 +186,7 @@ impl SlashCommand {
+                 | SlashCommand::Voice
+                 | SlashCommand::Ide
+                 | SlashCommand::Keymap
++                | SlashCommand::Editor
+                 | SlashCommand::Mcp
+                 | SlashCommand::Export
+                 | SlashCommand::Raw
+@@ -276,6 +279,7 @@ impl SlashCommand {
+             | SlashCommand::Permissions
+             | SlashCommand::Copy
+             | SlashCommand::Raw
++            | SlashCommand::Editor
+             | SlashCommand::Rename
+             | SlashCommand::Mention
+             | SlashCommand::Skills

@@ -1,0 +1,763 @@
+restrict-linux-workspace-permissions
+
+Lane: backend
+
+Unit: configure-linux-workspace-permissions
+
+ChildPatch: restrict-linux-workspace-permissions
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -20,7 +20,6 @@ use codex_app_server_protocol::McpServerStatusDetail;
+ use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::SandboxMode;
+-#[cfg(not(windows))]
+ use codex_app_server_protocol::SandboxPolicy;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::TextPosition;
+@@ -71,6 +70,205 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
+ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+ const EXEC_POLICY_PARSE_WARNING_SUMMARY: &str = "Error parsing rules; custom rules not applied.";
+ 
++#[tokio::test]
++async fn published_workspace_roots_survive_start_resume_and_permission_selection() -> Result<()> {
++    use app_test_support::MockResponsesConfig;
++    use app_test_support::create_fake_rollout;
++    use codex_app_server_protocol::CommandExecParams;
++    use codex_app_server_protocol::CommandExecResponse;
++    use codex_app_server_protocol::ThreadResumeParams;
++    use codex_app_server_protocol::ThreadResumeResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdateParams;
++    use codex_app_server_protocol::ThreadSettingsUpdateResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
++    use codex_utils_absolute_path::AbsolutePathBuf;
++
++    let fixture = TempDir::new()?;
++    let codex_home = fixture.path().join("home");
++    let cwd = fixture.path().join("workspace");
++    std::fs::create_dir_all(&codex_home)?;
++    std::fs::create_dir_all(&cwd)?;
++    let variables = [
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "REPOS_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ];
++    let roots = variables.map(|name| fixture.path().join(name));
++    for root in std::iter::once(&cwd).chain(&roots) {
++        std::fs::create_dir_all(root)?;
++        for name in [".git", ".agents", ".codex", ".aws"] {
++            std::fs::create_dir(root.join(name))?;
++        }
++    }
++    let env_overrides: Vec<_> = variables
++        .iter()
++        .zip(&roots)
++        .map(|(name, root)| (*name, root.to_str()))
++        .collect();
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    MockResponsesConfig::new(&server.uri())
++        .with_sandbox_mode("workspace-write")
++        .with_extra_config("[sandbox_workspace_write]\nnetwork_access = true")
++        .write(&codex_home)?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(&codex_home)
++        .without_auto_env()
++        .with_env_overrides(&env_overrides)
++        .build_initialized()
++        .await?;
++    let cwd = AbsolutePathBuf::from_absolute_path(cwd)?;
++    let assert_storage = |policy: &SandboxPolicy| {
++        let SandboxPolicy::WorkspaceWrite {
++            writable_roots,
++            exclude_tmpdir_env_var,
++            exclude_slash_tmp,
++            ..
++        } = policy
++        else {
++            panic!("expected Workspace, got {policy:?}");
++        };
++        for root in &roots {
++            assert!(writable_roots.iter().any(|path| path.as_path() == root));
++        }
++        assert!(*exclude_tmpdir_env_var);
++        assert!(*exclude_slash_tmp);
++    };
++    for params in [
++        ThreadStartParams::default(),
++        ThreadStartParams {
++            sandbox: Some(SandboxMode::WorkspaceWrite),
++            ..Default::default()
++        },
++        ThreadStartParams {
++            permissions: Some(":workspace".to_string()),
++            ..Default::default()
++        },
++    ] {
++        let expected_network = params.permissions.is_none();
++        let response: ThreadStartResponse = app
++            .request(|request_id| ClientRequest::ThreadStart {
++                request_id,
++                params: ThreadStartParams {
++                    cwd: Some(cwd.as_path().to_string_lossy().into_owned()),
++                    runtime_workspace_roots: Some(vec![cwd.clone()]),
++                    approval_policy: Some(AskForApproval::Never),
++                    ..params
++                },
++            })
++            .await?;
++        assert_storage(&response.sandbox);
++        assert_eq!(response.approval_policy, AskForApproval::Never);
++        let SandboxPolicy::WorkspaceWrite { network_access, .. } = response.sandbox else {
++            unreachable!();
++        };
++        assert_eq!(network_access, expected_network);
++    }
++
++    let writable_files = std::iter::once(cwd.as_path())
++        .chain(roots.iter().map(PathBuf::as_path))
++        .flat_map(|root| {
++            [
++                "write-probe",
++                ".git/write-probe",
++                ".agents/write-probe",
++                ".codex/write-probe",
++                ".aws/write-probe",
++            ]
++            .map(|path| root.join(path))
++        })
++        .collect::<Vec<_>>();
++    let command = std::iter::once("/usr/bin/touch".to_string())
++        .chain(
++            writable_files
++                .iter()
++                .map(|path| path.to_string_lossy().into_owned()),
++        )
++        .collect();
++    let request = CommandExecParams {
++        command,
++        process_id: None,
++        tty: false,
++        stream_stdin: false,
++        stream_stdout_stderr: false,
++        output_bytes_cap: None,
++        disable_output_cap: false,
++        disable_timeout: false,
++        timeout_ms: None,
++        cwd: Some(cwd.to_path_buf()),
++        env: None,
++        size: None,
++        sandbox_policy: None,
++        // command/exec is thread-independent; selecting the profile binds its roots to this cwd.
++        permission_profile: Some(":workspace".to_string()),
++    };
++    let request_id = app.send_command_exec_request(request.clone()).await?;
++    let written: CommandExecResponse = app.read_response(request_id).await?;
++    assert_eq!(written.exit_code, 0, "{}", written.stderr);
++    assert!(writable_files.iter().all(|path| path.is_file()));
++
++    let outside = fixture.path().join("outside-workspace");
++    let request_id = app
++        .send_command_exec_request(CommandExecParams {
++            command: vec![
++                "/usr/bin/touch".into(),
++                outside.to_string_lossy().into_owned(),
++            ],
++            ..request
++        })
++        .await?;
++    let denied: CommandExecResponse = app.read_response(request_id).await?;
++    assert_ne!(denied.exit_code, 0);
++    assert!(!outside.exists());
++
++    let thread_id = create_fake_rollout(
++        &codex_home,
++        "2026-01-01T12-00-00",
++        "2026-01-01T12:00:00Z",
++        "saved prompt",
++        Some("mock_provider"),
++        /*git_info*/ None,
++    )?;
++    let resumed: ThreadResumeResponse = app
++        .request(|request_id| ClientRequest::ThreadResume {
++            request_id,
++            params: ThreadResumeParams {
++                thread_id: thread_id.clone(),
++                cwd: Some(cwd.as_path().to_string_lossy().into_owned()),
++                runtime_workspace_roots: Some(vec![cwd.clone()]),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_storage(&resumed.sandbox);
++    let _: ThreadSettingsUpdateResponse = app
++        .request(|request_id| ClientRequest::ThreadSettingsUpdate {
++            request_id,
++            params: ThreadSettingsUpdateParams {
++                thread_id,
++                permissions: Some(":workspace".to_string()),
++                approval_policy: Some(AskForApproval::Never),
++                ..Default::default()
++            },
++        })
++        .await?;
++    let notification = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app.read_stream_until_notification_message("thread/settings/updated"),
++    )
++    .await??;
++    let notification: ThreadSettingsUpdatedNotification =
++        serde_json::from_value(notification.params.context("settings notification")?)?;
++    assert_storage(&notification.thread_settings.sandbox_policy);
++    assert_eq!(
++        notification.thread_settings.approval_policy,
++        AskForApproval::Never
++    );
++    Ok(())
++}
++
+ fn is_exec_policy_config_warning(notification: &JSONRPCNotification) -> bool {
+     notification.method == "configWarning"
+         && notification
+@@ -538,7 +736,16 @@ async fn thread_start_history_mode_accepts_legacy_and_paginated() -> Result<()>
+ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
+-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
++    create_config_toml(
++        codex_home.path(),
++        &server.uri(),
++        "default_permissions = \"runtime-roots\"",
++        r#"
++[permissions.runtime-roots.filesystem]
++":root" = "read"
++":workspace_roots" = "write"
++"#,
++    )?;
+ 
+     let cwd_tmp = TempDir::new()?;
+     let cwd = cwd_tmp.path().to_path_buf();
+@@ -554,7 +761,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+         .send_thread_start_request(ThreadStartParams {
+             cwd: Some(cwd.to_string_lossy().to_string()),
+             runtime_workspace_roots: Some(vec![extra_root.abs()]),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
++            permissions: Some("runtime-roots".to_string()),
+             ..Default::default()
+         })
+         .await?;
+@@ -589,7 +796,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+         .send_thread_start_request(ThreadStartParams {
+             runtime_workspace_roots: Some(vec![extra_root.abs()]),
+             environments: Some(vec![environment]),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
++            permissions: Some("runtime-roots".to_string()),
+             ..Default::default()
+         })
+         .await?;
+diff --git a/codex-rs/cli/tests/worktree.rs b/codex-rs/cli/tests/worktree.rs
+--- a/codex-rs/cli/tests/worktree.rs
++++ b/codex-rs/cli/tests/worktree.rs
+@@ -9,8 +9,6 @@ use std::io::Write as _;
+ use std::path::Path;
+ use std::process::Command;
+ use std::time::Duration;
+-#[cfg(not(unix))]
+-use tempfile::TempDir;
+ use wiremock::Mock;
+ use wiremock::MockServer;
+ use wiremock::ResponseTemplate;
+@@ -138,20 +136,13 @@ async fn interactive_worktree_start_and_fork_bind_owner_before_turn() -> anyhow:
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-#[cfg_attr(
+-    windows,
+-    ignore = "requires a non-elevated terminal with daemon breakaway support"
+-)]
+ async fn daemon_worktree_start_and_fork_bind_owner_before_turn() -> anyhow::Result<()> {
+     worktree_start_and_fork("daemon").await
+ }
+ 
+ async fn worktree_start_and_fork(backend: &str) -> anyhow::Result<()> {
+-    // Leave room for the local control socket on Unix platforms with short sun_path limits.
+-    #[cfg(unix)]
++    // Leave room for the local control socket's short sun_path limit.
+     let root = tempfile::Builder::new().tempdir_in("/tmp")?;
+-    #[cfg(not(unix))]
+-    let root = TempDir::new()?;
+     let root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(root.path())?
+         .canonicalize()?
+         .into_path_buf();
+@@ -195,9 +186,11 @@ check_for_update_on_startup = false
+ features.daemon_auto_start = {}
+ model_provider = "local"
+ model = "test-model"
+-sandbox_mode = "workspace-write"
+-windows.sandbox = "unelevated"
++default_permissions = "worktree"
+ tui.disable_paste_burst = true
++[permissions.worktree.filesystem]
++":root" = "read"
++":workspace_roots" = "write"
+ [otel]
+ metrics_exporter = {{ otlp-http = {{ endpoint = "{}/metrics", protocol = "json" }} }}
+ [model_providers.local]
+@@ -235,17 +228,6 @@ trust_level = "trusted"
+         codex_config::types::AuthCredentialsStoreMode::File,
+     )?;
+     let program = codex_utils_cargo_bin::cargo_bin("codex")?;
+-    // Keep cold Rosetta translation outside the timed startup assertions.
+-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+-    anyhow::ensure!(
+-        Command::new(&program)
+-            .env("CODEX_HOME", &home)
+-            .arg("--version")
+-            .output()?
+-            .status
+-            .success(),
+-        "failed to prepare CLI test executable"
+-    );
+     let mut env: HashMap<String, String> = std::env::vars().collect();
+     env.insert("CODEX_HOME".into(), home.display().to_string());
+     env.insert("CODEX_HARNESS".into(), harness.display().to_string());
+@@ -278,13 +260,8 @@ trust_level = "trusted"
+     let _daemon = if backend == "daemon" {
+         let bin = home.join("packages/app-server-daemon/current/bin");
+         fs::create_dir_all(&bin)?;
+-        let managed = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+-        // Hard links change the executable's ctime and invalidate Rosetta's translation cache.
+-        #[cfg(unix)]
++        let managed = bin.join("codex");
+         std::os::unix::fs::symlink(program.canonicalize()?, &managed)?;
+-        #[cfg(not(unix))]
+-        fs::hard_link(&program, &managed)
+-            .or_else(|_| codex_utils_cargo_bin::copy_executable(&program, &managed))?;
+         fs::create_dir(harness.join("app-server-daemon"))?;
+         fs::write(
+             harness.join("app-server-daemon/settings.json"),
+@@ -592,16 +569,14 @@ trust_level = "trusted"
+         }
+         let exit =
+             tokio::time::timeout(Duration::from_secs(/*secs*/ 10), spawned.exit_rx).await??;
+-        // Include shutdown output: ConPTY can retain the channel after process exit.
++        // Include shutdown output before checking the process result.
+         let _ = tokio::time::timeout(Duration::from_secs(/*secs*/ 1), async {
+             while let Some(bytes) = stdout.recv().await {
+                 output.push_str(&String::from_utf8_lossy(&bytes));
+             }
+         })
+         .await;
+-        let elevated_handoff = cfg!(windows)
+-            && output.contains("start the Windows daemon from a non-elevated terminal");
+-        assert_eq!(exit, i32::from(elevated_handoff), "{output}");
++        assert_eq!(exit, 0, "{output}");
+         assert!(!output.contains("The checkout was kept"), "{output}");
+         let metrics = server
+             .received_requests()
+@@ -663,10 +638,6 @@ trust_level = "trusted"
+                 ("update_interval_setting", "default"),
+                 ("shutdown_grace_setting", "default"),
+             ]);
+-            #[cfg(windows)]
+-            if codex_app_server_daemon::is_elevated()? {
+-                expected_tags.insert("daemon_selection_reason", "elevated_windows");
+-            }
+             if backend == "daemon" {
+                 expected_tags.extend([
+                     ("auto_update", "disabled"),
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -3192,9 +3192,10 @@ async fn default_permissions_can_select_builtin_profile_without_permissions_tabl
+         policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
+         "expected :workspace to allow writing the project root, policy: {policy:?}"
+     );
+-    assert!(
+-        !policy.can_write_local_path_with_cwd(&cwd.path().join(".git"), cwd.path()),
+-        "expected :workspace to protect project metadata, policy: {policy:?}"
++    assert_eq!(
++        policy.can_write_local_path_with_cwd(&cwd.path().join(".git"), cwd.path()),
++        published_storage_roots()?.is_some(),
++        "published Workspace makes project metadata writable, policy: {policy:?}"
+     );
+     Ok(())
+ }
+@@ -3590,9 +3591,10 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project(
+             policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
+             "expected trusted project fallback to use :workspace, policy: {policy:?}"
+         );
+-        assert!(
+-            !policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
+-            "expected :workspace metadata carveouts, policy: {policy:?}"
++        assert_eq!(
++            policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
++            published_storage_roots()?.is_some(),
++            "published Workspace makes project metadata writable, policy: {policy:?}"
+         );
+     }
+     Ok(())
+@@ -3649,11 +3651,117 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
+             policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
+             "expected untrusted project fallback to use :workspace, policy: {policy:?}"
+         );
++        assert_eq!(
++            policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
++            published_storage_roots()?.is_some(),
++            "published Workspace makes project metadata writable, policy: {policy:?}"
++        );
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn implicit_builtin_workspace_uses_published_storage_roots_when_available()
++-> std::io::Result<()> {
++    let Some(roots) = published_storage_roots()? else {
++        // Published project roots are an embedding contract, not an upstream cargo-test default.
++        return Ok(());
++    };
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            projects: Some(HashMap::from([(
++                cwd.path().to_string_lossy().to_string(),
++                ProjectConfig {
++                    trust_level: Some(TrustLevel::Trusted),
++                },
++            )])),
++            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
++                network_access: true,
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    let policy = config.permissions.file_system_sandbox_policy();
++    for path in [cwd.path().to_path_buf(), cwd.path().join(".git/config")]
++        .into_iter()
++        .chain(roots.iter().map(|root| root.as_path().join("nested/file")))
++    {
+         assert!(
+-            !policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
+-            "expected :workspace metadata carveouts, policy: {policy:?}"
++            policy.can_write_local_path_with_cwd(&path, cwd.path()),
++            "expected Workspace to write {path:?}, policy: {policy:?}"
+         );
+     }
++    for path in [codex_home.path(), std::path::Path::new("/tmp/unrelated")] {
++        assert!(
++            !policy.can_write_local_path_with_cwd(path, cwd.path()),
++            "unexpected Workspace write to {path:?}, policy: {policy:?}"
++        );
++    }
++    assert_eq!(
++        config.permissions.network_sandbox_policy(),
++        NetworkSandboxPolicy::Enabled
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn supplied_builtin_workspace_uses_published_storage_roots_when_available()
++-> std::io::Result<()> {
++    let Some(roots) = published_storage_roots()? else {
++        return Ok(());
++    };
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let supplied = PermissionProfile::workspace_write_with(
++        &[],
++        NetworkSandboxPolicy::Enabled,
++        /*exclude_tmpdir_env_var*/ false,
++        /*exclude_slash_tmp*/ false,
++    );
++    let mut config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            permission_profile: Some(supplied),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    let policy = config.permissions.file_system_sandbox_policy();
++    for path in [cwd.path().join(".git/config")]
++        .into_iter()
++        .chain(roots.iter().map(|root| root.as_path().join("nested/file")))
++    {
++        assert!(
++            policy.can_write_local_path_with_cwd(&path, cwd.path()),
++            "{path:?}"
++        );
++    }
++    assert!(
++        !policy.can_write_local_path_with_cwd(std::path::Path::new("/tmp/unrelated"), cwd.path())
++    );
++    assert_eq!(
++        config.permissions.network_sandbox_policy(),
++        NetworkSandboxPolicy::Enabled
++    );
++    config
++        .permissions
++        .set_workspace_roots(vec![codex_home.abs()]);
++    let policy = config.permissions.file_system_sandbox_policy();
++    assert!(!policy.can_write_local_path_with_cwd(codex_home.path(), cwd.path()));
++    assert!(policy.can_write_local_path_with_cwd(&cwd.path().join(".git/config"), cwd.path()));
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -182,6 +182,7 @@ pub(crate) use runtime_refresh::RuntimeConfigRefresh;
+ mod schema;
+ mod token_budget_startup;
+ mod windows_sandbox_config;
++mod workspace_permissions;
+ pub use auth_keyring::bootstrap_auth_config;
+ pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
+ pub use codex_agent_roles::AgentRoleConfig;
+@@ -221,6 +222,8 @@ pub use windows_sandbox_config::PreparedWindowsSandboxConfig;
+ use windows_sandbox_config::config_allows_mxc;
+ pub use windows_sandbox_config::prepare_windows_sandbox_config;
+ use windows_sandbox_config::resolve_windows_sandbox_type;
++use workspace_permissions::published_storage_roots;
++use workspace_permissions::workspace_file_system;
+ 
+ const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
+ const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
+@@ -3633,8 +3636,8 @@ impl Config {
+         dedupe_absolute_paths(&mut workspace_roots);
+         let (
+             configured_network_proxy_config,
+-            permission_profile,
+-            file_system_sandbox_policy,
++            mut permission_profile,
++            mut file_system_sandbox_policy,
+             mut active_permission_profile,
+             mut profile_workspace_roots,
+         ) = if let Some(permission_profile) = permission_profile {
+@@ -3769,6 +3772,25 @@ impl Config {
+                 Vec::new(),
+             )
+         };
++        // All startup and resume selectors have resolved to the same profile here.
++        // Restored workspace folders do not change the built-in Workspace contract.
++        if active_permission_profile
++            .as_ref()
++            .is_none_or(|profile| profile.id == BUILT_IN_WORKSPACE_PROFILE)
++            && sandbox_mode_requirement_for_permission_profile(&permission_profile)
++                == SandboxModeRequirement::WorkspaceWrite
++            && let Some(storage_roots) = published_storage_roots()?
++        {
++            file_system_sandbox_policy = workspace_file_system(&resolved_cwd, &storage_roots);
++            permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
++                permission_profile.enforcement(),
++                &file_system_sandbox_policy,
++                permission_profile.network_sandbox_policy(),
++            );
++            workspace_roots.clear();
++            workspace_roots.push(resolved_cwd.clone());
++            profile_workspace_roots.clear();
++        }
+         let prepared_network = PreparedNetworkConfig::from_inputs(NetworkConfigInputs {
+             configured_proxy: configured_network_proxy_config,
+             feature_enabled: enable_network_proxy,
+diff --git a/codex-rs/core/src/config/workspace_permissions.rs b/codex-rs/core/src/config/workspace_permissions.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/config/workspace_permissions.rs
+@@ -0,0 +1,161 @@
++use codex_protocol::permissions::FileSystemAccessMode;
++use codex_protocol::permissions::FileSystemPath;
++use codex_protocol::permissions::FileSystemSandboxEntry;
++use codex_protocol::permissions::FileSystemSandboxPolicy;
++use codex_protocol::permissions::FileSystemSpecialPath;
++use codex_protocol::permissions::PROTECTED_METADATA_PATH_NAMES;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use std::ffi::OsString;
++use std::io;
++use std::path::PathBuf;
++
++const STORAGE_ROOT_VARIABLES: [&str; 6] = [
++    "PROJECT_SCRATCH_ROOT",
++    "PROJECT_RUNTIME_ROOT",
++    "PROJECT_PERSISTENT_ROOT",
++    "REPOS_ROOT",
++    "SKILLS_ROOT",
++    "SKILLS_SCRATCH_ROOT",
++];
++
++pub(super) fn published_storage_roots() -> io::Result<Option<Vec<AbsolutePathBuf>>> {
++    published_storage_roots_with(|name| std::env::var_os(name))
++}
++
++fn published_storage_roots_with(
++    mut variable: impl FnMut(&str) -> Option<OsString>,
++) -> io::Result<Option<Vec<AbsolutePathBuf>>> {
++    let selected =
++        STORAGE_ROOT_VARIABLES.map(|name| (name, variable(name).filter(|value| !value.is_empty())));
++    if selected.iter().all(|(_, value)| value.is_none()) {
++        return Ok(None);
++    }
++    selected
++        .into_iter()
++        .map(|(name, value)| {
++            let value = value.ok_or_else(|| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    format!("{name} was not published with the other storage roots"),
++                )
++            })?;
++            AbsolutePathBuf::from_absolute_path_checked(PathBuf::from(value)).map_err(|error| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    format!("{name} must be an absolute path: {error}"),
++                )
++            })
++        })
++        .collect::<io::Result<Vec<_>>>()
++        .map(Some)
++}
++
++pub(super) fn workspace_file_system(
++    cwd: &AbsolutePathBuf,
++    storage_roots: &[AbsolutePathBuf],
++) -> FileSystemSandboxPolicy {
++    let mut entries = vec![FileSystemSandboxEntry::new(
++        FileSystemPath::Special {
++            value: FileSystemSpecialPath::Root,
++        },
++        FileSystemAccessMode::Read,
++    )];
++    // Bind the entered cwd rather than symbolic workspace folders, which can change later.
++    for root in std::iter::once(cwd).chain(storage_roots) {
++        entries.push(FileSystemSandboxEntry::new(
++            root.clone().into(),
++            FileSystemAccessMode::Write,
++        ));
++        // Native policy gives these names implicit read-only protection unless explicitly granted.
++        for name in PROTECTED_METADATA_PATH_NAMES {
++            entries.push(FileSystemSandboxEntry::new(
++                root.join(name).into(),
++                FileSystemAccessMode::Write,
++            ));
++        }
++    }
++    FileSystemSandboxPolicy::restricted(entries)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::HashMap;
++    use std::path::Path;
++
++    #[test]
++    fn published_roots_are_all_or_none_and_absolute() {
++        assert_eq!(published_storage_roots_with(|_| None).unwrap(), None);
++        let partial = published_storage_roots_with(|name| {
++            (name == "PROJECT_SCRATCH_ROOT").then(|| OsString::from("/scratch"))
++        })
++        .unwrap_err();
++        assert!(partial.to_string().contains("PROJECT_RUNTIME_ROOT"));
++        let relative = published_storage_roots_with(|name| {
++            Some(if name == "SKILLS_ROOT" {
++                OsString::from("codex/skills")
++            } else {
++                OsString::from(format!("/{name}"))
++            })
++        })
++        .unwrap_err();
++        assert!(
++            relative
++                .to_string()
++                .contains("SKILLS_ROOT must be an absolute path")
++        );
++    }
++
++    #[test]
++    fn workspace_and_six_storage_trees_are_fully_writable() {
++        let roots = HashMap::from([
++            ("PROJECT_SCRATCH_ROOT", "/harness/repos/project"),
++            ("PROJECT_RUNTIME_ROOT", "/harness/tmp/project"),
++            ("PROJECT_PERSISTENT_ROOT", "/harness/state/project"),
++            ("REPOS_ROOT", "/home/person/repos"),
++            ("SKILLS_ROOT", "/codex/skills"),
++            ("SKILLS_SCRATCH_ROOT", "/harness/skills"),
++        ]);
++        let roots = published_storage_roots_with(|name| roots.get(name).map(OsString::from))
++            .unwrap()
++            .unwrap();
++        let cwd = AbsolutePathBuf::from_absolute_path_checked("/workspace").unwrap();
++        let policy = workspace_file_system(&cwd, &roots);
++        for path in [
++            "/workspace/file",
++            "/workspace/.git/config",
++            "/workspace/.agents/skills/example",
++            "/workspace/.codex/config.toml",
++            "/workspace/.aws/config",
++            "/workspace/any/nested/path",
++            "/harness/repos/project/rust/target",
++            "/harness/tmp/project/socket",
++            "/harness/state/project/data",
++            "/home/person/repos/other/file",
++            "/codex/skills/example/SKILL.md",
++            "/harness/skills/topic.md",
++            "/harness/skills/.aws/config",
++        ] {
++            assert!(
++                policy.can_write_local_path_with_cwd(Path::new(path), Path::new("/workspace")),
++                "expected write access to {path}"
++            );
++        }
++        for path in [
++            "/codex/config.toml",
++            "/harness/app-server/runtime",
++            "/tmp/unrelated",
++            "/var/tmp/unrelated",
++        ] {
++            assert!(
++                !policy.can_write_local_path_with_cwd(Path::new(path), Path::new("/workspace")),
++                "unexpected write access to {path}"
++            );
++        }
++        let unrelated = AbsolutePathBuf::from_absolute_path_checked("/unrelated").unwrap();
++        let materialized = policy
++            .clone()
++            .materialize_project_roots_with_workspace_roots(&[unrelated]);
++        assert_eq!(materialized, policy);
++    }
++}
+diff --git a/codex-rs/exec/tests/suite/worktree.rs b/codex-rs/exec/tests/suite/worktree.rs
+--- a/codex-rs/exec/tests/suite/worktree.rs
++++ b/codex-rs/exec/tests/suite/worktree.rs
+@@ -78,7 +78,7 @@ async fn worktree_start_and_fork_use_host_pool_and_preserve_legacy_resume() -> a
+     fs::write(
+         home.join("config.toml"),
+         format!(
+-            "sandbox_mode = \"workspace-write\"\nfeatures.worktrees = true\n[desktop]\ngit-worktree-root = {}\n[projects.{}]\ntrust_level = \"trusted\"\n",
++            "default_permissions = \"worktree\"\nfeatures.worktrees = true\n[permissions.worktree.filesystem]\n\":root\" = \"read\"\n\":workspace_roots\" = \"write\"\n[desktop]\ngit-worktree-root = {}\n[projects.{}]\ntrust_level = \"trusted\"\n",
+             serde_json::to_string(&pool)?,
+             serde_json::to_string(&source)?,
+         ),

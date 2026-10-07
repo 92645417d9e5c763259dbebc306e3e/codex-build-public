@@ -1,0 +1,666 @@
+record-response-attempts
+
+Lane: draft
+
+Unit: producer
+
+ChildPatch: record-response-attempts
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -14,6 +14,8 @@ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_history;
+ mod realtime_prompt;
++mod response_metrics;
++pub use response_metrics::ResponseMetrics;
+ mod responses_headers;
+ pub use responses_headers::CodexResponsesHeaders;
+ mod responses_metadata;
+diff --git a/codex-rs/core/src/response_metrics.rs b/codex-rs/core/src/response_metrics.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_metrics.rs
+@@ -0,0 +1,267 @@
++//! Attempt-owned transport observations and published response snapshots.
++
++mod recording;
++pub use recording::ResponseMetrics;
++
++use codex_api::ResponseObservation;
++use codex_api::ResponseObserver;
++use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseQuotaObservation;
++use codex_protocol::response_metrics::ResponseTokenCounts;
++use serde_json::Value;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++use tokio::time::Instant;
++use uuid::Uuid;
++
++struct AttemptState {
++    record: ResponseAttempt,
++    started: Instant,
++    sent: Option<Instant>,
++    terminal: Option<Instant>,
++    notified: Instant,
++}
++
++pub(crate) struct ResponseAttemptContext {
++    pub thread_id: ThreadId,
++    pub turn_id: Option<String>,
++    pub request_kind: String,
++    pub provider: String,
++    pub account_id: Option<String>,
++    pub requested_model: String,
++    pub reasoning_effort: Option<String>,
++}
++
++pub(crate) struct ResponseAttemptTracker {
++    state: Mutex<AttemptState>,
++    metrics: Arc<ResponseMetrics>,
++}
++
++impl AttemptState {
++    fn new(context: ResponseAttemptContext, started: Instant, started_at: i64) -> Self {
++        let now = Instant::now();
++        Self {
++            record: ResponseAttempt {
++                attempt_id: Uuid::now_v7(),
++                revision: 1,
++                thread_id: context.thread_id,
++                turn_id: context.turn_id,
++                response_id: None,
++                request_kind: context.request_kind,
++                provider: context.provider,
++                account_id: context.account_id,
++                requested_model: context.requested_model,
++                served_model: None,
++                reasoning_effort: context.reasoning_effort,
++                started_at,
++                ttfb_ms: None,
++                ttfc_ms: None,
++                usage_observed_sequence: None,
++                rate_limits: Vec::new(),
++                terminal_observed_offset_ms: None,
++                elapsed_ms: millis(now.duration_since(started)),
++                sent_payload_bytes: None,
++                received_payload_bytes: 0,
++                end_reason: None,
++                tokens: ResponseTokenCounts::default(),
++                tps: None,
++            },
++            started,
++            sent: None,
++            terminal: None,
++            notified: now,
++        }
++    }
++
++    fn snapshot(&self) -> ResponseAttempt {
++        let mut record = self.record.clone();
++        if record.end_reason.is_none() {
++            record.elapsed_ms = self
++                .terminal
++                .map(|at| millis(at.duration_since(self.started)))
++                .unwrap_or_else(|| {
++                    millis(Instant::now().duration_since(self.started)).max(record.elapsed_ms)
++                });
++            // Billing facts become public with the validated terminal, while
++            // the official response ID and transport progress remain available.
++            record.served_model = None;
++            record.tokens = ResponseTokenCounts::default();
++            record.tps = None;
++            record.usage_observed_sequence = None;
++            record.rate_limits.clear();
++        }
++        record
++    }
++
++    fn received(&mut self, observation: ResponseObservation, at: Instant) -> bool {
++        if let Some(model) = observation.served_model {
++            self.record.served_model = Some(model);
++        }
++        let Some(sent) = self.sent else {
++            return false;
++        };
++        let record = &mut self.record;
++        let first_payload = record.ttfb_ms.is_none() && observation.payload_bytes > 0;
++        let first_content = record.ttfc_ms.is_none() && observation.has_content;
++        record.elapsed_ms = millis(at.duration_since(self.started));
++        record.received_payload_bytes += observation.payload_bytes;
++        if first_payload {
++            record.ttfb_ms = Some(millis(at.duration_since(sent)));
++        }
++        if first_content {
++            record.ttfc_ms = Some(millis(at.duration_since(sent)));
++        }
++        if let Some(id) = observation.response_id {
++            record.response_id = Some(id);
++        }
++        if let Some(usage) = observation.usage {
++            let window = at.duration_since(sent);
++            record.tokens = token_counts(&usage);
++            record.usage_observed_sequence = Some(Uuid::now_v7());
++            record.tps = record.tokens.output.and_then(|tokens| {
++                let rate = tokens as f64 / window.as_secs_f64();
++                (window > Duration::ZERO && rate.is_finite()).then_some(rate)
++            });
++        }
++        if let Some(limits) = observation.rate_limits {
++            let weekly = [limits.primary.as_ref(), limits.secondary.as_ref()]
++                .into_iter()
++                .flatten()
++                .find(|window| window.window_minutes == Some(7 * 24 * 60))
++                .filter(|window| (0.0..=100.0).contains(&window.used_percent));
++            record.rate_limits.push(ResponseQuotaObservation {
++                sequence: Uuid::now_v7(),
++                limit_id: limits.limit_id.clone().unwrap_or_else(|| "codex".into()),
++                used_percent: weekly.map(|window| window.used_percent),
++                resets_at: weekly.and_then(|window| window.resets_at),
++            });
++        }
++        if let Some(terminal) = observation.terminal {
++            self.terminal = Some(at);
++            record.terminal_observed_offset_ms = Some(millis(at.duration_since(sent)));
++            if terminal != ResponseAttemptEnd::Completed {
++                record.end_reason = Some(terminal);
++            }
++        }
++        if first_payload
++            || first_content
++            || observation.terminal.is_some()
++            || at.duration_since(self.notified) >= Duration::from_millis(100)
++        {
++            self.notified = at;
++            true
++        } else {
++            false
++        }
++    }
++}
++
++impl ResponseAttemptTracker {
++    fn update(&self, update: impl FnOnce(&mut AttemptState) -> bool) {
++        let mut state = self.state.lock().expect("response attempt lock");
++        if state.record.end_reason.is_some() {
++            return;
++        }
++        state.record.revision += 1;
++        if update(&mut state) {
++            // History holds snapshots, never tracker locks. Keeping this lock
++            // through publication preserves revision order for all subscribers.
++            self.metrics.publish(&state);
++        }
++    }
++
++    pub(crate) fn configured(&self, request: &codex_api::ResponsesApiRequest) {
++        self.update(|state| {
++            state.record.requested_model.clone_from(&request.model);
++            state.record.reasoning_effort = request
++                .reasoning
++                .as_ref()
++                .and_then(|reasoning| reasoning.effort.as_ref())
++                .map(ToString::to_string);
++            false
++        });
++    }
++}
++
++impl ResponseObserver for ResponseAttemptTracker {
++    fn prepared(&self, payload_bytes: u64) {
++        self.update(|state| {
++            state.record.sent_payload_bytes = Some(payload_bytes);
++            false
++        });
++    }
++
++    fn sent(&self, at: Instant) {
++        self.update(|state| {
++            state.sent = Some(at);
++            state.record.elapsed_ms = millis(at.duration_since(state.started));
++            true
++        });
++    }
++
++    fn received(&self, observation: ResponseObservation, at: Instant) {
++        self.update(|state| state.received(observation, at));
++    }
++
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant) {
++        self.update(|state| {
++            let elapsed = millis(state.terminal.unwrap_or(at).duration_since(state.started));
++            state.record.end_reason = Some(reason);
++            state.record.elapsed_ms = elapsed;
++            true
++        });
++    }
++}
++
++impl Drop for ResponseAttemptTracker {
++    fn drop(&mut self) {
++        self.ended(ResponseAttemptEnd::Canceled, Instant::now());
++    }
++}
++
++fn millis(duration: Duration) -> u64 {
++    duration.as_millis().try_into().unwrap_or(u64::MAX)
++}
++
++fn token_counts(usage: &Value) -> ResponseTokenCounts {
++    let input = usage.get("input_tokens").and_then(Value::as_u64);
++    let output = usage.get("output_tokens").and_then(Value::as_u64);
++    // Native optional details default to zero, but missing totals or invalid
++    // reported values cannot establish a zero token count.
++    let (cache_read, cache_write) = if input.is_some() {
++        match usage.get("input_tokens_details") {
++            None | Some(Value::Null) => (Some(0), Some(0)),
++            Some(Value::Object(details)) => (
++                details.get("cached_tokens").and_then(Value::as_u64),
++                details
++                    .get("cache_write_tokens")
++                    .map_or(Some(0), Value::as_u64),
++            ),
++            _ => (None, None),
++        }
++    } else {
++        (None, None)
++    };
++    let reasoning = if output.is_some() {
++        match usage.get("output_tokens_details") {
++            None | Some(Value::Null) => Some(0),
++            Some(details) => details.get("reasoning_tokens").and_then(Value::as_u64),
++        }
++    } else {
++        None
++    };
++    ResponseTokenCounts {
++        input,
++        cache_read,
++        cache_write,
++        output,
++        reasoning,
++    }
++}
++
++#[cfg(test)]
++#[path = "response_metrics_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/response_metrics/recording.rs b/codex-rs/core/src/response_metrics/recording.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_metrics/recording.rs
+@@ -0,0 +1,132 @@
++//! Shared published records. Live trackers never belong to the retained queue.
++
++use super::AttemptState;
++use super::ResponseAttemptContext;
++use super::ResponseAttemptTracker;
++use super::millis;
++use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::RECENT_RESPONSE_LIMIT;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponsePerformance;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::collections::HashMap;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use tokio::sync::broadcast;
++use tokio::time::Instant;
++use uuid::Uuid;
++
++#[derive(Debug)]
++pub struct ResponseMetrics {
++    codex_home: PathBuf,
++    history: Mutex<ResponseHistory>,
++    updates: broadcast::Sender<ResponseAttempt>,
++}
++
++#[derive(Debug, Default)]
++struct ResponseHistory {
++    recent: BTreeMap<Uuid, PublishedAttempt>,
++    has_older: bool,
++    models: BTreeSet<String>,
++    last_generations: HashMap<ThreadId, ResponsePerformance>,
++}
++
++#[derive(Debug)]
++struct PublishedAttempt {
++    record: ResponseAttempt,
++    observed_at: Option<Instant>,
++}
++
++impl PublishedAttempt {
++    fn snapshot(&self) -> ResponseAttempt {
++        let mut record = self.record.clone();
++        if let Some(at) = self.observed_at {
++            record.elapsed_ms += millis(at.elapsed());
++        }
++        record
++    }
++}
++
++impl ResponseMetrics {
++    pub fn new(codex_home: impl Into<PathBuf>) -> Self {
++        Self {
++            codex_home: codex_home.into(),
++            history: Mutex::new(ResponseHistory::default()),
++            updates: broadcast::channel(1024).0,
++        }
++    }
++
++    pub(crate) fn start(
++        self: &Arc<Self>,
++        context: ResponseAttemptContext,
++        started: Instant,
++        started_at: i64,
++    ) -> Arc<ResponseAttemptTracker> {
++        let state = AttemptState::new(context, started, started_at);
++        self.publish(&state);
++        Arc::new(ResponseAttemptTracker {
++            state: Mutex::new(state),
++            metrics: Arc::clone(self),
++        })
++    }
++
++    pub(crate) fn snapshot(&self) -> Vec<ResponseAttempt> {
++        self.history
++            .lock()
++            .expect("response history lock")
++            .recent
++            .values()
++            .rev()
++            .map(PublishedAttempt::snapshot)
++            .collect()
++    }
++
++    pub fn subscribe(&self) -> broadcast::Receiver<ResponseAttempt> {
++        self.updates.subscribe()
++    }
++
++    /// Resynchronize lagged subscribers without reviving unfinished stored records.
++    pub fn notification_snapshot(&self) -> Vec<ResponseAttempt> {
++        self.history
++            .lock()
++            .expect("response history lock")
++            .recent
++            .values()
++            .rev()
++            .filter(|row| row.observed_at.is_some() || row.record.end_reason.is_some())
++            .map(PublishedAttempt::snapshot)
++            .collect()
++    }
++
++    pub(super) fn publish(&self, state: &AttemptState) {
++        let record = state.snapshot();
++        let mut history = self.history.lock().expect("response history lock");
++        history.models.insert(record.requested_model.clone());
++        if record.end_reason.is_some() && record.request_kind == "generation" {
++            let performance = ResponsePerformance::from(&record);
++            let current = history
++                .last_generations
++                .entry(record.thread_id)
++                .or_insert_with(|| performance.clone());
++            if current.attempt_id < performance.attempt_id {
++                *current = performance;
++            }
++        }
++        history.recent.insert(
++            record.attempt_id,
++            PublishedAttempt {
++                record: record.clone(),
++                observed_at: (record.end_reason.is_none() && state.terminal.is_none())
++                    .then(Instant::now),
++            },
++        );
++        if history.recent.len() > RECENT_RESPONSE_LIMIT {
++            history.recent.pop_first();
++            history.has_older = true;
++        }
++        // A manager can have no UI subscribers while still owning response history.
++        let _ = self.updates.send(record);
++    }
++}
+diff --git a/codex-rs/core/src/response_metrics_tests.rs b/codex-rs/core/src/response_metrics_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_metrics_tests.rs
+@@ -0,0 +1,227 @@
++use super::*;
++use codex_protocol::response_metrics::RECENT_RESPONSE_LIMIT;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn context() -> ResponseAttemptContext {
++    ResponseAttemptContext {
++        thread_id: ThreadId::new(),
++        turn_id: Some("turn-1".into()),
++        request_kind: "generation".into(),
++        provider: "OpenAI".into(),
++        account_id: Some("selected-account".into()),
++        requested_model: "model".into(),
++        reasoning_effort: None,
++    }
++}
++
++#[tokio::test(start_paused = true)]
++async fn live_progress_and_final_tokens_share_the_transport_clock() {
++    let home = tempfile::tempdir().unwrap();
++    let metrics = Arc::new(ResponseMetrics::new(home.path()));
++    let attempt = metrics.start(context(), Instant::now(), 1000);
++    tokio::time::advance(Duration::from_secs(2)).await;
++    attempt.sent(Instant::now());
++    tokio::time::advance(Duration::from_millis(300)).await;
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 100,
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    tokio::time::advance(Duration::from_millis(8700)).await;
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 150,
++            has_content: true,
++            served_model: Some("served-model".into()),
++            usage: Some(json!({"output_tokens": 100})),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    let live = metrics.snapshot().pop().unwrap();
++    assert_eq!(
++        (live.ttfb_ms, live.ttfc_ms, live.received_payload_bytes),
++        (Some(300), Some(9000), 250)
++    );
++    assert_eq!(live.tokens, ResponseTokenCounts::default());
++    assert_eq!((live.tps, live.served_model), (None, None));
++    tokio::time::advance(Duration::from_secs(1)).await;
++    let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
++        "output_tokens": 200, "output_tokens_details": {"reasoning_tokens": 180}});
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 200,
++            response_id: Some("response-1".into()),
++            usage: Some(usage.clone()),
++            terminal: Some(ResponseAttemptEnd::Completed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    assert_eq!(metrics.snapshot()[0].elapsed_ms, 12000);
++    tokio::time::advance(Duration::from_secs(30)).await;
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let row = metrics.snapshot().pop().unwrap();
++    assert_eq!(row.elapsed_ms, 12000);
++    assert_eq!(
++        (row.ttfb_ms, row.ttfc_ms, row.tps),
++        (Some(300), Some(9000), Some(20.0))
++    );
++    assert_eq!(
++        row.tokens,
++        ResponseTokenCounts {
++            input: Some(100),
++            cache_read: Some(60),
++            cache_write: Some(10),
++            output: Some(200),
++            reasoning: Some(180),
++        }
++    );
++    assert_eq!(row.received_payload_bytes, 450);
++    assert_eq!(row.served_model.as_deref(), Some("served-model"));
++    drop(attempt);
++    assert_eq!(metrics.snapshot(), vec![row]);
++}
++
++#[tokio::test(start_paused = true)]
++async fn failed_partial_usage_and_retries_are_distinct_records() {
++    let home = tempfile::tempdir().unwrap();
++    let metrics = Arc::new(ResponseMetrics::new(home.path()));
++    let attempt = metrics.start(context(), Instant::now(), 1000);
++    attempt.sent(Instant::now());
++    tokio::time::advance(Duration::from_secs(5)).await;
++    attempt.received(
++        ResponseObservation {
++            has_content: true,
++            usage: Some(json!({"output_tokens": 100})),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    tokio::time::advance(Duration::from_secs(300)).await;
++    attempt.ended(ResponseAttemptEnd::ProgressTimeout, Instant::now());
++    let retry = metrics.start(context(), Instant::now(), 1305);
++    tokio::time::advance(Duration::from_secs(1)).await;
++    retry.ended(ResponseAttemptEnd::SetupFailed, Instant::now());
++    let rows = metrics.snapshot();
++    assert_eq!(rows.len(), 2);
++    assert_ne!(rows[0].attempt_id, rows[1].attempt_id);
++    assert_eq!(rows[0].tokens, ResponseTokenCounts::default());
++    assert_eq!(
++        (rows[1].ttfc_ms, rows[1].tps, rows[1].elapsed_ms),
++        (Some(5000), Some(20.0), 305000)
++    );
++    assert_eq!(rows[1].tokens.output, Some(100));
++    attempt.ended(ResponseAttemptEnd::Canceled, Instant::now());
++    assert_eq!(metrics.snapshot(), rows);
++}
++
++#[tokio::test]
++async fn retained_snapshots_do_not_keep_trackers_alive() {
++    let home = tempfile::tempdir().unwrap();
++    let metrics = Arc::new(ResponseMetrics::new(home.path()));
++    let oldest = metrics.start(context(), Instant::now(), 1000);
++    let oldest_id = metrics.snapshot()[0].attempt_id;
++    for _ in 0..RECENT_RESPONSE_LIMIT {
++        drop(metrics.start(context(), Instant::now(), 1000));
++    }
++    let rows = metrics.snapshot();
++    assert_eq!(rows.len(), RECENT_RESPONSE_LIMIT);
++    assert!(
++        rows.iter()
++            .all(|row| row.end_reason == Some(ResponseAttemptEnd::Canceled))
++    );
++    assert!(
++        rows.windows(2)
++            .all(|rows| rows[0].attempt_id > rows[1].attempt_id)
++    );
++    let mut updates = metrics.subscribe();
++    drop(oldest);
++    let final_record = updates.try_recv().unwrap();
++    assert_eq!(final_record.attempt_id, oldest_id);
++    assert_eq!(final_record.end_reason, Some(ResponseAttemptEnd::Canceled));
++    assert_eq!(metrics.snapshot(), rows);
++}
++
++#[test]
++fn usage_preserves_known_zero_and_unknown_totals() {
++    assert_eq!(token_counts(&json!({})), ResponseTokenCounts::default());
++    assert_eq!(
++        token_counts(&json!({"input_tokens": 100, "output_tokens": 0})),
++        ResponseTokenCounts {
++            input: Some(100),
++            cache_read: Some(0),
++            cache_write: Some(0),
++            output: Some(0),
++            reasoning: Some(0),
++        }
++    );
++    let invalid = token_counts(
++        &json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": -1, "cache_write_tokens": null}}),
++    );
++    assert_eq!(
++        (invalid.cache_read, invalid.cache_write, invalid.output),
++        (None, None, None)
++    );
++}
++
++#[tokio::test]
++async fn live_records_expose_the_official_id_and_payload_size_without_request_content() {
++    let home = tempfile::tempdir().unwrap();
++    let metrics = Arc::new(ResponseMetrics::new(home.path()));
++    let attempt = metrics.start(context(), Instant::now(), 1000);
++    let request = r#"{"input":"private message"}"#;
++    attempt.prepared(request.len() as u64);
++    attempt.sent(Instant::now());
++    assert_eq!(metrics.snapshot()[0].response_id, None);
++    attempt.received(
++        ResponseObservation {
++            response_id: Some("resp-provider".into()),
++            payload_bytes: 20,
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    let row = metrics.snapshot().pop().unwrap();
++    assert_eq!(row.sent_payload_bytes, Some(request.len() as u64));
++    assert_eq!(row.response_id.as_deref(), Some("resp-provider"));
++    assert_eq!(row.end_reason, None);
++    assert!(!serde_json::to_string(&row).unwrap().contains("private"));
++}
++
++#[tokio::test(start_paused = true)]
++async fn subscribers_receive_identical_ordered_revisions_and_frozen_terminals() {
++    let home = tempfile::tempdir().unwrap();
++    let metrics = Arc::new(ResponseMetrics::new(home.path()));
++    let mut first = metrics.subscribe();
++    let mut second = metrics.subscribe();
++    let attempt = metrics.start(context(), Instant::now(), 1000);
++    attempt.sent(Instant::now());
++    tokio::time::advance(Duration::from_secs(1)).await;
++    assert_eq!(metrics.snapshot()[0].elapsed_ms, 1000);
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 100,
++            usage: Some(json!({"input_tokens": 0, "output_tokens": 0})),
++            terminal: Some(ResponseAttemptEnd::Failed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    tokio::time::advance(Duration::from_secs(10)).await;
++    drop(attempt);
++    let mut revisions = Vec::new();
++    while let Ok(row) = first.try_recv() {
++        assert_eq!(second.try_recv().unwrap(), row);
++        revisions.push(row.revision);
++    }
++    assert!(revisions.windows(2).all(|pair| pair[0] < pair[1]));
++    let row = metrics.snapshot().pop().unwrap();
++    assert_eq!(row.elapsed_ms, 1000);
++    assert_eq!(row.tokens.output, Some(0));
++    assert_eq!(row.tps, Some(0.0));
++    assert_eq!(metrics.notification_snapshot(), vec![row]);
++}

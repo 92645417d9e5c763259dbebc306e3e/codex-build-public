@@ -1,0 +1,6 @@
+- Retain account or transport conditions only when they simplify the complete implementation; otherwise prefer shared code and preserve unrelated upstream behavior.
+- Treat TUI as the default terminal interface and refer to it only as TUI.
+- Keep status-line previews consistent with live output in value, format, color, and unavailable state.
+- Every private Patch in every lane serves Linux only; non-Linux compatibility and compilation are outside its scope.
+- Retain a platform condition only when it simplifies the required Linux implementation compared with shared or unconditional code.
+- Preserve required Linux behavior and assertions, prefer shared code when simpler, and avoid blanket Linux gating or changes to unrelated upstream platform boundaries.

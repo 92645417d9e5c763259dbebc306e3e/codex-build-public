@@ -1,0 +1,703 @@
+render-accounting-tables
+
+Lane: mixed
+
+Unit: present-local-usage-analytics
+
+ChildPatch: render-accounting-tables
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -170,6 +170,7 @@ mod keymap_setup;
+ mod line_truncation;
+ pub(crate) mod live_wrap;
+ mod local_settings;
++mod local_usage;
+ pub use live_wrap::RowBuilder;
+ mod local_chatgpt_auth;
+ mod managed_new_thread_defaults;
+diff --git a/codex-rs/tui/src/local_usage/mod.rs b/codex-rs/tui/src/local_usage/mod.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/local_usage/mod.rs
+@@ -0,0 +1,89 @@
++//! Presentation of the app-server's shared local accounting snapshot.
++pub(crate) mod table;
++
++pub(crate) use codex_app_server_protocol::LocalUsageReport as UsageReport;
++use codex_app_server_protocol::LocalUsageTotals as Usage;
++use std::collections::BTreeMap;
++
++pub(crate) const TITLE: &str = "Local usage analytics";
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum UsageRange {
++    Today,
++    Yesterday,
++    Daily,
++    Weekly,
++    Monthly,
++    Yearly,
++    Heatmap,
++    Quota,
++}
++
++impl UsageRange {
++    pub(crate) const VIEWS: [Self; 8] = [
++        Self::Heatmap,
++        Self::Today,
++        Self::Yesterday,
++        Self::Daily,
++        Self::Weekly,
++        Self::Monthly,
++        Self::Yearly,
++        Self::Quota,
++    ];
++
++    pub(crate) fn index(self) -> usize {
++        Self::VIEWS
++            .iter()
++            .position(|range| *range == self)
++            .expect("every usage view is listed")
++    }
++
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::Today => "today",
++            Self::Yesterday => "yesterday",
++            Self::Daily => "daily",
++            Self::Weekly => "weekly",
++            Self::Monthly => "monthly",
++            Self::Yearly => "yearly",
++            Self::Heatmap => "heatmap",
++            Self::Quota => "weekly quota",
++        }
++    }
++}
++
++fn periods(
++    report: &UsageReport,
++    range: UsageRange,
++) -> impl DoubleEndedIterator<Item = (&String, &BTreeMap<String, Usage>)> {
++    let rows = match range {
++        UsageRange::Weekly => &report.weekly_rows,
++        UsageRange::Monthly => &report.monthly_rows,
++        UsageRange::Yearly => &report.yearly_rows,
++        UsageRange::Today
++        | UsageRange::Yesterday
++        | UsageRange::Daily
++        | UsageRange::Heatmap
++        | UsageRange::Quota => &report.rows,
++    };
++    let today = report.refreshed_at.date_naive();
++    let bounds = match range {
++        UsageRange::Today => Some((today, today)),
++        UsageRange::Yesterday => {
++            let yesterday = today - chrono::Duration::days(1);
++            Some((yesterday, yesterday))
++        }
++        UsageRange::Heatmap => Some((today - chrono::Duration::days(364), today)),
++        UsageRange::Daily
++        | UsageRange::Weekly
++        | UsageRange::Monthly
++        | UsageRange::Yearly
++        | UsageRange::Quota => None,
++    }
++    .map(|(start, end)| (start.to_string(), end.to_string()));
++    rows.iter().filter(move |(date, _)| {
++        bounds
++            .as_ref()
++            .is_none_or(|(start, end)| *date >= start && *date <= end)
++    })
++}
+diff --git a/codex-rs/tui/src/local_usage/table.rs b/codex-rs/tui/src/local_usage/table.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/local_usage/table.rs
+@@ -0,0 +1,580 @@
++//! Bounded table cells with real row and column spans.
++
++use crate::render::renderable::Renderable;
++use itertools::Itertools;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Color;
++use ratatui::style::Style;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use ratatui::widgets::Widget;
++
++pub(crate) struct Cell {
++    pub(crate) lines: Vec<Line<'static>>,
++    pub(crate) value: Option<f64>,
++    pub(crate) right: bool,
++    pub(crate) rows: usize,
++    pub(crate) columns: usize,
++    pub(crate) style: Style,
++}
++
++impl Cell {
++    pub(crate) fn text(text: impl Into<String>) -> Self {
++        Self::lines(
++            text.into()
++                .split('\n')
++                .map(|line| line.to_owned().into())
++                .collect(),
++        )
++    }
++
++    pub(crate) fn lines(lines: Vec<Line<'static>>) -> Self {
++        Self {
++            lines,
++            value: None,
++            right: false,
++            rows: 1,
++            columns: 1,
++            style: Style::default(),
++        }
++    }
++
++    pub(crate) fn header(text: &str) -> Self {
++        Self {
++            style: Style::default().bold().gray(),
++            ..Self::text(text)
++        }
++    }
++
++    pub(crate) fn number(text: impl Into<String>) -> Self {
++        Self {
++            right: true,
++            ..Self::text(text)
++        }
++    }
++
++    pub(crate) fn spanning(mut self, rows: usize, columns: usize) -> Self {
++        self.rows = rows;
++        self.columns = columns;
++        self
++    }
++
++    pub(crate) fn value(value: Option<f64>, text: impl Into<String>) -> Self {
++        Self {
++            value,
++            ..Self::number(text)
++        }
++    }
++}
++
++pub(crate) fn widths(available: u16, limits: &[(usize, usize)]) -> Option<Vec<usize>> {
++    let room = usize::from(available).checked_sub(limits.len() * 3 + 1)?;
++    let mut widths: Vec<_> = limits.iter().map(|(min, _)| *min).collect();
++    let mut remaining = room.checked_sub(widths.iter().sum())?;
++    while remaining > 0 {
++        let mut grew = false;
++        for (width, (_, max)) in widths.iter_mut().zip(limits) {
++            if remaining > 0 && *width < *max {
++                *width += 1;
++                remaining -= 1;
++                grew = true;
++            }
++        }
++        if !grew {
++            break;
++        }
++    }
++    Some(widths)
++}
++
++struct Placed<'a> {
++    cell: &'a Cell,
++    row: usize,
++    column: usize,
++}
++
++/// Center the longest visible label, then align every label to its left edge.
++pub(crate) fn center_left_column(rows: &mut [Vec<Cell>], column: usize, width: usize) {
++    let text_width = rows
++        .iter()
++        .flat_map(|row| &row[column].lines)
++        .map(Line::width)
++        .max()
++        .unwrap_or_default()
++        .min(width);
++    for row in rows {
++        for line in &mut row[column].lines {
++            let padding = text_width.saturating_sub(line.width());
++            if padding > 0 {
++                line.spans.push(Span::from(" ".repeat(padding)));
++            }
++        }
++    }
++}
++
++pub(crate) fn shade_columns(rows: &mut [Vec<Cell>]) {
++    for column in 0..rows.iter().map(Vec::len).max().unwrap_or(0) {
++        let scale = rows
++            .iter()
++            .filter_map(|row| row.get(column)?.value)
++            .filter(|value| *value > 0.0)
++            .sorted_by(f64::total_cmp)
++            .dedup()
++            .collect::<Vec<_>>();
++        for cell in rows.iter_mut().filter_map(|row| row.get_mut(column)) {
++            if let Some(value) = cell.value.filter(|value| *value > 0.0) {
++                let rank = scale.partition_point(|candidate| *candidate < value);
++                cell.style = cell.style.patch(intensity_style(if scale.len() == 1 {
++                    16
++                } else {
++                    1 + rank * 15 / (scale.len() - 1)
++                }));
++            }
++        }
++    }
++}
++
++pub(crate) struct Table {
++    lines: Vec<Line<'static>>,
++    // Physical row starts and their column edges preserve merged cells at viewport cuts.
++    row_edges: Vec<(usize, Vec<usize>)>,
++}
++
++impl Table {
++    fn cap(&self, after: usize, bottom: bool) -> Line<'static> {
++        let row = self.row_edges.partition_point(|(start, _)| *start <= after) - 1;
++        let columns = &self.row_edges[row].1;
++        let mut spans = vec![Span::from(if bottom { "└" } else { "┌" }).dim()];
++        for (index, pair) in columns.windows(2).enumerate() {
++            spans.push(Span::from("─".repeat(pair[1] - pair[0] - 1)).dim());
++            let edge = if index + 2 == columns.len() {
++                if bottom { "┘" } else { "┐" }
++            } else if bottom {
++                "┴"
++            } else {
++                "┬"
++            };
++            spans.push(Span::from(edge).dim());
++        }
++        spans.into()
++    }
++}
++
++impl Renderable for Table {
++    fn desired_height(&self, _width: u16) -> u16 {
++        self.lines.len().min(usize::from(u16::MAX)) as u16
++    }
++
++    fn render(&self, area: Rect, buf: &mut Buffer) {
++        self.render_scrolled(area, buf, 0);
++    }
++
++    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
++        let offset = usize::from(scroll_offset);
++        let mut height = usize::from(area.height).min(self.lines.len().saturating_sub(offset));
++        if offset + height < self.lines.len()
++            && height > 2
++            && self
++                .row_edges
++                .binary_search_by_key(&(offset + height - 2), |(start, _)| *start)
++                .is_ok()
++        {
++            // Close above an orphan separator, at the last displayed content row.
++            // Keep source offsets unchanged so overlapping pages retain every row.
++            height -= 1;
++        }
++        for (row, line) in self.lines.iter().skip(offset).take(height).enumerate() {
++            // Even a short fragment at a viewport edge must close its cut boundary.
++            let cap = if height > 1 && row == 0 && offset > 0 {
++                Some(self.cap(offset, false))
++            } else if row + 1 == height && offset + height < self.lines.len() {
++                Some(self.cap(offset + height.saturating_sub(2), true))
++            } else {
++                None
++            };
++            Widget::render(
++                cap.as_ref().unwrap_or(line),
++                Rect::new(area.x, area.y + row as u16, area.width, 1),
++                buf,
++            );
++        }
++        true
++    }
++}
++
++/// Every row supplies only cells that start there; spanned positions are omitted.
++pub(crate) fn render(widths: &[usize], rows: &[Vec<Cell>]) -> Table {
++    if rows.is_empty() || widths.is_empty() {
++        return Table {
++            lines: Vec::new(),
++            row_edges: Vec::new(),
++        };
++    }
++    let mut placed = Vec::new();
++    let mut owners = vec![vec![usize::MAX; widths.len()]; rows.len()];
++    let mut heights = vec![1; rows.len()];
++    for (row, cells) in rows.iter().enumerate() {
++        let mut column = 0;
++        for cell in cells {
++            while column < widths.len() && owners[row][column] != usize::MAX {
++                column += 1;
++            }
++            assert!(cell.rows > 0 && cell.columns > 0);
++            assert!(row + cell.rows <= rows.len() && column + cell.columns <= widths.len());
++            for occupied in &mut owners[row..row + cell.rows] {
++                for slot in &mut occupied[column..column + cell.columns] {
++                    assert_eq!(*slot, usize::MAX, "overlapping table cells");
++                    *slot = placed.len();
++                }
++            }
++            if cell.rows == 1 {
++                heights[row] = heights[row].max(cell.lines.len());
++            }
++            placed.push(Placed { cell, row, column });
++            column += cell.columns;
++        }
++        assert!(owners[row].iter().all(|owner| *owner != usize::MAX));
++    }
++    for entry in &placed {
++        let end = entry.row + entry.cell.rows;
++        let available = heights[entry.row..end].iter().sum::<usize>() + entry.cell.rows - 1;
++        heights[end - 1] += entry.cell.lines.len().saturating_sub(available);
++    }
++    let mut boundaries = vec![0];
++    for height in &heights {
++        boundaries.push(boundaries.last().unwrap() + height + 1);
++    }
++    let horizontal = |row: usize, column: usize| {
++        row == 0 || row == rows.len() || owners[row - 1][column] != owners[row][column]
++    };
++    let vertical = |row: usize, column: usize| {
++        column == 0 || column == widths.len() || owners[row][column - 1] != owners[row][column]
++    };
++    let junction = |row: usize, column: usize| {
++        let north = row > 0 && vertical(row - 1, column);
++        let south = row < rows.len() && vertical(row, column);
++        let west = column > 0 && horizontal(row, column - 1);
++        let east = column < widths.len() && horizontal(row, column);
++        let mask =
++            u8::from(north) | u8::from(south) << 1 | u8::from(west) << 2 | u8::from(east) << 3;
++        match mask {
++            15 => "┼",
++            14 => "┬",
++            13 => "┴",
++            11 => "├",
++            7 => "┤",
++            10 => "┌",
++            6 => "┐",
++            9 => "└",
++            5 => "┘",
++            3 => "│",
++            12 => "─",
++            _ => " ",
++        }
++    };
++    let content = |entry: &Placed<'_>, y: usize| {
++        let width = widths[entry.column..entry.column + entry.cell.columns]
++            .iter()
++            .sum::<usize>()
++            + (entry.cell.columns - 1) * 3;
++        let height = boundaries[entry.row + entry.cell.rows] - boundaries[entry.row] - 1;
++        let offset = y - boundaries[entry.row] - 1;
++        cell_line(entry.cell, width, offset, height)
++    };
++    let mut lines = Vec::with_capacity(boundaries.last().unwrap() + 1);
++    for row in 0..=rows.len() {
++        let mut spans = Vec::new();
++        let mut column = 0;
++        while column < widths.len() {
++            spans.push(Span::from(junction(row, column)).dim());
++            if horizontal(row, column) {
++                spans.push(Span::from("─".repeat(widths[column] + 2)).dim());
++                column += 1;
++            } else {
++                let entry = &placed[owners[row][column]];
++                spans.extend(content(entry, boundaries[row]));
++                column += entry.cell.columns;
++            }
++        }
++        spans.push(Span::from(junction(row, column)).dim());
++        lines.push(spans.into());
++        if row == rows.len() {
++            break;
++        }
++        for y in 0..heights[row] {
++            let mut spans = vec![Span::from("│").dim()];
++            let mut column = 0;
++            while column < widths.len() {
++                let entry = &placed[owners[row][column]];
++                spans.extend(content(entry, boundaries[row] + y + 1));
++                spans.push(Span::from("│").dim());
++                column += entry.cell.columns;
++            }
++            lines.push(spans.into());
++        }
++    }
++    let mut columns = vec![0];
++    for width in widths {
++        columns.push(columns.last().unwrap() + width + 3);
++    }
++    let row_edges = boundaries
++        .into_iter()
++        .take(rows.len())
++        .enumerate()
++        .map(|(row, start)| {
++            let edges = columns
++                .iter()
++                .enumerate()
++                .filter(|(column, _)| vertical(row, *column))
++                .map(|(_, x)| *x)
++                .collect();
++            (start, edges)
++        })
++        .collect();
++    Table { lines, row_edges }
++}
++
++fn cell_line(cell: &Cell, width: usize, row: usize, height: usize) -> Vec<Span<'static>> {
++    let padding_top = height.saturating_sub(cell.lines.len()) / 2;
++    let line = row
++        .checked_sub(padding_top)
++        .and_then(|row| cell.lines.get(row))
++        .cloned()
++        .unwrap_or_default();
++    let mut line = crate::line_truncation::truncate_line_with_ellipsis_if_overflow(line, width);
++    let padding = width.saturating_sub(line.width());
++    let left = if cell.right { padding } else { padding / 2 };
++    line.spans.insert(0, Span::from(" ".repeat(left + 1)));
++    line.spans.push(Span::from(" ".repeat(padding - left + 1)));
++    for span in &mut line.spans {
++        span.style = cell.style.patch(line.style).patch(span.style);
++    }
++    line.spans
++}
++
++pub(crate) fn intensity_style(level: usize) -> Style {
++    use crate::terminal_palette::StdoutColorLevel;
++    use crate::terminal_palette::effective_stdout_color_level;
++    const SHADES: [u8; 16] = [
++        64, 76, 88, 100, 112, 124, 136, 148, 160, 172, 184, 196, 208, 220, 236, 255,
++    ];
++    let color = if level == 0 {
++        Color::Rgb(39, 39, 39)
++    } else {
++        match effective_stdout_color_level() {
++            StdoutColorLevel::TrueColor => {
++                let gray = SHADES[level.min(16) - 1];
++                Color::Rgb(gray, gray, gray)
++            }
++            StdoutColorLevel::Ansi256 => Color::Indexed(232 + level.min(16) as u8),
++            StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => match level {
++                1..=5 => Color::DarkGray,
++                6..=11 => Color::Gray,
++                _ => Color::White,
++            },
++        }
++    };
++    Style::default().fg(color)
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use itertools::Itertools;
++    use ratatui::style::Color;
++    use unicode_width::UnicodeWidthStr;
++
++    pub(crate) fn render_lines(
++        content: Vec<Box<dyn Renderable>>,
++        width: u16,
++    ) -> Vec<Line<'static>> {
++        let height = content.iter().map(|item| item.desired_height(width)).sum();
++        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
++        let mut y = 0;
++        for item in content {
++            let height = item.desired_height(width);
++            item.render(Rect::new(0, y, width, height), &mut buffer);
++            y += height;
++        }
++        buffer
++            .content
++            .chunks_exact(usize::from(width))
++            .map(|row| {
++                let mut spans: Vec<Span<'static>> = Vec::new();
++                let mut continuation = 0;
++                for cell in row {
++                    if continuation > 0 {
++                        continuation -= 1;
++                        continue;
++                    }
++                    continuation = cell.symbol().width().saturating_sub(1);
++                    let style = Style {
++                        fg: (cell.fg != Color::Reset).then_some(cell.fg),
++                        bg: (cell.bg != Color::Reset).then_some(cell.bg),
++                        ..cell.style()
++                    };
++                    if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
++                        last.content.to_mut().push_str(cell.symbol());
++                    } else {
++                        spans.push(Span::styled(cell.symbol().to_owned(), style));
++                    }
++                }
++                while let Some(last) = spans.last_mut() {
++                    last.content = last.content.trim_end().to_owned().into();
++                    if !last.content.is_empty() {
++                        break;
++                    }
++                    spans.pop();
++                }
++                Line::from(spans)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn viewport_caps_follow_merged_cells_and_leave_interior_styles_untouched() {
++        let rows = vec![
++            vec![Cell::header("Group").spanning(1, 2)],
++            vec![Cell::header("Model"), Cell::header("Value")],
++            vec![
++                Cell::text("model").spanning(2, 1),
++                Cell::lines(vec!["first".yellow().into(), "second".yellow().into()]),
++            ],
++            vec![Cell::number("100")],
++            vec![Cell::text("last"), Cell::number("200")],
++        ];
++        let table = render(&[5, 7], &rows);
++        let mut full = Buffer::empty(Rect::new(0, 0, 19, table.desired_height(19)));
++        table.render(*full.area(), &mut full);
++        for (offset, expected_top, expected_bottom) in [
++            (0, "┌─────────────────┐", "└─────────────────┘"),
++            (2, "┌───────┬─────────┐", "└───────┴─────────┘"),
++            (5, "┌───────┬─────────┐", "└───────┴─────────┘"),
++        ] {
++            let area = Rect::new(4, 3, 19, 3);
++            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
++            for cell in &mut buffer.content {
++                cell.set_symbol("~");
++            }
++            assert!(table.render_scrolled(area, &mut buffer, offset));
++            let line = |row| {
++                (area.x..area.right())
++                    .map(|x| buffer[(x, row)].symbol())
++                    .collect::<String>()
++            };
++            assert_eq!(line(area.y), expected_top);
++            assert_eq!(line(area.bottom() - 1), expected_bottom);
++            for x in 0..area.width {
++                assert_eq!(buffer[(area.x + x, area.y + 1)], full[(x, offset + 1)]);
++                assert_eq!(buffer[(area.x + x, area.y)].fg, Color::Reset);
++                assert_eq!(buffer[(area.x + x, area.bottom() - 1)].fg, Color::Reset);
++            }
++            for y in 0..12 {
++                for x in 0..30 {
++                    if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
++                        assert_eq!(buffer[(x, y)].symbol(), "~");
++                    }
++                }
++            }
++        }
++        for height in 0..=2 {
++            let area = Rect::new(4, 3, 19, height);
++            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
++            table.render_scrolled(area, &mut buffer, 5);
++            if height > 0 {
++                assert_eq!(buffer[(area.x, area.bottom() - 1)].symbol(), "└");
++                assert_eq!(buffer[(area.right() - 1, area.bottom() - 1)].symbol(), "┘");
++            }
++        }
++    }
++
++    #[test]
++    fn every_viewport_cut_closes_after_content_without_an_orphan_separator() {
++        let rows = vec![
++            vec![Cell::header("Group").spanning(1, 2)],
++            vec![Cell::header("Model").spanning(2, 1), Cell::header("Value")],
++            vec![Cell::header("Units")],
++            vec![
++                Cell::text("first"),
++                Cell::lines(vec!["one".yellow().into(), "two".yellow().into()]),
++            ],
++            vec![Cell::text("last"), Cell::number("200")],
++        ];
++        let table = render(&[5, 7], &rows);
++        let full_height = table.desired_height(19);
++        let mut full = Buffer::empty(Rect::new(0, 0, 19, full_height));
++        table.render(*full.area(), &mut full);
++        for offset in 0..=full_height {
++            for height in 0..=full_height + 1 {
++                let area = Rect::new(4, 3, 19, height);
++                let mut buffer = Buffer::empty(Rect::new(0, 0, 30, full_height + 5));
++                table.render_scrolled(area, &mut buffer, offset);
++                let visible = (area.y..area.bottom())
++                    .filter(|y| buffer[(area.x, *y)].symbol() != " ")
++                    .collect::<Vec<_>>();
++                let Some(&bottom) = visible.last() else {
++                    assert!(height == 0 || offset == full_height);
++                    continue;
++                };
++                assert_eq!(buffer[(area.x, bottom)].symbol(), "└");
++                assert_eq!(buffer[(area.right() - 1, bottom)].symbol(), "┘");
++                if visible.len() > 1 {
++                    assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
++                }
++                if visible.len() > 2 {
++                    let previous = (area.x..area.right())
++                        .map(|x| buffer[(x, bottom - 1)].symbol())
++                        .collect::<String>();
++                    assert!(
++                        !previous.contains('─'),
++                        "offset {offset}, height {height}: {previous}"
++                    );
++                }
++                for y in area.y + 1..bottom {
++                    for x in 0..area.width {
++                        assert_eq!(buffer[(area.x + x, y)], full[(x, offset + y - area.y)]);
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn merged_headers_and_rows_share_borders_and_preserve_cell_styles() {
++        let rows = vec![
++            vec![
++                Cell::header("Period").spanning(2, 1),
++                Cell::header("Context").spanning(1, 2),
++            ],
++            vec![Cell::header("Input"), Cell::header("Cost")],
++            vec![
++                Cell {
++                    style: Style::default().fg(Color::Yellow),
++                    ..Cell::text("2026-10-04").spanning(2, 1)
++                },
++                Cell::text("modèle-internal-build-name").spanning(1, 2),
++            ],
++            vec![Cell::text("served"), Cell::number("$1.00")],
++        ];
++        let table = render(&[10, 7, 7], &rows);
++        let lines = table.lines;
++        assert!(lines.iter().all(|line| line.width() == 34));
++        let text = lines.iter().join("\n");
++        assert_eq!(text.matches("Period").count(), 1);
++        assert!(text.contains("│   Period   ├"));
++        assert!(text.contains("│ served  │   $1.00 │"));
++        assert!(text.contains("modèle-internal-…"));
++        for line in &lines[5..8] {
++            let styled_width = line
++                .spans
++                .iter()
++                .filter(|span| span.style.fg == Some(Color::Yellow))
++                .map(Span::width)
++                .sum::<usize>();
++            assert_eq!(styled_width, 12);
++        }
++        insta::assert_snapshot!(text);
++    }
++}

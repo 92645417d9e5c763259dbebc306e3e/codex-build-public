@@ -1,0 +1,220 @@
+route-arg0-helpers-to-harness
+
+Lane: normalization
+
+FlatPatch: route-arg0-helpers-to-harness
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/src/config_manager_service_tests.rs b/codex-rs/app-server/src/config_manager_service_tests.rs
+--- a/codex-rs/app-server/src/config_manager_service_tests.rs
++++ b/codex-rs/app-server/src/config_manager_service_tests.rs
+@@ -2758,19 +2758,19 @@ async fn permission_config_reload_merges_session_layers() -> Result<()> {
+     use codex_config::ConfigLayerSource;
+     use codex_config::ConfigLayerStack;
+     let tmp = tempdir()?;
+-    let wrapper_dir = tmp.path().join("tmp/arg0/session");
+-    std::fs::create_dir_all(&wrapper_dir)?;
++    let codex_harness = tmp.path().join("harness");
++    let arg0_root = codex_harness.join("arg0");
++    let wrapper_dir = arg0_root.join("session");
+     let wrapper = wrapper_dir.join("codex-execve-wrapper");
+-    std::fs::write(&wrapper, "")?;
+     let service = ConfigManager::new(
+         tmp.path().to_path_buf(),
+-        tmp.path().join("harness"),
++        codex_harness,
+         Vec::new(),
+         LoaderOverrides::without_managed_config_for_tests(),
+         /*strict_config*/ false,
+         CloudConfigBundleLoader::default(),
+         codex_arg0::Arg0DispatchPaths {
+-            main_execve_wrapper_exe: Some(wrapper),
++            main_execve_wrapper_exe: Some(wrapper.to_path_buf()),
+             ..Default::default()
+         },
+         std::sync::Arc::new(codex_config::NoopThreadConfigLoader),
+@@ -2821,10 +2821,7 @@ async fn permission_config_reload_merges_session_layers() -> Result<()> {
+     assert_eq!(
+         (
+             policy.can_read_local_path_with_cwd(&wrapper_dir, loaded.cwd.as_path()),
+-            policy.can_read_local_path_with_cwd(
+-                &tmp.path().join("tmp/arg0/other"),
+-                loaded.cwd.as_path()
+-            ),
++            policy.can_read_local_path_with_cwd(&arg0_root.join("other"), loaded.cwd.as_path()),
+         ),
+         (true, false),
+     );
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -351,26 +351,30 @@ where
+ fn prepare_path_entry_for_codex_aliases(
+     existing_path: Option<OsString>,
+ ) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+-    let codex_home = find_codex_home()?;
++    let codex_harness = ensure_codex_harness()?;
++    prepare_path_entry_for_codex_aliases_in(&codex_harness, existing_path)
++}
++
++fn prepare_path_entry_for_codex_aliases_in(
++    codex_harness: &Path,
++    existing_path: Option<OsString>,
++) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+     #[cfg(not(debug_assertions))]
+     {
+         // Guard against placing helpers in system temp directories outside debug builds.
+         let temp_root = std::env::temp_dir();
+-        if codex_home.starts_with(&temp_root) {
++        if codex_harness.starts_with(&temp_root) {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::InvalidInput,
+                 format!(
+-                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_home: {codex_home:?})"
++                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_harness: {codex_harness:?})"
+                 ),
+             ));
+         }
+     }
+ 
+-    std::fs::create_dir_all(&codex_home)?;
+-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+-    let temp_root = codex_home.join("tmp").join("arg0");
++    let temp_root = codex_harness.join("arg0");
+     std::fs::create_dir_all(&temp_root)?;
+-    #[cfg(unix)]
+     {
+         use std::os::unix::fs::PermissionsExt;
+ 
+@@ -616,6 +620,22 @@ mod tests {
+         })
+     }
+ 
++    #[test]
++    fn arg0_aliases_are_staged_under_harness() -> anyhow::Result<()> {
++        let root = TempDir::new()?;
++        let codex_harness = root.path().join("harness");
++
++        let (guard, _path) = super::prepare_path_entry_for_codex_aliases_in(&codex_harness, None)?;
++
++        assert!(
++            guard
++                ._temp_dir
++                .path()
++                .starts_with(codex_harness.join("arg0"))
++        );
++        Ok(())
++    }
++
+     #[cfg(windows)]
+     #[test]
+     fn windows_batch_alias_preserves_unicode_executable_paths() -> anyhow::Result<()> {
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -4215,7 +4215,7 @@ impl Config {
+             &shell_environment_policy.r#set,
+         )?;
+         let mut helper_readable_roots = get_readable_roots_required_for_codex_runtime(
+-            &codex_home,
++            &codex_harness,
+             zsh_path.as_ref(),
+             main_execve_wrapper_exe.as_ref(),
+         );
+diff --git a/codex-rs/core/src/config/permissions.rs b/codex-rs/core/src/config/permissions.rs
+--- a/codex-rs/core/src/config/permissions.rs
++++ b/codex-rs/core/src/config/permissions.rs
+@@ -512,11 +512,11 @@ pub(crate) fn reject_unknown_builtin_permission_profile(profile_name: &str) -> i
+ /// for Codex to function. These should always be added to the
+ /// `FileSystemSandboxPolicy` for a thread.
+ pub(crate) fn get_readable_roots_required_for_codex_runtime(
+-    codex_home: &Path,
++    codex_harness: &Path,
+     zsh_path: Option<&PathBuf>,
+     main_execve_wrapper_exe: Option<&PathBuf>,
+ ) -> Vec<AbsolutePathBuf> {
+-    let arg0_root = AbsolutePathBuf::from_absolute_path(codex_home.join("tmp").join("arg0")).ok();
++    let arg0_root = AbsolutePathBuf::from_absolute_path(codex_harness.join("arg0")).ok();
+     let zsh_path = zsh_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
+     let execve_wrapper_root = main_execve_wrapper_exe.and_then(|path| {
+         let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
+diff --git a/codex-rs/core/src/config/permissions_tests.rs b/codex-rs/core/src/config/permissions_tests.rs
+--- a/codex-rs/core/src/config/permissions_tests.rs
++++ b/codex-rs/core/src/config/permissions_tests.rs
+@@ -40,17 +40,15 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+     let temp_dir = TempDir::new()?;
+     let cwd = temp_dir.path().join("workspace");
+     let codex_home = temp_dir.path().join(".codex");
++    let codex_harness = codex_utils_home_dir::find_codex_harness()?;
+     let zsh_path = temp_dir.path().join("runtime").join("zsh");
+-    let arg0_root = codex_home.join("tmp").join("arg0");
++    let arg0_root = codex_harness.as_path().join("arg0");
+     let allowed_arg0_dir = arg0_root.join("codex-arg0-session");
+     let sibling_arg0_dir = arg0_root.join("codex-arg0-other-session");
+     let execve_wrapper = allowed_arg0_dir.join("codex-execve-wrapper");
+     std::fs::create_dir_all(&cwd)?;
+     std::fs::create_dir_all(zsh_path.parent().expect("zsh path should have parent"))?;
+-    std::fs::create_dir_all(&allowed_arg0_dir)?;
+-    std::fs::create_dir_all(&sibling_arg0_dir)?;
+     std::fs::write(&zsh_path, "")?;
+-    std::fs::write(&execve_wrapper, "")?;
+ 
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml {
+diff --git a/codex-rs/test-binary-support/lib.rs b/codex-rs/test-binary-support/lib.rs
+--- a/codex-rs/test-binary-support/lib.rs
++++ b/codex-rs/test-binary-support/lib.rs
+@@ -7,8 +7,10 @@ use tempfile::TempDir;
+ 
+ pub struct TestBinaryDispatchGuard {
+     _codex_home: TempDir,
++    _codex_harness: TempDir,
+     arg0: Arg0PathEntryGuard,
+     _previous_codex_home: Option<std::ffi::OsString>,
++    _previous_codex_harness: Option<std::ffi::OsString>,
+ }
+ 
+ impl TestBinaryDispatchGuard {
+@@ -48,10 +50,16 @@ where
+                 Ok(codex_home) => codex_home,
+                 Err(error) => panic!("failed to create test CODEX_HOME: {error}"),
+             };
++            let codex_harness = match tempfile::Builder::new().prefix("codex-harness").tempdir() {
++                Ok(codex_harness) => codex_harness,
++                Err(error) => panic!("failed to create test CODEX_HARNESS: {error}"),
++            };
+             let previous_codex_home = std::env::var_os("CODEX_HOME");
++            let previous_codex_harness = std::env::var_os("CODEX_HARNESS");
+             // Safety: this runs from a test ctor before test threads begin.
+             unsafe {
+                 std::env::set_var("CODEX_HOME", codex_home.path());
++                std::env::set_var("CODEX_HARNESS", codex_harness.path());
+             }
+ 
+             let arg0 = match arg0_dispatch() {
+@@ -66,11 +74,21 @@ where
+                     std::env::remove_var("CODEX_HOME");
+                 },
+             }
++            match previous_codex_harness.as_ref() {
++                Some(value) => unsafe {
++                    std::env::set_var("CODEX_HARNESS", value);
++                },
++                None => unsafe {
++                    std::env::remove_var("CODEX_HARNESS");
++                },
++            }
+ 
+             Some(TestBinaryDispatchGuard {
+                 _codex_home: codex_home,
++                _codex_harness: codex_harness,
+                 arg0,
+                 _previous_codex_home: previous_codex_home,
++                _previous_codex_harness: previous_codex_harness,
+             })
+         }
+     }

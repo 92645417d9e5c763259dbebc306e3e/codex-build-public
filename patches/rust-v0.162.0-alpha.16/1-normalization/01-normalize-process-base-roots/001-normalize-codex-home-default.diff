@@ -1,0 +1,69 @@
+normalize-codex-home-default
+
+Lane: normalization
+
+Unit: normalize-process-base-roots
+
+ChildPatch: normalize-codex-home-default
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -1,10 +1,11 @@
+ use codex_utils_absolute_path::AbsolutePathBuf;
+-use dirs::home_dir;
+ use std::path::PathBuf;
+ 
++const DEFAULT_CODEX_HOME: &str = "/codex";
++
+ /// Returns the path to the Codex configuration directory, which can be
+ /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
+-/// `~/.codex`.
++/// `/codex`.
+ ///
+ /// - If `CODEX_HOME` is set, the value must exist and be a directory. The
+ ///   value will be canonicalized and this function will Err otherwise.
+@@ -49,24 +50,15 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
+                 AbsolutePathBuf::from_absolute_path(canonical)
+             }
+         }
+-        None => {
+-            let mut p = home_dir().ok_or_else(|| {
+-                std::io::Error::new(
+-                    std::io::ErrorKind::NotFound,
+-                    "Could not find home directory",
+-                )
+-            })?;
+-            p.push(".codex");
+-            AbsolutePathBuf::from_absolute_path(p)
+-        }
++        None => AbsolutePathBuf::from_absolute_path(DEFAULT_CODEX_HOME),
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::DEFAULT_CODEX_HOME;
+     use super::find_codex_home_from_env;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+-    use dirs::home_dir;
+     use pretty_assertions::assert_eq;
+     use std::fs;
+     use std::io::ErrorKind;
+@@ -126,9 +118,8 @@ mod tests {
+     fn find_codex_home_without_env_uses_default_home_dir() {
+         let resolved =
+             find_codex_home_from_env(/*codex_home_env*/ None).expect("default CODEX_HOME");
+-        let mut expected = home_dir().expect("home dir");
+-        expected.push(".codex");
+-        let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
++        let expected =
++            AbsolutePathBuf::from_absolute_path(DEFAULT_CODEX_HOME).expect("absolute home");
+         assert_eq!(resolved, expected);
+     }
+ }
