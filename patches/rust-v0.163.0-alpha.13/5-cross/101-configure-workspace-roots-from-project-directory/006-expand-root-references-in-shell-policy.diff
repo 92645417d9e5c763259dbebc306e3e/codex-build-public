@@ -1,0 +1,378 @@
+expand-root-references-in-shell-policy
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: expand-root-references-in-shell-policy
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -301,7 +301,9 @@ async fn workspace_roots_follow_selected_project_in_settings_and_standalone_comm
+         ("SKILLS_SCRATCH_ROOT", None),
+     ];
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+-    MockResponsesConfig::new(&server.uri()).write(&home)?;
++    MockResponsesConfig::new(&server.uri())
++        .with_extra_config("[shell_environment_policy.set]\nGOPATH = '$PROJECT_SCRATCH_ROOT/go'\n")
++        .write(&home)?;
+     let mut app = TestAppServer::builder()
+         .with_codex_home(&home)
+         .without_auto_env()
+@@ -404,6 +406,7 @@ async fn workspace_roots_follow_selected_project_in_settings_and_standalone_comm
+         ("REPOS_ROOT", user_home.join("repos")),
+         ("SKILLS_ROOT", home.join("skills")),
+         ("SKILLS_SCRATCH_ROOT", harness.join("skills")),
++        ("GOPATH", harness.join("work/second/go")),
+     ] {
+         let expected = format!("{name}={}", path.display());
+         assert!(
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -3749,6 +3749,36 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn invalid_shell_root_reference_fails_preparation_instead_of_config_loading()
++-> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        toml::from_str(
++            "default_permissions = ':workspace'\n[shell_environment_policy.set]\nGOPATH = '$UNKNOWN_ROOT/go'\n",
++        ).expect("configuration"),
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    ).await?;
++    assert_eq!(
++        config.permissions.shell_environment_policy.r#set["GOPATH"],
++        "$UNKNOWN_ROOT/go"
++    );
++    let error = config
++        .prepare_local_permissions()
++        .expect_err("local preparation must reject the reference");
++    assert!(error.to_string().contains("$UNKNOWN_ROOT"));
++    assert_eq!(
++        config.permissions.shell_environment_policy.r#set["GOPATH"],
++        "$UNKNOWN_ROOT/go"
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn implicit_builtin_workspace_uses_selected_storage_roots() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -178,6 +178,7 @@ pub(crate) use runtime_refresh::RuntimeConfigRefresh;
+ pub use runtime_refresh::TUI_MCP_SERVER_NAMES;
+ #[cfg(test)]
+ mod schema;
++pub(crate) mod shell_environment_policy_roots;
+ pub(crate) mod storage_roots;
+ mod token_budget_startup;
+ mod windows_sandbox_config;
+@@ -1667,6 +1668,9 @@ impl Config {
+             .permission_profile_state
+             .bind_local_workspace(&self.cwd, &roots)?;
+         permissions.shell_environment_policy.inherited_environment = roots.environment()?;
++        shell_environment_policy_roots::expand_published_root_references(
++            &mut permissions.shell_environment_policy,
++        )?;
+         Ok(permissions)
+     }
+ 
+diff --git a/codex-rs/core/src/config/shell_environment_policy_roots.rs b/codex-rs/core/src/config/shell_environment_policy_roots.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/config/shell_environment_policy_roots.rs
+@@ -0,0 +1,152 @@
++use codex_protocol::config_types::ShellEnvironmentPolicy;
++use std::io;
++
++/// Expands a local execution snapshot, leaving the configured templates reusable for another cwd.
++pub(crate) fn expand_published_root_references(
++    policy: &mut ShellEnvironmentPolicy,
++) -> io::Result<()> {
++    for value in policy.r#set.values_mut() {
++        *value = expand_value(value, &mut |name| {
++            if matches!(name, "CODEX_HOME" | "CODEX_HARNESS" | "TMPDIR") {
++                return match std::env::var(name) {
++                    Ok(value) if !value.is_empty() => Ok(value),
++                    Ok(_) | Err(std::env::VarError::NotPresent) => Err(io::Error::new(
++                        io::ErrorKind::InvalidInput,
++                        format!("published root environment variable {name} is missing or empty"),
++                    )),
++                    Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
++                        io::ErrorKind::InvalidInput,
++                        format!("published root environment variable {name} is not valid UTF-8"),
++                    )),
++                };
++            }
++            policy
++                .inherited_environment
++                .get(name)
++                .cloned()
++                .ok_or_else(|| {
++                    io::Error::new(
++                        io::ErrorKind::InvalidInput,
++                        format!("project root environment variable {name} was not prepared"),
++                    )
++                })
++        })?;
++    }
++    Ok(())
++}
++
++fn expand_value(
++    input: &str,
++    variable: &mut impl FnMut(&str) -> io::Result<String>,
++) -> io::Result<String> {
++    let bytes = input.as_bytes();
++    let mut output = String::with_capacity(input.len());
++    let mut copied_until = 0;
++    let mut index = 0;
++    while index < bytes.len() {
++        if bytes[index] != b'$'
++            || bytes
++                .get(index + 1)
++                .copied()
++                .is_none_or(|byte| !is_variable_start(byte))
++        {
++            index += 1;
++            continue;
++        }
++        let start = index + 1;
++        let mut end = start + 1;
++        while bytes.get(end).copied().is_some_and(is_variable_continue) {
++            end += 1;
++        }
++        let name = &input[start..end];
++        if !matches!(
++            name,
++            "CODEX_HOME"
++                | "CODEX_HARNESS"
++                | "TMPDIR"
++                | "PROJECT_SCRATCH_ROOT"
++                | "PROJECT_RUNTIME_ROOT"
++                | "PROJECT_PERSISTENT_ROOT"
++                | "REPOS_ROOT"
++                | "SKILLS_ROOT"
++                | "SKILLS_SCRATCH_ROOT"
++        ) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("unknown shell_environment_policy root reference ${name}"),
++            ));
++        }
++        output.push_str(&input[copied_until..index]);
++        output.push_str(&variable(name)?);
++        copied_until = end;
++        index = end;
++    }
++    output.push_str(&input[copied_until..]);
++    Ok(output)
++}
++
++fn is_variable_start(byte: u8) -> bool {
++    byte == b'_' || byte.is_ascii_uppercase()
++}
++
++fn is_variable_continue(byte: u8) -> bool {
++    is_variable_start(byte) || byte.is_ascii_digit()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::HashMap;
++
++    #[test]
++    fn expands_root_references_with_suffixes_nonrecursively() {
++        let mut policy = ShellEnvironmentPolicy {
++            r#set: HashMap::from([("GOPATH".into(), "$PROJECT_SCRATCH_ROOT/go".into())]),
++            inherited_environment: HashMap::from([(
++                "PROJECT_SCRATCH_ROOT".into(),
++                "/selected/$CODEX_HOME".into(),
++            )]),
++            ..Default::default()
++        };
++        expand_published_root_references(&mut policy).unwrap();
++        assert_eq!(policy.r#set["GOPATH"], "/selected/$CODEX_HOME/go");
++        assert_eq!(
++            expand_value("$CODEX_HOME/config.toml:$TMPDIR/cache", &mut |name| {
++                Ok(match name {
++                    "CODEX_HOME" => "/codex",
++                    "TMPDIR" => "/tmp",
++                    _ => unreachable!(),
++                }
++                .into())
++            })
++            .unwrap(),
++            "/codex/config.toml:/tmp/cache"
++        );
++    }
++
++    #[test]
++    fn rejects_unknown_or_unprepared_root_references() {
++        for (reference, diagnostic) in [
++            ("$HOME/cache", "unknown"),
++            ("$SKILLS_ROOT/cache", "not prepared"),
++        ] {
++            let mut policy = ShellEnvironmentPolicy {
++                r#set: HashMap::from([("VALUE".into(), reference.into())]),
++                ..Default::default()
++            };
++            let error = expand_published_root_references(&mut policy).unwrap_err();
++            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++            assert!(error.to_string().contains(diagnostic));
++        }
++    }
++
++    #[test]
++    fn leaves_nonreference_dollar_signs_literal() {
++        for literal in ["literal", "cost$-literal", "$not_a_root"] {
++            assert_eq!(
++                expand_value(literal, &mut |_| unreachable!()).unwrap(),
++                literal
++            );
++        }
++    }
++}
+diff --git a/codex-rs/core/src/environment_selection_storage_tests.rs b/codex-rs/core/src/environment_selection_storage_tests.rs
+--- a/codex-rs/core/src/environment_selection_storage_tests.rs
++++ b/codex-rs/core/src/environment_selection_storage_tests.rs
+@@ -52,6 +52,10 @@ async fn storage_roots_follow_selected_cwd_and_preserve_captured_environments()
+     std::fs::create_dir_all(&second_cwd).unwrap();
+     let manager = Arc::new(EnvironmentManager::default_for_tests());
+     let workspace_config = EnvironmentConfig {
++        shell_environment_policy: codex_protocol::config_types::ShellEnvironmentPolicy {
++            r#set: HashMap::from([("GOPATH".into(), "$PROJECT_SCRATCH_ROOT/go".into())]),
++            ..Default::default()
++        },
+         permission_profile: codex_protocol::models::PermissionProfileSnapshot::active(
+             codex_protocol::models::PermissionProfile::workspace_write(),
+             codex_protocol::models::ActivePermissionProfile {
+@@ -79,6 +83,10 @@ async fn storage_roots_follow_selected_cwd_and_preserve_captured_environments()
+     environments.update_selections(std::slice::from_ref(&selection));
+     let first = environments.snapshot().await;
+     let first_environment = first.local().expect("first project is ready");
++    assert_eq!(
++        crate::exec_env::create_env(first_environment.shell_environment_policy(), None)["GOPATH"],
++        root.join("harness/work/first/go").display().to_string()
++    );
+     assert_eq!(
+         first_environment
+             .shell_environment_policy()
+@@ -115,6 +123,18 @@ async fn storage_roots_follow_selected_cwd_and_preserve_captured_environments()
+     environments.update_selections(std::slice::from_ref(&selection));
+     let second = environments.snapshot().await;
+     let second_environment = second.local().expect("second project is ready");
++    assert_eq!(
++        crate::exec_env::create_env(second_environment.shell_environment_policy(), None)["GOPATH"],
++        root.join("harness/work/second/go").display().to_string()
++    );
++    assert_eq!(
++        workspace_config.shell_environment_policy.r#set["GOPATH"],
++        "$PROJECT_SCRATCH_ROOT/go"
++    );
++    assert_eq!(
++        crate::exec_env::create_env(first_environment.shell_environment_policy(), None)["GOPATH"],
++        root.join("harness/work/first/go").display().to_string()
++    );
+     let second_roots = &second_environment
+         .shell_environment_policy()
+         .inherited_environment;
+@@ -256,6 +276,25 @@ async fn storage_roots_follow_selected_cwd_and_preserve_captured_environments()
+         *second_roots
+     );
+ 
++    let mut invalid_config = workspace_config.clone();
++    invalid_config
++        .shell_environment_policy
++        .r#set
++        .insert("GOPATH".into(), "$UNKNOWN_ROOT/go".into());
++    let invalid_defaults = ThreadEnvironmentDefaults::for_tests(invalid_config, SandboxType::None);
++    let (invalid_selection, origin) = resolve_selection_config(
++        TurnEnvironmentSelection {
++            cwd: PathUri::from_abs_path(&second_cwd),
++            ..selection.clone()
++        },
++        &invalid_defaults,
++    );
++    assert_eq!(origin, EnvironmentConfigOrigin::Thread);
++    assert!(
++        matches!(invalid_selection.config, EnvironmentConfigState::Failed(error) if error.contains("$UNKNOWN_ROOT"))
++    );
++    assert!(child.snapshot().await.local().is_some());
++
+     let mut owner_config = tests::test_environment_config();
+     owner_config
+         .shell_environment_policy
+diff --git a/codex-rs/core/src/session/environment.rs b/codex-rs/core/src/session/environment.rs
+--- a/codex-rs/core/src/session/environment.rs
++++ b/codex-rs/core/src/session/environment.rs
+@@ -25,6 +25,7 @@ use crate::config::ConstraintError;
+ use crate::config::ConstraintResult;
+ use crate::config::NetworkProxySpec;
+ use crate::config::PermissionProfileState;
++use crate::config::shell_environment_policy_roots::expand_published_root_references;
+ use crate::config::storage_roots::StorageRoots;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use crate::session::session::Session;
+@@ -96,6 +97,7 @@ impl ThreadEnvironmentDefaults {
+             .ensure()?;
+             permissions.bind_local_workspace(&cwd, &roots)?;
+             shell_environment_policy.inherited_environment = roots.environment()?;
++            expand_published_root_references(&mut shell_environment_policy)?;
+             windows_sandbox_type = self.local_windows_sandbox_type;
+         } else {
+             shell_environment_policy.inherited_environment.clear();
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -4443,6 +4443,10 @@ terminal_visualization_instructions = true
+ async fn slash_cd_rebinds_project_roots_and_workspace_permissions() -> Result<()> {
+     let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
+     let home = tempdir()?;
++    std::fs::write(
++        home.path().join("config.toml"),
++        "[shell_environment_policy.set]\nGOPATH = '$PROJECT_SCRATCH_ROOT/go'\n",
++    )?;
+     let source = home.path().join("source");
+     let destination = home.path().join("destination");
+     for cwd in [&source, &destination] {
+@@ -4509,6 +4513,21 @@ async fn slash_cd_rebinds_project_roots_and_workspace_permissions() -> Result<()
+         .config
+         .local_storage_environment()
+         .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
++    assert_eq!(
++        app.config.permissions.shell_environment_policy.r#set["GOPATH"],
++        "$PROJECT_SCRATCH_ROOT/go"
++    );
++    let permissions = app
++        .config
++        .prepare_local_permissions()
++        .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
++    assert_eq!(
++        permissions.shell_environment_policy.r#set["GOPATH"],
++        Path::new(&roots["PROJECT_SCRATCH_ROOT"])
++            .join("go")
++            .display()
++            .to_string()
++    );
+     assert_eq!(roots.len(), 6);
+     for root in roots.values() {
+         assert!(Path::new(root).is_dir(), "root was not prepared: {root}");

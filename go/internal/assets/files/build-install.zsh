@@ -19,25 +19,13 @@ cargo update --workspace --offline
 cargo build --release --locked --verbose -p codex-cli -p codex-code-mode-host --bin codex --bin codex-code-mode-host
 RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-rpath,\$ORIGIN/../lib" cargo build --release --locked --verbose -p codex-voice-host --bin codex-voice-host
 build_tools_root=/cache/build/tools
-for build_tool in shuck tokei ccusage; do
+for build_tool in shuck tokei; do
     build_source=$build_tools_root/$build_tool/source
     rm -rf -- "$build_source"
     mkdir -p "$build_source"
     tar -xzf /runner/$build_tool-source.tar.gz --strip-components=1 -C "$build_source"
     build_package=$build_tool
     [[ $build_tool != shuck ]] || build_package=shuck-cli
-    if [[ $build_tool == ccusage ]]; then
-        build_source+=/rust
-        export CCUSAGE_PRICING_JSON_PATH=$build_tools_root/ccusage/pricing.json
-        if [[ ! -e $CCUSAGE_PRICING_JSON_PATH ]]; then
-            cp -- /runner/ccusage-pricing.json "$CCUSAGE_PRICING_JSON_PATH"
-        elif cmp -s -- /runner/ccusage-pricing.json "$CCUSAGE_PRICING_JSON_PATH"; then
-            :
-        else
-            (( $? == 1 )) || exit 1
-            cp -- /runner/ccusage-pricing.json "$CCUSAGE_PRICING_JSON_PATH"
-        fi
-    fi
     CARGO_BUILD_BUILD_DIR="$build_tools_root/$build_tool/build" CARGO_TARGET_DIR="/cache/target/tools/$build_tool" cargo build --release --locked --offline --verbose --manifest-path "$build_source/Cargo.toml" -p "$build_package" --bin "$build_tool"
     install -m 0755 "/cache/target/tools/$build_tool/$CARGO_BUILD_TARGET/release/$build_tool" /result/$build_tool
 done

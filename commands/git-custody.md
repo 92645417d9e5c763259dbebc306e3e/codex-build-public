@@ -4,8 +4,9 @@
 
 - Product owns topology, direction, parent, retention, removal, promotion, and publication.
 - Fork, Prepare, Apply, Commit, and Revise require the caller-supplied exact indexed release task before GitCustody changes topology or history, and retain that task unchanged through the selected terminal.
-- A Unit or Flat Patch, not a Child Patch, is the history-edit boundary. Forward work never forks. Repeated edits within the terminal Unit stay on Current, including resetting to its middle Child Patch and rebuilding its suffix. Committed status alone requires no Fork; crossing back to an earlier Lane child forks first.
-- Adopt the fork before native reset, rebase or authoring; helper Commit publishes final Patches. Automatic Roll rewrites and non-idempotent fixup folds run corresponding focused tests. For a temporary Main fixup fold, compare `HEAD^{tree}` with its focused-tested Main source: equal trees need no retest, unequal trees require focused tests on rewritten Patches. No topology operation selects a full suite.
+- A Unit or Flat Patch, not a Child Patch, is the ordinary history-edit boundary. Forward work never forks. Repeated edits within the terminal Unit stay on Current, including resetting to its middle Child Patch and rebuilding its suffix. Committed status alone requires no Fork; crossing back to an earlier Lane child forks first.
+- Adopt the fork before ordinary native reset, rebase or authoring; helper Commit publishes final Patches. Automatic Roll rewrites and non-idempotent fixup folds run corresponding focused tests. For a temporary Main fixup fold, compare its source with focused-tested Main using native Git diff: identical source needs no retest, changed source requires focused tests on rewritten Patches. No topology operation selects a full suite.
+- ReleaseRollForward's explicitly selected draft quick iteration owns native fixup and autosquash on Main without Fork or helper Commit.
 
 ```
 AvailableForkOrdinalOwner

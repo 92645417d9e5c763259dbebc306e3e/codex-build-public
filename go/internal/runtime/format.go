@@ -91,7 +91,7 @@ func RunRepositoryFormat(options RepositoryFormatOptions) (result RepositoryForm
 		result.FailureDomain = runnerFailureDomain(err)
 		return result, errors.Join(err, errors.New("repository format source differs"))
 	}
-	toolchain, err := resolveToolchainProjection(options.ProjectWorkingRoot)
+	toolchain, err := resolveToolchainProjection(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot)
 	if err != nil {
 		result.FailureDomain = failureDomainHelper
 		return result, err

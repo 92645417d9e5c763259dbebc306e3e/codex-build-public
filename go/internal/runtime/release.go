@@ -319,7 +319,7 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 	toolchainErr := suite.phase("Toolchain")
 	toolchain := ToolchainProjection{}
 	if toolchainErr == nil {
-		toolchain, toolchainErr = resolveToolchain(options.WorkingRoot, suite.deadline())
+		toolchain, toolchainErr = resolveToolchain(options.WorkingRoot, suite.Source, options.RuntimeRoot, suite.deadline())
 	}
 	value, preimage, baselineErr := readRustSuiteBaselineFile(suite.BaselineSelectionPath, suite.Tag)
 	if toolchainErr != nil || baselineErr != nil || value.Established == nil || !validRustSuiteBaselineSelection(value.Established.Selection, options.Tag, toolchain) {
@@ -423,12 +423,12 @@ type PatchReplayOptions struct {
 	rustfmt                                string
 	Lane, Unit, ChildPatch, FlatPatch      string
 	Form, Segment                          string
+	Contract                               PatchContract
 	WorkingRoot, ScratchRoot, RecordRoot   string
 	PredecessorTag                         string
 	ExpectedTerminal                       string
 	schemaSourceCommit                     string
 	ChildPatchSequence                     string
-	ApplySourceCustody                     string
 	ExportOpen                             string
 	ForkOpen                               string
 	ForkRetainedParents                    string
@@ -439,13 +439,20 @@ type PatchReplayOptions struct {
 	onTerminal                             func(nativePatchReplayResult) error
 }
 
+type PatchContract struct {
+	Purpose, Provides, Boundary, Verification string
+	Requires                                  []string
+	CrossGroup                                string `json:",omitempty"`
+}
+
 type PatchReplayRow struct {
 	Kind, Lane, Form, Segment string
-	FlatPatch                 string   `json:",omitempty"`
-	Unit                      string   `json:",omitempty"`
-	ChildPatches              []string `json:",omitempty"`
-	Transform                 string   `json:",omitempty"`
-	TransformPatch            string   `json:",omitempty"`
+	FlatPatch                 string         `json:",omitempty"`
+	Unit                      string         `json:",omitempty"`
+	ChildPatches              []string       `json:",omitempty"`
+	Transform                 string         `json:",omitempty"`
+	TransformPatch            string         `json:",omitempty"`
+	Contract                  *PatchContract `json:",omitempty"`
 }
 
 type PatchReplayResult struct {
@@ -501,7 +508,7 @@ func patchReplayRowSelector(row PatchReplayRow) string {
 func generatedTransformSelector(selector string) bool {
 	kind, identity, found := strings.Cut(selector, ":")
 	lane, name, separated := strings.Cut(identity, "/")
-	return found && separated && kind == "Transform" && listed("regenerate-snapshots regenerate-app-server-schema", name) && listed("bugfix normalization backend mixed frontend draft", lane)
+	return found && separated && kind == "Transform" && listed("regenerate-snapshots regenerate-app-server-schema", name) && listed("bugfix normalization backend mixed frontend cross draft", lane)
 }
 
 func onePatchSelector(unit, flatPatch, transform string) (string, error) {
@@ -656,6 +663,9 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 	}
 	exportedSource := sourcePrefix != ""
 	if options.Mode == "apply" {
+		if !options.worktrees.productPath(options.Tag, options.Target) {
+			return result, errors.New("replay target is not this release's registered Current")
+		}
 		if exportedSource {
 			end, _ := options.endSelector()
 			if end != "" {
@@ -667,10 +677,6 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 		err = errors.Join(selectorErr, err)
 		if err != nil {
 			return result, err
-		}
-		options.ApplySourceCustody = "retained"
-		if exportedSource {
-			options.ApplySourceCustody = "exported"
 		}
 	}
 	if options.Mode == "commit" {
@@ -731,11 +737,6 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 	}
 	if exportedSource {
 		options.PredecessorTag = sourcePrefix
-		if options.Mode == "apply" {
-			if !options.worktrees.productPath(options.Tag, options.Target) {
-				return result, errors.New("prefix replay target is not this release's registered Current")
-			}
-		}
 	} else if options.Mode == "list" {
 		fields, taskErr := taskGraphFields(taskBytes, "CurrentWorktree", "RetainedParents")
 		allowed := fields["CurrentWorktree"] != "" && options.Source == fields["CurrentWorktree"]
@@ -927,7 +928,7 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 
 func validUnit(value string) bool {
 	parts := strings.Split(value, "/")
-	return len(parts) == 2 && listed("bugfix normalization backend mixed frontend draft", parts[0]) && validName(parts[1], "-")
+	return len(parts) == 2 && listed("bugfix normalization backend mixed frontend cross draft", parts[0]) && validName(parts[1], "-")
 }
 
 func validForkOrdinal(value string) bool {
@@ -1041,6 +1042,9 @@ func taskGraphFields(data []byte, names ...string) (map[string]string, error) {
 
 func applyTaskChildPatchSequence(data []byte, selector, source, target string, exported bool) (string, error) {
 	sequence, structureErr := taskPatchStructure(data, selector, target)
+	if source == "" {
+		return sequence, structureErr
+	}
 	fields, err := taskGraphFields(data, "RetainedParents")
 	sourceRetained := exported
 	for _, parent := range strings.Split(fields["RetainedParents"], ", ") {
@@ -1136,33 +1140,37 @@ func validatePatchReplayOptions(options PatchReplayOptions) error {
 		valid = valid && options.Target != "" && containedBy(options.ScratchRoot, options.Target)
 	case "list":
 		valid = valid && options.Source != "" && (options.WorkingRoot == "" && options.RecordRoot == "" || noFollowPath("patch replay export root", options.WorkingRoot) == nil && noFollowPath("patch replay record root", options.RecordRoot) == nil && containedBy(options.ScratchRoot, options.RecordRoot) && !pathsOverlap(options.RuntimeRoot, options.RecordRoot))
+		if options.StartUnit != "" || options.StartFlatPatch != "" {
+			_, selectionErr := options.startSelector()
+			valid = valid && selectionErr == nil
+		}
 	case "apply":
-		_, startErr := options.startSelector()
-		_, endErr := options.endSelector()
+		start, startErr := options.startSelector()
+		end, endErr := options.endSelector()
 		if startErr != nil {
 			return errors.New("Apply requires one canonical --start-unit, --start-flat-patch, or --start-transform Lane/Patch")
 		}
 		if endErr != nil {
 			return errors.New("Apply permits at most one canonical --end-* Lane/Patch")
 		}
-		valid = valid && options.Source != options.Target && options.Source != "" && options.Target != ""
-	case "commit", "revise":
-		kind, _, _, identityErr := options.mutationIdentity()
-		segments := "none"
-		if listed("backend mixed", options.Lane) {
-			segments = "none non-schema schema"
-		} else if options.Lane == "draft" {
-			segments = "none schema"
+		valid = valid && options.Target != ""
+		if start == "Transform:normalization/normalize-terminal-chrome-for-powerline" {
+			valid = valid && options.Source == "" && end == ""
+		} else {
+			valid = valid && options.Source != options.Target && options.Source != ""
 		}
-		if options.Lane == "mixed" && kind != "Unit" {
-			return fmt.Errorf("Lane=mixed Field=PatchKind Expected=Unit Actual=%.256s", kind)
+	case "commit", "revise":
+		_, _, _, identityErr := options.mutationIdentity()
+		segments := "none snapshot"
+		if listed("backend mixed cross draft", options.Lane) {
+			segments = "none schema snapshot schema-snapshot"
 		}
 		if !listed(segments, options.Segment) {
 			return fmt.Errorf("Lane=%.256s Field=Segment Expected=%s Actual=%.256s", options.Lane, segments, options.Segment)
 		}
 		valid = valid && identityErr == nil && options.Target != "" && options.Form == "GitDiff"
 	case "finalize", "config-schema":
-		valid = valid && options.Target != "" && (options.Mode == "config-schema" || listed("bugfix normalization backend mixed frontend draft", options.Lane))
+		valid = valid && options.Target != "" && (options.Mode == "config-schema" || listed("bugfix normalization backend mixed frontend cross draft", options.Lane))
 	case "export":
 		valid = valid && options.Source == ""
 	}
@@ -1231,20 +1239,32 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 		}
 	}
 	action, arguments := "patch-replay-"+options.Mode, []string{}
+	contract := ""
+	if options.Contract.Purpose != "" || options.Contract.Provides != "" || options.Contract.Boundary != "" || options.Contract.Verification != "" || len(options.Contract.Requires) != 0 || options.Contract.CrossGroup != "" {
+		data, encodeErr := json.Marshal(options.Contract)
+		if encodeErr != nil {
+			return nativePatchReplayResult{}, "", encodeErr
+		}
+		contract = string(data)
+	}
 	switch options.Mode {
 	case "fork":
 		arguments = []string{options.ScratchRoot, options.Tag, options.ParentFork, options.ForkOpen, options.ExpectedTerminal, options.ForkRetainedParents, options.worktrees.Main, options.worktrees.parent(options.Tag, options.ParentFork), options.worktrees.ForkRoot}
 	case "list":
-		arguments = []string{options.Source, options.Tag, options.PredecessorTag}
+		selector := ""
+		if options.StartUnit != "" || options.StartFlatPatch != "" {
+			selector, _ = options.startSelector()
+		}
+		arguments = []string{options.Source, options.Tag, options.PredecessorTag, selector}
 	case "apply":
 		start, _ := options.startSelector()
 		end, _ := options.endSelector()
-		arguments = []string{options.Source, options.Target, options.Tag, start, end, options.rustfmt, root, options.PredecessorTag, options.ChildPatchSequence, options.ApplySourceCustody}
+		arguments = []string{options.Source, options.Target, options.Tag, start, end, options.rustfmt, root, options.PredecessorTag, options.ChildPatchSequence}
 		arguments = append(arguments, filepath.Join(options.SkillRoot, "bin"), options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, core.StageDeadline().String())
 	case "revise":
 		kind, identity, patch, _ := options.mutationIdentity()
 		_, name, _ := strings.Cut(identity, "/")
-		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, root, options.ChildPatchSequence, options.ExpectedTerminal}
+		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, root, options.ChildPatchSequence, options.ExpectedTerminal, contract}
 	case "prepare":
 		arguments = []string{options.Target, options.Tag, options.ExpectedTerminal}
 	case "finalize":
@@ -1254,7 +1274,7 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 	case "commit":
 		kind, identity, patch, _ := options.mutationIdentity()
 		_, name, _ := strings.Cut(identity, "/")
-		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, options.ChildPatchSequence, strconv.FormatBool(options.SkipLineLimit)}
+		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, options.ChildPatchSequence, strconv.FormatBool(options.SkipLineLimit), contract}
 	case "export":
 		arguments = []string{options.Source, options.WorkingRoot, options.ScratchRoot, exportRepositoryRoot(options.WorkingRoot), options.Tag, options.ExportOpen, strconv.FormatBool(options.SkipLineLimit)}
 	}
@@ -1308,7 +1328,7 @@ func patchReplaySnapshotRunnerOptions(options PatchReplayOptions, cancellation <
 	}
 	benchmark := suite.end.Sub(suite.started)
 	suite.end = suite.end.Add(benchmark/2 + benchmark/4 + core.CleanupDeadline())
-	toolchain, err := resolveToolchain(options.WorkingRoot, suite.deadline())
+	toolchain, err := resolveToolchain(options.WorkingRoot, options.Target, options.RuntimeRoot, suite.deadline())
 	if err != nil {
 		return RunnerExecOptions{}, RustSuitePlan{}, err
 	}
@@ -1409,7 +1429,7 @@ func snapshotSuiteProjection(terminal RunnerExecResult, workingRoot string) proj
 }
 
 func validateCurrentPatchReplaySnapshotPlan(options PatchReplayOptions, plan RustSuitePlan, window deadline) error {
-	toolchain, err := resolveToolchain(options.WorkingRoot, window)
+	toolchain, err := resolveToolchain(options.WorkingRoot, options.Target, options.RuntimeRoot, window)
 	if err != nil {
 		return err
 	}

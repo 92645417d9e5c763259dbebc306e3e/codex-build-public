@@ -1,0 +1,1191 @@
+integrate-response-tab-with-tui-lifecycle
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: integrate-response-tab-with-tui-lifecycle
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -8,6 +8,7 @@ mod response_tab;
+ mod scrolling;
+ mod transcript;
+ 
++pub(crate) use control_center::CenterScreen;
+ pub(crate) use control_center::ControlCenter;
+ pub(crate) use transcript::TranscriptOverlay;
+ 
+@@ -82,13 +83,23 @@ impl Overlay {
+     }
+ 
+     pub(crate) fn new_control_center_loading(
+-        range: crate::usage::UsageRange,
+-        keymap: PagerKeymap,
++        keymap: &crate::keymap::RuntimeKeymap,
+         request_id: Uuid,
+         width: u16,
+         mouse_scroll_speed: f64,
++        frames: crate::tui::FrameRequester,
++        events: crate::app_event_sender::AppEventSender,
++        catalog: Arc<crate::model_catalog::ModelCatalog>,
+     ) -> Self {
+-        let mut overlay = ControlCenter::new(None, range, keymap, width, mouse_scroll_speed);
++        let mut overlay = ControlCenter::new(
++            None,
++            keymap,
++            width,
++            mouse_scroll_speed,
++            frames,
++            events,
++            catalog,
++        );
+         overlay.request_id = Some(request_id);
+         Self::ControlCenter(Box::new(overlay))
+     }
+@@ -718,10 +729,9 @@ mod tests {
+ 
+     #[test]
+     fn control_center_keeps_short_content_visible_at_nonzero_origin() {
+-        let mut overlay = ControlCenter::new(
++        let mut overlay = control_center::test_center(
+             None,
+-            crate::usage::UsageRange::Daily,
+-            default_pager_keymap(),
++            CenterScreen::Usage(crate::usage::UsageRange::Daily),
+             48,
+             1.0,
+         );
+@@ -734,8 +744,9 @@ mod tests {
+                 .map(|column| buffer[(column, row)].symbol())
+                 .collect::<String>()
+         };
+-        assert!(text_at(3).contains("Daily"));
+-        assert!(text_at(5).contains("visible error"));
++        assert!(text_at(3).contains("visible error"));
++        assert!(text_at(4).trim().is_empty());
++        assert!(text_at(5).trim().is_empty());
+         assert!(text_at(6).trim().is_empty());
+         assert!(text_at(7).trim().is_empty());
+         assert!(text_at(8).trim().is_empty());
+@@ -744,19 +755,26 @@ mod tests {
+ 
+     #[test]
+     fn usage_loading_keeps_navigation_and_summary_controls_available() {
+-        for range in crate::usage::UsageRange::VIEWS {
++        for screen in [CenterScreen::Summary, CenterScreen::Quotas]
++            .into_iter()
++            .chain(crate::usage::UsageRange::VIEWS.map(CenterScreen::Usage))
++        {
+             let request_id = Uuid::new_v4();
++            let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+             let mut overlay = Overlay::new_control_center_loading(
+-                range,
+-                default_pager_keymap(),
++                &crate::keymap::RuntimeKeymap::defaults(),
+                 request_id,
+                 120,
+                 1.0,
++                crate::tui::FrameRequester::test_dummy(),
++                crate::app_event_sender::AppEventSender::new(events),
++                Arc::new(crate::model_catalog::ModelCatalog::new(Vec::new())),
+             );
+             assert!(overlay.accepts_usage_request(request_id));
+             let Overlay::ControlCenter(view) = &mut overlay else {
+                 unreachable!();
+             };
++            view.screen = screen;
+             let area = Rect::new(0, 0, 120, 12);
+             let mut buffer = Buffer::empty(area);
+             view.render(area, &mut buffer);
+@@ -765,11 +783,24 @@ mod tests {
+                     .map(|x| buffer[(x, y)].symbol())
+                     .collect::<String>()
+             };
+-            assert!(row(0).contains("Summary"));
+-            assert!(row(2).contains("Loading usage..."));
+-            assert_eq!(view.range, range);
+-            assert!(row(area.height - 1).contains("q quit"));
+-            for y in 3..area.height - 1 {
++            let content_top = if screen == CenterScreen::Summary {
++                assert!(row(0).contains("Summary"));
++                assert!(row(area.height - 1).contains("q quit"));
++                2
++            } else {
++                assert_eq!(row(area.height - 1).trim(), "esc back");
++                0
++            };
++            assert!(row(content_top).contains("Loading usage..."));
++            assert_eq!(view.screen, screen);
++            for y in content_top + 1
++                ..area.height
++                    - if screen == CenterScreen::Summary {
++                        2
++                    } else {
++                        1
++                    }
++            {
+                 let left = (2..77).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                 assert!(left.trim().is_empty());
+             }
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -1,15 +1,21 @@
+ //! One control center owns its chrome and transient report navigation.
+ 
+ use super::PagerView;
++use super::response_tab::ResponseTab;
++use crate::app_event_sender::AppEventSender;
+ use crate::bottom_pane::render_filled_tab_bar;
+ use crate::control_center_table::Palette;
++use crate::control_center_table::interaction::TableInteraction;
++use crate::control_center_table::interaction::TableMouseAction;
++use crate::footer_hint;
+ use crate::key_hint;
+-use crate::keymap::PagerKeymap;
++use crate::keymap::RuntimeKeymap;
+ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
++use crate::model_catalog::ModelCatalog;
+ use crate::render::highlight::syntax_theme_revision;
+-use crate::style::footer_hint_label_style;
+ use crate::style::table_separator_style;
+ use crate::tui;
++use crate::tui::FrameRequester;
+ use crate::tui::TuiEvent;
+ use crate::usage::UsageRange;
+ use crate::usage::UsageReport;
+@@ -20,7 +26,6 @@ use crossterm::event::KeyCode;
+ use crossterm::event::KeyEvent;
+ use crossterm::event::KeyEventKind;
+ use crossterm::event::KeyModifiers;
+-use crossterm::event::MouseEventKind;
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Constraint;
+ use ratatui::layout::Layout;
+@@ -34,41 +39,68 @@ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::Widget;
+ use std::io::Result;
+ use std::sync::Arc;
++use std::time::Instant;
+ use uuid::Uuid;
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum CenterScreen {
++    Summary,
++    Usage(UsageRange),
++    Quotas,
++    Responses,
++}
++
++impl CenterScreen {
++    fn shortcut(key: KeyEvent) -> Option<Self> {
++        if key.modifiers != KeyModifiers::ALT || key.kind == KeyEventKind::Release {
++            return None;
++        }
++        match key.code {
++            KeyCode::Char('0') => Some(Self::Quotas),
++            KeyCode::Char(digit @ '1'..='5') => Some(Self::Usage(
++                UsageRange::VIEWS[(digit as u8 - b'1') as usize],
++            )),
++            _ => None,
++        }
++    }
++}
++
+ pub(crate) struct ControlCenter {
+     view: PagerView,
+     is_done: bool,
+     report: std::result::Result<Option<Arc<UsageReport>>, String>,
+     pub(crate) request_id: Option<Uuid>,
+-    pub(crate) range: UsageRange,
++    pub(crate) screen: CenterScreen,
++    pub(crate) responses: ResponseTab,
+     selected_day: Option<NaiveDate>,
+     viewport_width: u16,
+     theme_revision: u64,
+-    mouse_scroll_speed: f64,
+-    pending_mouse_scroll: f64,
++    pub(crate) table_interaction: TableInteraction,
+     pub(crate) details: Vec<Line<'static>>,
+ }
+ 
+ impl ControlCenter {
+     pub(crate) fn new(
+         report: Option<Arc<UsageReport>>,
+-        range: UsageRange,
+-        keymap: PagerKeymap,
++        keymap: &RuntimeKeymap,
+         width: u16,
+         mouse_scroll_speed: f64,
++        frames: FrameRequester,
++        events: AppEventSender,
++        catalog: Arc<ModelCatalog>,
+     ) -> Self {
++        let selected_day = report.as_deref().and_then(crate::usage::latest_usage_day);
+         let mut overlay = Self {
+-            view: PagerView::new(Vec::new(), String::new(), 0, keymap),
++            view: PagerView::new(Vec::new(), String::new(), 0, keymap.pager.clone()),
+             is_done: false,
+             report: Ok(report),
+             request_id: None,
+-            range,
+-            selected_day: None,
++            screen: CenterScreen::Summary,
++            responses: ResponseTab::new(keymap.list.clone(), frames.clone(), events, catalog),
++            selected_day,
+             viewport_width: width,
+             theme_revision: syntax_theme_revision(),
+-            mouse_scroll_speed,
+-            pending_mouse_scroll: 0.0,
++            table_interaction: TableInteraction::new(mouse_scroll_speed, frames),
+             details: Vec::new(),
+         };
+         overlay.refresh();
+@@ -82,7 +114,9 @@ impl ControlCenter {
+     pub(crate) fn set_report(&mut self, result: std::result::Result<Arc<UsageReport>, String>) {
+         self.report = result.map(Some);
+         self.request_id = None;
+-        self.selected_day = None;
++        self.selected_day = self
++            .report()
++            .and_then(|report| crate::usage::latest_usage_day(report));
+         self.refresh();
+     }
+ 
+@@ -92,7 +126,7 @@ impl ControlCenter {
+ 
+     fn content_width(&self) -> u16 {
+         let inner = self.viewport_width.saturating_sub(4);
+-        if self.range == UsageRange::Summary && inner >= 90 {
++        if self.screen == CenterScreen::Summary && inner >= 90 {
+             inner - 41
+         } else {
+             inner
+@@ -100,17 +134,25 @@ impl ControlCenter {
+     }
+ 
+     fn refresh(&mut self) {
++        self.theme_revision = syntax_theme_revision();
++        if self.screen == CenterScreen::Responses {
++            self.view.renderables.clear();
++            return;
++        }
+         self.view.renderables = match &self.report {
+-            Ok(Some(report)) => crate::usage::render_selected(
+-                report,
+-                self.range,
+-                self.content_width(),
+-                self.selected_day,
+-            ),
++            Ok(Some(report)) => match self.screen {
++                CenterScreen::Summary => {
++                    crate::usage::render_summary(report, self.content_width(), self.selected_day)
++                }
++                CenterScreen::Usage(range) => {
++                    crate::usage::render(report, range, self.content_width())
++                }
++                CenterScreen::Quotas => crate::usage::render_quotas(report, self.content_width()),
++                CenterScreen::Responses => unreachable!(),
++            },
+             Ok(None) => vec!["Loading usage...".dim().into()],
+             Err(error) => vec![format!(" Usage unavailable: {error}").dim().into()],
+         };
+-        self.theme_revision = syntax_theme_revision();
+     }
+ 
+     fn handle_key(&mut self, key: KeyEvent) -> bool {
+@@ -120,20 +162,19 @@ impl ControlCenter {
+         let next = key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE;
+         let previous = key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::SHIFT;
+         if next || previous {
+-            let ranges = UsageRange::VIEWS;
+-            let index = self.range.index();
+-            let step = if next { 1 } else { ranges.len() - 1 };
+-            self.range = ranges[(index + step) % ranges.len()];
+-            self.selected_day = None;
++            self.screen = if self.screen == CenterScreen::Responses {
++                CenterScreen::Summary
++            } else {
++                CenterScreen::Responses
++            };
+             self.view.scroll_offset = 0;
++            self.table_interaction.reset_scroll();
+             self.refresh();
+             return true;
+         }
+-        if key.modifiers != KeyModifiers::NONE {
+-            return false;
+-        }
+-        if key.code == KeyCode::Esc {
+-            if self.selected_day.take().is_some() {
++        if key_hint::plain(KeyCode::Esc).is_press(key) {
++            if matches!(self.screen, CenterScreen::Usage(_) | CenterScreen::Quotas) {
++                self.screen = CenterScreen::Summary;
+                 self.view.scroll_offset = 0;
+                 self.refresh();
+             } else {
+@@ -141,12 +182,33 @@ impl ControlCenter {
+             }
+             return true;
+         }
++        if self.screen == CenterScreen::Responses {
++            if let Some(direction) = self.responses.scroll_direction(key) {
++                let rows = self.table_interaction.scroll_rows(direction);
++                self.scroll(rows);
++            } else {
++                self.table_interaction.reset_scroll();
++                self.is_done = self.responses.handle_key(key, &mut self.table_interaction);
++            }
++            return true;
++        }
++        if self.screen == CenterScreen::Summary
++            && let Some(screen) = CenterScreen::shortcut(key)
++        {
++            self.screen = screen;
++            self.view.scroll_offset = 0;
++            self.refresh();
++            return true;
++        }
++        if key.modifiers != KeyModifiers::NONE {
++            return false;
++        }
+         let arrow = matches!(
+             key.code,
+             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+         );
+-        if self.range != UsageRange::Summary {
+-            return arrow;
++        if self.screen != CenterScreen::Summary {
++            return false;
+         }
+         let Some(report) = self.report() else {
+             return arrow || key.code == KeyCode::Enter;
+@@ -193,43 +255,107 @@ impl ControlCenter {
+         let resized = self.viewport_width != area.width;
+         if resized {
+             self.viewport_width = area.width;
+-            if let Some(report) = self.report() {
+-                let (start, today) = crate::usage::heatmap_bounds(report, self.content_width());
+-                self.selected_day = self
+-                    .selected_day
+-                    .filter(|day| (start..=today).contains(day));
+-            }
+         }
+         if resized || self.theme_revision != syntax_theme_revision() {
+             self.refresh();
+         }
+         Clear.render(area, buf);
+         let inner = area.inner(Margin::new(2, 0));
+-        let [mut tabs, rule, mut body, footer] = Layout::vertical([
+-            Constraint::Length(1),
+-            Constraint::Length(1),
++        let auxiliary = matches!(self.screen, CenterScreen::Usage(_) | CenterScreen::Quotas);
++        let [tabs, rule, body, footer] = Layout::vertical([
++            Constraint::Length(u16::from(!auxiliary)),
++            Constraint::Length(u16::from(!auxiliary)),
+             Constraint::Min(0),
+-            Constraint::Length(1),
++            Constraint::Length(if self.screen == CenterScreen::Summary {
++                2
++            } else {
++                1
++            }),
+         ])
+         .areas(inner);
+-        let tab_hint = hint_line(&[("tab/shift+tab", "view")]);
+-        if tabs.width >= 80 {
+-            let width = tab_hint.width() as u16;
+-            tab_hint.render(Rect::new(tabs.right() - width, tabs.y, width, 1), buf);
+-            tabs.width = tabs.width.saturating_sub(width + 2);
+-        }
+-        render_filled_tab_bar(
+-            &UsageRange::VIEWS.map(UsageRange::label),
+-            self.range.index(),
+-            tabs,
++        if !auxiliary {
++            render_filled_tab_bar(
++                &["Summary", "Responses"],
++                usize::from(self.screen == CenterScreen::Responses),
++                tabs,
++                buf,
++            );
++            Line::from("─".repeat(usize::from(rule.width)))
++                .style(table_separator_style())
++                .render(rule, buf);
++        }
++
++        self.table_interaction.cells = match self.screen {
++            CenterScreen::Responses => {
++                self.responses
++                    .render(body, buf, &mut self.table_interaction)
++            }
++            _ => self.render_usage(body, buf),
++        };
++        let mut general = match self.screen {
++            CenterScreen::Responses => {
++                let mut line = footer_hint::shortcut("left", "model filter");
++                line.spans.push(Span::styled(
++                    format!(" {}", self.responses.model_label()),
++                    Palette::current().model(0),
++                ));
++                line.spans.push("  ".dim());
++                line.spans
++                    .extend(footer_hint::shortcut("right", "status filter").spans);
++                line.spans.push(Span::styled(
++                    format!(" {}", self.responses.status_label()),
++                    Palette::current().model(1),
++                ));
++                line
++            }
++            CenterScreen::Summary => hint_line(&[
++                ("esc", "back"),
++                ("p", "proxy"),
++                ("t", "telegram"),
++                ("q", "quit"),
++            ]),
++            CenterScreen::Usage(_) | CenterScreen::Quotas => {
++                hint_line(&[("esc", "back"), ("r", "refresh cache")])
++            }
++        };
++        let mut general_area = footer;
++        if self.screen == CenterScreen::Summary {
++            let label_style = Palette::current().header("").style;
++            let mut usage = hint_line(&[
++                ("alt+1", "all"),
++                ("alt+2", "daily"),
++                ("alt+3", "weekly"),
++                ("alt+4", "monthly"),
++                ("alt+5", "yearly"),
++                ("alt+0", "quotas"),
++                ("r", "refresh cache"),
++            ]);
++            usage.spans.insert(0, Span::styled("  usage ", label_style));
++            truncate_line_with_ellipsis_if_overflow(usage, usize::from(footer.width))
++                .render(Rect::new(footer.x, footer.y, footer.width, 1), buf);
++            general
++                .spans
++                .insert(0, Span::styled("general ", label_style));
++            general_area.y += 1;
++            general_area.height = general_area.height.saturating_sub(1);
++        }
++        truncate_line_with_ellipsis_if_overflow(general, usize::from(general_area.width))
++            .render(general_area, buf);
++        self.table_interaction.render_feedback(
++            Rect::new(
++                area.x,
++                area.bottom().saturating_sub(1),
++                area.width,
++                area.height.min(1),
++            ),
+             buf,
++            Instant::now(),
+         );
+-        Line::from("─".repeat(usize::from(rule.width)))
+-            .style(table_separator_style())
+-            .render(rule, buf);
++    }
+ 
++    fn render_usage(&mut self, mut body: Rect, buf: &mut Buffer) -> Vec<(Rect, Arc<str>)> {
+         let width = self.content_width();
+-        let sidebar = if self.range == UsageRange::Summary {
++        let sidebar = if self.screen == CenterScreen::Summary {
+             crate::wrapping::word_wrap_lines(
+                 self.sidebar(),
+                 usize::from(if width < body.width {
+@@ -278,14 +404,7 @@ impl ControlCenter {
+             )
+             .render(sidebar_area, buf);
+         }
+-        self.view.render_content(body, buf, 0);
+-        let mut hints = vec![("esc", "back"), ("r", "refresh usage cache")];
+-        if self.range == UsageRange::Summary {
+-            hints.extend([("p", "proxy"), ("t", "telegram")]);
+-        }
+-        hints.push(("q", "quit"));
+-        truncate_line_with_ellipsis_if_overflow(hint_line(&hints), usize::from(footer.width))
+-            .render(footer, buf);
++        self.view.render_content(body, buf, 0).1
+     }
+ 
+     fn sidebar(&self) -> Vec<Line<'static>> {
+@@ -367,25 +486,12 @@ impl ControlCenter {
+         lines
+     }
+ 
+-    fn scroll_mouse(&mut self, kind: MouseEventKind) -> bool {
+-        let direction = match kind {
+-            MouseEventKind::ScrollUp => -1.0,
+-            MouseEventKind::ScrollDown => 1.0,
+-            _ => return false,
+-        };
+-        if self.pending_mouse_scroll.signum() != direction {
+-            self.pending_mouse_scroll = 0.0;
+-        }
+-        self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+-        // Match the transcript's fractional-row and direction-reversal behavior.
+-        let rounded = self.pending_mouse_scroll.round();
+-        if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
+-            self.pending_mouse_scroll = rounded;
+-        }
+-        let rows = self.pending_mouse_scroll as isize;
+-        self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
+-        self.view.scroll_offset = self.view.scroll_offset.saturating_add_signed(rows);
+-        true
++    fn scroll(&mut self, rows: isize) {
++        if self.screen == CenterScreen::Responses {
++            self.responses.scroll(rows);
++        } else {
++            self.view.scroll_offset = self.view.scroll_offset.saturating_add_signed(rows);
++        }
+     }
+ 
+     pub(super) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+@@ -394,14 +500,26 @@ impl ControlCenter {
+                 tui.frame_requester().schedule_frame();
+                 Ok(())
+             }
+-            TuiEvent::Mouse(mouse) if self.scroll_mouse(mouse.kind) => {
+-                tui.frame_requester().schedule_frame();
++            TuiEvent::Mouse(mouse) => {
++                if let Some(action) = self.table_interaction.handle_mouse(mouse, tui) {
++                    if let TableMouseAction::Scroll(rows) = action {
++                        self.scroll(rows);
++                    }
++                    tui.frame_requester().schedule_frame();
++                }
+                 Ok(())
+             }
+             TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
+                 tui.draw(u16::MAX, |frame| self.render(frame.area(), frame.buffer))?;
++                let millis = if self.screen == CenterScreen::Responses
++                    && self.responses.history.rows().any(|row| row.is_running())
++                {
++                    250
++                } else {
++                    1_000
++                };
+                 tui.frame_requester()
+-                    .schedule_frame_in(std::time::Duration::from_secs(1));
++                    .schedule_frame_in(std::time::Duration::from_millis(millis));
+                 Ok(())
+             }
+             TuiEvent::Key(key) => self.view.handle_key_event(tui, key),
+@@ -416,11 +534,8 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+         if !line.spans.is_empty() {
+             line.spans.push("  ".dim());
+         }
+-        line.spans.extend(key_hint::key_label_spans(key));
+-        line.spans.push(Span::styled(
+-            format!(" {description}"),
+-            footer_hint_label_style().not_bold(),
+-        ));
++        line.spans
++            .extend(footer_hint::shortcut(key, description).spans);
+     }
+     line
+ }
+@@ -441,14 +556,192 @@ fn format_age(seconds: u64) -> String {
+     }
+ }
+ 
++#[cfg(test)]
++pub(super) fn test_center(
++    report: Option<Arc<UsageReport>>,
++    screen: CenterScreen,
++    width: u16,
++    speed: f64,
++) -> ControlCenter {
++    let (events, _received) = tokio::sync::mpsc::unbounded_channel();
++    let mut center = ControlCenter::new(
++        report,
++        &RuntimeKeymap::defaults(),
++        width,
++        speed,
++        FrameRequester::test_dummy(),
++        AppEventSender::new(events),
++        Arc::new(ModelCatalog::new(Vec::new())),
++    );
++    center.screen = screen;
++    center.refresh();
++    center
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::usage::UsageRange;
+     use chrono::Local;
++    use crossterm::event::MouseEvent;
++    use crossterm::event::MouseEventKind;
++
++    #[test]
++    fn report_pages_publish_painted_cells_and_release_them_when_content_disappears() {
++        let mut report = crate::usage::test_report();
++        let models = report.rows["2026-09-28"].clone();
++        report
++            .weekly_rows
++            .insert("2026-09-28".into(), models.clone());
++        report.monthly_rows.insert("2026-09".into(), models.clone());
++        report.yearly_rows.insert("2026".into(), models);
++        let report = Arc::new(report);
++        for screen in [CenterScreen::Summary, CenterScreen::Quotas]
++            .into_iter()
++            .chain(UsageRange::VIEWS.map(CenterScreen::Usage))
++        {
++            let mut center = test_center(Some(Arc::clone(&report)), screen, 204, 1.0);
++            let area = Rect::new(4, 3, 204, 40);
++            let mut buffer = Buffer::empty(area);
++            center.render(area, &mut buffer);
++            assert!(!center.table_interaction.cells.is_empty(), "{screen:?}");
++            for (rect, _) in &center.table_interaction.cells {
++                assert_eq!(rect.intersection(area), *rect);
++                assert!(rect.bottom() < area.bottom());
++                assert!(!matches!(buffer[(rect.x, rect.y)].symbol(), "│" | "─"));
++            }
++            center.set_report(Err("unavailable".into()));
++            // Replacement data does not change the source of the still-painted cells.
++            assert!(!center.table_interaction.cells.is_empty());
++            center.render(area, &mut buffer);
++            assert!(center.table_interaction.cells.is_empty());
++        }
++    }
++
++    #[test]
++    fn switching_views_retains_response_pages_without_filter_dialogs() {
++        use crate::app_event::AppEvent;
++        use crate::response_timing::tests::attempt;
++        use crate::response_timing::tests::page;
++        use codex_models_manager::model_pricing::Prices;
++        use std::time::Instant;
++
++        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
++        let report = Arc::new(crate::usage::test_report());
++        let mut center = ControlCenter::new(
++            Some(Arc::clone(&report)),
++            &RuntimeKeymap::defaults(),
++            120,
++            1.0,
++            FrameRequester::test_dummy(),
++            AppEventSender::new(events),
++            Arc::new(ModelCatalog::new(Vec::new())),
++        );
++        let AppEvent::ReadResponseAttempts { request_id, .. } = received.try_recv().unwrap() else {
++            panic!("initial response page")
++        };
++        center.responses.history.finish(
++            request_id,
++            Ok(page(vec![attempt(7, None)])),
++            Ok(Prices::new()),
++            Instant::now(),
++        );
++        center.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
++        assert_eq!(center.screen, CenterScreen::Responses);
++        let area = Rect::new(0, 0, 120, 20);
++        let mut buffer = Buffer::empty(area);
++        center.render(area, &mut buffer);
++        assert!(
++            buffer.content[..120]
++                .iter()
++                .map(|cell| cell.symbol())
++                .collect::<String>()
++                .contains("Responses")
++        );
++        let footer = buffer
++            .content
++            .chunks_exact(120)
++            .last()
++            .unwrap()
++            .iter()
++            .map(|cell| cell.symbol())
++            .collect::<String>();
++        assert_eq!(
++            footer.trim(),
++            "left model filter All  right status filter All"
++        );
++        let all_column = footer.find("All").unwrap() as u16;
++        assert_eq!(
++            buffer[(all_column, area.bottom() - 1)].fg,
++            Palette::current().model(0).fg.unwrap()
++        );
++        assert!(
++            !buffer[(all_column, area.bottom() - 1)]
++                .modifier
++                .contains(ratatui::style::Modifier::DIM)
++        );
++        assert!(
++            !buffer
++                .content
++                .iter()
++                .map(|cell| cell.symbol())
++                .collect::<String>()
++                .contains("refresh responses")
++        );
++        center.handle_key(KeyCode::Char('m').into());
++        assert_eq!(center.screen, CenterScreen::Responses);
++        assert!(!center.is_done());
++        center.handle_key(KeyCode::Tab.into());
++        assert_eq!(center.screen, CenterScreen::Summary);
++        assert!(Arc::ptr_eq(center.report().unwrap(), &report));
++        center.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
++        assert_eq!(center.responses.history.count(), 1);
++        assert!(received.try_recv().is_err());
++    }
+ 
+     #[tokio::test]
+-    async fn heatmap_selection_escape_then_close_and_resize_preserve_report() -> Result<()> {
++    async fn summary_details_remain_reachable_on_narrow_and_short_screens() -> Result<()> {
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        for width in [60, 120] {
++            let mut center = test_center(
++                Some(Arc::new(crate::usage::test_report())),
++                CenterScreen::Summary,
++                width,
++                1.0,
++            );
++            let labels = (0..50)
++                .map(|index| format!("model-{index:02} statistics"))
++                .collect::<Vec<_>>();
++            center.details = labels.iter().cloned().map(Line::from).collect();
++            let area = Rect::new(0, 0, width, 12);
++            let mut seen = std::collections::BTreeSet::new();
++            let mut previous = None;
++            for _ in 0..100 {
++                let mut buffer = Buffer::empty(area);
++                center.render(area, &mut buffer);
++                let text = buffer
++                    .content
++                    .iter()
++                    .map(|cell| cell.symbol())
++                    .collect::<String>();
++                for label in &labels {
++                    if text.contains(label) {
++                        seen.insert(label.clone());
++                    }
++                }
++                if previous == Some(center.view.scroll_offset) {
++                    break;
++                }
++                previous = Some(center.view.scroll_offset);
++                center.handle_event(&mut tui, TuiEvent::Key(KeyCode::PageDown.into()))?;
++            }
++            assert_eq!(seen, labels.into_iter().collect(), "width {width}");
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn heatmap_defaults_to_latest_and_keeps_selection_across_tabs_and_resize() -> Result<()> {
+         let mut tui = crate::tui::test_support::make_test_tui()?;
+         let today = Local::now().date_naive();
+         let latest = today - Duration::days(i64::from(today.weekday().num_days_from_sunday()) + 2);
+@@ -474,14 +767,7 @@ mod tests {
+             );
+         }
+         let report = Arc::new(report);
+-        let mut overlay = ControlCenter::new(
+-            Some(report.clone()),
+-            UsageRange::Summary,
+-            crate::keymap::RuntimeKeymap::defaults().pager,
+-            120,
+-            1.0,
+-        );
+-        assert!(overlay.handle_key(KeyCode::Left.into()));
++        let mut overlay = test_center(Some(report.clone()), CenterScreen::Summary, 120, 1.0);
+         assert_eq!(overlay.selected_day, Some(latest));
+         assert!(overlay.handle_key(KeyCode::Left.into()));
+         assert_eq!(overlay.selected_day, Some(latest - Duration::days(14)));
+@@ -519,18 +805,15 @@ mod tests {
+         assert_eq!(overlay.content_width(), 36);
+         assert!(overlay.selected_day.is_some());
+         assert!(overlay.handle_key(KeyCode::Tab.into()));
+-        assert_eq!(overlay.range, UsageRange::Daily);
+-        assert_eq!(overlay.selected_day, None);
++        assert_eq!(overlay.screen, CenterScreen::Responses);
++        assert_eq!(overlay.selected_day, Some(latest));
+         assert_eq!(overlay.view.scroll_offset, 0);
+         assert!(Arc::ptr_eq(overlay.report().unwrap(), &report));
+         assert!(overlay.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+-        assert_eq!(overlay.range, UsageRange::Summary);
++        assert_eq!(overlay.screen, CenterScreen::Summary);
+         assert!(overlay.handle_key(KeyCode::Up.into()));
+         assert!(overlay.selected_day.is_some());
+         assert!(overlay.handle_key(KeyCode::Esc.into()));
+-        assert!(overlay.selected_day.is_none());
+-        assert!(!overlay.is_done());
+-        assert!(overlay.handle_key(KeyCode::Esc.into()));
+         assert!(overlay.is_done());
+         Ok(())
+     }
+@@ -549,10 +832,9 @@ mod tests {
+                 );
+                 let report = Arc::new(crate::usage::test_report());
+                 let area = Rect::new(0, 0, 204, 10);
+-                let mut overlay = ControlCenter::new(
++                let mut overlay = test_center(
+                     Some(Arc::clone(&report)),
+-                    UsageRange::Daily,
+-                    crate::keymap::RuntimeKeymap::defaults().pager,
++                    CenterScreen::Usage(UsageRange::Daily),
+                     area.width,
+                     1.0,
+                 );
+@@ -579,7 +861,7 @@ mod tests {
+                     Palette::current().intensity(16).fg.unwrap()
+                 );
+                 assert!(Arc::ptr_eq(overlay.report().unwrap(), &report));
+-                assert_eq!(overlay.range, UsageRange::Daily);
++                assert_eq!(overlay.screen, CenterScreen::Usage(UsageRange::Daily));
+                 assert_eq!(overlay.view.scroll_offset, 3);
+                 assert_eq!(overlay.theme_revision, syntax_theme_revision());
+                 for (before, after) in before.content[usize::from(area.width)..]
+@@ -605,13 +887,7 @@ mod tests {
+             .with_timezone(report.refreshed_at.offset())
+             .format("%Y-%m-%d %H:%M:%S")
+             .to_string();
+-        let mut overlay = ControlCenter::new(
+-            Some(Arc::new(report)),
+-            UsageRange::Summary,
+-            crate::keymap::RuntimeKeymap::defaults().pager,
+-            120,
+-            1.0,
+-        );
++        let mut overlay = test_center(Some(Arc::new(report)), CenterScreen::Summary, 120, 1.0);
+         let area = Rect::new(0, 0, 120, 24);
+         let mut buffer = Buffer::empty(area);
+         overlay.render(area, &mut buffer);
+@@ -622,9 +898,10 @@ mod tests {
+         };
+         let tabs = row_text(&buffer, 0);
+         assert!(
+-            tabs.contains("Summary") && tabs.trim_end().ends_with("view"),
++            tabs.contains("Summary") && tabs.contains("Responses"),
+             "{tabs}"
+         );
++        assert!(!tabs.contains("tab/shift+tab"));
+         assert!(!tabs.contains("Codex control center"));
+         let sidebar = overlay
+             .sidebar()
+@@ -644,9 +921,30 @@ mod tests {
+         assert!(!sidebar.iter().any(|line| line.starts_with("Updated:")));
+         assert_eq!(buffer[(80, 2)].symbol(), "U");
+         let footer = row_text(&buffer, 23);
+-        assert!(footer.contains("esc back") && footer.contains("r refresh usage cache"));
++        assert!(footer.contains("general") && footer.contains("esc back"));
++        assert!(!footer.contains("r refresh cache"));
+         assert!(footer.contains("p proxy") && footer.contains("t telegram"));
+         assert!(footer.contains("q quit"));
++        let usage = row_text(&buffer, 22);
++        assert!(
++            usage.contains("usage")
++                && usage.contains("alt+0 quotas")
++                && usage.contains("alt+5 yearly")
++                && usage.contains("r refresh cache")
++        );
++        assert!(usage.starts_with("    usage "));
++        assert!(footer.starts_with("  general "));
++        assert!(usage.find("alt+5 yearly").unwrap() < usage.find("alt+0 quotas").unwrap());
++        assert_eq!(usage, usage.to_lowercase());
++        assert_eq!(footer, footer.to_lowercase());
++        assert_eq!(
++            buffer[(2, 22)].fg,
++            Palette::current().header("").style.fg.unwrap()
++        );
++        assert_eq!(
++            buffer[(2, 23)].fg,
++            Palette::current().header("").style.fg.unwrap()
++        );
+         let key_column = footer.find("p proxy").unwrap() as u16;
+         assert!(
+             buffer[(key_column, 23)]
+@@ -665,7 +963,8 @@ mod tests {
+         overlay.render(area, &mut buffer);
+         assert!(!row_text(&buffer, 4).contains(&timestamp));
+         assert!(!row_text(&buffer, 23).contains("select day"));
+-        assert!(row_text(&buffer, 23).contains("q quit"));
++        assert!(row_text(&buffer, 23).contains("left model filter All"));
++        assert!(row_text(&buffer, 23).contains("right status filter All"));
+     }
+ 
+     #[test]
+@@ -691,10 +990,9 @@ mod tests {
+             (today - Duration::days(2)).to_string(),
+             std::collections::BTreeMap::from([("zero".into(), Default::default())]),
+         );
+-        let mut overlay = ControlCenter::new(
++        let mut overlay = test_center(
+             Some(Arc::new(report.clone())),
+-            UsageRange::Summary,
+-            crate::keymap::RuntimeKeymap::defaults().pager,
++            CenterScreen::Summary,
+             120,
+             1.0,
+         );
+@@ -767,10 +1065,9 @@ mod tests {
+             (1.5, vec![-1, -2, 1, 2]),
+             (3.0, vec![-3, 3]),
+         ] {
+-            let mut view = ControlCenter::new(
++            let mut view = test_center(
+                 Some(Arc::clone(&report)),
+-                UsageRange::Daily,
+-                crate::keymap::RuntimeKeymap::defaults().pager,
++                CenterScreen::Usage(UsageRange::Daily),
+                 area.width,
+                 speed,
+             );
+@@ -806,25 +1103,84 @@ mod tests {
+                 assert!(Arc::ptr_eq(view.report().unwrap(), &report));
+             }
+             overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Esc.into()))?;
++            assert!(!overlay.is_done());
++            assert!(tui.overlay_input == tui::OverlayInput::Usage);
++            overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Esc.into()))?;
+             assert!(overlay.is_done());
+             assert!(tui.overlay_input == tui::OverlayInput::Default);
+         }
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn response_arrows_and_wheel_share_fractional_speed_and_immediate_viewport_scrolling()
++    -> Result<()> {
++        use crate::response_timing::tests::attempt;
++        use codex_protocol::response_metrics::ResponseAttemptEnd;
++
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        for (speed, deltas) in [
++            (0.1, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, -1]),
++            (0.5, vec![0, -1, 0, 0, 1]),
++            (1.5, vec![-1, -2, 1, 2]),
++            (3.0, vec![-3, 3]),
++        ] {
++            for keyboard in [false, true] {
++                let mut center = test_center(None, CenterScreen::Responses, 120, speed);
++                let now = std::time::Instant::now();
++                for id in 1..=60 {
++                    center
++                        .responses
++                        .history
++                        .update(attempt(id, Some(ResponseAttemptEnd::Completed)), now);
++                }
++                center.responses.history.update_viewport(10, now);
++                center.responses.history.scroll_by(20, now);
++                let mut expected = 20_usize;
++                let up_events = if speed == 0.1 {
++                    deltas.len()
++                } else {
++                    deltas.len().div_ceil(2)
++                };
++                for (index, delta) in deltas.iter().enumerate() {
++                    if keyboard {
++                        assert!(center.handle_key(if index < up_events {
++                            KeyCode::Up.into()
++                        } else {
++                            KeyCode::Down.into()
++                        }));
++                    } else {
++                        center.handle_event(
++                            &mut tui,
++                            TuiEvent::Mouse(MouseEvent {
++                                kind: if index < up_events {
++                                    MouseEventKind::ScrollUp
++                                } else {
++                                    MouseEventKind::ScrollDown
++                                },
++                                column: 10,
++                                row: 10,
++                                modifiers: KeyModifiers::NONE,
++                            }),
++                        )?;
++                    }
++                    expected = expected.saturating_add_signed(*delta);
++                    assert_eq!(center.responses.history.scroll_top, expected);
++                    assert_eq!(center.view.scroll_offset, 0);
++                }
++            }
++        }
++        Ok(())
++    }
++
+     #[test]
+     fn control_center_error_keeps_navigation_with_or_without_the_sidebar() {
+         let mut report = crate::usage::test_report();
+         report.latest_usage_at = None;
+         let report = Arc::new(report);
+         for width in [60, 120] {
+-            let mut overlay = ControlCenter::new(
+-                Some(Arc::clone(&report)),
+-                UsageRange::Summary,
+-                crate::keymap::RuntimeKeymap::defaults().pager,
+-                width,
+-                1.0,
+-            );
++            let mut overlay =
++                test_center(Some(Arc::clone(&report)), CenterScreen::Summary, width, 1.0);
+             overlay.set_report(Err("cache unavailable".into()));
+             let area = Rect::new(0, 0, width, 24);
+             let mut buffer = Buffer::empty(area);
+@@ -854,16 +1210,15 @@ mod tests {
+     #[test]
+     fn usage_dashboard_closes_tables_at_both_viewport_edges() {
+         let report = Arc::new(crate::usage::test_report());
+-        // A short body cuts the period table before its natural bottom border.
+-        let area = Rect::new(4, 3, 204, 10);
+-        let mut overlay = ControlCenter::new(
++        // Full table width isolates the six-row cut immediately above an orphan separator.
++        let area = Rect::new(4, 3, 224, 6 + 1);
++        let mut overlay = test_center(
+             Some(report),
+-            UsageRange::Daily,
+-            crate::keymap::RuntimeKeymap::defaults().pager,
++            CenterScreen::Usage(UsageRange::Daily),
+             area.width,
+             1.0,
+         );
+-        let mut buffer = Buffer::empty(Rect::new(0, 0, 220, 20));
++        let mut buffer = Buffer::empty(Rect::new(0, 0, 240, 20));
+         let row = |buffer: &Buffer, y| {
+             (area.x..area.right())
+                 .map(|x| buffer[(x, y)].symbol())
+@@ -878,30 +1233,43 @@ mod tests {
+         assert!(row(&buffer, area.bottom() - 2).trim().is_empty());
+         overlay.view.scroll_offset = 3;
+         overlay.render(area, &mut buffer);
+-        let top = row(&buffer, area.y + 2);
++        let top = row(&buffer, area.y);
+         assert!(
+             top.trim().starts_with('┌') && top.trim().ends_with('┐'),
+             "{top}"
+         );
+         assert!(row(&buffer, area.bottom() - 1).contains("esc back"));
+-        assert!(row(&buffer, area.y).contains("Summary"));
++        assert!(!row(&buffer, area.y).contains("Daily"));
+     }
+ 
+     #[tokio::test]
+-    async fn every_report_exits_with_escape_and_ignores_key_release() -> Result<()> {
++    async fn every_report_returns_to_summary_and_ignores_key_release() -> Result<()> {
+         let mut tui = crate::tui::test_support::make_test_tui()?;
+         let mut report = crate::usage::test_report();
+         report.rows.clear();
+         report.quota.clear();
+         let report = Arc::new(report);
+-        for range in UsageRange::VIEWS {
+-            let mut overlay = ControlCenter::new(
+-                Some(report.clone()),
+-                range,
+-                crate::keymap::RuntimeKeymap::defaults().pager,
+-                120,
+-                1.0,
+-            );
++        for screen in [CenterScreen::Summary, CenterScreen::Quotas]
++            .into_iter()
++            .chain(UsageRange::VIEWS.map(CenterScreen::Usage))
++        {
++            let mut overlay = test_center(Some(report.clone()), screen, 120, 1.0);
++            let area = Rect::new(0, 0, 120, 24);
++            let mut buffer = Buffer::empty(area);
++            overlay.render(area, &mut buffer);
++            let footer = buffer
++                .content
++                .chunks_exact(120)
++                .rev()
++                .take(if screen == CenterScreen::Summary {
++                    2
++                } else {
++                    1
++                })
++                .flatten()
++                .map(|cell| cell.symbol())
++                .collect::<String>();
++            assert!(footer.contains("r refresh cache"), "{screen:?}: {footer}");
+             for key in [
+                 KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
+                 KeyCode::Char('q').into(),
+@@ -920,15 +1288,23 @@ mod tests {
+                 assert!(overlay.selected_day.is_none());
+             }
+             for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+-                assert!(overlay.handle_key(key.into()));
++                assert_eq!(
++                    overlay.handle_key(key.into()),
++                    screen == CenterScreen::Summary
++                );
+                 assert_eq!(overlay.view.scroll_offset, 0);
+                 assert!(overlay.selected_day.is_none());
+             }
+             assert_eq!(
+                 overlay.handle_key(KeyCode::Enter.into()),
+-                range == UsageRange::Summary
++                screen == CenterScreen::Summary
+             );
+             assert!(overlay.handle_key(KeyCode::Esc.into()));
++            if screen != CenterScreen::Summary {
++                assert!(!overlay.is_done());
++                assert_eq!(overlay.screen, CenterScreen::Summary);
++                assert!(overlay.handle_key(KeyCode::Esc.into()));
++            }
+             assert!(overlay.is_done());
+         }
+         Ok(())
+@@ -954,12 +1330,11 @@ mod tests {
+             .collect();
+         let report = Arc::new(report);
+         for body_height in 3..=10 {
+-            let area = Rect::new(4, 3, 204, body_height + 3);
++            let area = Rect::new(4, 3, 204, body_height + 1);
+             let mut buffer = Buffer::empty(Rect::new(0, 0, 220, 24));
+-            let mut overlay = ControlCenter::new(
++            let mut overlay = test_center(
+                 Some(Arc::clone(&report)),
+-                UsageRange::Daily,
+-                crate::keymap::RuntimeKeymap::defaults().pager,
++                CenterScreen::Usage(UsageRange::Daily),
+                 area.width,
+                 1.0,
+             );
+@@ -967,7 +1342,7 @@ mod tests {
+             let mut previous_offset = None;
+             for _ in 0..100 {
+                 overlay.render(area, &mut buffer);
+-                for y in area.y + 2..area.bottom() - 1 {
++                for y in area.y..area.bottom() - 1 {
+                     let line = (area.x..area.right())
+                         .map(|x| buffer[(x, y)].symbol())
+                         .collect::<String>();
+@@ -976,7 +1351,7 @@ mod tests {
+                             seen.insert(day.clone());
+                         }
+                     }
+-                    if line.trim().starts_with('└') && y > area.y + 2 {
++                    if line.trim().starts_with('└') && y > area.y {
+                         let above = (area.x..area.right())
+                             .map(|x| buffer[(x, y - 1)].symbol())
+                             .collect::<String>();
+diff --git a/codex-rs/tui/src/usage/mod.rs b/codex-rs/tui/src/usage/mod.rs
+--- a/codex-rs/tui/src/usage/mod.rs
++++ b/codex-rs/tui/src/usage/mod.rs
+@@ -33,16 +33,6 @@ impl UsageRange {
+         Self::Monthly,
+         Self::Yearly,
+     ];
+-
+-    pub(crate) fn label(self) -> &'static str {
+-        match self {
+-            Self::Daily => "Daily",
+-            Self::Weekly => "Weekly",
+-            Self::Monthly => "Monthly",
+-            Self::Yearly => "Yearly",
+-            Self::All => "All",
+-        }
+-    }
+ }
+ 
+ fn periods(

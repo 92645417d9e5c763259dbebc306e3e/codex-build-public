@@ -1,0 +1,79 @@
+omit-content-attribution-from-wire-requests
+
+Lane: bugfix
+
+FlatPatch: omit-content-attribution-from-wire-requests
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Prevent Responses and Responses Lite schema rejection of unsupported per-content attribution.
+
+Requires: none
+
+Provides: Remove content_item_metadata only from the formatted wire-request copy for HTTP and WebSocket Responses while retaining supported metadata and local prompt provenance.
+
+Boundary: Preserve content-item classifications, turn metadata, content, local history and compaction attribution, model selection, transport and retry behavior; do not import an upstream fix.
+
+Verification: Responses Lite and standard request tests assert attribution absence on initial and resumed inputs while preserving instructions, content classifications, tools and stable retained prefixes; native provenance tests retain local attribution.
+
+
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1004,11 +1004,10 @@ impl ModelClient {
+             prefix.push(instructions);
+         }
+         input.splice(0..0, prefix);
+-        if !model_info.use_responses_lite {
+-            // Only RLite accepts per-content attribution until the Responses API schema expands.
+-            for item in &mut input {
+-                item.clear_content_item_metadata();
+-            }
++        // Neither Responses endpoint accepts per-content attribution. Strip only the
++        // request copy so prompt assembly and compaction retain local provenance.
++        for item in &mut input {
++            item.clear_content_item_metadata();
+         }
+         if !is_openai {
+             for item in &mut input {
+diff --git a/codex-rs/core/tests/suite/responses_lite.rs b/codex-rs/core/tests/suite/responses_lite.rs
+--- a/codex-rs/core/tests/suite/responses_lite.rs
++++ b/codex-rs/core/tests/suite/responses_lite.rs
+@@ -133,7 +133,7 @@ async fn base_instructions_use_input_items(responses_lite: bool) -> Result<()> {
+             .as_str()
+             .is_some_and(|id| id.starts_with("msg_"))
+     );
+-    let mut expected_instructions = serde_json::json!({
++    let expected_instructions = serde_json::json!({
+         "id": instructions["id"],
+         "type": "message",
+         "role": "developer",
+@@ -145,11 +145,11 @@ async fn base_instructions_use_input_items(responses_lite: bool) -> Result<()> {
+             "content_item_kinds": ["model.base_instructions"],
+         },
+     });
+-    if responses_lite {
+-        expected_instructions["internal_chat_message_metadata_passthrough"]["content_item_metadata"] =
+-            serde_json::json!([{"provenance": {"type": "harness", "hook": false}}]);
+-    }
+     assert_eq!(instructions, &expected_instructions);
++    assert!(input.iter().all(|item| {
++        item.pointer("/internal_chat_message_metadata_passthrough/content_item_metadata")
++            .is_none()
++    }));
+ 
+     let tools = if responses_lite {
+         assert!(body.get("tools").is_none());
+@@ -202,6 +202,10 @@ async fn base_instructions_use_input_items(responses_lite: bool) -> Result<()> {
+     .await;
+     let resumed = builder().restart(&server, &test).await?;
+     resumed.submit_turn("continue").await?;
++    assert!(followup.single_request().input().iter().all(|item| {
++        item.pointer("/internal_chat_message_metadata_passthrough/content_item_metadata")
++            .is_none()
++    }));
+     assert_eq!(
+         &followup.single_request().input()[..=instructions_index],
+         &input[..=instructions_index]

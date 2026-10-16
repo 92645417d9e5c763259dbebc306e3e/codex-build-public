@@ -15,6 +15,9 @@ type NativeToolchainOptions struct {
 	WorkingRoot string
 	ScratchRoot string
 	RuntimeRoot string
+	Source      string
+	Release     string
+	Auxiliary   []string
 	OnLive      func()
 }
 
@@ -32,9 +35,26 @@ type nativeToolchainResult struct {
 
 func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResult, error) {
 	result := NativeToolchainResult{SchemaVersion: core.SchemaVersion, RecordType: "NativeToolchainResult", Terminal: "Blocked", FailureDomain: failureDomainInput, ProductEffect: "None"}
-	for _, path := range []string{options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot} {
+	for _, path := range []string{options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, options.Source} {
 		if noFollowPath("native toolchain root", path) != nil {
 			return result, errors.New("native toolchain root differs")
+		}
+	}
+	window := newDeadline(core.StageDeadline(), nil)
+	roles, err := readReleaseWorktrees(options.Source, options.ScratchRoot, options.Release, window)
+	if err != nil {
+		return result, err
+	}
+	registered := false
+	for _, source := range roles.Registered {
+		registered = registered || source == options.Source
+	}
+	if !registered || len(options.Auxiliary) != 6 {
+		return result, errors.New("native toolchain source or auxiliary selection differs")
+	}
+	for _, version := range options.Auxiliary {
+		if !validToolRelease(version) {
+			return result, errors.New("native toolchain auxiliary version is not a semantic release")
 		}
 	}
 	lock, err := cargoLock(options.ScratchRoot)
@@ -51,7 +71,7 @@ func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResu
 	defer removeOwnedPaths(attempt)
 	resultPath := filepath.Join(attempt, "result.json")
 	script := filepath.Join(attempt, "native-toolchain.py")
-	arguments := []string{options.WorkingRoot, options.ScratchRoot, attempt, resultPath}
+	arguments := append([]string{options.WorkingRoot, options.ScratchRoot, attempt, resultPath, options.Source}, options.Auxiliary...)
 	data, stderr, runErr := runNativeProcess(attempt, script, "prepare", arguments, nativeEnvironment(attempt), 32<<20, resultPath, core.StageDeadline(), nil, options.OnLive)
 	if diagnostic := strings.TrimSpace(stderr); diagnostic != "" {
 		runErr = errors.Join(runErr, errors.New(diagnostic))
@@ -68,7 +88,7 @@ func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResu
 		}
 		return result, errors.Join(runErr, diagnosticErr, errors.New("native toolchain build failed"))
 	}
-	projection, err := resolveToolchainProjection(options.WorkingRoot)
+	projection, err := resolveToolchainProjection(options.WorkingRoot, options.Source, options.RuntimeRoot)
 	if err != nil {
 		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
 		return result, errors.Join(err, errors.New("published native toolchain admission failed"))

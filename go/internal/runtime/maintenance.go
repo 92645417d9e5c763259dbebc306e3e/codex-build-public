@@ -81,7 +81,7 @@ func RunRepositoryMaintenance(options RepositoryMaintenanceOptions) (result Repo
 		result.FailureDomain = runnerFailureDomain(err)
 		return result, errors.Join(err, errors.New("repository maintenance source differs"))
 	}
-	toolchain, err := resolveToolchainProjection(options.ProjectWorkingRoot)
+	toolchain, err := resolveToolchainProjection(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot)
 	if err != nil {
 		result.FailureDomain = failureDomainHelper
 		return result, err
@@ -199,7 +199,7 @@ func repositoryMaintenancePreimage(options RepositoryMaintenanceOptions, branch 
 		}
 	} else {
 		bazelVersion, err := readRegularNoFollow(filepath.Join(options.Source, ".bazelversion"))
-		if err != nil || !bytes.Equal(bazelVersion, []byte(repositoryBazelVersion+"\n")) {
+		if err != nil || !bytes.HasSuffix(bazelVersion, []byte("\n")) || !validToolRelease(strings.TrimSuffix(string(bazelVersion), "\n")) {
 			return nil, nil, errors.Join(err, errors.New("repository Bazel selection differs"))
 		}
 	}

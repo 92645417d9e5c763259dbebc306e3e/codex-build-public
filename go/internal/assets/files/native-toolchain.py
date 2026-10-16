@@ -10,40 +10,16 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 import urllib.request
 
 
-GSTREAMER_VERSION = "1.28.6"
 GSTREAMER_SOURCE = "https://gitlab.freedesktop.org/gstreamer/gstreamer.git"
-RUST_VERSION = "1.95.0"
 RUSTUP_SOURCE = (
     "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init"
 )
-NEXTEST_VERSION = "0.9.131"
-NEXTEST_SOURCE = (
-    f"https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{NEXTEST_VERSION}/"
-    f"cargo-nextest-{NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-)
-SCCACHE_VERSION = "0.15.0"
-SCCACHE_SOURCE = (
-    f"https://github.com/mozilla/sccache/releases/download/v{SCCACHE_VERSION}/"
-    f"sccache-v{SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-)
-V8_VERSION = "150.4.0"
-V8_RELEASE = f"https://github.com/openai/codex/releases/download/rusty-v8-v{V8_VERSION}"
 V8_ARCHIVE = "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz"
 V8_BINDING = "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs"
-BAZELISK_VERSION = "1.29.0"
-BAZELISK_SOURCE = (
-    f"https://github.com/bazelbuild/bazelisk/releases/download/v{BAZELISK_VERSION}/"
-    "bazelisk-linux-amd64"
-)
-JUST_VERSION = "1.57.0"
-JUST_SOURCE = f"https://github.com/casey/just/releases/download/{JUST_VERSION}/just-{JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-DOTSLASH_VERSION = "0.5.9"
-DOTSLASH_SOURCE = f"https://github.com/facebook/dotslash/releases/download/v{DOTSLASH_VERSION}/dotslash-ubuntu-22.04.x86_64.tar.gz"
-UV_VERSION = "0.11.8"
-UV_SOURCE = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
 TARGET = "x86_64-unknown-linux-gnu"
 PLUGINS = (
     "libgstapp.so",
@@ -54,6 +30,45 @@ PLUGINS = (
     "libgstrtp.so",
     "libgstrtpmanager.so",
 )
+
+
+def release_version(value):
+    if not isinstance(value, str) or re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value) is None:
+        raise RuntimeError(f"tool requirement is not a semantic release: {value!r}")
+    return value
+
+
+def source_requirements(source):
+    with (source / "codex-rs/rust-toolchain.toml").open("rb") as stream:
+        rust = tomllib.load(stream)["toolchain"]
+    with (source / "codex-rs/Cargo.lock").open("rb") as stream:
+        v8 = {package["version"] for package in tomllib.load(stream)["package"] if package["name"] == "v8"}
+    if len(v8) != 1:
+        raise RuntimeError("source must select one V8 release")
+    voice = json.loads((source / "third_party/voice/sources.json").read_text())["sources"]
+    gstreamer = [item["version"] for item in voice if item["name"] in {"gstreamer", "gst-plugins-base", "gst-plugins-good"}]
+    opus = [item["version"] for item in voice if item["name"] == "opus"]
+    if len(gstreamer) != 3 or len(set(gstreamer)) != 1 or len(opus) != 1:
+        raise RuntimeError("source voice requirements differ")
+    return {
+        "Rust": release_version(rust["channel"]),
+        "Components": sorted(set(rust.get("components", [])) | {"clippy", "rustfmt", "rust-src"}),
+        "V8": release_version(v8.pop()),
+        "GStreamer": release_version(gstreamer[0]),
+        "Opus": release_version(opus[0]),
+    }
+
+
+def rust_components_ready(root, components):
+    try:
+        installed = (root / "rust/lib/rustlib/components").read_text().splitlines()
+    except FileNotFoundError:
+        return False
+    for component in components:
+        name = {"clippy": "clippy-preview", "rustfmt": "rustfmt-preview"}.get(component, component)
+        if name not in installed and f"{name}-{TARGET}" not in installed:
+            return False
+    return True
 
 
 def run(arguments, *, cwd=None, environment=None):
@@ -160,7 +175,7 @@ def prepare_runtime(sdk, runtime):
     )
 
 
-def build_voice(attempt, stage):
+def build_voice(attempt, stage, version):
     source = attempt / "source"
     build = attempt / "build"
     home = attempt / "voice-home"
@@ -184,7 +199,7 @@ def build_voice(attempt, stage):
             "--depth",
             "1",
             "--branch",
-            GSTREAMER_VERSION,
+            version,
             GSTREAMER_SOURCE,
             source,
         ],
@@ -198,7 +213,7 @@ def build_voice(attempt, stage):
         stdout=subprocess.PIPE,
         text=True,
     ).stdout.strip()
-    if tag != GSTREAMER_VERSION:
+    if tag != version:
         raise RuntimeError("GStreamer source tag differs")
     sdk = stage / "voice" / "sdk"
     setup = [
@@ -369,7 +384,7 @@ def install_executable(
     os.replace(pending, stage / "bin" / name)
 
 
-def bootstrap_rust(attempt, stage):
+def bootstrap_rust(attempt, stage, requirements):
     initializer = attempt / "rustup-init"
     rustup_home = attempt / "rustup"
     cargo_home = attempt / "cargo"
@@ -398,13 +413,9 @@ def bootstrap_rust(attempt, stage):
             "--default-host",
             TARGET,
             "--default-toolchain",
-            RUST_VERSION,
+            requirements["Rust"],
             "--component",
-            "clippy",
-            "--component",
-            "rustfmt",
-            "--component",
-            "rust-src",
+            ",".join(requirements["Components"]),
         ],
         environment=environment,
     )
@@ -417,8 +428,8 @@ def bootstrap_rust(attempt, stage):
         raise RuntimeError("Rust toolchain selection differs")
     source = toolchains[0]
     expected = {
-        "cargo": f"cargo {RUST_VERSION}",
-        "rustc": f"rustc {RUST_VERSION}",
+        "cargo": f"cargo {requirements['Rust']}",
+        "rustc": f"rustc {requirements['Rust']}",
     }
     for name, prefix in expected.items():
         if not tool_version(source / "bin" / name).startswith(prefix):
@@ -432,13 +443,14 @@ def bootstrap_rust(attempt, stage):
     shutil.copytree(source, stage / "rust", symlinks=True)
 
 
-def install_v8(attempt, stage):
+def install_v8(stage, version):
     root = stage / "rusty_v8" / TARGET
     root.mkdir(parents=True)
     archive = root / V8_ARCHIVE
     binding = root / V8_BINDING
-    download(f"{V8_RELEASE}/{V8_ARCHIVE}", archive)
-    download(f"{V8_RELEASE}/{V8_BINDING}", binding)
+    release = f"https://github.com/openai/codex/releases/download/rusty-v8-v{version}"
+    download(f"{release}/{V8_ARCHIVE}", archive)
+    download(f"{release}/{V8_BINDING}", binding)
     try:
         with gzip.open(archive, "rb") as source:
             if not source.read(8):
@@ -449,30 +461,25 @@ def install_v8(attempt, stage):
         raise RuntimeError("rusty_v8 binding differs")
 
 
-def expected_manifest():
-    return {
-        "bazelisk": BAZELISK_VERSION,
-        "cargo": RUST_VERSION,
-        "cargo-nextest": NEXTEST_VERSION,
-        "dotslash": DOTSLASH_VERSION,
-        "gstreamer": GSTREAMER_VERSION,
-        "just": JUST_VERSION,
-        "rust": RUST_VERSION,
-        "rusty_v8": V8_VERSION,
-        "sccache": SCCACHE_VERSION,
+def expected_manifest(requirements, auxiliary):
+    versions = dict(zip(("cargo-nextest", "sccache", "bazelisk", "just", "dotslash", "uv"), auxiliary, strict=True))
+    return versions | {
+        "cargo": requirements["Rust"],
+        "gstreamer": requirements["GStreamer"],
+        "rust": requirements["Rust"],
+        "rusty_v8": requirements["V8"],
         "schemaVersion": 1,
         "target": TARGET,
-        "uv": UV_VERSION,
     }
 
 
-def voice_ready(root, native_state):
+def voice_ready(root, native_state, version):
     try:
         sdk_state = json.loads((root / "voice" / "sdk" / "sdk.json").read_text())
     except (OSError, ValueError):
         sdk_state = {}
     return (
-        native_state.get("gstreamer") == GSTREAMER_VERSION
+        native_state.get("gstreamer") == version
         and sdk_state == {"schemaVersion": 1, "target": TARGET}
         and (root / "voice" / "runtime" / "runtime.json").is_file()
         and (
@@ -486,34 +493,34 @@ def voice_ready(root, native_state):
     )
 
 
-def composite_ready(root, native_state):
-    expected = expected_manifest()
+def composite_ready(root, native_state, expected, requirements):
     if (
         set(native_state) != set(expected)
         or any(
             native_state.get(name) != value for name, value in expected.items()
         )
-        or not voice_ready(root, native_state)
+        or not voice_ready(root, native_state, requirements["GStreamer"])
+        or not rust_components_ready(root, requirements["Components"])
     ):
         return False
-    expected_tools = {
-        "dotslash": f"DotSlash {DOTSLASH_VERSION}",
-        "just": f"just {JUST_VERSION}",
-        "sccache": f"sccache {SCCACHE_VERSION}",
-        "uv": f"uv {UV_VERSION} ({TARGET})",
+    reported_names = {
+        "dotslash": "DotSlash",
+        "just": "just",
+        "sccache": "sccache",
+        "uv": "uv",
     }
     if any(
-        tool_version(root / "bin" / name) != version
-        for name, version in expected_tools.items()
+        semantic_version(root / "bin" / name, report) != expected[name]
+        for name, report in reported_names.items()
     ):
         return False
-    if nextest_version(root / "bin" / "cargo-nextest") != NEXTEST_VERSION:
+    if nextest_version(root / "bin" / "cargo-nextest") != expected["cargo-nextest"]:
         return False
-    if bazelisk_version(root / "bin" / "bazel") != BAZELISK_VERSION:
+    if bazelisk_version(root / "bin" / "bazel") != expected["bazelisk"]:
         return False
-    if not tool_version(root / "rust" / "bin" / "rustc").startswith(f"rustc {RUST_VERSION}"):
+    if semantic_version(root / "rust" / "bin" / "rustc", "rustc") != requirements["Rust"]:
         return False
-    if not tool_version(root / "rust" / "bin" / "cargo").startswith(f"cargo {RUST_VERSION}"):
+    if semantic_version(root / "rust" / "bin" / "cargo", "cargo") != requirements["Rust"]:
         return False
     for path in (
         root / "rust" / "bin" / "clippy-driver",
@@ -527,9 +534,14 @@ def composite_ready(root, native_state):
 
 
 def main():
-    if len(sys.argv) != 6 or sys.argv[1] != "prepare":
+    if len(sys.argv) == 4 and sys.argv[1] == "requirements":
+        write_json(Path(sys.argv[3]), source_requirements(Path(sys.argv[2])))
+        return
+    if len(sys.argv) != 13 or sys.argv[1] != "prepare":
         raise SystemExit(2)
-    working, scratch, attempt, result = map(Path, sys.argv[2:])
+    working, scratch, attempt, result, source = map(Path, sys.argv[2:7])
+    requirements = source_requirements(source)
+    versions = expected_manifest(requirements, sys.argv[7:])
     for path in (working, scratch, attempt):
         if not path.is_absolute() or not path.is_dir() or path.is_symlink():
             raise RuntimeError("native toolchain root differs")
@@ -549,63 +561,72 @@ def main():
             native_state = {}
         if not isinstance(native_state, dict):
             native_state = {}
-        if not composite_ready(final, native_state):
+        if not composite_ready(final, native_state, versions, requirements):
             stage.mkdir()
             (stage / "bin").mkdir()
-            bootstrap_rust(attempt, stage)
+            bootstrap_rust(attempt, stage, requirements)
+            nextest = versions["cargo-nextest"]
             install_tool(
                 attempt,
                 stage,
                 "cargo-nextest",
-                NEXTEST_SOURCE,
+                f"https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{nextest}/cargo-nextest-{nextest}-{TARGET}.tar.gz",
                 "cargo-nextest",
-                NEXTEST_VERSION,
+                nextest,
                 nextest_version,
             )
+            bazelisk = versions["bazelisk"]
             install_executable(
                 attempt,
                 stage,
                 "bazel",
-                BAZELISK_SOURCE,
-                BAZELISK_VERSION,
+                f"https://github.com/bazelbuild/bazelisk/releases/download/v{bazelisk}/bazelisk-linux-amd64",
+                bazelisk,
                 bazelisk_version,
             )
+            sccache = versions["sccache"]
             install_tool(
                 attempt,
                 stage,
                 "sccache",
-                SCCACHE_SOURCE,
-                f"sccache-v{SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache",
-                SCCACHE_VERSION,
+                f"https://github.com/mozilla/sccache/releases/download/v{sccache}/sccache-v{sccache}-x86_64-unknown-linux-musl.tar.gz",
+                f"sccache-v{sccache}-x86_64-unknown-linux-musl/sccache",
+                sccache,
                 sccache_version,
             )
-            install_v8(attempt, stage)
+            install_v8(stage, requirements["V8"])
+            just = versions["just"]
             install_tool(
                 attempt,
                 stage,
                 "just",
-                JUST_SOURCE,
+                f"https://github.com/casey/just/releases/download/{just}/just-{just}-x86_64-unknown-linux-musl.tar.gz",
                 "just",
-                f"just {JUST_VERSION}",
+                just,
+                lambda path: semantic_version(path, "just"),
             )
             install_tool(
                 attempt,
                 stage,
                 "dotslash",
-                DOTSLASH_SOURCE,
+                f"https://github.com/facebook/dotslash/releases/download/v{versions['dotslash']}/dotslash-ubuntu-22.04.x86_64.tar.gz",
                 "dotslash",
-                f"DotSlash {DOTSLASH_VERSION}",
+                versions["dotslash"],
+                lambda path: semantic_version(path, "DotSlash"),
             )
             install_tool(
                 attempt,
                 stage,
                 "uv",
-                UV_SOURCE,
+                f"https://github.com/astral-sh/uv/releases/download/{versions['uv']}/uv-{TARGET}.tar.gz",
                 "uv-x86_64-unknown-linux-gnu/uv",
-                f"uv {UV_VERSION} ({TARGET})",
+                versions["uv"],
+                lambda path: semantic_version(path, "uv"),
             )
-            build_voice(attempt, stage)
-            write_json(stage / "native-toolchain.json", expected_manifest())
+            build_voice(attempt, stage, requirements["GStreamer"])
+            if source_requirements(source) != requirements:
+                raise RuntimeError("source toolchain requirements changed during preparation")
+            write_json(stage / "native-toolchain.json", versions)
             if final.exists():
                 exchange_directories(stage, final)
                 shutil.rmtree(stage)

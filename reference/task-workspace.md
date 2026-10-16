@@ -10,6 +10,9 @@
 - Attached cleanup owns only tracked source restoration and the exact ordinary non-ignored untracked inventory at the supplied repository root. Root classification never makes ignored descendants or another supplied root disposable.
 - Editable notes live under <ProjectScratchRoot>/lane-notes/<Tag>: notes.md holds shared product constraints and <LaneDirectory>/notes.md holds only lane-specific additions. Read the root before the selected lane; lane notes do not override shared guards. Platform, account, and transport scope belong here, not in skill defaults or repeated lane entries.
 - Notes hold exact current-user-approved critical cross-Patch guards. Self-contained behavior, identity, topology, and history stay with task, Git, source, and routes. The whole set survives Current, Fork, reset, promotion, and export rotation. Every entry mutation needs separate exact approval; private export only copies it.
+- The cross diagram's editable owner is `<ProjectScratchRoot>/lane-notes/<Tag>/5-cross/relationships.txt`, beside the lane's notes rather than inside Markdown or a task record.
+- Its published copy is `<ProjectWorkingRoot>/build/patches/private/<Tag>/5-cross/relationships.txt`; inheritance and authorized relationship changes update the working file before export.
+- PatchExport owns the diagram contract and exact publication. The same working-set lifetime preserves it across Fork, promotion and partial exports, and retires only an exactly published copy during selected cleanup.
 
 ## Worktrees
 
@@ -70,12 +73,31 @@ ClosedPatchTaskReductionOwner
 - A concurrent edit returns to the current file for reconciliation instead of replacing it with an earlier whole-file copy.
 - An active operation retains its process and completes before these additions select a successor; no watcher, polling loop, interrupt, or separate instruction queue is added.
 - If task-byte admission reports an edit during an operation, reconcile its actual effect with the current anchor instead of repeating the operation to restore old task bytes.
-- Reconcile on every entry, whole Apply return, completed Unit or Flat Patch authoring, selected test or review return, and before export, handoff or next selection. Read the entire anchor, actual Git rows and relevant source and existing results before deriving work. If interruption separated Git effects from task publication, reconcile those effects first; never repeat transport merely to repair stale prose.
-- For each affected pending instruction, compare its requested behavior with Current's implementation and selected verification outcomes. Remove satisfied instructions wherever they occur, including tree-wide rewrite plans, duplicate reminders and obsolete successors. Remove resolved cause, design, detail and result locators rather than append completion history. Partial fulfillment replaces that instruction with only its unresolved remainder and relevant evidence.
+- Reconcile on every entry, whole Apply return, completed Unit or Flat Patch authoring, selected test or review return, and before export, BuildInstall, task replacement, retirement, handoff or next selection. Read the entire anchor, actual Git rows and relevant source and existing results before deriving work. If interruption separated Git effects from task publication, reconcile those effects first; never repeat transport merely to repair stale prose.
+- Before BuildInstall, reconcile the current request and any indexed task against the selected Main implementation and required verification.
+- An indexed Roll also consumes ReleaseRollForward's complete inventory comparison before BuildInstall or task retirement.
+- Unresolved current requirements keep their existing product successor instead of selecting installation.
+- Only explicit user approval naming the unresolved remainder permits deferral, withdrawal, or a partial build or installation.
+- Preserve approved deferrals and their conditions in the task; generic build, cleanup or newer-tag requests do not imply that approval.
+- Explicit draft quick iteration may build its verified temporary suffix before the required fold; unrelated pending requirements remain unresolved.
+- Task retirement requires every obligation fulfilled or explicitly withdrawn; deferred work still needs its task.
+- During selected draft quick iteration, native Git supplies the temporary fixup suffix and PendingWork retains its draft owners and fold obligation.
+- Canonical terminal fields remain at the last canonical row until that suffix is folded under ReleaseRollForward.
+- Resume this native suffix before invoking canonical-history consumers.
+- For each affected pending instruction, compare its requested behavior with Current's implementation and selected verification outcomes. Remove satisfied actions, duplicate reminders and obsolete successors wherever they occur. Partial fulfillment replaces an action with only its unresolved remainder and relevant evidence.
+- Preserve the original user decision and its source for every boundary still governing pending work, including explicit group members, exclusions and deferred integration.
+- Keep that decision once beside the affected scope; distinguish it from candidate rationale, current metadata and the next execution action.
+- Completing a member or its tests does not discharge a boundary still governing other members or deferred consumers.
+- Reentry consumes OriginalPatchPurposeOwner before selecting work; recover missing user decisions from available history rather than infer them from task prose or ask for repetition.
+- When that owner rejects a premise, replace all dependent pending decisions together without changing the user's controlling boundary.
+- Remove resolved cause, design, detail and result locators only when no remaining admitted action depends on them; preserve no completion history or separate grouping ledger.
 - Matching Patch names, clean Apply, or a passing narrow test cannot discharge a different outstanding rewrite or stronger failure. Conflict preserves the accepted prefix and rejected Patch; missing children, unmet behavior, failed checks and interrupted checks retain their exact remaining action. Reconcile each completed selected check before choosing another action without creating a full-suite gate.
 - Keep the anchor limited to release identity, necessary task topology, and ongoing, deferred, or pending-verification work.
+- Keep unresolved decisions and their controlling user boundaries; native Git retains committed per-responsibility contracts.
 - Retain implementation detail only when it is necessary to resume deferred work.
 - Recover completed behavior from its source, current decisions, and relevant history rather than retaining its implementation contract in the anchor.
+- A compact Git inventory and selected contracts narrow source navigation after authority recovery; a short-context return does not change that order.
+- Derive the first unresolved action from ReleaseRollForward's complete typed inventory comparison rather than the lane label or last successful operation.
 - Preserve the complete declared future order and unresolved work on other Patches.
 - Git owns completed order.
 - Native results own test evidence.
@@ -83,7 +105,10 @@ ClosedPatchTaskReductionOwner
 - With no selected open Patch, omit its fields.
 - Reread the postimage to ensure prose and fields choose the same remaining action before continuing.
 - Closure consumes direct cumulative semantic acceptance and GitCustody convergence before publishing the task and invoking its successor.
-- Export Pass proves publication only; it cannot discharge pending task instructions or select a completion handoff.
+- Before closing a lane, compare every admitted source Unit, Flat Patch and ordered Child Patch in that lane with its accepted current Git responsibility and the authorized disposition of every difference.
+- Any missing or unexplained entry forbids lane crossing, a completion claim or removal of its pending work.
+- A shorter closed prefix may still be exported without closing its unfinished lane.
+- Clean Git, matching Patch names, passing checks and artifact publication cannot discharge a different pending requirement or select a completion handoff.
 - A question cannot reorder topology or establish an accident. Only actual topology mismatch requires renumbering and approval; otherwise answer and continue the reconciled successor. Task reduction grants no changed responsibility and does not edit separately approved lane-note guards.
 - A requested recap consumes the task, Git, available Apply diagnostics and selected check terminals; it creates no recap file or copied progress state.
 - Explain rejected Apply inputs and the reason for reconstruction, followed by the committed Child Patch rewrite order and observed outcomes.
@@ -92,7 +117,7 @@ ClosedPatchTaskReductionOwner
 - An open Unit names unique ordered ChildPatchSequence. An open Flat Patch names itself, and an open Transform names TransformPatch. Each also names CurrentWorktree and retained Sources. Apply copies only that declared structure.
 - Publish the selected Patch, complete Unit sequence, adopted topology, pre-authoring terminal, cause and successor before authoring. Keep that selection through Unit-local reset, rebase and final Child Commits. At the completed source boundary publish its actual terminal before a selected test; retain unresolved verification or behavior. No per-Child transition or premature Unit closure follows a partial prefix. A handoff during authoring preserves the unfinished selection and truthful continuation.
 - Candidates before topology resolution are unordered; declared order survives reduction.
-- Roll executes task order; an explicit interactive pause follows ReleaseRollForward's read-only exploration on clean Current. Task bytes grant no change of responsibility or topology.
+- Roll executes the reconciled order only while its assignment remains supported by OriginalPatchPurposeOwner; an explicit interactive pause selects read-only exploration on clean Current.
 - Preserve the complete approved purpose and its establishing source or user decision. Candidate rejection does not cancel requirements; task wording, repair hypotheses and tests cannot replace or narrow them.
 - Record findings and any selected complete reconstruction against their assigned Unit or Flat Patch. Retain every unmet obligation and its original authority until implemented or explicitly withdrawn; a shorter or passing replacement cannot clear it. Tree-wide plans retain unresolved requirements only.
 - The rewrite start decision records actual Main, proposed start, and disposition of existing Lane children and suffix sources before Fork or reset. Desired state never replaces observed facts.
@@ -104,6 +129,9 @@ ClosedPatchTaskReductionOwner
 - EditNamedTask publishes the sole release-roll-<Tag>.md before baseline, at Fork adoption and through reconciliation above. Temporary Main fixup retains its focused-tested fold plan until absorbed. Finalize and Prepare synchronize only the generated-tail terminal by exact preimage; semantic pending instructions remain the product agent's responsibility.
 - ActiveTask contains zero or one release task. OtherTasks is always empty and OverallTask keeps its independent existing role. The task survives each selected roll stop until explicit retirement. No semantic-version ordering or next-task selector exists.
 - Each task declares SourcePrefixes as one or more unique release tags joined by comma-space. The first is the primary predecessor and differs from the task tag. Further entries may name older, newer completed, or same-tag retained canonical prefixes. They provide read-only purpose evidence and exact unchanged transport input for the declared next Patch; they do not authorize changing its responsibility.
+- Before replacing the sole task for a user-selected newer tag, report pending work and carry every unresolved obligation, approved deferral and controlling user boundary into the replacement.
+- Preserve source-prefix and lane-note custody across that replacement.
+- Reread the replacement through EOF before Baseline retires predecessor roles.
 - ReleaseBaseline consumes the sole selected task and index unchanged. It admits either that tag's canonical global roles for same-tag continuation or its primary predecessor's canonical global roles after product work replaced the sole task without losing unresolved custody. A predecessor with private history requires the exact exported primary prefix; an absent prefix is admitted only when Established exists and clean Main equals the official tag parent.
 - The predecessor roles are retired and replaced at the same paths before selected-tag preparation returns; no completion receipt or invented empty export is required. Failure after preparation resumes the same tag and chain. Tag-scoped, mixed, duplicate, or unvalidated predecessor topology blocks.
 - The single rust-suite-baselines.json contains at most the selected release and its primary predecessor, each mapped to exactly one completed matching Established generation. Inheritance reads the primary predecessor without changing the existing pair and leaves the new tag absent; validated cross-tag Pass publication atomically replaces an older generation with the selected entry while retaining that predecessor. Same-tag publication preserves the pair.

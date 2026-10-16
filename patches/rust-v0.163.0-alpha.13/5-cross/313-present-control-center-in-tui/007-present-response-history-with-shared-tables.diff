@@ -1,0 +1,1179 @@
+present-response-history-with-shared-tables
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-response-history-with-shared-tables
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -204,6 +204,7 @@ mod proxy_dialogs;
+ pub(crate) mod public_widgets;
+ mod render;
+ mod resize_reflow_cap;
++mod response_table;
+ mod response_timing;
+ mod resume_permissions;
+ mod resume_picker;
+diff --git a/codex-rs/tui/src/response_table.rs b/codex-rs/tui/src/response_table.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_table.rs
+@@ -0,0 +1,518 @@
++//! Fixed response columns in the shared merged-cell control-center table.
++
++use crate::control_center_table::Cell;
++use crate::control_center_table::Column;
++use crate::control_center_table::Palette;
++use crate::control_center_table::center_left_column;
++use crate::control_center_table::render;
++use crate::control_center_table::shade_columns;
++use crate::control_center_table::widths;
++use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
++use crate::model_catalog::ModelCatalog;
++use crate::response_timing::ObservedResponse;
++use crate::response_timing::seconds;
++use crate::response_timing::tps;
++use codex_models_manager::model_pricing::Prices;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseAttemptStatus;
++use itertools::Itertools;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Style;
++use std::ops::Range;
++use std::sync::Arc;
++use std::time::Instant;
++
++pub(crate) const HEADER_HEIGHT: usize = 5;
++pub(crate) const ROW_HEIGHT: usize = 2;
++const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
++
++pub(crate) const STATUSES: [ResponseAttemptStatus; 13] = [
++    ResponseAttemptStatus::Working,
++    ResponseAttemptStatus::Received,
++    ResponseAttemptStatus::Unfinished,
++    ResponseAttemptStatus::Completed,
++    ResponseAttemptStatus::Incomplete,
++    ResponseAttemptStatus::Failed,
++    ResponseAttemptStatus::Interrupted,
++    ResponseAttemptStatus::Canceled,
++    ResponseAttemptStatus::SetupFailed,
++    ResponseAttemptStatus::SendFailed,
++    ResponseAttemptStatus::TransportClosed,
++    ResponseAttemptStatus::ProgressTimeout,
++    ResponseAttemptStatus::ProtocolError,
++];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ResponseColumn {
++    Time,
++    Model,
++    ServedModel,
++    Duration,
++    Received,
++    Input,
++    Read,
++    Write,
++    Output,
++    Reasoning,
++    Hit,
++    Tps,
++    Cost,
++    Ttfb,
++    Ttfc,
++    Effort,
++    Status,
++    AttemptId,
++    Sent,
++}
++
++impl ResponseColumn {
++    const ALL: &[Self] = &[
++        Self::Time,
++        Self::AttemptId,
++        Self::Model,
++        Self::ServedModel,
++        Self::Effort,
++        Self::Status,
++        Self::Duration,
++        Self::Sent,
++        Self::Received,
++        Self::Input,
++        Self::Write,
++        Self::Read,
++        Self::Output,
++        Self::Reasoning,
++        Self::Hit,
++        Self::Tps,
++        Self::Ttfb,
++        Self::Ttfc,
++        Self::Cost,
++    ];
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Time => "Time",
++            Self::AttemptId => "Attempt ID",
++            Self::Model => "Requested",
++            Self::ServedModel => "Served",
++            Self::Effort => "Effort",
++            Self::Status => "Status",
++            Self::Duration => "Duration",
++            Self::Sent => "Sent",
++            Self::Received => "Received",
++            Self::Input => "Input",
++            Self::Write => "Write",
++            Self::Read => "Read",
++            Self::Output => "Output",
++            Self::Reasoning => "Reasoning",
++            Self::Hit => "Hit",
++            Self::Tps => "TPS",
++            Self::Ttfb => "TTFB",
++            Self::Ttfc => "TTFC",
++            Self::Cost => "Cost",
++        }
++    }
++
++    /// Bound long labels and exceptional numeric values with the native ellipsis.
++    fn max_width(self) -> usize {
++        match self {
++            Self::Time => 19,
++            Self::Model | Self::ServedModel => 30,
++            Self::Status => STATUSES
++                .into_iter()
++                .map(status_label)
++                .map(str::len)
++                .max()
++                .expect("response statuses"),
++            Self::AttemptId => 36,
++            Self::Effort => 8,
++            Self::Hit => 7,
++            Self::Duration | Self::Ttfb | Self::Ttfc | Self::Tps => 12,
++            Self::Received | Self::Sent | Self::Cost => 16,
++            Self::Input | Self::Read | Self::Write | Self::Output | Self::Reasoning => 10,
++        }
++    }
++
++    fn layout(self) -> Column {
++        let minimum = match self {
++            Self::Model | Self::ServedModel => 12,
++            Self::Time | Self::AttemptId | Self::Status | Self::Effort => self.max_width(),
++            Self::Duration | Self::Ttfb | Self::Ttfc => seconds(0).len(),
++            Self::Received | Self::Sent => payload_size(0).len(),
++            Self::Input | Self::Read | Self::Write | Self::Output | Self::Reasoning => {
++                "0.00K".len()
++            }
++            Self::Hit => "100.00%".len(),
++            Self::Tps => tps(0.0).len(),
++            Self::Cost => "$0.0000".len(),
++        };
++        Column::new(self.label(), minimum, self.max_width())
++    }
++}
++
++/// Format-sized numeric columns, content-sized labels, and shades over all matching rows.
++pub(crate) struct ResponseTable {
++    rows: Vec<Vec<Cell>>,
++    failed: Vec<bool>,
++    widths: Vec<usize>,
++    palette: Palette,
++}
++
++impl ResponseTable {
++    pub(crate) fn new(
++        attempts: &[&ObservedResponse],
++        prices: Option<&Prices>,
++        catalog: &ModelCatalog,
++        now: Instant,
++    ) -> Self {
++        let palette = Palette::current();
++        let failed = attempts
++            .iter()
++            .map(|attempt| is_failed(&attempt.row))
++            .collect();
++        // Catalog order keeps configured model colors steady across pages and filters.
++        let models = catalog
++            .models
++            .iter()
++            .map(|model| model.model.as_str())
++            .chain(
++                attempts
++                    .iter()
++                    .map(|attempt| attempt.row.requested_model.as_str()),
++            )
++            .unique()
++            .collect::<Vec<_>>();
++        let mut rows = attempts
++            .iter()
++            .map(|attempt| {
++                let model_style = palette.model(
++                    models
++                        .iter()
++                        .position(|model| *model == attempt.row.requested_model)
++                        .expect("every requested model is included"),
++                );
++                ResponseColumn::ALL
++                    .iter()
++                    .map(|column| {
++                        cell(
++                            *column,
++                            attempt,
++                            prices,
++                            catalog,
++                            &palette,
++                            model_style,
++                            now,
++                        )
++                    })
++                    .collect()
++            })
++            .collect::<Vec<Vec<Cell>>>();
++        shade_columns(&mut rows, &palette);
++        let columns = ResponseColumn::ALL
++            .iter()
++            .map(|column| column.layout())
++            .collect::<Vec<_>>();
++        let widths = widths(u16::MAX, &columns, &rows);
++        center_left_column(&mut rows, 2, widths[2]);
++        center_left_column(&mut rows, 3, widths[3]);
++        Self {
++            rows,
++            failed,
++            widths,
++            palette,
++        }
++    }
++
++    pub(crate) fn max_offset(&self, width: u16) -> u16 {
++        self.widths
++            .iter()
++            .sum::<usize>()
++            .saturating_add(3 * self.widths.len() + 1)
++            .saturating_sub(usize::from(width))
++            .try_into()
++            .unwrap_or(u16::MAX)
++    }
++
++    pub(crate) fn render(
++        self,
++        visible: Range<usize>,
++        area: Rect,
++        buffer: &mut Buffer,
++        offset: u16,
++    ) -> Vec<(Rect, Arc<str>)> {
++        let mut rows = headers(&self.palette);
++        rows.extend(
++            self.rows
++                .into_iter()
++                .skip(visible.start)
++                .take(visible.len()),
++        );
++        let table = render(&self.widths, &rows, &self.palette);
++        table.render_viewport(area, buffer, 0, offset);
++        for (position, failed) in self
++            .failed
++            .iter()
++            .skip(visible.start)
++            .take(visible.len())
++            .enumerate()
++        {
++            let row_y = HEADER_HEIGHT + position * ROW_HEIGHT;
++            // The viewport replaces a cut-off last content row with a border.
++            if row_y + 1 >= usize::from(area.height) {
++                break;
++            }
++            let y = area.y + row_y as u16;
++            if *failed {
++                // Include padding and separators in the failed row's treatment.
++                buffer.set_style(
++                    Rect::new(area.x, y, area.width, 1),
++                    Style::default().italic(),
++                );
++            }
++        }
++        table.visible_cells(area, 0, offset)
++    }
++}
++
++fn headers(palette: &Palette) -> Vec<Vec<Cell>> {
++    let mut groups = Vec::new();
++    let mut leaves = Vec::new();
++    for column in ResponseColumn::ALL {
++        match column {
++            ResponseColumn::Model => groups.push(palette.header("Models").spanning(1, 2)),
++            ResponseColumn::Sent => groups.push(palette.header("Bytes").spanning(1, 2)),
++            ResponseColumn::Input => groups.push(palette.header("Token usage").spanning(1, 5)),
++            ResponseColumn::ServedModel
++            | ResponseColumn::Received
++            | ResponseColumn::Write
++            | ResponseColumn::Read
++            | ResponseColumn::Output
++            | ResponseColumn::Reasoning => {}
++            _ => groups.push(palette.header(column.label()).spanning(2, 1)),
++        }
++        if matches!(
++            column,
++            ResponseColumn::Model
++                | ResponseColumn::ServedModel
++                | ResponseColumn::Sent
++                | ResponseColumn::Received
++                | ResponseColumn::Input
++                | ResponseColumn::Write
++                | ResponseColumn::Read
++                | ResponseColumn::Output
++                | ResponseColumn::Reasoning
++        ) {
++            leaves.push(palette.header(column.label()));
++        }
++    }
++    vec![groups, leaves]
++}
++
++fn cell(
++    column: ResponseColumn,
++    attempt: &ObservedResponse,
++    prices: Option<&Prices>,
++    catalog: &ModelCatalog,
++    palette: &Palette,
++    model_style: Style,
++    now: Instant,
++) -> Cell {
++    let row = &attempt.row;
++    match column {
++        ResponseColumn::Time => text(
++            chrono::DateTime::from_timestamp(row.started_at, 0)
++                .map(|time| {
++                    time.with_timezone(&chrono::Local)
++                        .format(TIME_FORMAT)
++                        .to_string()
++                })
++                .unwrap_or_else(|| "--".into()),
++        ),
++        ResponseColumn::Model => {
++            let mut cell = text(catalog.display_name(&row.requested_model));
++            cell.style = model_style;
++            if row
++                .served_model
++                .as_ref()
++                .is_some_and(|model| model != &row.requested_model)
++            {
++                cell.style = cell.style.red();
++            }
++            cell
++        }
++        ResponseColumn::ServedModel => {
++            let mut cell = optional(
++                row.served_model
++                    .as_deref()
++                    .map(|model| catalog.display_name(model)),
++            );
++            if let Some(model) = &row.served_model {
++                let width = text(catalog.display_name(&row.requested_model)).lines[0]
++                    .width()
++                    .min(ResponseColumn::Model.layout().maximum());
++                cell.lines = cell
++                    .lines
++                    .into_iter()
++                    .map(|line| truncate_line_with_ellipsis_if_overflow(line, width))
++                    .collect();
++                cell.style = if model == &row.requested_model {
++                    model_style
++                } else {
++                    model_style.red()
++                };
++            }
++            cell
++        }
++        ResponseColumn::Status => {
++            let (label, style) = state(attempt, palette);
++            Cell {
++                style,
++                ..text(label)
++            }
++        }
++        ResponseColumn::Duration => duration(Some(attempt.elapsed_ms(now))),
++        ResponseColumn::Received => bytes(Some(row.received_payload_bytes)),
++        ResponseColumn::Input => Cell::tokens(
++            match (
++                row.tokens.input,
++                row.tokens.cache_read,
++                row.tokens.cache_write,
++            ) {
++                (Some(input), Some(read), Some(write)) => {
++                    Some(input.saturating_sub(read).saturating_sub(write))
++                }
++                _ => None,
++            },
++        ),
++        ResponseColumn::Read => Cell::tokens(row.tokens.cache_read),
++        ResponseColumn::Write => Cell::tokens(row.tokens.cache_write),
++        ResponseColumn::Output => Cell::tokens(row.tokens.output),
++        ResponseColumn::Reasoning => Cell::tokens(row.tokens.reasoning),
++        ResponseColumn::Hit => {
++            let value = match (row.tokens.input, row.tokens.cache_read) {
++                (Some(input), Some(read)) if input > 0 => Some(read as f64 * 100.0 / input as f64),
++                _ => None,
++            };
++            Cell::value(
++                value,
++                value.map_or_else(|| "--".into(), |value| format!("{value:.2}%")),
++            )
++        }
++        ResponseColumn::Tps => Cell::value(row.tps, row.tps.map_or_else(|| "--".into(), tps)),
++        ResponseColumn::Cost => {
++            let value = cost(row, prices);
++            Cell::value(
++                value,
++                value.map_or_else(|| "--".into(), |usd| format!("${usd:.4}")),
++            )
++        }
++        ResponseColumn::Ttfb => duration(row.ttfb_ms),
++        ResponseColumn::Ttfc => duration(row.ttfc_ms),
++        ResponseColumn::Effort => {
++            let mut cell = optional(row.reasoning_effort.as_deref());
++            if row.reasoning_effort.is_some() {
++                cell.style = palette.effort;
++            }
++            cell
++        }
++        ResponseColumn::AttemptId => {
++            let mut cell = text(row.attempt_id.to_string());
++            if is_failed(row) {
++                cell.style = cell.style.red();
++            }
++            cell
++        }
++        ResponseColumn::Sent => bytes(row.sent_payload_bytes),
++    }
++}
++
++fn is_failed(row: &ResponseAttempt) -> bool {
++    row.end_reason
++        .is_some_and(|reason| reason != ResponseAttemptEnd::Completed)
++}
++
++fn state(attempt: &ObservedResponse, palette: &Palette) -> (&'static str, Style) {
++    let status = attempt.row.status(attempt.is_running());
++    let style = match status {
++        ResponseAttemptStatus::Working
++        | ResponseAttemptStatus::Received
++        | ResponseAttemptStatus::Unfinished
++        | ResponseAttemptStatus::Incomplete
++        | ResponseAttemptStatus::Interrupted
++        | ResponseAttemptStatus::Canceled => palette.attention,
++        ResponseAttemptStatus::Completed => palette.success,
++        ResponseAttemptStatus::Failed
++        | ResponseAttemptStatus::SetupFailed
++        | ResponseAttemptStatus::SendFailed
++        | ResponseAttemptStatus::TransportClosed
++        | ResponseAttemptStatus::ProgressTimeout
++        | ResponseAttemptStatus::ProtocolError => palette.failure,
++    };
++    (status_label(status), style)
++}
++
++pub(crate) fn status_label(status: ResponseAttemptStatus) -> &'static str {
++    match status {
++        ResponseAttemptStatus::Working => "Working",
++        ResponseAttemptStatus::Received => "Received",
++        ResponseAttemptStatus::Unfinished => "Unfinished",
++        ResponseAttemptStatus::Completed => "Done",
++        ResponseAttemptStatus::Incomplete => "Incomplete",
++        ResponseAttemptStatus::Failed => "Failed",
++        ResponseAttemptStatus::Interrupted => "Interrupted",
++        ResponseAttemptStatus::Canceled => "Canceled",
++        ResponseAttemptStatus::SetupFailed => "Setup failed",
++        ResponseAttemptStatus::SendFailed => "Send failed",
++        ResponseAttemptStatus::TransportClosed => "Disconnected",
++        ResponseAttemptStatus::ProgressTimeout => "Timeout",
++        ResponseAttemptStatus::ProtocolError => "Protocol error",
++    }
++}
++
++fn duration(value: Option<u64>) -> Cell {
++    Cell::value(
++        value.map(|value| value as f64 / 1000.0),
++        value.map_or_else(|| "--".into(), seconds),
++    )
++}
++
++fn bytes(value: Option<u64>) -> Cell {
++    Cell::value(
++        value.map(|value| value as f64),
++        value.map_or_else(|| "--".into(), payload_size),
++    )
++}
++
++fn payload_size(value: u64) -> String {
++    format!("{:.1} KiB", value as f64 / 1024.0)
++}
++
++fn text(value: impl Into<String>) -> Cell {
++    Cell::text(value.into().replace(['\r', '\n'], " "))
++}
++
++fn optional(value: Option<&str>) -> Cell {
++    text(value.unwrap_or("--"))
++}
++
++fn cost(row: &ResponseAttempt, prices: Option<&Prices>) -> Option<f64> {
++    let price = prices?.get(row.served_model.as_deref().unwrap_or(&row.requested_model))?;
++    if price.is_zero() {
++        return None;
++    }
++    Some(
++        price
++            .quote(
++                row.tokens.input?,
++                row.tokens.cache_read?,
++                row.tokens.cache_write?,
++                row.tokens.output?,
++            )
++            .usd,
++    )
++}
++
++#[cfg(test)]
++#[path = "response_table_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/response_table_tests.rs b/codex-rs/tui/src/response_table_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_table_tests.rs
+@@ -0,0 +1,627 @@
++use super::*;
++use crate::response_timing::tests::attempt;
++use crate::style::readable_color_on;
++use pretty_assertions::assert_eq;
++use ratatui::style::Color;
++use ratatui::style::Modifier;
++use ratatui::text::Line;
++use serde_json::json;
++
++fn prices() -> Prices {
++    serde_json::from_value(json!({"served": {
++        "0": {"input": 2.0, "cache_read": 1.0, "cache_write": 3.0, "output": 4.0},
++        "1000": {"input": 4.0, "cache_read": 2.0, "cache_write": 6.0, "output": 8.0}
++    }}))
++    .unwrap()
++}
++
++fn buffer_text(buffer: &Buffer) -> String {
++    buffer.content.iter().map(|cell| cell.symbol()).collect()
++}
++
++fn value(table: &ResponseTable, row: usize, column: ResponseColumn) -> String {
++    table.rows[row][ResponseColumn::ALL
++        .iter()
++        .position(|candidate| *candidate == column)
++        .unwrap()]
++    .lines[0]
++        .to_string()
++}
++
++fn make_table(
++    attempts: &[&ObservedResponse],
++    prices: Option<&Prices>,
++    now: Instant,
++) -> ResponseTable {
++    ResponseTable::new(attempts, prices, &ModelCatalog::new(Vec::new()), now)
++}
++
++fn paint(table: ResponseTable, visible: Range<usize>, width: u16, offset: u16) -> Buffer {
++    let area = Rect::new(
++        0,
++        0,
++        width,
++        (HEADER_HEIGHT + visible.len() * ROW_HEIGHT) as u16,
++    );
++    let mut buffer = Buffer::empty(area);
++    table.render(visible, area, &mut buffer, offset);
++    buffer
++}
++
++fn row_text(buffer: &Buffer, y: u16) -> String {
++    (0..buffer.area.width)
++        .map(|x| buffer[(x, y)].symbol())
++        .collect()
++}
++
++fn assert_header_padding(buffer: &Buffer) {
++    let lines = (0..HEADER_HEIGHT as u16)
++        .map(|row| Line::from(row_text(buffer, row)))
++        .collect::<Vec<_>>();
++    crate::control_center_table::tests::assert_symmetric_headers(&lines);
++}
++
++#[test]
++fn table_preserves_billing_units_unknowns_and_attempt_identity() {
++    let now = Instant::now();
++    let mut row = attempt(7, Some(ResponseAttemptEnd::Completed));
++    row.served_model = Some("served".into());
++    row.sent_payload_bytes = Some(2048);
++    row.response_id = Some("resp_official".into());
++    row.turn_id = Some("original-turn-id".into());
++    let session = row.thread_id.unwrap().to_string();
++    let attempt_id = row.attempt_id.to_string();
++    let mut observed = ObservedResponse::new(row, false, now);
++    let prices = prices();
++    let table = make_table(&[&observed], Some(&prices), now);
++    assert_eq!(table.max_offset(250), 0);
++    assert_eq!(value(&table, 0, ResponseColumn::Model), "gpt-5.4");
++    assert_eq!(value(&table, 0, ResponseColumn::ServedModel), "served");
++    assert_eq!(
++        [
++            ResponseColumn::Input,
++            ResponseColumn::Read,
++            ResponseColumn::Write,
++            ResponseColumn::Output,
++            ResponseColumn::Reasoning,
++            ResponseColumn::Hit,
++            ResponseColumn::Tps,
++            ResponseColumn::Cost
++        ]
++        .map(|column| value(&table, 0, column)),
++        [
++            "500", "400", "100", "100", "50", "40.00%", "50.0", "$0.0042"
++        ]
++    );
++    assert_eq!(value(&table, 0, ResponseColumn::Received), "0.5 KiB");
++    assert_eq!(value(&table, 0, ResponseColumn::Sent), "2.0 KiB");
++    assert_eq!(value(&table, 0, ResponseColumn::AttemptId), attempt_id);
++    let displayed = table.rows[0]
++        .iter()
++        .flat_map(|cell| &cell.lines)
++        .map(ToString::to_string)
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(!displayed.contains("resp_official"));
++    assert!(!displayed.contains("original-turn-id"));
++    assert!(!displayed.contains(&session));
++    assert_eq!(value(&table, 0, ResponseColumn::Status), "Done");
++    assert_eq!(value(&table, 0, ResponseColumn::Duration), "2.10s");
++    observed.row.tokens.cache_write = None;
++    observed.row.response_id = None;
++    observed.row.turn_id = None;
++    observed.row.thread_id = None;
++    observed.row.ttfb_ms = None;
++    observed.row.ttfc_ms = None;
++    observed.row.tps = None;
++    let unknown = make_table(&[&observed], Some(&prices), now);
++    assert_eq!(value(&unknown, 0, ResponseColumn::Write), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Input), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Cost), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::AttemptId), attempt_id);
++    assert_eq!(value(&unknown, 0, ResponseColumn::Ttfb), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Ttfc), "--");
++    assert_eq!(value(&unknown, 0, ResponseColumn::Tps), "--");
++    observed.row.tokens.cache_write = Some(0);
++    observed.row.tokens.input = Some(0);
++    observed.row.tokens.cache_read = Some(0);
++    observed.row.tokens.output = Some(0);
++    observed.row.ttfb_ms = Some(0);
++    observed.row.ttfc_ms = Some(0);
++    observed.row.tps = Some(0.0);
++    let zero = make_table(&[&observed], Some(&prices), now);
++    assert_eq!(value(&zero, 0, ResponseColumn::Input), "0");
++    assert_eq!(value(&zero, 0, ResponseColumn::Hit), "--");
++    assert_eq!(value(&zero, 0, ResponseColumn::Cost), "$0.0000");
++    assert_eq!(value(&zero, 0, ResponseColumn::Ttfb), "0.00s");
++    assert_eq!(value(&zero, 0, ResponseColumn::Ttfc), "0.00s");
++    assert_eq!(value(&zero, 0, ResponseColumn::Tps), "0.0");
++    assert_eq!(
++        value(
++            &make_table(&[&observed], None, now),
++            0,
++            ResponseColumn::Cost
++        ),
++        "--"
++    );
++    let placeholders = serde_json::from_value(json!({"served": {
++        "0": {"input": 0.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0}
++    }}))
++    .unwrap();
++    assert_eq!(
++        value(
++            &make_table(&[&observed], Some(&placeholders), now),
++            0,
++            ResponseColumn::Cost
++        ),
++        "--"
++    );
++}
++
++#[test]
++fn horizontal_view_reaches_every_header_and_value_without_a_detail_panel() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Completed));
++    row.requested_model = "a-long-requested-model-name".into();
++    row.served_model = Some("a-different-served-model-name".into());
++    let observed = ObservedResponse::new(row, false, now);
++    let table = make_table(&[&observed], None, now);
++    let width = table.max_offset(0);
++    let full = paint(table, 0..1, width, 0);
++    let headers = (0..HEADER_HEIGHT as u16)
++        .map(|y| row_text(&full, y))
++        .collect::<Vec<_>>();
++    assert!(
++        headers[1].contains("Models")
++            && headers[1].contains("Bytes")
++            && headers[1].contains("Token usage")
++    );
++    assert_header_padding(&full);
++    for label in [
++        "Time",
++        "Attempt ID",
++        "Effort",
++        "Status",
++        "Duration",
++        "Hit",
++        "TPS",
++        "TTFB",
++        "TTFC",
++        "Cost",
++    ] {
++        assert!(headers[2].contains(label));
++    }
++    assert_eq!(
++        headers[3]
++            .split('│')
++            .map(str::trim)
++            .filter(|part| !part.is_empty())
++            .collect::<Vec<_>>(),
++        [
++            "Requested",
++            "Served",
++            "Sent",
++            "Received",
++            "Input",
++            "Write",
++            "Read",
++            "Output",
++            "Reasoning"
++        ]
++    );
++    assert!(headers[0].starts_with('┌') && headers[0].ends_with('┐'));
++    let table = make_table(&[&observed], None, now);
++    let values = table.rows[0]
++        .iter()
++        .map(|cell| cell.lines[0].to_string())
++        .collect::<Vec<_>>();
++    let body = row_text(&full, HEADER_HEIGHT as u16);
++    for column in [2, 3] {
++        let cell = body.split('│').nth(column + 1).unwrap();
++        assert_eq!(cell.chars().count(), table.widths[column] + 2);
++    }
++    assert_eq!(
++        body.split('│')
++            .skip(1)
++            .take(ResponseColumn::ALL.len())
++            .map(str::trim)
++            .collect::<Vec<_>>(),
++        values
++    );
++    for offset in 0..=table.max_offset(40) {
++        let viewport = paint(make_table(&[&observed], None, now), 0..1, 40, offset);
++        for y in 0..viewport.area.height {
++            for x in 0..viewport.area.width {
++                assert_eq!(viewport[(x, y)], full[(x + offset, y)]);
++            }
++        }
++    }
++    let end = paint(table, 0..1, 40, width - 40);
++    assert!(buffer_text(&end).contains("Cost"));
++}
++
++#[test]
++fn visible_response_cells_copy_headers_and_full_values_before_column_truncation() {
++    let now = Instant::now();
++    let first = ObservedResponse::new(attempt(1, None), true, now);
++    let mut row = attempt(2, Some(ResponseAttemptEnd::Completed));
++    row.requested_model = "short".into();
++    row.served_model = Some("served-model-with-a-long-suffix".into());
++    row.tokens.output = Some(1_234_567);
++    let second = ObservedResponse::new(row, false, now);
++    let table = make_table(&[&first, &second], None, now);
++    let area = Rect::new(7, 3, table.max_offset(0), 7);
++    let mut buffer = Buffer::empty(area);
++    let cells = table.render(1..2, area, &mut buffer, 0);
++    let values = cells
++        .iter()
++        .map(|(_, text)| text.as_ref())
++        .collect::<Vec<_>>();
++    assert!(values.contains(&"Attempt ID"));
++    assert!(values.contains(&"Models"));
++    assert!(values.contains(&"Served"));
++    assert!(values.contains(&"short"));
++    assert!(values.contains(&"served-model-with-a-long-suffix"));
++    assert!(values.contains(&"1234567"));
++    assert!(!values.contains(&"1.23M"));
++    assert!(buffer_text(&buffer).contains("1.23M"));
++    assert!(values.contains(&second.row.attempt_id.to_string().as_str()));
++    assert!(!values.contains(&first.row.attempt_id.to_string().as_str()));
++    assert!(!buffer_text(&buffer).contains("served-model-with-a-long-suffix"));
++}
++
++#[test]
++fn themed_rows_distinguish_models_without_selection_and_keep_whole_row_failure_italics() {
++    let original = crate::render::highlight::current_syntax_theme();
++    let mut numeric_colors = Vec::new();
++    for (theme, bg, fg) in [
++        ("ada", (20, 35, 50), (220, 230, 240)),
++        ("github", (250, 241, 235), (30, 40, 50)),
++    ] {
++        crate::render::highlight::set_syntax_theme(
++            crate::render::highlight::resolve_theme_by_name(theme, None).unwrap(),
++        );
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors { fg, bg },
++            || numeric_colors.push(assert_themed_rows()),
++        );
++    }
++    crate::render::highlight::set_syntax_theme(original);
++    assert_ne!(numeric_colors[0], numeric_colors[1]);
++}
++
++fn assert_themed_rows() -> Color {
++    let palette = Palette::current();
++    let now = Instant::now();
++    let working = ObservedResponse::new(attempt(1, None), true, now);
++    let mut completed =
++        ObservedResponse::new(attempt(2, Some(ResponseAttemptEnd::Completed)), false, now);
++    completed.row.requested_model = "gpt-5.5".into();
++    completed.row.served_model = Some(completed.row.requested_model.clone());
++    let failed = ObservedResponse::new(attempt(3, Some(ResponseAttemptEnd::Failed)), false, now);
++    let table = make_table(&[&working, &completed, &failed], None, now);
++    let buffer = paint(table, 0..3, 80, 0);
++    assert_eq!(buffer[(0, 5)].bg, buffer[(0, 7)].bg);
++    assert_eq!(buffer[(0, 7)].bg, buffer[(0, 9)].bg);
++    for y in [5, 7, 9] {
++        for x in 0..80 {
++            let cell = &buffer[(x, y)];
++            assert_eq!(cell.modifier.contains(Modifier::ITALIC), y == 9);
++        }
++    }
++    let table = make_table(&[&working, &completed, &failed], None, now);
++    let offset = table.max_offset(80);
++    let scrolled = paint(table, 2..3, 80, offset);
++    assert!((0..80).all(|x| scrolled[(x, 5)].modifier.contains(Modifier::ITALIC)));
++    assert!(!scrolled[(0, 5)].modifier.contains(Modifier::REVERSED));
++    assert!(scrolled.content.iter().all(|cell| cell.bg == Color::Reset));
++    let numeric = make_table(&[&completed], None, now);
++    let input_column = ResponseColumn::ALL
++        .iter()
++        .position(|column| *column == ResponseColumn::Input)
++        .unwrap();
++    let offset = numeric.widths[..input_column]
++        .iter()
++        .map(|width| width + 3)
++        .sum::<usize>() as u16;
++    let input_width = numeric.widths[input_column];
++    let x = (input_width + 1) as u16;
++    let numeric_buffer = paint(numeric, 0..1, 80, offset);
++    assert_eq!(numeric_buffer[(x, 5)].fg, palette.intensity(16).fg.unwrap());
++    let x = 2 + (input_width - "Input".len()) as u16 / 2;
++    assert_eq!(
++        numeric_buffer[(x, 3)].fg,
++        readable_color_on(crate::style::accent_style().fg.unwrap(), None)
++    );
++    let table = make_table(&[&working, &completed, &failed], None, now);
++    let widths = table.widths.clone();
++    let width = table.max_offset(0);
++    let categorical = paint(table, 0..3, width, 0);
++    assert_ne!(palette.model(0).fg, palette.model(1).fg);
++    for (row, column, expected) in [
++        (0, ResponseColumn::Model, palette.model(0)),
++        (1, ResponseColumn::Model, palette.model(1)),
++        (1, ResponseColumn::ServedModel, palette.model(1)),
++        (0, ResponseColumn::Effort, palette.effort),
++        (0, ResponseColumn::Status, palette.attention),
++        (1, ResponseColumn::Status, palette.success),
++        (2, ResponseColumn::Status, palette.failure),
++    ] {
++        let index = ResponseColumn::ALL
++            .iter()
++            .position(|item| *item == column)
++            .unwrap();
++        let start = widths[..index].iter().map(|width| width + 3).sum::<usize>() as u16 + 1;
++        let y = (HEADER_HEIGHT + row * ROW_HEIGHT) as u16;
++        let x = (start..start + widths[index] as u16 + 2)
++            .find(|x| categorical[(*x, y)].symbol() != " ")
++            .unwrap();
++        assert_eq!(categorical[(x, y)].fg, expected.fg.unwrap());
++    }
++    numeric_buffer[(input_width as u16 + 1, 5)].fg
++}
++
++#[test]
++fn column_shades_recalculate_with_loaded_rows_and_live_time() {
++    let palette = Palette::current();
++    let now = Instant::now();
++    let mut first =
++        ObservedResponse::new(attempt(1, Some(ResponseAttemptEnd::Completed)), false, now);
++    first.row.tokens.input = Some(120);
++    first.row.tokens.cache_read = Some(20);
++    first.row.tokens.cache_write = Some(0);
++    let mut second =
++        ObservedResponse::new(attempt(2, Some(ResponseAttemptEnd::Completed)), false, now);
++    second.row.tokens.input = Some(210);
++    second.row.tokens.cache_read = Some(10);
++    second.row.tokens.cache_write = Some(0);
++    let mut third =
++        ObservedResponse::new(attempt(3, Some(ResponseAttemptEnd::Completed)), false, now);
++    third.row.tokens.input = Some(340);
++    third.row.tokens.cache_read = Some(40);
++    third.row.tokens.cache_write = Some(0);
++    third.row.elapsed_ms = 3100;
++    let working = ObservedResponse::new(attempt(5, None), true, now);
++    let columns = [
++        ResponseColumn::Input,
++        ResponseColumn::Read,
++        ResponseColumn::Duration,
++    ];
++    let indexes = columns.map(|column| {
++        ResponseColumn::ALL
++            .iter()
++            .position(|candidate| *candidate == column)
++            .unwrap()
++    });
++    let table = make_table(&[&first, &second, &third, &working], None, now);
++    for (row, levels) in [[1, 8, 1], [8, 1, 1], [16, 16, 16]].into_iter().enumerate() {
++        for (column, level) in levels.into_iter().enumerate() {
++            assert_eq!(
++                table.rows[row][indexes[column]].style,
++                palette.intensity(level)
++            );
++        }
++    }
++    assert_eq!(table.rows[3][indexes[0]].style.fg, None);
++    assert_eq!(table.rows[3][indexes[2]].style, palette.intensity(1));
++    let mut fourth =
++        ObservedResponse::new(attempt(4, Some(ResponseAttemptEnd::Completed)), false, now);
++    fourth.row.tokens.input = Some(1400);
++    fourth.row.tokens.cache_write = Some(0);
++    let later = now + std::time::Duration::from_secs(2);
++    let updated = make_table(&[&first, &second, &third, &fourth, &working], None, later);
++    assert_eq!(updated.rows[1][indexes[0]].style, palette.intensity(6));
++    assert_eq!(updated.rows[4][indexes[2]].style, palette.intensity(16));
++    assert_eq!(updated.rows[2][indexes[2]].style, palette.intensity(8));
++    let filtered = make_table(&[&second, &third], None, later);
++    assert_eq!(filtered.rows[0][indexes[0]].style, palette.intensity(1));
++    assert_eq!(filtered.rows[1][indexes[0]].style, palette.intensity(16));
++}
++
++#[test]
++fn metadata_labels_preserve_raw_mismatch_and_pricing_identity() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Failed));
++    row.served_model = Some("served".into());
++    row.response_id = Some("resp_official".into());
++    let observed = ObservedResponse::new(row, false, now);
++    let mut requested = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    requested.model = "gpt-5.4".into();
++    requested.display_name = "Friendly model".into();
++    let mut served = requested.clone();
++    served.model = "served".into();
++    let catalog = ModelCatalog::new(vec![requested, served]);
++    let prices = prices();
++    let table = ResponseTable::new(&[&observed], Some(&prices), &catalog, now);
++    assert_eq!(value(&table, 0, ResponseColumn::Model), "Friendly model");
++    assert_eq!(
++        value(&table, 0, ResponseColumn::ServedModel),
++        "Friendly model"
++    );
++    assert_eq!(value(&table, 0, ResponseColumn::Cost), "$0.0042");
++    let width = table.max_offset(0);
++    let buffer = paint(table, 0..1, width, 0);
++    assert!(buffer_text(&buffer).contains(&observed.row.attempt_id.to_string()));
++    let body = row_text(&buffer, 5);
++    assert_eq!(body.matches("Friendly model").count(), 2);
++    assert!(
++        !body.contains("gpt-5.4") && !body.contains("served") && !body.contains("resp_official")
++    );
++    let labels = (0..width)
++        .filter(|x| buffer[(*x, 5)].symbol() == "F")
++        .collect::<Vec<_>>();
++    assert_eq!(labels.len(), 3); // Both model labels and the Failed status.
++    for x in &labels[..2] {
++        assert_eq!(buffer[(*x, 5)].fg, Color::Red);
++    }
++    assert_eq!(observed.row.requested_model, "gpt-5.4");
++    assert_eq!(observed.row.served_model.as_deref(), Some("served"));
++}
++
++#[test]
++fn served_suffix_is_bounded_by_requested_label_and_keeps_raw_pricing() {
++    let now = Instant::now();
++    let mut row = attempt(1, Some(ResponseAttemptEnd::Completed));
++    row.served_model = Some("served".into());
++    let observed = ObservedResponse::new(row, false, now);
++    let mut requested = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    requested.model = observed.row.requested_model.clone();
++    requested.display_name = "Model".into();
++    let mut served = requested.clone();
++    served.model = "served".into();
++    served.display_name = "Model-experimental-long-suffix".into();
++    let catalog = ModelCatalog::new(vec![requested, served]);
++    let prices = prices();
++    let table = ResponseTable::new(&[&observed], Some(&prices), &catalog, now);
++    assert_eq!(value(&table, 0, ResponseColumn::Model), "Model");
++    assert_eq!(value(&table, 0, ResponseColumn::ServedModel), "Mode…");
++    assert_eq!(value(&table, 0, ResponseColumn::Cost), "$0.0042");
++    assert_eq!(table.widths[3], 12);
++    assert_eq!(observed.row.served_model.as_deref(), Some("served"));
++}
++
++#[test]
++fn model_names_share_the_usage_tables_centered_left_edge() {
++    let now = Instant::now();
++    let mut first = attempt(1, Some(ResponseAttemptEnd::Completed));
++    first.requested_model = "Long model label".into();
++    first.served_model = Some("Long served label".into());
++    let mut second = attempt(2, Some(ResponseAttemptEnd::Completed));
++    second.requested_model = "Short".into();
++    second.served_model = Some("Served".into());
++    let first = ObservedResponse::new(first, false, now);
++    let second = ObservedResponse::new(second, false, now);
++    let table = make_table(&[&first, &second], None, now);
++    let width = table.max_offset(0);
++    let buffer = paint(table, 0..2, width, 0);
++    for column in [2, 3] {
++        let rows = [row_text(&buffer, 5), row_text(&buffer, 7)];
++        let starts = rows.map(|row| {
++            let value = row.split('│').nth(column + 1).unwrap();
++            value.len() - value.trim_start().len()
++        });
++        assert_eq!(starts[0], starts[1]);
++        assert!(starts[0] >= 1);
++    }
++}
++
++#[test]
++fn column_bounds_and_status_widths_hold_across_lifecycle_pages_and_filters() {
++    let now = Instant::now();
++    let empty = make_table(&[], None, now);
++    let minimum_width = empty.max_offset(0);
++    assert!(minimum_width <= 250);
++    assert_header_padding(&paint(make_table(&[], None, now), 0..0, minimum_width, 0));
++    let minimum_columns = empty.widths;
++    let maximum_width = ResponseColumn::ALL
++        .iter()
++        .map(|column| column.layout().maximum() + 3)
++        .sum::<usize>()
++        + 1;
++    let mut rows = vec![ObservedResponse::new(attempt(1, None), true, now)];
++    let mut received = attempt(2, None);
++    received.terminal_observed_offset_ms = Some(1000);
++    rows.push(ObservedResponse::new(received, true, now));
++    rows.push(ObservedResponse::new(attempt(3, None), false, now));
++    for (index, end) in [
++        ResponseAttemptEnd::Completed,
++        ResponseAttemptEnd::Incomplete,
++        ResponseAttemptEnd::Failed,
++        ResponseAttemptEnd::Interrupted,
++        ResponseAttemptEnd::Canceled,
++        ResponseAttemptEnd::SetupFailed,
++        ResponseAttemptEnd::SendFailed,
++        ResponseAttemptEnd::TransportClosed,
++        ResponseAttemptEnd::ProgressTimeout,
++        ResponseAttemptEnd::ProtocolError,
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let mut row = attempt(index as u64 + 4, Some(end));
++        row.requested_model = "long-model-".repeat(20);
++        row.served_model = Some("long-served-model-".repeat(20));
++        row.response_id = Some("resp_".repeat(30));
++        row.turn_id = Some("long-turn-".repeat(20));
++        row.reasoning_effort = Some("very-long-effort".into());
++        row.elapsed_ms = u64::MAX;
++        row.ttfb_ms = Some(u64::MAX);
++        row.ttfc_ms = Some(u64::MAX);
++        row.received_payload_bytes = u64::MAX;
++        row.sent_payload_bytes = Some(u64::MAX);
++        row.tokens.input = Some(u64::MAX);
++        row.tokens.cache_read = Some(0);
++        row.tokens.cache_write = Some(0);
++        row.tokens.output = Some(u64::MAX);
++        row.tokens.reasoning = Some(u64::MAX);
++        row.tps = Some(1e20);
++        rows.push(ObservedResponse::new(row, false, now));
++    }
++    let prices = prices();
++    for loaded in 1..=rows.len() {
++        for filtered in [false, true] {
++            let matching = if filtered {
++                &rows[loaded - 1..loaded]
++            } else {
++                &rows[..loaded]
++            };
++            let matching = matching.iter().collect::<Vec<_>>();
++            let later = now + std::time::Duration::from_secs(1000);
++            for row in 0..matching.len() {
++                let table = make_table(&matching, Some(&prices), later);
++                let status = value(&table, row, ResponseColumn::Status);
++                assert!(status.as_bytes()[0].is_ascii_uppercase());
++                let width = table.max_offset(0);
++                assert!(width >= minimum_width && usize::from(width) <= maximum_width);
++                assert_eq!(table.max_offset(37), width - 37);
++                let widths = table.widths.clone();
++                for ((column, width), minimum) in ResponseColumn::ALL
++                    .iter()
++                    .zip(&widths)
++                    .zip(&minimum_columns)
++                {
++                    assert!(width >= minimum && *width <= column.layout().maximum());
++                    if matches!(
++                        column,
++                        ResponseColumn::Time
++                            | ResponseColumn::AttemptId
++                            | ResponseColumn::Status
++                            | ResponseColumn::Effort
++                    ) {
++                        assert_eq!(width, minimum, "{column:?}: {status}");
++                    }
++                }
++                let body = paint(table, row..row + 1, width, 0);
++                assert_header_padding(&body);
++                let attempt_x = widths[0] as u16 + 5;
++                assert_eq!(
++                    body[(attempt_x, 5)].fg == Color::Red,
++                    matching[row]
++                        .row
++                        .end_reason
++                        .is_some_and(|end| end != ResponseAttemptEnd::Completed)
++                );
++                let mut edge = 0;
++                for cell_width in widths {
++                    assert_eq!(body[(edge, 5)].symbol(), "│");
++                    edge += cell_width as u16 + 3;
++                }
++                assert_eq!(edge + 1, width);
++                assert_eq!(body[(edge, 5)].symbol(), "│");
++                for offset in [0, 8, width - 37] {
++                    let scrolled = paint(
++                        make_table(&matching, Some(&prices), later),
++                        row..row + 1,
++                        37,
++                        offset,
++                    );
++                    for y in 0..scrolled.area.height {
++                        for x in 0..37 {
++                            assert_eq!(scrolled[(x, y)], body[(x + offset, y)]);
++                        }
++                    }
++                }
++            }
++        }
++    }
++}

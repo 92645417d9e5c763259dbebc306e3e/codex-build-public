@@ -1,0 +1,54 @@
+Cross: workspace-permissions
+
+101 Workspace roots ----- local filesystem policy -----+
+                                                       v
+102 Workspace network --- network policy -----------> 103 Workspace and Never defaults
+                                                       |
+                                                  shared choices
+                                                       v
+                                                     104 Permission keyboard cycling
+
+Cross: model-catalog
+
+201 Local model catalog ---- active models ----> 202 Prompt reload
+          |
+          +----------------- catalog view -----> 203 Model synchronization
+
+Cross: control-center
+
+301 Native dialog adaptation ---------------- centered host -----------------------------+
+          |                                                                              |
+    native settings views                                                                |
+          +-----------------------------------------+                                    |
+          v                                         v                                    |
+303 Application proxy -------- transport ----> 304 Telegram notifications <-- settings --+
+          ^                                                                              |
+          +-------------------------------- settings ------------------------------------+
+          +-------------------------------- proxy alias ---------------------------------+
+          |                                                                              |
+          +---- transport ----> 306 WebSocket RTT ---------- RTT ------------------------+
+                                                                                         |
+302 Daemon lifecycle ---------------------- client count --------------------------------+
+          ^                                                                              |
+          +-------------------------------- idle shutdown -------------------------------+
+                                                                                         |
+305 Home and Harness capacity ------------- free space ----------------------------------+<----> 313 Control center
+                                                                                         |
+307 Usage accounting ---------------------- reports -------------------------------------+
+                                                                                         |
+308 Three-day diagnostics                                                                |
+          |                                                                              |
+    logs SQLite storage                                                                  |
+          v                                                                              |
+309 Response recording -------------------- history and statistics ----------------------+
+          |                                                                              |
+          +------------------------ timing -------------+                                |
+          |                                             |                                |
+       progress                                         v                                |
+          |                                   312 Live response status --- formatters ---+
+          v                                             ^
+310 Atomic output ------------- buffering --------------+
+          |                                             |
+   complete reasoning                                   |
+          v                                             |
+311 Reasoning display ------- presentation state -------+

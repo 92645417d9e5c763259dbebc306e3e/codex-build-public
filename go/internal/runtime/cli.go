@@ -52,12 +52,14 @@ func RunCLI(arguments []string, stdout, stderr io.Writer) int {
 }
 
 func runRelease(arguments []string, command, route string, invoke func(ReleaseBaselineOptions) (ReleaseRouteResult, error), stdout, stderr io.Writer) int {
-	names := []string{"project-working-root", "project-scratch-root", "runtime-tmp-root", "record-root", "tag"}
-	endpoint, values, ok := parseEndpointStrings(command, arguments, stderr, names...)
-	if !ok {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := ReleaseBaselineOptions{}
+	bindPublicRoots(flags, &options.endpointOptions, &options.WorkingRoot, &options.ScratchRoot, &options.RuntimeRoot, &options.RecordRoot)
+	flags.StringVar(&options.Tag, "tag", "", "")
+	if parsePublicFlags(flags, arguments) != nil || flags.NArg() != 0 {
 		return 2
 	}
-	options := ReleaseBaselineOptions{endpointOptions: endpoint, WorkingRoot: values[0], ScratchRoot: values[1], RuntimeRoot: values[2], RecordRoot: values[3], Tag: values[4]}
 	return runReleaseOperation(&options, route, command, func() (ReleaseRouteResult, error) { return invoke(options) }, stdout, stderr)
 }
 
@@ -106,11 +108,23 @@ func runReleaseOperation(options *ReleaseBaselineOptions, route, operation strin
 }
 
 func runNativeToolchain(arguments []string, stdout, stderr io.Writer) int {
-	options, values, ok := parseEndpointStrings("native-toolchain", arguments, stderr, "project-working-root", "project-scratch-root", "runtime-tmp-root")
-	if !ok {
+	flags := flag.NewFlagSet("native-toolchain", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	if len(arguments) == 1 && arguments[0] == "--help" {
+		flags.SetOutput(stdout)
+	}
+	request := NativeToolchainOptions{Auxiliary: make([]string, 6)}
+	bindPublicRoots(flags, &request.endpointOptions, &request.WorkingRoot, &request.ScratchRoot, &request.RuntimeRoot, nil)
+	flags.StringVar(&request.Source, "source", "", "registered release source (required)")
+	flags.StringVar(&request.Release, "release", "", "selected release (required)")
+	for index, name := range []string{"nextest", "sccache", "bazelisk", "just", "dotslash", "uv"} {
+		flags.StringVar(&request.Auxiliary[index], name+"-version", "", "selected semantic release (required)")
+	}
+	if err := parsePublicFlags(flags, arguments); errors.Is(err, flag.ErrHelp) {
+		return 0
+	} else if err != nil || flags.NArg() != 0 {
 		return 2
 	}
-	request := NativeToolchainOptions{endpointOptions: options, WorkingRoot: values[0], ScratchRoot: values[1], RuntimeRoot: values[2]}
 	result := NativeToolchainResult{SchemaVersion: core.SchemaVersion, RecordType: "NativeToolchainResult", Terminal: "Blocked", FailureDomain: failureDomainInput, ProductEffect: "None"}
 	if err := admitPublicRoute(&request.endpointOptions, "NativeToolchainSupport"); err != nil {
 		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
@@ -145,7 +159,7 @@ func runPatchReplay(arguments []string, stdout, stderr io.Writer) int {
 func parsePatchReplayOptions(arguments []string, stderr io.Writer) (PatchReplayOptions, error) {
 	flags := flag.NewFlagSet("patch-replay", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	options := PatchReplayOptions{}
+	options := PatchReplayOptions{Contract: PatchContract{Requires: []string{}}}
 	bindPublicRoots(flags, &options.endpointOptions, &options.WorkingRoot, &options.ScratchRoot, &options.RuntimeRoot, &options.RecordRoot)
 	bind := func(target *string, name string) { flags.StringVar(target, name, "", "") }
 	bind(&options.Mode, "mode")
@@ -164,6 +178,12 @@ func parsePatchReplayOptions(arguments []string, stderr io.Writer) (PatchReplayO
 	bind(&options.FlatPatch, "flat-patch")
 	bind(&options.Form, "form")
 	bind(&options.Segment, "segment")
+	flags.StringVar(&options.Contract.Purpose, "purpose", "", "approved outcome; supply all four contract text fields together")
+	flags.StringVar(&options.Contract.Provides, "provides", "", "owned behavior and interfaces")
+	flags.StringVar(&options.Contract.Boundary, "boundary", "", "responsibilities retained by other owners")
+	flags.StringVar(&options.Contract.Verification, "verification", "", "relevant verification entrypoints and observable assertions")
+	flags.Var((*repeatedStrings)(&options.Contract.Requires), "requires", "direct Unit:Lane/name or FlatPatch:Lane/name prerequisite; repeat as needed")
+	flags.StringVar(&options.Contract.CrossGroup, "cross-group", "", "semantic cross group on a cross responsibility contract; forbidden in other Lanes")
 	flags.BoolVar(&options.SkipLineLimit, "skip-line-limit", false, "")
 	bind(&options.ParentFork, "parent-fork")
 	bind(&options.ActiveTask, "active-task")
@@ -172,16 +192,17 @@ func parsePatchReplayOptions(arguments []string, stderr io.Writer) (PatchReplayO
 	modes := map[string]string{
 		"fork":          common + " parent-fork",
 		"prepare":       common + " target",
-		"list":          common + " project-working-root record-root source",
+		"list":          common + " project-working-root record-root source start-flat-patch start-unit",
 		"apply":         common + " end-flat-patch end-transform end-unit project-working-root record-root source start-flat-patch start-transform start-unit target",
-		"revise":        common + " child-patch flat-patch form lane project-working-root record-root segment target unit",
+		"revise":        common + " boundary child-patch cross-group flat-patch form lane project-working-root provides purpose record-root requires segment target unit verification",
 		"finalize":      common + " lane project-working-root record-root resume target",
 		"config-schema": common + " project-working-root record-root target",
-		"commit":        common + " child-patch flat-patch form lane project-working-root record-root segment skip-line-limit target unit",
+		"commit":        common + " boundary child-patch cross-group flat-patch form lane project-working-root provides purpose record-root requires segment skip-line-limit target unit verification",
 		"export":        common + " project-working-root record-root skip-line-limit",
 	}
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "patch-replay --mode MODE --active-task TASK --tag TAG [flags]; roots default to cwd and the declared environment")
+		fmt.Fprintln(stderr, "Commit requires a contract on a Flat Patch or first Unit child; later children omit it. Revise retains it unless replaced.")
 		fmt.Fprintln(stderr, "Mode-specific allowed flags:")
 		for _, mode := range strings.Fields("apply commit config-schema export finalize fork list prepare revise") {
 			fmt.Fprintln(stderr, mode+": --"+strings.ReplaceAll(strings.TrimPrefix(modes[mode], common+" "), " ", " --"))
@@ -225,6 +246,7 @@ func runBuildInstall(arguments []string, stdout, stderr io.Writer) int {
 	}
 	flags.Uint64Var(&options.BuildSequence, "build-sequence", 0, "")
 	flags.BoolVar(&options.InstallRequested, "install", false, "")
+	flags.BoolVar(&options.ReplaceDraft, "replace-draft", false, "rebuild and replace the selected version for explicit draft iteration; requires --install")
 	flags.DurationVar(&options.Deadline, "deadline", 0, "")
 	if err := parsePublicFlags(flags, arguments); errors.Is(err, flag.ErrHelp) {
 		return 0
@@ -282,18 +304,6 @@ func parsePublicFlags(flags *flag.FlagSet, arguments []string) error {
 		}
 	}
 	return nil
-}
-
-func parseEndpointStrings(command string, arguments []string, stderr io.Writer, names ...string) (endpointOptions, []string, bool) {
-	flags, options, values := flag.NewFlagSet(command, flag.ContinueOnError), endpointOptions{}, make([]string, len(names))
-	flags.SetOutput(stderr)
-	var records *string
-	if len(names) > 3 {
-		records = &values[3]
-		flags.StringVar(&values[4], names[4], "", "")
-	}
-	bindPublicRoots(flags, &options, &values[0], &values[1], &values[2], records)
-	return options, values, parsePublicFlags(flags, arguments) == nil && flags.NArg() == 0
 }
 
 func runRunnerExec(arguments []string, stdout, stderr io.Writer) int {

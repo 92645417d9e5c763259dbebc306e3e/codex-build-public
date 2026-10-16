@@ -7,7 +7,7 @@ CurrentWorktreeRollTransition
 +-- Owner: SingleCurrentReleaseBoundaryOwner
 +-- Consumer: CanonicalPrefixRetirementConsumer
 +-- Current: task-named clean MainWorktree or selected fork worktree
-+-- Forward: clean Apply advances; source authoring stays on Current and selected tests answer actual source questions
++-- Forward: purpose acceptance precedes transport and source authoring on Current
 +-- Fork: selected committed-history isolation follows GitCustody's Unit boundary
 +-- Retained: the parent supplies its complete frontier for coverage comparison
 +-- Converge: Current absorbs each fully covered parent after Git comparison and any required non-idempotent fixup-fold focused test
@@ -18,11 +18,11 @@ CurrentWorktreeRollTransition
 ```
 
 ```
-PatchSelectionAuthorityOwner
+LocalResponsibilityRollOwner
 +-- Consumer: TaskNamedPatchAndReadOnlyEvidenceConsumer
-+-- Select: automatic Roll follows the sole task's complete declared Patch order; interactive Roll requires an explicit request
++-- Select: complete canonical inventory and Git coverage identify the first unconsumed responsibility before OriginalPatchPurposeOwner admits its purpose and placement
 +-- Authority: the Roll request executes that topology but never changes its responsibilities or order
-+-- Continue: Apply the next unchanged Patch across Lanes until the declared set is exhausted
++-- Continue: Apply the next unchanged Patch only while its purpose and placement remain supported
 +-- Rewrite: reconstruct a rejected Patch inside its declared Unit or Flat Patch after read-only purpose analysis
 +-- Change: material contract or requirement-cost choices use PreparePatchForApproval
 +-- Conflict: retain the successful prefix, publish the rejected Patch through Commit, and continue the selected suffix
@@ -32,12 +32,15 @@ PatchSelectionAuthorityOwner
 ```
 
 - Root and lane note changes retain separate exact current-user approval; Roll execution never grants it.
+- Interactive Roll requires an explicit request.
 - Product evidence may change direction only within the sole current release. TaskIndex admits exactly one unfinished release task and no release selector or ordering policy.
-- TaskWorkspace publishes one release-roll-<Tag>.md as Active. SourcePrefixes declares the exact canonical tag directories available to that task; the first tag is its primary predecessor. Read every selected source's complete Unit set and preserve the responsibility contract across source changes.
+- TaskWorkspace publishes one release-roll-<Tag>.md as Active. SourcePrefixes declares the exact canonical tag directories available to that task; the first tag is its primary predecessor. Read the selected responsibility's complete Unit or Flat Patch and preserve its contract across source changes.
 - Entry and material returns select TaskWorkspace reconciliation and closure before continuing.
-- A shorter source prefix selects the next declared source; missing input or a changed contract stops. Baseline stays through export.
-- Interrupted baseline, replay, verification, or export reenters the same tag and retained evidence. A user-selected newer tag requires either a canonically exported clean closed Main frontier or an Established predecessor with zero private history whose Main equals its official parent. EditNamedTask then replaces the sole task and index while preserving unresolved responsibility, source-prefix, and lane-note custody. Failure recovery never creates a coexisting release, retained release queue, semantic-version selector, or compatibility state.
-- The new ordinary Baseline validates that exact exported prefix or zero-patch parent and its one predecessor global topology, retires only those predecessor Git roles, and creates the target roles at the same paths. A selected full suite, BuildInstall, and explicit task retirement retain their own inputs and are not prerequisites for this next-tag transition.
+- A shorter source prefix selects the next declared source; missing input or an unapproved contract change pauses dependent work. Baseline stays through export.
+- Interrupted baseline, replay, verification, or export reenters the same tag and retained evidence.
+- A user-selected newer tag consumes TaskWorkspace's replacement boundary before ordinary Baseline reuses the global Git roles.
+- A selected full suite, BuildInstall, and explicit task retirement retain their own inputs and are not prerequisites for that transition.
+- Failure recovery never creates a coexisting release, retained release queue, semantic-version selector, or compatibility state.
 - A request to clean the previous tag while this next-tag Baseline is selected names that existing predecessor-role retirement. Continue the same Baseline successor with its exact task and preserved prefix/Established inputs; do not reinterpret it as disk recovery, raw-output cleanup, Attached restoration, or completed-task release-cleanup.
 - Lane children are Flat Patches or Units of at least two Child Patches. Their GitCustody boundary applies to insertion, withdrawal, append, modification and repair alike; a Child Patch is not a separate Lane child.
 - Only a committed-Patch Product failure in the user's Established-relative full Finalize after declared Patch completion on clean, closed, converged Current Main starts temporary Main fixup. Pass and Helper terminals keep their normal successors; generic RunnerExec cannot start fixup.
@@ -49,9 +52,33 @@ PatchSelectionAuthorityOwner
 - Failed checks return to read-only diagnosis; retain the selected full-suite failure as evidence.
 - Publish the actual temporary source terminal and Patch-owner fold plan in the sole task. `git format-patch` only the contiguous focused-tested temporary source commits, not generated tail, into the exact `<ProjectScratchRoot>/fixup-handoff/<Tag>` child. Require a real scratch root and absent tag child; reentry verifies patch bytes without overwriting. This is not canonical export. Another complete Finalize occurs only on an explicit user request, never as handoff admission.
 - Treat the handoff as read-only evidence and enter Editing Committed Patch History at the first affected Patch. Its ordinary Fork, helper Commit, retained-parent comparison, and Main convergence own the fold. Prepare any generated tail before comparing the final fork and tested temporary Main source trees. Exact equality needs no test; if an owner rewrite makes them unequal, run corresponding focused tests on the fork and repair any failure there before promotion. No extra full suite or topology follows. Only rewritten canonical Patches enter `export`.
-- Clean unchanged Apply reaches the next declared Unit or Flat Patch without a focused current gate. During automatic Roll, reconstruction of a rejected Patch runs its focused tests before advancing; other post-baseline testing is selected by its diagnostic purpose. An ordinary nonfinal Lane exports its clean prefix and continues.
+- After purpose and placement acceptance, clean unchanged Apply advances without a focused test gate. Automatic reconstruction runs corresponding focused tests before advancing. Other post-baseline tests follow their diagnostic purpose. A closed nonfinal Lane exports its clean prefix and continues.
 - Helper failure retains the actual test evidence and topology without phase or cursor; it does not turn a freely selected test into a full-suite prerequisite.
 - PatchAcceptance resolves platform conditions against current user authority and version notes before dependent authoring, including resumed rewrites and conflict reconstruction. Normalization closure consumes its cumulative audit before selected full verification.
+
+## Draft Quick Iteration
+
+- Only an explicit current-user request for quick draft iteration selects this authoring option.
+- Enter on clean, closed, converged Main with canonical draft history and no retained parents.
+- Prepare a generated tail before the first fixup.
+- Restrict each change to an already approved draft responsibility and its draft-owned source.
+- Preserve the complete formal prefix and all unrelated draft behavior.
+- New responsibilities, formal fixes and cross-boundary changes use ordinary Roll after folding any temporary suffix.
+- Publish the selected draft owners and remaining fold in the existing task's PendingWork before authoring.
+- Keep the terminal fields at the last canonical row while native Git records the temporary suffix.
+- Use native `git commit --fixup` for each selected draft commit, with nobody as author and committer.
+- Each fixup consumes OriginalPatchPurposeOwner and cumulative PatchAcceptance for its owning responsibility.
+- Run corresponding focused checks on the clean fixup tip before building or handing it off.
+- BuildInstall consumes that clean Main directly without canonicalizing its temporary subjects.
+- Only an explicit request to reuse the selected version supplies BuildInstall's `--replace-draft` with `--install`.
+- Before export, canonical Patch transport, generated-tail operations or ordinary Roll, use native interactive rebase with autosquash over only the draft suffix on Main.
+- Preserve canonical metadata and empty required commits during the fold.
+- Update an affected first-commit contract when the approved behavior requires it.
+- Compare the pre-fold and post-fold source with native Git diff.
+- Identical source preserves its focused evidence; changed source requires the affected focused checks before continuation.
+- Verify the unchanged formal prefix, cumulative draft responsibilities, canonical List and clean Main after folding.
+- Reconcile the actual terminal and remove the consumed PendingWork instruction before the ordinary successor.
+- Interruption resumes the same native Git operation and task; it creates no alternate worktree, handoff archive, receipt or parser for temporary subjects.
 
 ## Start Normalization
 
@@ -89,12 +116,33 @@ OriginalPatchPurposeOwner
 `-- Terminal: CurrentNativeRewriteReadyTerminal
 ```
 
-- This owner selects when a candidate must be reconstructed and the Unit or Flat Patch whose complete responsibility is affected. Rust owns construction and semantic review of its code.
-- Recover the selected Patch's complete approved behavior from current authority, establishing rationale, complete retained Patches and relevant history, including approved dependents.
-- Attribute every required effect and direct-entrypoint integration to its existing Unit or Flat Patch and unique current native implementation. Missing, overlapping or contradictory assignment is not resolved by editing more files.
-- Agent-authored task text, candidate code, tests and historical structure cannot authorize broader behavior or replace approved obligations.
-- Before broad discovery enters context, reduce it in the command to counts and at most sixteen sorted unique exact identifiers, then inspect the minimum causal ranges. Raw matches and truncation select no evidence.
-- Follow introduction, repair, reversal, movement and partial replacement when a strategy recurs. Reconcile interacting strategies and their surviving consumers before choosing another correction.
+- This owner decides purpose, responsibility and placement before Apply, reconstruction, metadata publication or continuation. Rust owns code construction and semantic review inside that assignment.
+- Recover the original user decisions and later explicit changes first, using available conversation history when needed rather than asking the user to repeat established decisions.
+- Bind the approved outcome, group boundary, exclusions and formal-versus-draft maturity before reading candidate contracts as evidence.
+- An explicit member set remains closed until the user changes it; a shared call, observed event or new Requires claim cannot expand it.
+- Read the complete selected Unit or Flat Patch, its establishing rationale, native upstream owners and affected callers to distinguish required private behavior from existing native behavior.
+- Compare with the last historical implementation satisfying the same user decision, following introductions, removals, relocations and later independent obligations.
+- First-commit contracts and task summaries locate evidence; neither can establish its own truth or override the recovered decision.
+- Apply PatchFormat's Responsibility Classification to the actual assigned behavior before deriving Requires, Segment, order or ordinals.
+- For a proposed cross member, identify the assigned producer or consumer effect and the other member whose behavior must change with it.
+- Explain the concrete approved outcome that separate treatment would break or duplicate; shared infrastructure and incidental implementation attachment do not answer that question.
+- Check the complete proposed group against explicit inclusions and exclusions, including approved consumers deferred to draft.
+- A user-defined future integration belongs to this comparison but supplies no present implementation or promotion authority.
+- Read and maintain the mandatory cross `relationships.txt` under PatchExport's contract during this comparison, including on reentry and before continuing from cross to draft.
+- Draw only relationships among current cross members; broader source investigation does not expand the diagram's scope.
+- Then prove each direct private prerequisite through PatchFormat's native-before-private comparison, including inherited declarations used by the selected decision.
+- Read only the prerequisite source needed for that proof; do not recursively expand unrelated implementations.
+- Assign generation impact from actual generators and assertions, then check dependency, type and continuous-region order together.
+- If those constraints conflict, inspect the actual shared-interface or integration owner and use the existing approval decision; never change membership or metadata merely to make transport pass.
+- Preserve supported prior decisions without recomputing grouping from each newly encountered call graph.
+- A new member, responsibility transfer, maturity change or changed Patch structure requires exact existing authority or PreparePatchForApproval before effects.
+- Missing evidence leaves the affected decision unresolved; clean Apply, helper admission and tests cannot substitute for it.
+- Record only the controlling user boundary and unresolved decision in the existing task through TaskWorkspace.
+- A contradicted premise rejects every dependent classification, dependency and pending-order decision before another source edit or Patch advance.
+- Recheck the affected included and omitted responsibilities against original authority and native source, replacing the whole rejected rationale rather than appending exceptions.
+- Reuse unchanged source and test evidence, but not semantic acceptance derived from that premise.
+- Expanded investigation grants no mutation or Git authority; corrections use the existing earliest-owner and retained-suffix boundary.
+- Before broad discovery enters context, reduce it to counts and at most sixteen sorted unique exact identifiers, then inspect the necessary causal ranges.
 - Compare actual entrypoints, construction, effective configuration, lifecycle, shared fixtures and RunnerEnv. Establish each test premise independently through Rust Diagnostic triage.
 - Adequate existing configuration for every requested entrypoint blocks private code absent explicit code authority. An uncovered requirement permits source work; changing user configuration needs separate authority.
 - Compare failed selected outcomes with Established before treating them as novel. Missing or incomparable evidence stays unresolved rather than implying a new Patch defect.
@@ -103,7 +151,7 @@ OriginalPatchPurposeOwner
 - A correct retained event becoming visible is not a defect merely because it breaks a downstream isolation assumption. Preserve its approved route and presentation while identifying the actual faulty premise or consumer.
 - Rejecting an implementation does not withdraw any approved feature or constraint. Do not replace a failed candidate with a reduced, test-only or no-op Patch to obtain green verification.
 - Before any further edit, select the complete owning Patch through actual Git and the established responsibility assignment, preserving every later accepted or unfinished Patch and retained source.
-- Outside temporary Main fixup, a terminal Patch correction stays on Current; an earlier committed Lane child consumes the existing Fork, adoption and retained-suffix route. Failure alone creates no fork or reset authority.
+- Outside temporary Main fixup and explicitly selected draft quick iteration, a terminal Patch correction stays on Current; an earlier committed Lane child consumes the existing Fork, adoption and retained-suffix route. Failure alone creates no fork or reset authority.
 - Reconstruct every surviving obligation in that selected boundary through Rust Semantic review, removing its disproved repairs together without retaining the candidate as a foundation for incremental fixes.
 - A fixture finding belongs to its actual construction or integration owner; a dependent Patch cannot absorb missing predecessor seams or suppress predecessor behavior to make its test pass.
 - PatchAcceptance owns cumulative source acceptance before publication and post-check continuation, including temporary Main corrections.
@@ -114,18 +162,56 @@ OriginalPatchPurposeOwner
 - Otherwise complete authorized reconstruction and continue its successor. Needed unresolved work stays in the sole task, without a receipt, quality state or alternate repair route.
 - Withdraw a declared Patch only through its separately authorized task and Git boundary. Reuse construction evidence only while its complete contract, consumers and execution premises remain supported.
 
+## Behavior Changes
+
+- Feature addition, removal and upstream adaptation enter the existing purpose decision even when Git applies cleanly.
+- OriginalPatchPurposeOwner supplies the authoritative comparison; prior contracts remain evidence checked against that purpose and actual source.
+- Classify the requested or observed difference before selecting source effects.
+- A textual conflict with unchanged behavior reconstructs the same responsibility on current native owners without changing its contract or inventing an approval stop.
+- A new requirement extends an existing responsibility only when it belongs to that responsibility's observable outcome and lifecycle.
+- An independently complete outcome belongs to a distinct Unit or Flat Patch; shared files, a shared consumer or patch size do not justify merging responsibilities.
+- A request to disable or remove behavior from the local product does not retire its continuing upstream implementation.
+- Bridge that local absence at the narrowest stable current-native policy or activation seam covering the approved behavior.
+- Preserve upstream implementation, its tests, outside control flow and server-reserved serialization behind that seam.
+- Within the requested absence boundary, close every applicable registration, presentation, configuration or schema exposure, loading, collection and dispatch producer.
+- Hiding one consumer does not establish complete disablement.
+- A bridge carries only the missing local delta without a new wrapper or compatibility layer.
+- Continuing upstream source is not a retired compatibility path merely because local activation is disabled.
+- Explicitly authorized source retirement or removal of exclusively private behavior deletes its implementation and exclusively owned routes, activation, protocol, documentation and tests.
+- Preserve every shared producer still required by another admitted consumer or by its own independently approved behavior.
+- A changed producer contract starts with its actual direct consumers, including callers missing from the declared dependency list.
+- Expand to the next dependency boundary only when a consumer's own provided behavior or contract must change.
+- An implementation-only change does not reopen unrelated or unchanged downstream implementations.
+- When upstream supplies a required capability, compare every affected entrypoint, lifecycle, error policy and assertion before selecting native fulfillment.
+- Native fulfillment preserves the feature; retiring its now-unneeded private Patch is a separate authorized structure change, not an inferred feature withdrawal or an empty replacement commit.
+- Before mutation, put only the requested behavior difference, affected responsibilities, retained obligations and unresolved decisions in the existing task.
+- Apply current authority when it already covers those changes; otherwise ask one concrete question about the missing behavior, scope or compatibility decision and preserve the previous contract.
+- Update the affected first-commit contracts and direct dependency declarations together with their owning source changes through the existing Git boundary.
+- Preserve unrelated sequence positions, insert a new producer before its actual consumers, and remove dependencies only when the corresponding use is removed or supplied natively.
+- Begin a multi-responsibility rewrite at its earliest affected committed owner, retain the later source, and continue through every affected consumer before claiming the change complete.
+- Source acceptance proves preserved obligations, implemented additions and complete authorized removals; dependency admission and conflict resolution alone prove none of them.
+
 ## Forward Replay
 
 - Before starting or changing a rewrite frontier, use List and Git history to inspect Main's complete discriminated rows, Current, retained parents, and proposed start. Compare actual Flat Patches, Units, Child Patches, and behavior. Resolve existing content as reused, rebuilt in its assigned structure with a retained suffix source, or explicitly withdrawn before mutation.
 - Normal progression keeps Current and exports a closed lane before crossing it. Fork only when editing committed history; Prepare removes a clean generated tail before later source authoring.
 - If Main already contains the requested structures, use that frontier. An earlier start cannot silently discard them; rebuilding requires explicit disposition of displaced behavior and source custody, followed by ordinary Fork, adoption, and convergence.
-- Reconcile complete predecessor Flat Patches, Units, Child Patches, and relevant history with current decisions before consuming PatchSelectionAuthorityOwner.
+- Before the first selection and on reentry, obtain unselected PatchReplay List rows for every declared source prefix, Current and retained parents.
+- Compare their complete ordered typed inventory, including every Flat Patch, Unit ChildPatchSequence and generated Transform, with current user decisions and actual Git coverage.
+- Directory-only or file-only discovery cannot establish Patch membership, the next responsibility or lane closure.
+- Select the first unconsumed responsibility after accounting for approved renames, replacements, native fulfillment and explicit withdrawals at their existing owners.
+- A bypassed responsibility, incomplete committed Unit or unexplained order difference keeps its lane open and returns to its earliest affected owner before further transport.
+- Reuse unchanged source inventories, refresh Current after source mutations, and recompute the comparison when its frontier or controlling decisions change.
+- Keep this comparison in native List and Git evidence and unresolved task scope, without a parallel manifest, progress ledger or completion record.
 - Publish only unresolved responsibilities and continuation details in the task.
 - Preserve boundaries unless exact redistribution is approved.
 - Prepare absent root and lane notes from the corresponding current publication, selected sources, or an empty file. Copy inherited entries exactly; preserve existing drafts, including empty files.
+- Prepare an absent cross diagram from the current canonical publication or selected predecessor diagram before cross work; when neither exists, author the approved relationships from source in the same working lane directory.
+- Preserve an existing working diagram on resume, reconcile it with current user decisions and source, and update it with authorized relationship changes before dependent work or export.
 - Before every new or resumed Patch analysis, read root notes then the selected lane's notes and applicable source guards. Current user decisions govern; conflicting guards require resolution before dependent edits.
 - Notes are not summaries. Put shared critical cross-Patch guards at the root and only lane-specific additions in lane files. Self-contained behavior stays with its native owners. Present exact additions, rewrites, moves, or removals for explicit current-user approval; task edits, Patch completion, tests, and agent importance grant none. Notes contain no Patch identity, topology, history, workflow, progress, or test transition.
-- Before each declared Lane, reconcile its Unit and Flat Patch responsibilities, dependencies, and order. A changed membership, order, or Patch form needs approval. Producer seams and direct entrypoints stay in their assigned Unit.
+- Before choosing transport, consume OriginalPatchPurposeOwner's supported assignment and the draft-independent prefix.
+- Preserve the approved relative order; expand source review only for a changed obligation or unresolved interaction.
 - An interactive pause requested with exploration consumes OriginalPatchPurposeOwner for the next Patch on clean Current. Present its implementation, retained responsibilities, owners, dependents, focused checks and unresolved decisions before stopping; transport and task topology stay unchanged.
 - Attribute each finding to its approved Unit and actual prefix before edits. An override selecting or propagating an earlier output returns to that Unit's committed-history edit and is removed during replay. Current stays Current and later stays later; ambiguity or redistribution repeats approval before dependent authoring or Commit.
 - A proposed redistribution identifies the source and destination Units, exact moved behavior, dependencies, direct entrypoints, tests, and retained suffix consequences in the existing task. Apply existing user authority when it covers that concrete change; otherwise the existing approval successor owns the decision. General roll or repair authority and editing the task alone do not approve changing an established boundary. Resolve the assignment before Fork or reconstruction, then use the same Unit transport and verification route.

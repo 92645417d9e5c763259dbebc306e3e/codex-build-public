@@ -1,0 +1,678 @@
+render-reasoning-strength-meter-in-statusline
+
+Lane: frontend
+
+Unit: control-model-and-reasoning-with-keyboard
+
+ChildPatch: render-reasoning-strength-meter-in-statusline
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -118,6 +118,7 @@ pub(crate) use async_questions::QuestionSubmission;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
++pub(crate) use status_line_style::StatusLineDetails;
+ pub(crate) use status_line_style::status_line_from_segments;
+ pub(crate) use voice_strip::VoiceStripPhase;
+ pub(crate) use voice_strip::VoiceStripState;
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -685,6 +685,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn preview_uses_live_reasoning_meter_styling() {
++        let mut preview_data =
++            StatusSurfacePreviewData::from_iter([(StatusSurfacePreviewItem::Reasoning, "")]);
++        preview_data.reasoning_effort = Some(codex_protocol::openai_models::ReasoningEffort::High);
++
++        let line = preview_data
++            .status_line_for_items([StatusLineItem::Reasoning], /*use_theme_colors*/ true)
++            .expect("reasoning status line preview");
++        assert_eq!(
++            line.spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect::<String>(),
++            "■■■■■■"
++        );
++    }
++
+     #[test]
+     fn setup_view_snapshot_uses_runtime_preview_values() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -1,6 +1,7 @@
+ //! Theme-derived styling for the configurable footer statusline.
+ 
+ use ratatui::style::Color;
++use ratatui::style::Modifier;
+ use ratatui::style::Style;
+ use ratatui::style::Styled;
+ use ratatui::text::Line;
+@@ -14,11 +15,19 @@ use crate::terminal_palette::StdoutColorLevel;
+ use crate::terminal_palette::effective_stdout_color_level;
+ use crate::thread_color::thread_color;
+ use codex_protocol::ThreadId;
++use codex_protocol::openai_models::ReasoningEffort;
+ 
+ const STATUS_LINE_SEPARATOR: &str = " · ";
+ const STATUS_LINE_COLOR_SATURATION_PERCENT: u16 = 85;
+ const STATUS_LINE_COLOR_BRIGHTNESS_PERCENT: u16 = 100;
+ 
++/// Borrowed runtime values used while styling one footer.
++#[derive(Default)]
++pub(crate) struct StatusLineDetails<'a> {
++    pub(crate) reasoning_effort: Option<&'a ReasoningEffort>,
++    pub(crate) fast_label: Option<&'a str>,
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum StatusLineAccent {
+     Model,
+@@ -96,19 +105,25 @@ pub(crate) fn status_line_from_segments<I>(
+     segments: I,
+     use_theme_colors: bool,
+     thread_id: Option<ThreadId>,
++    details: StatusLineDetails<'_>,
+ ) -> Option<Line<'static>>
+ where
+     I: IntoIterator<Item = (StatusLineItem, String)>,
+ {
+-    status_line_from_segments_with_resolver(segments, use_theme_colors, thread_id, |accent| {
+-        foreground_style_for_scopes(accent.scopes())
+-    })
++    status_line_from_segments_with_resolver(
++        segments,
++        use_theme_colors,
++        thread_id,
++        details,
++        |accent| foreground_style_for_scopes(accent.scopes()),
++    )
+ }
+ 
+ fn status_line_from_segments_with_resolver<I, F>(
+     segments: I,
+     use_theme_colors: bool,
+     thread_id: Option<ThreadId>,
++    details: StatusLineDetails<'_>,
+     theme_style_for_accent: F,
+ ) -> Option<Line<'static>>
+ where
+@@ -154,11 +169,80 @@ where
+             style
+         };
+         spans.push(Span::styled(text, style));
++        if matches!(
++            item,
++            StatusLineItem::Reasoning | StatusLineItem::ModelWithReasoning
++        ) && let Some(effort) = details.reasoning_effort
++        {
++            append_reasoning_strength_meter(
++                &mut spans,
++                effort,
++                use_theme_colors,
++                item == StatusLineItem::ModelWithReasoning,
++            );
++            if item == StatusLineItem::ModelWithReasoning
++                && let Some(label) = details.fast_label
++            {
++                spans.push(Span::styled(
++                    format!(" {label}"),
++                    if use_theme_colors {
++                        Style::default().fg(Color::Red)
++                    } else {
++                        style
++                    },
++                ));
++            }
++        }
+     }
+ 
+     (!spans.is_empty()).then(|| Line::from(spans))
+ }
+ 
++fn append_reasoning_strength_meter(
++    spans: &mut Vec<Span<'static>>,
++    effort: &ReasoningEffort,
++    use_theme_colors: bool,
++    leading_space: bool,
++) {
++    let filled = match effort {
++        ReasoningEffort::Low => 1,
++        ReasoningEffort::Medium => 2,
++        ReasoningEffort::High => 3,
++        ReasoningEffort::XHigh => 4,
++        ReasoningEffort::Max => 5,
++        ReasoningEffort::Ultra => 6,
++        ReasoningEffort::None
++        | ReasoningEffort::Minimal
++        | ReasoningEffort::Persistent
++        | ReasoningEffort::Custom(_) => 0,
++    };
++    let colors = [
++        Color::Rgb(250, 204, 21),
++        Color::Rgb(251, 168, 24),
++        Color::Rgb(249, 115, 22),
++        Color::Rgb(239, 68, 68),
++        Color::Rgb(225, 29, 72),
++        Color::Rgb(190, 18, 60),
++    ];
++    if leading_space {
++        spans.push(Span::raw(" "));
++    }
++    for (index, color) in colors.into_iter().enumerate() {
++        let style = if use_theme_colors {
++            Style::default().fg(if index < filled {
++                readable_color_on(color, /*background*/ None)
++            } else {
++                Color::DarkGray
++            })
++        } else if index < filled {
++            Style::default().add_modifier(Modifier::BOLD)
++        } else {
++            Style::default().add_modifier(Modifier::DIM)
++        };
++        spans.push(Span::styled("■", style));
++    }
++}
++
+ fn soften_status_line_style(mut style: Style) -> Style {
+     if let Some(fg) = style.fg {
+         style.fg = Some(soften_status_line_color(fg));
+@@ -218,6 +302,56 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use ratatui::style::Modifier;
+ 
++    #[test]
++    fn reasoning_meter_preserves_neighboring_items_and_live_colors() {
++        let line = status_line_from_segments(
++            [
++                (StatusLineItem::WeeklyLimit, "7D 32% left".to_string()),
++                (StatusLineItem::Reasoning, String::new()),
++                (StatusLineItem::ModelWithReasoning, "gpt-5".to_string()),
++            ],
++            true,
++            None,
++            StatusLineDetails {
++                reasoning_effort: Some(&ReasoningEffort::High),
++                ..Default::default()
++            },
++        )
++        .expect("status line");
++        assert_eq!(line_text(&line), "7D 32% left · ■■■■■■ · gpt-5 ■■■■■■");
++        let squares = line
++            .spans
++            .iter()
++            .filter(|span| span.content == "■")
++            .collect::<Vec<_>>();
++        assert_eq!(squares.len(), 12);
++        assert_ne!(squares[0].style.fg, Some(Color::DarkGray));
++        assert_eq!(squares[3].style.fg, Some(Color::DarkGray));
++    }
++
++    #[test]
++    fn standalone_reasoning_meter_keeps_six_cells_in_monochrome() {
++        let line = status_line_from_segments(
++            [(StatusLineItem::Reasoning, String::new())],
++            false,
++            None,
++            StatusLineDetails {
++                reasoning_effort: Some(&ReasoningEffort::Low),
++                ..Default::default()
++            },
++        )
++        .expect("status line");
++        assert_eq!(line_text(&line), "■■■■■■");
++        let squares = line
++            .spans
++            .iter()
++            .filter(|span| span.content == "■")
++            .collect::<Vec<_>>();
++        assert_eq!(squares.len(), 6);
++        assert!(squares[0].style.add_modifier.contains(Modifier::BOLD));
++        assert!(squares[1].style.add_modifier.contains(Modifier::DIM));
++    }
++
+     fn line_text(line: &Line<'static>) -> String {
+         line.spans
+             .iter()
+@@ -235,6 +369,7 @@ mod tests {
+             ],
+             /*use_theme_colors*/ true,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+             |_| None,
+         )
+         .expect("status line");
+@@ -257,6 +392,7 @@ mod tests {
+             ],
+             /*use_theme_colors*/ true,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+             |accent| match accent {
+                 StatusLineAccent::Model => Some(Style::default().red()),
+                 _ => None,
+@@ -280,6 +416,7 @@ mod tests {
+             ],
+             /*use_theme_colors*/ true,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+             |_| None,
+         )
+         .expect("thread usage status line");
+@@ -301,6 +438,7 @@ mod tests {
+                 [(StatusLineItem::ModelName, "gpt-5".to_string())],
+                 /*use_theme_colors*/ true,
+                 /*thread_id*/ None,
++                StatusLineDetails::default(),
+                 |_| Some(Style::default().fg(Color::Rgb(255, 0, 0))),
+             )
+             .expect("status line");
+@@ -325,6 +463,7 @@ mod tests {
+             ],
+             /*use_theme_colors*/ false,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+             |_| Some(Style::default().red()),
+         )
+         .expect("status line");
+@@ -341,6 +480,7 @@ mod tests {
+             [(StatusLineItem::PullRequestNumber, "PR #20252".to_string())],
+             /*use_theme_colors*/ false,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+             |_| None,
+         )
+         .expect("status line");
+@@ -355,6 +495,7 @@ mod tests {
+                 Vec::<(StatusLineItem, String)>::new(),
+                 /*use_theme_colors*/ true,
+                 /*thread_id*/ None,
++                StatusLineDetails::default(),
+                 |_| None,
+             ),
+             None
+@@ -383,6 +524,7 @@ mod tests {
+                 ],
+                 /*use_theme_colors*/ true,
+                 /*thread_id*/ None,
++                StatusLineDetails::default(),
+                 |accent| {
+                     let rgb = match accent {
+                         StatusLineAccent::Model => (240, 210, 160),
+@@ -443,6 +585,7 @@ mod tests {
+             ],
+             /*use_theme_colors*/ true,
+             /*thread_id*/ None,
++            StatusLineDetails::default(),
+         )
+         .expect("status line");
+         if level == "0" {
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -1,8 +1,10 @@
+ use std::collections::BTreeMap;
+ 
+ use codex_protocol::ThreadId;
++use codex_protocol::openai_models::ReasoningEffort;
+ use ratatui::text::Line;
+ 
++use super::StatusLineDetails;
+ use super::status_line_from_segments;
+ use super::status_line_setup::StatusLineItem;
+ 
+@@ -131,6 +133,8 @@ struct PreviewValue {
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct StatusSurfacePreviewData {
+     pub(crate) thread_id: Option<ThreadId>,
++    pub(crate) reasoning_effort: Option<ReasoningEffort>,
++    pub(crate) fast_label: Option<String>,
+     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
+ }
+ 
+@@ -138,6 +142,8 @@ impl Default for StatusSurfacePreviewData {
+     fn default() -> Self {
+         let mut data = Self {
+             thread_id: None,
++            reasoning_effort: None,
++            fast_label: None,
+             values: BTreeMap::new(),
+         };
+         for item in StatusSurfacePreviewItem::iter() {
+@@ -248,7 +254,15 @@ impl StatusSurfacePreviewData {
+             self.value_for(item.preview_item())
+                 .map(|value| (item, value.to_string()))
+         });
+-        status_line_from_segments(segments, use_theme_colors, self.thread_id)
++        status_line_from_segments(
++            segments,
++            use_theme_colors,
++            self.thread_id,
++            StatusLineDetails {
++                reasoning_effort: self.reasoning_effort.as_ref(),
++                fast_label: self.fast_label.as_deref(),
++            },
++        )
+     }
+ }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -368,6 +368,10 @@ impl ChatWidget {
+             }),
+         );
+         preview_data.thread_id = self.thread_id;
++        if self.local_settings.tui.fullscreen_transcript {
++            preview_data.reasoning_effort = self.effective_reasoning_effort();
++        }
++        preview_data.fast_label = self.status_line_fast_label();
+ 
+         if self.rate_limit_snapshots_by_limit_id.contains_key("codex") {
+             for item in [
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -4,6 +4,7 @@
+ //! behavior easier to review without paging through the rest of `chatwidget.rs`.
+ 
+ use super::*;
++use crate::bottom_pane::StatusLineDetails;
+ use crate::bottom_pane::status_line_from_segments;
+ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+@@ -220,6 +221,16 @@ impl ChatWidget {
+             segments,
+             self.local_settings.tui.status_line_use_colors,
+             self.thread_id,
++            StatusLineDetails {
++                reasoning_effort: self
++                    .local_settings
++                    .tui
++                    .fullscreen_transcript
++                    .then(|| self.effective_reasoning_effort())
++                    .flatten()
++                    .as_ref(),
++                fast_label: self.status_line_fast_label().as_deref(),
++            },
+         ));
+         let hyperlink_url = selections
+             .status_line_items
+@@ -729,8 +740,19 @@ impl ChatWidget {
+     pub(super) fn status_line_value(&mut self, item: StatusLineItem) -> Option<String> {
+         match item {
+             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
+-            StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
+-            StatusLineItem::Reasoning => Some(self.reasoning_display_name()),
++            StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name(
++                !self.local_settings.tui.fullscreen_transcript
++                    || self.effective_reasoning_effort().is_none(),
++            )),
++            StatusLineItem::Reasoning => Some(
++                if self.local_settings.tui.fullscreen_transcript
++                    && self.effective_reasoning_effort().is_some()
++                {
++                    String::new()
++                } else {
++                    self.reasoning_display_name()
++                },
++            ),
+             StatusLineItem::CurrentDir => {
+                 Some(format_directory_display(
+                     self.status_line_cwd(),
+@@ -980,7 +1002,7 @@ impl ChatWidget {
+                 /*max_chars*/ 32,
+             )),
+             TerminalTitleItem::ModelWithReasoning => Some(Self::truncate_terminal_title_part(
+-                self.model_with_reasoning_display_name(),
++                self.model_with_reasoning_display_name(/*include_reasoning*/ true),
+                 /*max_chars*/ 32,
+             )),
+             TerminalTitleItem::Reasoning => Some(Self::truncate_terminal_title_part(
+@@ -996,10 +1018,39 @@ impl ChatWidget {
+         Self::status_line_reasoning_effort_label(effort.as_ref())
+     }
+ 
+-    fn model_with_reasoning_display_name(&self) -> String {
+-        let label = self.reasoning_display_name();
+-        let service_tier_label = self
+-            .current_service_tier()
++    fn model_with_reasoning_display_name(&self, include_reasoning: bool) -> String {
++        let reasoning_label = if include_reasoning {
++            format!(" {}", self.reasoning_display_name())
++        } else {
++            String::new()
++        };
++        let service_tier_label = if !include_reasoning
++            && self.current_service_tier() == Some(ServiceTier::Fast.request_value())
++        {
++            String::new()
++        } else {
++            self.model_service_tier_display_label()
++                .map(|tier| format!(" {tier}"))
++                .unwrap_or_default()
++        };
++        format!(
++            "{}{reasoning_label}{service_tier_label}",
++            self.model_display_name()
++        )
++    }
++
++    pub(super) fn status_line_fast_label(&self) -> Option<String> {
++        if !self.local_settings.tui.fullscreen_transcript
++            || self.effective_reasoning_effort().is_none()
++            || self.current_service_tier() != Some(ServiceTier::Fast.request_value())
++        {
++            return None;
++        }
++        self.model_service_tier_display_label()
++    }
++
++    fn model_service_tier_display_label(&self) -> Option<String> {
++        self.current_service_tier()
+             .and_then(|service_tier| {
+                 self.current_model_service_tier_commands()
+                     .into_iter()
+@@ -1007,9 +1058,6 @@ impl ChatWidget {
+                     .map(|tier| tier.name)
+             })
+             .filter(|_| self.has_chatgpt_account)
+-            .map(|tier| format!(" {tier}"))
+-            .unwrap_or_default();
+-        format!("{} {label}{service_tier_label}", self.model_display_name())
+     }
+ 
+     /// Computes the compact runtime status label used by word-based status items.
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -4040,6 +4040,7 @@ async fn status_line_fast_mode_footer_snapshot() {
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
+     set_fast_mode_test_catalog(&mut chat);
+     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+     chat.config.cwd = test_project_path().abs();
+@@ -4053,12 +4054,56 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
+     set_chatgpt_auth(&mut chat);
+     set_fast_mode_test_catalog(&mut chat);
+     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+-    chat.refresh_status_line();
+     let test_cwd = test_path_display("/tmp/project");
++    for colors in [true, false] {
++        chat.local_settings.tui.status_line_use_colors = colors;
++        chat.refresh_status_line();
++        let expected = format!("gpt-5.4 ■■■■■■ fast · Context 0% used · {test_cwd}");
++        assert_eq!(status_line_text(&chat), Some(expected.clone()));
++        let preview = chat
++            .status_surface_preview_data()
++            .status_line_for_items(
++                [
++                    StatusLineItem::ModelWithReasoning,
++                    StatusLineItem::ContextUsed,
++                    StatusLineItem::CurrentDir,
++                ],
++                colors,
++            )
++            .expect("live status preview");
++        assert_eq!(
++            preview
++                .spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect::<String>(),
++            expected,
++        );
++        let fast = preview
++            .spans
++            .iter()
++            .find(|span| span.content == " fast")
++            .expect("separately styled fast suffix");
++        if colors {
++            assert_eq!(fast.style.fg, Some(ratatui::style::Color::Red));
++        } else {
++            assert_eq!(fast.style, crate::style::secondary_text_style());
++        }
++    }
+ 
++    chat.local_settings.tui.fullscreen_transcript = false;
++    chat.refresh_status_line();
+     assert_eq!(
+         status_line_text(&chat),
+-        Some(format!("gpt-5.4 xhigh fast · Context 0% used · {test_cwd}"))
++        Some(format!("gpt-5.4 xhigh fast · Context 0% used · {test_cwd}")),
++    );
++    assert_eq!(chat.status_surface_preview_data().fast_label, None);
++    chat.local_settings.tui.fullscreen_transcript = true;
++    chat.local_settings.tui.terminal_title = Some(vec!["model-with-reasoning".to_string()]);
++    chat.refresh_terminal_title();
++    assert_eq!(
++        chat.last_terminal_title.as_deref(),
++        Some("gpt-5.4 xhigh fast")
+     );
+ 
+     chat.set_model("gpt-5.2");
+@@ -4066,8 +4111,17 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
+ 
+     assert_eq!(
+         status_line_text(&chat),
+-        Some(format!("gpt-5.2 xhigh · Context 0% used · {test_cwd}"))
++        Some(format!("gpt-5.2 ■■■■■■ · Context 0% used · {test_cwd}"))
++    );
++    assert_eq!(chat.status_surface_preview_data().fast_label, None);
++    chat.set_model("gpt-5.4");
++    chat.has_chatgpt_account = false;
++    chat.refresh_status_line();
++    assert_eq!(
++        status_line_text(&chat),
++        Some(format!("gpt-5.4 ■■■■■■ · Context 0% used · {test_cwd}")),
+     );
++    assert_eq!(chat.status_surface_preview_data().fast_label, None);
+ }
+ 
+ #[tokio::test]
+@@ -4087,8 +4141,9 @@ async fn terminal_title_model_updates_on_model_change_without_manual_refresh() {
+ }
+ 
+ #[tokio::test]
+-async fn status_line_and_terminal_title_reasoning_render_only_effort() {
++async fn tui_status_line_uses_meter_but_terminal_title_keeps_effort_word() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
+     chat.local_settings.tui.status_line = Some(vec!["reasoning".to_string()]);
+     chat.local_settings.tui.terminal_title = Some(vec!["reasoning".to_string()]);
+     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+@@ -4097,46 +4152,62 @@ async fn status_line_and_terminal_title_reasoning_render_only_effort() {
+     chat.refresh_status_line();
+     chat.refresh_terminal_title();
+ 
+-    assert_eq!(status_line_text(&chat), Some("xhigh".to_string()));
++    assert_eq!(status_line_text(&chat), Some("■■■■■■".to_string()));
+     assert_eq!(chat.last_terminal_title, Some("xhigh".to_string()));
+ }
+ 
++#[tokio::test]
++async fn non_fullscreen_status_line_keeps_reasoning_words() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
++    chat.local_settings.tui.fullscreen_transcript = false;
++    chat.local_settings.tui.status_line = Some(vec!["model-with-reasoning".to_string()]);
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
++    chat.refresh_status_line();
++    assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
++
++    chat.local_settings.tui.status_line = Some(vec!["reasoning".to_string()]);
++    chat.refresh_status_line();
++    assert_eq!(status_line_text(&chat), Some("high".to_string()));
++}
++
+ #[tokio::test]
+ async fn status_line_reasoning_updates_on_mode_switch_without_manual_refresh() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
+     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+     chat.local_settings.tui.status_line = Some(vec!["reasoning".to_string()]);
+     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+ 
+-    assert_eq!(status_line_text(&chat), Some("high".to_string()));
++    assert_eq!(status_line_text(&chat), Some("■■■■■■".to_string()));
+ 
+     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+         .expect("expected plan collaboration mode");
+     chat.set_collaboration_mask(plan_mask);
+ 
+-    assert_eq!(status_line_text(&chat), Some("medium".to_string()));
++    assert_eq!(status_line_text(&chat), Some("■■■■■■".to_string()));
+ }
+ 
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_refresh() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
++    chat.local_settings.tui.fullscreen_transcript = true;
+     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+     chat.local_settings.tui.status_line = Some(vec!["model-with-reasoning".to_string()]);
+     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+ 
+-    assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
++    assert_eq!(status_line_text(&chat), Some("gpt-5.2 ■■■■■■".to_string()));
+ 
+     let plan_mask = collaboration_modes::plan_mask(chat.model_catalog.as_ref())
+         .expect("expected plan collaboration mode");
+     chat.set_collaboration_mask(plan_mask);
+ 
+-    assert_eq!(status_line_text(&chat), Some("gpt-5.2 medium".to_string()));
++    assert_eq!(status_line_text(&chat), Some("gpt-5.2 ■■■■■■".to_string()));
+ 
+     let default_mask = collaboration_modes::default_mask(chat.model_catalog.as_ref())
+         .expect("expected default collaboration mode");
+     chat.set_collaboration_mask(default_mask);
+ 
+-    assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
++    assert_eq!(status_line_text(&chat), Some("gpt-5.2 ■■■■■■".to_string()));
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -38,6 +38,7 @@ async fn thread_color_preview_matches_footer_while_auto_naming() {
+                             .map(|item| (item, chat.status_line_value_for_item(item).unwrap())),
+                         use_colors,
+                         Some(id),
++                        crate::bottom_pane::StatusLineDetails::default(),
+                     )
+                     .unwrap();
+                     assert_eq!(line, footer);

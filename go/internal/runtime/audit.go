@@ -425,7 +425,7 @@ func readRustSuiteResult(options RustSuiteOptions, alreadyEstablished bool) (Rus
 	if sourceErr == nil {
 		sourceErr = validateRustSuiteSourceRole(options, source)
 	}
-	toolchain, toolchainErr := resolveToolchain(options.ProjectWorkingRoot, options.deadline())
+	toolchain, toolchainErr := resolveToolchain(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot, options.deadline())
 	if options.Scope != "baseline" {
 		generation, baselineErr := readRustSuiteEstablishedGeneration(options, toolchain)
 		baselineErr = errors.Join(toolchainErr, baselineErr)
@@ -813,7 +813,7 @@ func prepareRustSuiteBaselinePromotion(options RustSuiteOptions, plan RustSuiteP
 	if err != nil {
 		return nil, err
 	}
-	toolchain, toolchainErr := resolveToolchain(options.ProjectWorkingRoot, options.deadline())
+	toolchain, toolchainErr := resolveToolchain(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot, options.deadline())
 	packages, packageErr := discoverRustSuitePackages(options, toolchain)
 	if options.baselinePreimage == nil || options.baselineProposal == nil {
 		return nil, errors.New("baseline promotion input differs")
@@ -1013,7 +1013,7 @@ func prepareRustSuite(options RustSuiteOptions) (rustSuitePreflight, error) {
 	if err := options.phase("Toolchain"); err != nil {
 		return rustSuitePreflight{}, err
 	}
-	toolchain, err := resolveToolchain(options.ProjectWorkingRoot, options.deadline())
+	toolchain, err := resolveToolchain(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot, options.deadline())
 	if err != nil {
 		return rustSuitePreflight{}, preflightHelperError{err}
 	}
@@ -1461,7 +1461,7 @@ func zeroRustSuiteBaseline(options RustSuiteOptions) (rustSuiteBaselineFile, err
 	if err := options.phase("Toolchain"); err != nil {
 		return rustSuiteBaselineFile{}, err
 	}
-	toolchain, err := resolveToolchain(options.ProjectWorkingRoot, options.deadline())
+	toolchain, err := resolveToolchain(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot, options.deadline())
 	if err != nil {
 		return rustSuiteBaselineFile{}, err
 	}

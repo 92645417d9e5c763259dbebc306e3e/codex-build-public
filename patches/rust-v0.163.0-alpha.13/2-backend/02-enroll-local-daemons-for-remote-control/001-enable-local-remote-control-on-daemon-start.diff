@@ -1,0 +1,356 @@
+enable-local-remote-control-on-daemon-start
+
+Lane: backend
+
+Unit: enroll-local-daemons-for-remote-control
+
+ChildPatch: enable-local-remote-control-on-daemon-start
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Enroll locally managed daemons for remote control and expose their current manual pairing code through protected daemon settings without requiring a TUI client.
+
+Requires: Unit:normalization/route-app-server-runtime-to-harness
+
+Provides: Enable remote control for explicit local start or fresh managed auto-start, preserve existing auto-started daemon policy and internal restart semantics, pair eligible managed daemons in the background, and store only valid current manual pairing artifacts under the daemon operation lock with private atomic settings writes and expiry, stop and disable cleanup.
+
+Boundary: Native remote authentication, enrollment eligibility, transport, cancellation, managed requirements and daemon ownership remain authoritative; unrelated settings survive writes, pairing failure is diagnostic rather than a local-server failure, and no running user daemon or real credentials are exercised during the roll.
+
+Verification: daemon lifecycle tests cover launch features, existing remote policy and restart ownership; settings tests cover replacement, file permissions, expiry and preservation; app-server managed_daemon_pairs_in_background_without_a_tui_client exercises background pairing against a local fake backend.
+
+
+diff --git a/codex-rs/app-server-daemon/src/launch.rs b/codex-rs/app-server-daemon/src/launch.rs
+--- a/codex-rs/app-server-daemon/src/launch.rs
++++ b/codex-rs/app-server-daemon/src/launch.rs
+@@ -3,7 +3,7 @@
+ 
+ use crate::Daemon;
+ use crate::LifecycleOutput;
+-use crate::ensure_supported_platform;
++use crate::StartIntent;
+ use anyhow::Result;
+ use anyhow::ensure;
+ use std::collections::BTreeMap;
+@@ -13,25 +13,21 @@ use std::collections::BTreeMap;
+ /// Callers must check the running server's configuration before using it.
+ /// Startup diagnostics go to tracing, so a caller with a live TUI can keep rendering.
+ pub async fn start_with_features(features: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
+-    ensure_supported_platform()?;
+-    #[cfg(windows)]
+-    crate::backend::windows::ensure_not_elevated()?;
+     let mut daemon = Daemon::from_environment()?;
+     daemon.log_diagnostics = true;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+     let selected = daemon.current_installation();
+     let mut overrides = selected.load_settings().await?.feature_overrides;
+     overrides.extend(features.clone());
+-    Box::pin(selected.start(&overrides)).await
++    // A fresh managed daemon owns remote startup. Attaching to an existing
++    // daemon must leave its remote-control policy unchanged.
++    Box::pin(selected.start(&overrides, StartIntent::ManagedAutoStart)).await
+ }
+ 
+ /// Apply confirmed feature settings to an existing managed daemon and restart it.
+ /// Callers must obtain consent for changes to shared services and interrupted work,
+ /// then verify effective server compatibility after this operation completes.
+ pub async fn restart_with_features(features: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
+-    ensure_supported_platform()?;
+-    #[cfg(windows)]
+-    crate::backend::windows::ensure_not_elevated()?;
+     let daemon = Daemon::from_environment()?;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+     let selected = daemon.current_installation();
+@@ -67,7 +63,7 @@ impl Daemon {
+         let previous = settings.feature_overrides.clone();
+         settings.feature_overrides.extend(features.clone());
+         if settings.feature_overrides == previous {
+-            return self.start(&previous).await;
++            return self.start(&previous, StartIntent::Internal).await;
+         }
+         self.restart_with_settings(settings).await
+     }
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -82,6 +82,13 @@ pub enum LifecycleStatus {
+     Running,
+ }
+ 
++#[derive(Clone, Copy)]
++enum StartIntent {
++    LocalEnrollment,
++    ManagedAutoStart,
++    Internal,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct LifecycleOutput {
+@@ -230,14 +237,6 @@ enum RestartDecision {
+ }
+ 
+ pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
+-    ensure_supported_platform()?;
+-    #[cfg(windows)]
+-    if matches!(
+-        command,
+-        LifecycleCommand::Start | LifecycleCommand::Restart { .. }
+-    ) {
+-        backend::windows::ensure_not_elevated()?;
+-    }
+     // Keep daemon package preparation off callers' async stack frames.
+     Box::pin(Daemon::from_environment()?.run(command)).await
+ }
+@@ -403,7 +402,11 @@ impl Daemon {
+         let _operation_lock = self.acquire_operation_lock().await?;
+         let selected = self.current_installation();
+         match command {
+-            LifecycleCommand::Start => selected.start(&BTreeMap::new()).await,
++            LifecycleCommand::Start => {
++                selected
++                    .start(&BTreeMap::new(), StartIntent::LocalEnrollment)
++                    .await
++            }
+             LifecycleCommand::Restart { feature_overrides } => {
+                 selected.restart(&feature_overrides).await
+             }
+@@ -418,9 +421,19 @@ impl Daemon {
+         }
+     }
+ 
+-    async fn start(&self, feature_overrides: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
++    async fn start(
++        &self,
++        feature_overrides: &BTreeMap<String, bool>,
++        intent: StartIntent,
++    ) -> Result<LifecycleOutput> {
+         let mut managed = self.clone();
+         let mut settings = self.load_settings().await?;
++        let foreground_enrollment = matches!(intent, StartIntent::LocalEnrollment);
++        let remote_control_setting_changed =
++            foreground_enrollment && !settings.remote_control_enabled;
++        if foreground_enrollment {
++            settings.remote_control_enabled = true;
++        }
+         let (status, backend, pid, info) = if let Ok(info) = client::probe(&self.socket_path).await
+         {
+             (
+@@ -437,6 +450,12 @@ impl Daemon {
+                 self.wait_until_ready().await?,
+             )
+         } else {
++            // Auto-start changes remote policy only when launching a fresh daemon.
++            let auto_start_remote_control =
++                matches!(intent, StartIntent::ManagedAutoStart) && !settings.remote_control_enabled;
++            if auto_start_remote_control {
++                settings.remote_control_enabled = true;
++            }
+             // A fresh start must ignore snapshots left by older stop clients.
+             if let Err(err) = thread_recovery::discard_pending(self) {
+                 self.diagnostic(format_args!(
+@@ -446,9 +465,12 @@ impl Daemon {
+             prepare_install::prepare(self, &settings).await?;
+             managed.managed_codex_bin = self.current_managed_codex_bin();
+             managed.ensure_managed_codex_bin()?;
+-            // Only a fresh launch may replace these settings. Keep them for restarts
+-            // and updates, without changing the user's config or a running daemon.
+-            if settings.feature_overrides != *feature_overrides {
++            // Only a fresh launch may replace feature overrides, without changing
++            // the config or remote policy of an already-running daemon.
++            if settings.feature_overrides != *feature_overrides
++                || remote_control_setting_changed
++                || auto_start_remote_control
++            {
+                 settings.feature_overrides = feature_overrides.clone();
+                 settings.save(&self.settings_file).await?;
+             }
+@@ -467,6 +489,15 @@ impl Daemon {
+                 "warning: failed to ensure managed updater after app-server start: {err:#}"
+             ));
+         }
++        if foreground_enrollment && backend.is_some() {
++            remote_control_client::enable_remote_control(&self.socket_path).await?;
++        }
++        if foreground_enrollment
++            && status == LifecycleStatus::AlreadyRunning
++            && remote_control_setting_changed
++        {
++            settings.save(&self.settings_file).await?;
++        }
+         Ok(managed
+             .output(status, backend, pid, Some(info.app_server_version))
+             .await)
+@@ -734,7 +765,9 @@ impl Daemon {
+             let _ = selected
+                 .set_remote_control_locked(RemoteControlMode::Enabled)
+                 .await?;
+-            let output = selected.start(&BTreeMap::new()).await?;
++            let output = selected
++                .start(&BTreeMap::new(), StartIntent::Internal)
++                .await?;
+             return Ok(RemoteControlStartOutput::Start(output));
+         }
+ 
+@@ -1039,8 +1072,6 @@ impl Daemon {
+ 
+     fn ensure_managed_codex_bin(&self) -> Result<()> {
+         if self.managed_codex_bin.is_file() {
+-            #[cfg(windows)]
+-            backend::windows::ensure_detached_launch(&self.managed_codex_bin)?;
+             return Ok(());
+         }
+ 
+@@ -1103,7 +1134,6 @@ impl Daemon {
+ 
+     async fn open_operation_lock_file(&self) -> Result<tokio::fs::File> {
+         if let Some(parent) = self.operation_lock_file.parent() {
+-            #[cfg(unix)]
+             if let Some(home) = parent.parent() {
+                 tokio::fs::create_dir_all(home).await?;
+             }
+diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+--- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
++++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+@@ -1,9 +1,7 @@
+ use std::sync::Mutex;
+-#[cfg(unix)]
+ use std::time::Duration;
+ 
+ use pretty_assertions::assert_eq;
+-#[cfg(unix)]
+ use tempfile::TempDir;
+ 
+ use super::INSTALL_URL;
+@@ -12,7 +10,6 @@ use super::InstallerResponse;
+ use super::fetch_installer_script;
+ #[cfg(unix)]
+ use super::manual_update::run as manual_update_once;
+-#[cfg(unix)]
+ use crate::Daemon;
+ #[cfg(unix)]
+ use crate::RestartIfRunningOutcome;
+@@ -417,13 +414,8 @@ async fn cancelling_installer_stops_children_and_releases_fallback_lock() {
+     assert!(!delayed.exists());
+ }
+ 
+-#[cfg(unix)]
+ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
+-    let target = if cfg!(target_os = "macos") {
+-        format!("{}-apple-darwin", std::env::consts::ARCH)
+-    } else {
+-        format!("{}-unknown-linux-musl", std::env::consts::ARCH)
+-    };
++    let target = format!("{}-unknown-linux-musl", std::env::consts::ARCH);
+     let release = format!("1.0.0-{target}");
+     let standalone = home.path().join("packages/standalone");
+     let bin = standalone.join("releases").join(&release).join("codex");
+@@ -671,7 +663,6 @@ async fn unsupported_request_preserves_updater_schedule() {
+     worker.abort();
+ }
+ 
+-#[cfg(unix)]
+ async fn test_control_server(
+     daemon: &Daemon,
+     home: &std::path::Path,
+@@ -833,7 +824,6 @@ async fn manual_update_restarts_managed_daemon_with_automatic_updates_disabled()
+     check_manual_update_restart("standalone").await;
+ }
+ 
+-#[cfg(unix)]
+ #[tokio::test]
+ async fn daemon_start_and_restart_preserve_launch_features() {
+     for features in [
+@@ -868,23 +858,26 @@ async fn daemon_start_and_restart_preserve_launch_features() {
+                 .await
+                 .abort_handle()
+         };
+-        let (started, server) = tokio::join!(daemon.start(&features), control);
++        let (started, server) = tokio::join!(
++            daemon.start(&features, crate::StartIntent::ManagedAutoStart),
++            control
++        );
+         assert_eq!(started.unwrap().status, crate::LifecycleStatus::Started);
+         assert_eq!(
+             daemon.load_settings().await.unwrap().feature_overrides,
+             features
+         );
+         let expected = if features.is_empty() {
+-            "app-server\n--listen\nunix://\n--analytics-default-enabled\n--managed-daemon\n"
++            "app-server\n--remote-control\n--listen\nunix://\n--analytics-default-enabled\n--managed-daemon\n"
+         } else {
+-            "app-server\n--listen\nunix://\n--analytics-default-enabled\n-c\nfeatures.api_key_model_discovery=true\n-c\nfeatures.code_mode_host=false\n--managed-daemon\n"
++            "app-server\n--remote-control\n--listen\nunix://\n--analytics-default-enabled\n-c\nfeatures.api_key_model_discovery=true\n-c\nfeatures.code_mode_host=false\n--managed-daemon\n"
+         };
+         assert_eq!(std::fs::read_to_string(&args_path).unwrap(), expected);
+         let reused = daemon
+-            .start(&std::collections::BTreeMap::from([(
+-                "api_key_model_discovery".to_string(),
+-                false,
+-            )]))
++            .start(
++                &std::collections::BTreeMap::from([("api_key_model_discovery".to_string(), false)]),
++                crate::StartIntent::ManagedAutoStart,
++            )
+             .await
+             .unwrap();
+         assert_eq!(reused.status, crate::LifecycleStatus::AlreadyRunning);
+@@ -909,6 +902,57 @@ async fn daemon_start_and_restart_preserve_launch_features() {
+     }
+ }
+ 
++#[tokio::test]
++async fn managed_auto_start_leaves_existing_daemon_remote_policy_unchanged() {
++    let home = TempDir::new().unwrap();
++    let (daemon, _) = manual_update_daemon(&home);
++    let args_path = home.path().join("launch-args");
++    std::fs::write(
++        &daemon.settings_file,
++        r#"{"remoteControlEnabled":false,"updater":{"autoUpdateEnabled":false}}"#,
++    )
++    .unwrap();
++    codex_utils_cargo_bin::write_executable(
++        &daemon.managed_codex_bin,
++        &format!(
++            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo codex 1.0.0; exit; fi\nif [ \"$3\" = --help ]; then exit; fi\nprintf '%s\\n' \"$@\" > '{}'\nexec sleep 30\n",
++            args_path.display(),
++        ),
++    )
++    .unwrap();
++    let control = async {
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++        while !args_path.exists() {
++            assert!(
++                tokio::time::Instant::now() < deadline,
++                "daemon did not launch"
++            );
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++        test_control_server(&daemon, home.path())
++            .await
++            .abort_handle()
++    };
++    let features = std::collections::BTreeMap::new();
++    let (started, server) = tokio::join!(
++        daemon.start(&features, crate::StartIntent::Internal),
++        control
++    );
++    assert_eq!(started.unwrap().status, crate::LifecycleStatus::Started);
++    let original_args = std::fs::read_to_string(&args_path).unwrap();
++    assert!(!original_args.contains("--remote-control"));
++
++    let reused = daemon
++        .start(&features, crate::StartIntent::ManagedAutoStart)
++        .await
++        .unwrap();
++    assert_eq!(reused.status, crate::LifecycleStatus::AlreadyRunning);
++    assert!(!daemon.load_settings().await.unwrap().remote_control_enabled);
++    assert_eq!(std::fs::read_to_string(&args_path).unwrap(), original_args);
++    daemon.stop().await.unwrap();
++    server.abort();
++}
++
+ #[cfg(unix)]
+ #[tokio::test]
+ async fn confirmed_feature_restart_preserves_ownership_and_skips_matching_settings() {

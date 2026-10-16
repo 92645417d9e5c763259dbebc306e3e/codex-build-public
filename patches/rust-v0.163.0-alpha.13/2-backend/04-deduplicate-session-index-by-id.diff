@@ -1,0 +1,277 @@
+deduplicate-session-index-by-id
+
+Lane: backend
+
+FlatPatch: deduplicate-session-index-by-id
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Keep one current session-index entry per renamed thread across all naming callers.
+
+Requires: Unit:backend/rebuild-sqlite-history-from-paginated-rollouts
+
+Provides: Shared index writes replace every previous entry for the named thread; rename, deletion and complete-scan pruning serialize through the home directory lock and publish atomically while preserving unrelated lines and file permissions.
+
+Boundary: Session-index path, lookup behavior, metadata failure policies and TUI title-generation rules retain their existing owners; existing legacy duplicates are removed by the separately authorized one-time data operation.
+
+Verification: session_index::tests cover repeated rename, explicit clear, legacy duplicates, unrelated malformed lines, permissions, directory locking, open-reader snapshots, removal and cancellation.
+
+
+diff --git a/codex-rs/rollout/src/session_index.rs b/codex-rs/rollout/src/session_index.rs
+--- a/codex-rs/rollout/src/session_index.rs
++++ b/codex-rs/rollout/src/session_index.rs
+@@ -28,8 +28,7 @@ pub struct SessionIndexEntry {
+     pub updated_at: String,
+ }
+ 
+-/// Append a thread name update to the session index.
+-/// Name updates are append-only; the most recent entry wins when resolving names or ids.
++/// Store the current thread name, replacing every previous entry for this thread.
+ pub async fn append_thread_name(
+     codex_home: &Path,
+     thread_id: ThreadId,
+@@ -49,25 +48,13 @@ pub async fn append_thread_name(
+     append_session_index_entry(codex_home, entry).await
+ }
+ 
+-/// Append a raw session index entry to `session_index.jsonl`.
+-/// Consumers scan from the end to find the newest match.
++/// Store a raw session index entry, retaining only this entry for its thread.
+ pub async fn append_session_index_entry(
+     codex_home: &Path,
+     entry: SessionIndexEntry,
+ ) -> std::io::Result<()> {
+-    let path = session_index_path(codex_home);
+-    with_session_index_lock(&SESSION_INDEX_LOCK, move || {
+-        let mut file = std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(&path)?;
+-        let mut line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
+-        line.push('\n');
+-        file.write_all(line.as_bytes())?;
+-        file.flush()?;
+-        Ok(())
+-    })
+-    .await
++    let thread_id = entry.id;
++    update_session_index(codex_home, move |old| old.id != thread_id, Some(entry)).await
+ }
+ 
+ /// Remove all recorded names for a thread from the session index.
+@@ -75,33 +62,7 @@ pub async fn remove_thread_name_entries(
+     codex_home: &Path,
+     thread_id: ThreadId,
+ ) -> std::io::Result<()> {
+-    let path = session_index_path(codex_home);
+-    with_session_index_lock(&SESSION_INDEX_LOCK, move || {
+-        let contents = match std::fs::read_to_string(&path) {
+-            Ok(contents) => contents,
+-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+-            Err(err) => return Err(err),
+-        };
+-        let mut removed = false;
+-        let mut remaining = String::with_capacity(contents.len());
+-        for line in contents.lines() {
+-            let should_remove = serde_json::from_str::<SessionIndexEntry>(line.trim())
+-                .is_ok_and(|entry| entry.id == thread_id);
+-            if should_remove {
+-                removed = true;
+-            } else {
+-                remaining.push_str(line);
+-                remaining.push('\n');
+-            }
+-        }
+-        if !removed {
+-            return Ok(());
+-        }
+-        let temp_path = path.with_extension("jsonl.tmp");
+-        std::fs::write(&temp_path, remaining)?;
+-        std::fs::rename(temp_path, path)
+-    })
+-    .await
++    update_session_index(codex_home, move |entry| entry.id != thread_id, None).await
+ }
+ 
+ /// Remove names for threads absent from a complete active-and-archived rollout scan.
+@@ -111,32 +72,65 @@ pub async fn prune_thread_names_without_rollouts(
+     codex_home: &Path,
+     rollout_ids: &HashSet<ThreadId>,
+ ) -> std::io::Result<()> {
+-    let path = session_index_path(codex_home);
+     let rollout_ids = rollout_ids.clone();
++    update_session_index(
++        codex_home,
++        move |entry| rollout_ids.contains(&entry.id),
++        None,
++    )
++    .await
++}
++
++async fn update_session_index(
++    codex_home: &Path,
++    retain: impl Fn(&SessionIndexEntry) -> bool + Send + 'static,
++    replacement: Option<SessionIndexEntry>,
++) -> std::io::Result<()> {
++    let codex_home = codex_home.to_path_buf();
+     with_session_index_lock(&SESSION_INDEX_LOCK, move || {
++        // Lock the stable home directory rather than the index inode replaced below.
++        // This serializes read-modify-write across processes without a lock sidecar.
++        let directory = match File::open(&codex_home) {
++            Ok(directory) => directory,
++            Err(err) if err.kind() == ErrorKind::NotFound && replacement.is_none() => {
++                return Ok(());
++            }
++            Err(err) => return Err(err),
++        };
++        directory.lock()?;
++        let path = session_index_path(&codex_home);
+         let contents = match std::fs::read_to_string(&path) {
+             Ok(contents) => contents,
+-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
++            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+             Err(err) => return Err(err),
+         };
+         let mut removed = false;
+         let mut remaining = String::with_capacity(contents.len());
+         for line in contents.lines() {
+-            let stale = serde_json::from_str::<SessionIndexEntry>(line.trim())
+-                .is_ok_and(|entry| !rollout_ids.contains(&entry.id));
+-            if stale {
++            let discard = serde_json::from_str::<SessionIndexEntry>(line.trim())
++                .is_ok_and(|entry| !retain(&entry));
++            if discard {
+                 removed = true;
+             } else {
+                 remaining.push_str(line);
+                 remaining.push('\n');
+             }
+         }
+-        if !removed {
++        if let Some(entry) = replacement {
++            remaining.push_str(&serde_json::to_string(&entry).map_err(std::io::Error::other)?);
++            remaining.push('\n');
++        } else if !removed {
+             return Ok(());
+         }
+-        let temp_path = path.with_extension("jsonl.tmp");
+-        std::fs::write(&temp_path, remaining)?;
+-        std::fs::rename(temp_path, path)
++        let mut temp = tempfile::NamedTempFile::new_in(&codex_home)?;
++        match std::fs::metadata(&path) {
++            Ok(metadata) => temp.as_file().set_permissions(metadata.permissions())?,
++            Err(err) if err.kind() == ErrorKind::NotFound => {}
++            Err(err) => return Err(err),
++        }
++        temp.write_all(remaining.as_bytes())?;
++        temp.persist(path).map_err(|err| err.error)?;
++        Ok(())
+     })
+     .await
+ }
+diff --git a/codex-rs/rollout/src/session_index_tests.rs b/codex-rs/rollout/src/session_index_tests.rs
+--- a/codex-rs/rollout/src/session_index_tests.rs
++++ b/codex-rs/rollout/src/session_index_tests.rs
+@@ -356,6 +356,100 @@ async fn reverse_lookup_accepts_valid_eof_json_and_skips_invalid() -> std::io::R
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn renaming_replaces_duplicate_entries_and_preserves_unrelated_lines() -> std::io::Result<()>
++{
++    use std::os::unix::fs::PermissionsExt;
++
++    let home = TempDir::new()?;
++    let path = session_index_path(home.path());
++    let id = ThreadId::new();
++    let old = SessionIndexEntry {
++        id,
++        thread_name: "old name".to_string(),
++        updated_at: "2024-01-01T00:00:00Z".to_string(),
++    };
++    let retained = SessionIndexEntry {
++        id: ThreadId::new(),
++        thread_name: "unrelated".to_string(),
++        ..old.clone()
++    };
++    write_index(&path, &[old.clone(), retained.clone(), old])?;
++    std::fs::OpenOptions::new()
++        .append(true)
++        .open(&path)?
++        .write_all(b"malformed\n")?;
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
++
++    for name in ["new name", "newest name", ""] {
++        append_thread_name(home.path(), id, name).await?;
++        let contents = std::fs::read_to_string(&path)?;
++        let entries: Vec<SessionIndexEntry> = contents
++            .lines()
++            .filter_map(|line| serde_json::from_str(line).ok())
++            .collect();
++        assert_eq!(entries.len(), 2);
++        assert_eq!(entries[0], retained);
++        assert_eq!((entries[1].id, entries[1].thread_name.as_str()), (id, name));
++        assert!(contents.lines().any(|line| line == "malformed"));
++        assert_eq!(
++            std::fs::metadata(&path)?.permissions().mode() & 0o777,
++            0o640
++        );
++        assert_eq!(
++            find_thread_name_by_id(home.path(), &id).await?,
++            Some(name.to_string())
++        );
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn index_replacement_holds_directory_lock_and_preserves_open_readers() -> std::io::Result<()>
++{
++    use std::io::Read;
++
++    let home = TempDir::new()?;
++    let id = ThreadId::new();
++    append_thread_name(home.path(), id, "original").await?;
++    let path = session_index_path(home.path());
++    let original = std::fs::read_to_string(&path)?;
++    let mut reader = File::open(&path)?;
++    let directory = File::open(home.path())?;
++    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
++    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
++    let reached_tx = std::sync::Mutex::new(Some(reached_tx));
++    let update_home = home.path().to_path_buf();
++    let update = tokio::spawn(async move {
++        update_session_index(
++            &update_home,
++            move |_| {
++                reached_tx.lock().unwrap().take().unwrap().send(()).unwrap();
++                let _ = resume_rx.recv();
++                false
++            },
++            None,
++        )
++        .await
++    });
++    reached_rx.await.unwrap();
++    let lock_is_held = matches!(directory.try_lock(), Err(std::fs::TryLockError::WouldBlock));
++    resume_tx.send(()).unwrap();
++    update.await.unwrap()?;
++    assert!(
++        lock_is_held,
++        "another process must not enter the read-modify-write operation"
++    );
++    directory
++        .try_lock()
++        .expect("directory lock released after publication");
++    let mut retained = String::new();
++    reader.read_to_string(&mut retained)?;
++    assert_eq!(retained, original);
++    assert_eq!(std::fs::read_to_string(path)?, "");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn append_and_remove_thread_names_preserves_other_entries() -> std::io::Result<()> {
+     let temp = TempDir::new()?;

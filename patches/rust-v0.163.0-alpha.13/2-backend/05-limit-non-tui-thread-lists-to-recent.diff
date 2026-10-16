@@ -1,0 +1,236 @@
+limit-non-tui-thread-lists-to-recent
+
+Lane: backend
+
+FlatPatch: limit-non-tui-thread-lists-to-recent
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Keep non-TUI thread-list clients restricted to the five most recently updated matching threads while preserving the TUI browsing contract.
+
+Requires: none
+
+Provides: Use the initialized client name to preserve codex-tui list pagination and sorting; other clients ignore supplied cursors, use updated-at descending order with a limit of five, and receive no forward or backward cursor while other native filters remain intact.
+
+Boundary: Only thread/list is restricted; thread search, direct thread reads, native filter validation and storage ownership remain unchanged. Client naming selects presentation scope rather than an authorization boundary.
+
+Verification: The non-TUI list test verifies recency, the five-item limit and cursor removal; TUI pagination and section-order tests preserve full browsing and restart behavior.
+
+
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1481,7 +1481,9 @@ impl MessageProcessor {
+                     .await
+             }
+             ClientRequest::ThreadList { params, .. } => {
+-                self.thread_processor.thread_list(params).await
++                self.thread_processor
++                    .thread_list(params, app_server_client_name.as_deref())
++                    .await
+             }
+             ClientRequest::ProjectList { params, .. } => {
+                 self.project_processor.project_list(params).await
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -830,11 +830,22 @@ impl ThreadRequestProcessor {
+ 
+     pub(crate) async fn thread_list(
+         &self,
+-        params: ThreadListParams,
++        mut params: ThreadListParams,
++        app_server_client_name: Option<&str>,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.thread_list_response_inner(params)
+-            .await
+-            .map(|response| Some(response.into()))
++        let limit_to_recent = app_server_client_name != Some("codex-tui");
++        if limit_to_recent {
++            params.cursor = None;
++            params.limit = Some(5);
++            params.sort_key = Some(ThreadSortKey::UpdatedAt);
++            params.sort_direction = Some(SortDirection::Desc);
++        }
++        let mut response = self.thread_list_response_inner(params).await?;
++        if limit_to_recent {
++            response.next_cursor = None;
++            response.backwards_cursor = None;
++        }
++        Ok(Some(response.into()))
+     }
+ 
+     pub(crate) async fn thread_search(
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_list.rs b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+@@ -11,6 +11,7 @@ use app_test_support::rollout_path;
+ use app_test_support::test_absolute_path;
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::GitInfo as ApiGitInfo;
+ use codex_app_server_protocol::JSONRPCError;
+@@ -64,10 +65,24 @@ use uuid::Uuid;
+ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+ 
+ async fn init_mcp(codex_home: &Path) -> Result<TestAppServer> {
+-    TestAppServer::builder()
++    init_mcp_with_client_name(codex_home, "codex-tui").await
++}
++
++async fn init_mcp_with_client_name(codex_home: &Path, client_name: &str) -> Result<TestAppServer> {
++    let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home)
+-        .build_initialized()
+-        .await
++        .build()
++        .await?;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.initialize_with_client_info(ClientInfo {
++            name: client_name.to_string(),
++            title: None,
++            version: "0.1.0".to_string(),
++        }),
++    )
++    .await??;
++    Ok(mcp)
+ }
+ 
+ async fn list_threads(
+@@ -484,6 +499,65 @@ async fn thread_list_exclusions_validate_bound_without_truncating_and_keep_secti
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn non_tui_thread_list_returns_only_recent_five_without_cursors() -> Result<()> {
++    let codex_home = TempDir::new()?;
++    create_minimal_config(codex_home.path())?;
++    let mut ids = Vec::new();
++    for day in 1..=6 {
++        let (filename, timestamp) = timestamp_at(2025, 1, day, 12, 0, 0);
++        ids.push(create_fake_rollout(
++            codex_home.path(),
++            &filename,
++            &timestamp,
++            "Hello",
++            Some("mock_provider"),
++            /*git_info*/ None,
++        )?);
++    }
++
++    let mut mcp = init_mcp_with_client_name(codex_home.path(), "codex-vscode").await?;
++    let response: ThreadListResponse = mcp
++        .request(|request_id| ClientRequest::ThreadList {
++            request_id,
++            params: codex_app_server_protocol::ThreadListParams {
++                cursor: Some("ignored-client-cursor".to_string()),
++                limit: Some(100),
++                excluded_thread_ids: None,
++                sort_key: Some(ThreadSortKey::CreatedAt),
++                sort_direction: Some(SortDirection::Asc),
++                model_providers: Some(vec!["mock_provider".to_string()]),
++                source_kinds: None,
++                originators: None,
++                archived: None,
++                section_id: None,
++                project_id: None,
++                cwd: None,
++                use_state_db_only: false,
++                search_term: None,
++                parent_thread_id: None,
++                ancestor_thread_id: None,
++            },
++        })
++        .await?;
++
++    assert_eq!(
++        response
++            .data
++            .iter()
++            .map(|thread| thread.id.as_str())
++            .collect::<Vec<_>>(),
++        ids.iter()
++            .rev()
++            .take(5)
++            .map(String::as_str)
++            .collect::<Vec<_>>()
++    );
++    assert_eq!(response.next_cursor, None);
++    assert_eq!(response.backwards_cursor, None);
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn thread_list_reports_system_error_idle_flag_after_failed_turn() -> Result<()> {
+     let responses = vec![
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_metadata_update.rs b/codex-rs/app-server/tests/suite/v2/thread_metadata_update.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_metadata_update.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_metadata_update.rs
+@@ -5,6 +5,7 @@ use app_test_support::create_fake_rollout;
+ use app_test_support::create_mock_responses_server_repeating_assistant;
+ use app_test_support::rollout_path;
+ use app_test_support::to_response;
++use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::GitInfo;
+ use codex_app_server_protocol::JSONRPCError;
+@@ -221,7 +222,15 @@ async fn thread_section_move_pins_and_unpins_with_filtered_recency_pagination()
+         .with_codex_home(codex_home.path())
+         .build()
+         .await?;
+-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.initialize_with_client_info(ClientInfo {
++            name: "codex-tui".to_string(),
++            title: None,
++            version: "0.1.0".to_string(),
++        }),
++    )
++    .await??;
+ 
+     let pinned_section = ThreadSection {
+         id: PINNED_THREAD_SECTION_ID.to_string(),
+@@ -463,8 +472,17 @@ async fn thread_sections_preserve_server_owned_manual_order_across_moves_and_res
+ 
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
+-        .build_initialized()
++        .build()
+         .await?;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.initialize_with_client_info(ClientInfo {
++            name: "codex-tui".to_string(),
++            title: None,
++            version: "0.1.0".to_string(),
++        }),
++    )
++    .await??;
+ 
+     for thread_id in [first_pinned, second_pinned, third_pinned] {
+         let request_id = mcp
+@@ -566,8 +584,17 @@ async fn thread_sections_preserve_server_owned_manual_order_across_moves_and_res
+     drop(mcp);
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
+-        .build_initialized()
++        .build()
+         .await?;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.initialize_with_client_info(ClientInfo {
++            name: "codex-tui".to_string(),
++            title: None,
++            version: "0.1.0".to_string(),
++        }),
++    )
++    .await??;
+     let request_id = mcp.send_thread_list_request(list_params).await?;
+     let response = timeout(
+         DEFAULT_READ_TIMEOUT,

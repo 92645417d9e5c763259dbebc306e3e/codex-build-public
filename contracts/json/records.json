@@ -67,6 +67,7 @@
   ],
   "PatchReplayRow": {
     "Common": "KindLaneFormSegment",
+    "Contract": "SelectedListOnlyPurposeRequiresProvidesBoundaryVerificationAndCrossGroupOnlyForCrossFromFirstCommit",
     "FlatPatch": "ExactlyFlatPatchName",
     "Unit": "ExactlyUnitNameAndAtLeastTwoOrderedChildPatches",
     "Transform": "ExactlyTransformNameAndTransformPatch"

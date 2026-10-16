@@ -1,0 +1,216 @@
+restore-indexed-titles-on-rebuild
+
+Lane: backend
+
+Unit: rebuild-sqlite-history-from-paginated-rollouts
+
+ChildPatch: restore-indexed-titles-on-rebuild
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/rollout/src/metadata.rs b/codex-rs/rollout/src/metadata.rs
+--- a/codex-rs/rollout/src/metadata.rs
++++ b/codex-rs/rollout/src/metadata.rs
+@@ -26,6 +26,7 @@ use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
+ use codex_state::ExtractionOutcome;
+ use codex_state::ThreadMetadataBuilder;
+ use codex_state::apply_rollout_item;
++use std::collections::HashSet;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use tracing::info;
+@@ -295,6 +296,24 @@ pub(crate) async fn backfill_sessions_with_lease(
+         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
+     }
+ 
++    let thread_ids: HashSet<ThreadId> = rollout_paths
++        .iter()
++        .filter_map(|rollout| thread_id_from_path(&rollout.path))
++        .collect();
++    let indexed_names =
++        match crate::session_index::find_thread_names_by_ids(codex_home, &thread_ids).await {
++            Ok(names) => names,
++            Err(err) => {
++                // Do not checkpoint nameless rows as rebuilt after an unreadable index.
++                // The existing lease permits a later startup to resume this backfill.
++                warn!(
++                    "failed to read session names at {}: {err}",
++                    codex_home.display()
++                );
++                return;
++            }
++        };
++
+     let mut stats = BackfillStats {
+         scanned: 0,
+         upserted: 0,
+@@ -316,6 +335,9 @@ pub(crate) async fn backfill_sessions_with_lease(
+                         );
+                     }
+                     let mut metadata = outcome.metadata;
++                    // Native upsert inserts names for missing rows and leaves existing
++                    // SQLite names, including explicit clears, unchanged.
++                    metadata.name = indexed_names.get(&metadata.id).cloned();
+                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
+                     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
+                     let existing_metadata = runtime.get_thread(metadata.id).await.ok().flatten();
+diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
+--- a/codex-rs/rollout/src/metadata_tests.rs
++++ b/codex-rs/rollout/src/metadata_tests.rs
+@@ -522,6 +522,153 @@ async fn backfill_sessions_preserves_existing_paginated_memory_mode() {
+     );
+ }
+ 
++#[tokio::test]
++async fn backfill_restores_indexed_names_for_active_and_archived_rows() {
++    let dir = tempdir().expect("tempdir");
++    let home = dir.path();
++    let runtime = codex_state::StateRuntime::init(
++        codex_state::SqliteConfig::new_for_testing(home.abs()),
++        "test-provider".to_string(),
++    )
++    .await
++    .expect("initialize runtime");
++    let mut threads = Vec::new();
++    for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
++        for archived in [false, true] {
++            let uuid = Uuid::new_v4();
++            let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++            let path = write_rollout_in_sessions_with_cwd(
++                home,
++                "2026-01-27T12-34-56",
++                "2026-01-27T12:34:56Z",
++                uuid,
++                home.to_path_buf(),
++                None,
++                mode,
++            );
++            if archived {
++                let archive = home.join(ARCHIVED_SESSIONS_SUBDIR);
++                std::fs::create_dir_all(&archive).expect("create archive");
++                std::fs::rename(
++                    &path,
++                    archive.join(path.file_name().expect("rollout filename")),
++                )
++                .expect("archive rollout");
++            }
++            for name in ["previous name", "restored name"] {
++                crate::session_index::append_thread_name(home, id, name)
++                    .await
++                    .expect("index name");
++            }
++            threads.push((id, mode, archived));
++        }
++    }
++
++    backfill_sessions(runtime.as_ref(), home, "test-provider").await;
++
++    for (id, mode, archived) in threads {
++        let stored = runtime
++            .get_thread(id)
++            .await
++            .expect("get thread")
++            .expect("backfilled row");
++        assert_eq!(stored.name.as_deref(), Some("restored name"));
++        assert_eq!(stored.history_mode, mode);
++        assert_eq!(stored.archived_at.is_some(), archived);
++    }
++    assert_eq!(
++        runtime
++            .get_backfill_state()
++            .await
++            .expect("backfill state")
++            .status,
++        BackfillStatus::Complete
++    );
++}
++
++#[tokio::test]
++async fn backfill_preserves_sqlite_names_and_explicit_clears() {
++    let dir = tempdir().expect("tempdir");
++    let home = dir.path();
++    let runtime = codex_state::StateRuntime::init(
++        codex_state::SqliteConfig::new_for_testing(home.abs()),
++        "test-provider".to_string(),
++    )
++    .await
++    .expect("initialize runtime");
++    let mut threads = Vec::new();
++    for name in [Some("SQLite name"), None] {
++        let uuid = Uuid::new_v4();
++        let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++        let path = write_rollout_in_sessions_with_cwd(
++            home,
++            "2026-01-27T12-34-56",
++            "2026-01-27T12:34:56Z",
++            uuid,
++            home.to_path_buf(),
++            None,
++            ThreadHistoryMode::Paginated,
++        );
++        let mut metadata = extract_metadata_from_rollout(&path, "test-provider")
++            .await
++            .expect("extract metadata")
++            .metadata;
++        metadata.name = name.map(str::to_string);
++        runtime
++            .upsert_thread(&metadata)
++            .await
++            .expect("existing row");
++        crate::session_index::append_thread_name(home, id, "stale indexed name")
++            .await
++            .expect("index name");
++        threads.push((id, name));
++    }
++
++    backfill_sessions(runtime.as_ref(), home, "test-provider").await;
++
++    for (id, name) in threads {
++        let stored = runtime
++            .get_thread(id)
++            .await
++            .expect("get thread")
++            .expect("existing row");
++        assert_eq!(stored.name.as_deref(), name);
++    }
++}
++
++#[tokio::test]
++async fn unreadable_name_index_leaves_backfill_unfinished() {
++    let dir = tempdir().expect("tempdir");
++    let home = dir.path();
++    let uuid = Uuid::new_v4();
++    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    write_rollout_in_sessions(
++        home,
++        "2026-01-27T12-34-56",
++        "2026-01-27T12:34:56Z",
++        uuid,
++        None,
++    );
++    let index_path = home.join("session_index.jsonl");
++    // Opening a directory can produce an empty seekable input on Linux. A socket
++    // keeps the path present while making the native file open fail.
++    let _socket = std::os::unix::net::UnixListener::bind(&index_path).expect("block index read");
++    assert!(File::open(&index_path).is_err());
++    let runtime = codex_state::StateRuntime::init(
++        codex_state::SqliteConfig::new_for_testing(home.abs()),
++        "test-provider".to_string(),
++    )
++    .await
++    .expect("initialize runtime");
++
++    backfill_sessions(runtime.as_ref(), home, "test-provider").await;
++
++    assert!(runtime.get_thread(id).await.expect("get thread").is_none());
++    let state = runtime.get_backfill_state().await.expect("backfill state");
++    assert_eq!(state.status, BackfillStatus::Running);
++    assert_eq!(state.last_watermark, None);
++}
++
+ #[tokio::test]
+ async fn backfill_sessions_normalizes_cwd_before_upsert() {
+     let dir = tempdir().expect("tempdir");

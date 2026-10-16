@@ -1,2 +1,0 @@
-- Default `CODEX_HOME` to `/codex` and `CODEX_HARNESS` to `/harness`.
-- Ensure and publish `CODEX_HOME`, `CODEX_HARNESS`, and `TMPDIR`.

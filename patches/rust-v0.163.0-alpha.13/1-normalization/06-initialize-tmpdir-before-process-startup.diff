@@ -1,0 +1,140 @@
+initialize-tmpdir-before-process-startup
+
+Lane: normalization
+
+FlatPatch: initialize-tmpdir-before-process-startup
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Ensure and publish a canonical temporary root before normal process startup creates worker threads.
+
+Requires: none
+
+Provides: Preserve a nonempty TMPDIR override, otherwise remove an empty override and select the standard-library host temporary root; create and canonicalize the selected directory, propagate errors, and publish TMPDIR.
+
+Boundary: Home and harness selection, component-specific staging, and sandbox temporary-directory policy remain separate responsibilities.
+
+Verification: arg0 tmpdir_selection tests and home-dir ensure_tmpdir_creates_selected_override verify missing and empty selection, explicit overrides, directory creation, and canonical paths.
+
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -13,6 +13,7 @@ use codex_install_context::InstallContext;
+ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+ use codex_utils_home_dir::ensure_codex_harness;
+ use codex_utils_home_dir::ensure_codex_home;
++use codex_utils_home_dir::ensure_tmpdir;
+ use codex_utils_home_dir::find_codex_home;
+ #[cfg(target_os = "windows")]
+ use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
+@@ -206,6 +207,16 @@ where
+     let codex_harness = ensure_codex_harness()?;
+     // SAFETY: this runs before creating worker threads.
+     unsafe { std::env::set_var("CODEX_HARNESS", codex_harness.as_path()) };
++    let tmpdir_env = std::env::var_os("TMPDIR").filter(|value| !value.is_empty());
++    if tmpdir_env.is_none() {
++        // SAFETY: this runs before creating worker threads. Removing an empty override lets the
++        // standard library resolve the host's native temporary root.
++        unsafe { std::env::remove_var("TMPDIR") };
++    }
++    let tmpdir_path = select_tmpdir(tmpdir_env, std::env::temp_dir);
++    let tmpdir = ensure_tmpdir(&tmpdir_path)?;
++    // SAFETY: this runs before creating worker threads.
++    unsafe { std::env::set_var("TMPDIR", tmpdir.as_path()) };
+     let current_exe = std::env::current_exe().ok();
+ 
+     // Regular invocation. Run the async entry point on a thread with the same
+@@ -228,6 +239,12 @@ where
+     }
+ }
+ 
++fn select_tmpdir(tmpdir_env: Option<OsString>, host_temp_dir: impl FnOnce() -> PathBuf) -> PathBuf {
++    tmpdir_env
++        .filter(|value| !value.is_empty())
++        .map_or_else(host_temp_dir, PathBuf::from)
++}
++
+ async fn run_main_with_arg0_guard<F, Fut>(
+     path_entry_guard: Option<Arg0PathEntryGuard>,
+     current_exe: Option<PathBuf>,
+@@ -506,6 +523,8 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::ffi::OsString;
++
+     use super::Arg0DispatchPaths;
+     use super::Arg0PathEntryGuard;
+     use super::LOCK_FILENAME;
+@@ -546,6 +565,26 @@ mod tests {
+             .open(lock_path)
+     }
+ 
++    #[test]
++    fn tmpdir_selection_uses_host_root_for_missing_or_empty_override() {
++        for tmpdir_env in [None, Some(OsString::new())] {
++            assert_eq!(
++                super::select_tmpdir(tmpdir_env, || PathBuf::from("/host/temp")),
++                PathBuf::from("/host/temp")
++            );
++        }
++    }
++
++    #[test]
++    fn tmpdir_selection_preserves_explicit_override() {
++        assert_eq!(
++            super::select_tmpdir(Some(OsString::from("/selected/temp")), || {
++                PathBuf::from("/host/temp")
++            }),
++            PathBuf::from("/selected/temp")
++        );
++    }
++
+     fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture> {
+         let temp_dir = TempDir::new()?;
+         let arg0_dir = temp_dir.path().join("arg0");
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -43,6 +43,12 @@ pub fn ensure_codex_harness() -> std::io::Result<AbsolutePathBuf> {
+     ensure_codex_harness_from_env(codex_harness_env.as_deref())
+ }
+ 
++/// Creates the selected temporary root and returns its canonical path.
++pub fn ensure_tmpdir(path: &std::path::Path) -> std::io::Result<AbsolutePathBuf> {
++    std::fs::create_dir_all(path)?;
++    AbsolutePathBuf::from_absolute_path(path.canonicalize()?)
++}
++
+ fn ensure_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
+     ensure_directory_from_env(codex_home_env, DEFAULT_CODEX_HOME)
+ }
+@@ -115,6 +121,7 @@ mod tests {
+     use super::DEFAULT_CODEX_HOME;
+     use super::ensure_codex_harness_from_env;
+     use super::ensure_codex_home_from_env;
++    use super::ensure_tmpdir;
+     use super::find_codex_harness_from_env;
+     use super::find_codex_home_from_env;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -224,4 +231,17 @@ mod tests {
+ 
+         assert_eq!(resolved.as_path(), selected.canonicalize().unwrap());
+     }
++
++    #[test]
++    fn ensure_tmpdir_creates_selected_override() {
++        let root = TempDir::new().expect("temp root");
++        let selected = root.path().join("selected-temp");
++
++        let resolved = ensure_tmpdir(&selected).expect("ensure selected temporary root");
++
++        assert_eq!(
++            resolved.as_path(),
++            selected.canonicalize().expect("canonical selected temp")
++        );
++    }
+ }

@@ -1,0 +1,256 @@
+export-reasoning-with-complete-history
+
+Lane: cross
+
+Unit: present-complete-reasoning-in-tui
+
+ChildPatch: export-reasoning-with-complete-history
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app/transcript_export.rs b/codex-rs/tui/src/app/transcript_export.rs
+--- a/codex-rs/tui/src/app/transcript_export.rs
++++ b/codex-rs/tui/src/app/transcript_export.rs
+@@ -1,5 +1,6 @@
+ //! Complete, Markdown-preserving conversation exports.
+ 
++use std::collections::BTreeSet;
+ use std::io::Write;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -10,6 +11,7 @@ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::Turn;
+ use codex_protocol::ThreadId;
+ use codex_protocol::models::local_image_label_text;
++use codex_utils_absolute_path::AbsolutePathBuf;
+ 
+ use super::App;
+ use crate::app_event::TranscriptExportDestination;
+@@ -26,7 +28,7 @@ use crate::history_cell::UserHistoryCell;
+ use crate::history_cell::raw_lines_from_source;
+ use crate::legacy_core::config::Config;
+ use crate::thread_transcript::RawReasoningVisibility;
+-use crate::thread_transcript::thread_items_to_transcript_cells;
++use crate::thread_transcript::item_to_cells;
+ 
+ impl App {
+     pub(super) async fn export_transcript(
+@@ -121,22 +123,50 @@ pub(super) async fn load_export_transcript(
+             return Err(format!("could not load conversation history: {error}"));
+         }
+     }
++    Ok(export_turns_to_cells(
++        thread_id,
++        &thread.cwd,
++        thread.turns,
++        visibility,
++        visible_reasoning,
++        config,
++    ))
++}
++
++fn export_turns_to_cells(
++    thread_id: ThreadId,
++    cwd: &AbsolutePathBuf,
++    turns: Vec<Turn>,
++    visibility: RawReasoningVisibility,
++    visible_reasoning: bool,
++    config: Option<&Config>,
++) -> Vec<Arc<dyn HistoryCell>> {
++    let context = config.and_then(|config| {
++        crate::inline_visualization::InlineVisualizationContext::from_config(config, thread_id)
++    });
+     let mut cells: Vec<Arc<dyn HistoryCell>> = Vec::new();
+-    for item in visible_export_items(thread.turns) {
+-        if let Some(cell) = export_activity_cell(&item) {
+-            cells.push(Arc::new(cell));
+-        } else {
+-            cells.extend(thread_items_to_transcript_cells(
+-                Some(thread_id),
+-                &thread.cwd,
+-                [item],
+-                visibility,
+-                visible_reasoning,
+-                config,
+-            ));
++    for turn in visible_export_turns(turns) {
++        let mut seen = BTreeSet::new();
++        for item in turn.items {
++            if let Some(cell) = export_activity_cell(&item) {
++                cells.push(Arc::new(cell));
++            } else if let Some(cell) =
++                crate::thread_transcript::tools::historical_tool_fallback(&item)
++            {
++                cells.push(Arc::new(cell));
++            } else {
++                cells.extend(item_to_cells(
++                    item,
++                    cwd,
++                    visibility,
++                    visible_reasoning,
++                    &mut seen,
++                    context.clone(),
++                ));
++            }
+         }
+     }
+-    Ok(cells)
++    cells
+ }
+ 
+ fn export_activity_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+@@ -202,29 +232,25 @@ fn export_activity_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+     Some(PlainHistoryCell::new(lines))
+ }
+ 
+-fn visible_export_items(turns: Vec<Turn>) -> Vec<ThreadItem> {
+-    let mut visible = Vec::new();
++fn visible_export_turns(mut turns: Vec<Turn>) -> Vec<Turn> {
+     let mut review_mode = false;
+-    let mut previous_turn = None;
+-
+-    for turn in turns {
+-        let hidden_nested_review_turn = previous_turn.as_ref().is_some_and(|previous| {
+-            crate::app_backtrack::is_hidden_nested_review_turn(previous, &turn)
++    for index in 0..turns.len() {
++        let (previous, current) = turns.split_at_mut(index);
++        let turn = &mut current[0];
++        let hidden_nested_review_turn = previous.last().is_some_and(|previous| {
++            crate::app_backtrack::is_hidden_nested_review_turn(previous, turn)
+         });
+-        for item in turn.items.iter().cloned() {
+-            match item {
+-                ThreadItem::EnteredReviewMode { .. } | ThreadItem::ExitedReviewMode { .. } => {
+-                    review_mode = matches!(item, ThreadItem::EnteredReviewMode { .. });
+-                    visible.push(item);
+-                }
+-                ThreadItem::UserMessage { .. } if review_mode || hidden_nested_review_turn => {}
+-                _ => visible.push(item),
++        // Review markers remain available to classify the following turn.
++        turn.items.retain(|item| match item {
++            ThreadItem::EnteredReviewMode { .. } | ThreadItem::ExitedReviewMode { .. } => {
++                review_mode = matches!(item, ThreadItem::EnteredReviewMode { .. });
++                true
+             }
+-        }
+-        previous_turn = Some(turn);
++            ThreadItem::UserMessage { .. } if review_mode || hidden_nested_review_turn => false,
++            _ => true,
++        });
+     }
+-
+-    visible
++    turns
+ }
+ 
+ fn render_markdown_transcript(cells: &[Arc<dyn HistoryCell>]) -> Result<String, String> {
+diff --git a/codex-rs/tui/src/app/transcript_export_tests.rs b/codex-rs/tui/src/app/transcript_export_tests.rs
+--- a/codex-rs/tui/src/app/transcript_export_tests.rs
++++ b/codex-rs/tui/src/app/transcript_export_tests.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ use pretty_assertions::assert_eq;
+ 
+ use super::render_markdown_transcript;
+-use super::visible_export_items;
++use super::visible_export_turns;
+ use super::write_transcript;
+ use crate::history_cell::AgentMarkdownCell;
+ use crate::history_cell::HistoryCell;
+@@ -107,8 +107,11 @@ fn transcript_export_excludes_hidden_review_prompts_and_nested_duplicates() {
+         TurnStatus::Interrupted,
+     );
+     assert_eq!(
+-        visible_export_items(vec![review.clone(), nested]),
+-        vec![entered_review.clone(), exited_review.clone()],
++        visible_export_turns(vec![review.clone(), nested])
++            .into_iter()
++            .map(|turn| turn.items)
++            .collect::<Vec<_>>(),
++        vec![vec![entered_review.clone(), exited_review.clone()], vec![]],
+     );
+     let completed = turn(
+         "completed-turn",
+@@ -116,8 +119,14 @@ fn transcript_export_excludes_hidden_review_prompts_and_nested_duplicates() {
+         TurnStatus::Completed,
+     );
+     assert_eq!(
+-        visible_export_items(vec![review, completed]),
+-        vec![entered_review, exited_review, duplicate_one, duplicate_two],
++        visible_export_turns(vec![review, completed])
++            .into_iter()
++            .map(|turn| turn.items)
++            .collect::<Vec<_>>(),
++        vec![
++            vec![entered_review, exited_review],
++            vec![duplicate_one, duplicate_two]
++        ],
+     );
+ }
+ 
+@@ -202,6 +211,63 @@ fn transcript_file_resolves_relative_paths_and_refuses_to_overwrite() {
+     assert!(error.contains(&dirs::home_dir().expect("home").display().to_string()));
+ }
+ 
++#[test]
++fn export_reasoning_deduplicates_across_steers_but_keeps_turn_boundaries() {
++    let reasoning = |id: &str| ThreadItem::Reasoning {
++        id: id.into(),
++        summary: vec!["**Inspect**\n\nRetained [link](https://example.com).".into()],
++        content: vec!["Private raw".into()],
++    };
++    let turn = |id: &str, items| Turn {
++        id: id.into(),
++        root_turn_id: None,
++        items,
++        items_view: TurnItemsView::Full,
++        status: TurnStatus::Completed,
++        error: None,
++        started_at: None,
++        completed_at: None,
++        duration_ms: None,
++    };
++    let turns = vec![
++        turn(
++            "first",
++            vec![
++                reasoning("one"),
++                ThreadItem::UserMessage {
++                    id: "steer".into(),
++                    client_id: None,
++                    content: vec![UserInput::Text {
++                        text: "Continue".into(),
++                        text_elements: Vec::new(),
++                    }],
++                },
++                reasoning("two"),
++            ],
++        ),
++        turn("second", vec![reasoning("three")]),
++    ];
++    let cells = super::export_turns_to_cells(
++        codex_protocol::ThreadId::new(),
++        &codex_utils_absolute_path::AbsolutePathBuf::current_dir().unwrap(),
++        turns,
++        crate::thread_transcript::RawReasoningVisibility::Hidden,
++        true,
++        None,
++    );
++    let markdown = render_markdown_transcript(&cells).unwrap();
++    assert_eq!(markdown.matches("## Reasoning").count(), 2);
++    assert_eq!(markdown.matches("**Inspect**").count(), 2);
++    assert_eq!(
++        markdown
++            .matches("Retained [link](https://example.com).")
++            .count(),
++        2
++    );
++    assert!(markdown.contains("## User\n\nContinue"));
++    assert!(!markdown.contains("Private raw"));
++}
++
+ #[test]
+ fn persisted_web_and_image_activity_preserves_full_details() {
+     let items = [

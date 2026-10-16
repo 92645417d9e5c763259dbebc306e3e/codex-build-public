@@ -1,0 +1,384 @@
+resolve-daemon-executable-from-local-package
+
+Lane: normalization
+
+FlatPatch: resolve-daemon-executable-from-local-package
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Use the locally prepared package for managed daemon launches without upstream package installation or self-update.
+
+Requires: none
+
+Provides: Resolve the selected local release through build/dist/current/bin/codex, preserve launcher environment, and report missing or broken package paths and unsupported managed update modes explicitly.
+
+Boundary: Package construction and activation remain external build owners; daemon lifecycle, process roots, and configuration remain unchanged.
+
+Verification: app-server managed_install.rs and prepare_install.rs tests cover local package resolution, broken current links, prepared executable selection, and rejection of upstream managed release operations.
+
+
+diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
+--- a/codex-rs/app-server-daemon/src/managed_install.rs
++++ b/codex-rs/app-server-daemon/src/managed_install.rs
+@@ -14,10 +14,15 @@ use tokio::fs;
+ use tokio::process::Command;
+ use tokio::time::timeout;
+ 
+-/// New daemons own their packages, regardless of how the calling CLI was installed.
++/// Resolve a local release selection before upstream managed package layouts.
+ /// Preserve legacy launch state, including logs left after a daemon is stopped;
+ /// settings, installer selections, and lock files alone do not prove a prior launch.
+ pub(crate) fn package_root(codex_home: &Path) -> PathBuf {
++    if !matches!(codex_home.join("release").symlink_metadata(),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
++    {
++        return codex_home.to_path_buf();
++    }
+     let dedicated = codex_home.join("packages/app-server-daemon");
+     if !matches!(dedicated.join("current").symlink_metadata(),
+         Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+@@ -58,10 +63,15 @@ pub(crate) fn package_root(codex_home: &Path) -> PathBuf {
+ /// Resolve both packaged and legacy binaries without requiring a valid install.
+ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
+     let root = package_root(codex_home);
+-    let current = root.join("current");
+-    let packaged = current.join("bin").join(managed_codex_file_name());
+-    let legacy = current.join(managed_codex_file_name());
+-    if packaged.is_file()
++    let selection = root.join(if root == codex_home {
++        "release"
++    } else {
++        "current"
++    });
++    let packaged = selection.join("bin").join(managed_codex_file_name());
++    let legacy = selection.join(managed_codex_file_name());
++    if root == codex_home
++        || packaged.is_file()
+         || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon"))
+     {
+         packaged
+diff --git a/codex-rs/app-server-daemon/src/managed_install_path_tests.rs b/codex-rs/app-server-daemon/src/managed_install_path_tests.rs
+--- a/codex-rs/app-server-daemon/src/managed_install_path_tests.rs
++++ b/codex-rs/app-server-daemon/src/managed_install_path_tests.rs
+@@ -1,5 +1,95 @@
+ use pretty_assertions::assert_eq;
+ 
++#[test]
++fn local_selection_uses_the_short_link_and_observes_dist_switches() {
++    let temporary = tempfile::TempDir::new().expect("temporary directory");
++    let home = temporary.path().join("home");
++    let dist = temporary.path().join("build/dist");
++    std::fs::create_dir(&home).expect("home");
++    for version in ["first", "second"] {
++        let binary = dist.join(version).join("bin/codex");
++        std::fs::create_dir_all(binary.parent().expect("binary parent"))
++            .expect("package bin directory");
++        std::fs::write(binary, version).expect("package executable");
++        let package = dist.join(version);
++        std::fs::write(
++            package.join("codex-package.json"),
++            br#"{"version":"0.161.0-alpha.3"}"#,
++        )
++        .expect("package metadata");
++        for helper in [
++            "bin/codex-code-mode-host",
++            "codex-path/rg",
++            "codex-path/shuck",
++            "codex-path/tokei",
++            "codex-resources/bwrap",
++            "codex-resources/voice/bin/codex-voice-host",
++        ] {
++            let path = package.join(helper);
++            std::fs::create_dir_all(path.parent().expect("helper parent"))
++                .expect("helper directory");
++            std::fs::write(path, b"helper").expect("package helper");
++        }
++    }
++    let current = dist.join("current");
++    std::os::unix::fs::symlink("first", &current).expect("dist selection");
++    let home_release = home.join("release");
++    std::os::unix::fs::symlink(&current, &home_release).expect("stable home link");
++    assert_eq!(super::package_root(&home), home.clone());
++    assert_eq!(
++        super::managed_codex_bin(&home),
++        home_release.join("bin/codex")
++    );
++    assert_eq!(
++        super::managed_codex_bin(&home).canonicalize().unwrap(),
++        dist.join("first/bin/codex")
++    );
++    let replacement = dist.join(".current");
++    std::os::unix::fs::symlink("second", &replacement).expect("next selection");
++    std::fs::rename(replacement, &current).expect("atomic selection");
++    assert_eq!(std::fs::read_link(&home_release).unwrap(), current);
++    assert_eq!(
++        super::managed_codex_bin(&home).canonicalize().unwrap(),
++        dist.join("second/bin/codex")
++    );
++    let context = codex_install_context::InstallContext::from_exe(
++        /*is_macos*/ false,
++        Some(&super::managed_codex_bin(&home)),
++        /*method_override*/ None,
++    );
++    assert_eq!(
++        (
++            context.rg_command(),
++            context.code_mode_host_program(),
++            context.bundled_resource("bwrap").unwrap().into_path_buf(),
++            context
++                .bundled_resource("voice/bin/codex-voice-host")
++                .unwrap()
++                .into_path_buf(),
++            context
++                .package_layout
++                .as_ref()
++                .unwrap()
++                .path_dir
++                .as_ref()
++                .unwrap()
++                .to_path_buf(),
++        ),
++        (
++            dist.join("second/codex-path/rg"),
++            dist.join("second/bin/codex-code-mode-host"),
++            dist.join("second/codex-resources/bwrap"),
++            dist.join("second/codex-resources/voice/bin/codex-voice-host"),
++            dist.join("second/codex-path"),
++        )
++    );
++    assert!(!super::is_stable_standalone_release(
++        &home,
++        &super::managed_codex_bin(&home)
++    ));
++    assert!(!home.join("packages").exists());
++}
++
+ #[test]
+ fn discovers_package_and_legacy_installs() {
+     let home = tempfile::TempDir::new().expect("home");
+diff --git a/codex-rs/app-server-daemon/src/prepare_install.rs b/codex-rs/app-server-daemon/src/prepare_install.rs
+--- a/codex-rs/app-server-daemon/src/prepare_install.rs
++++ b/codex-rs/app-server-daemon/src/prepare_install.rs
+@@ -99,6 +99,14 @@ async fn prepare_from_package(
+         daemon.managed_codex_bin.starts_with(&previous_root),
+         "daemon package location changed; retry the command"
+     );
++    if previous_root == home {
++        anyhow::ensure!(
++            mode == InstallMode::Missing,
++            "the local daemon package is selected by build/dist/current; update it with the local build installer"
++        );
++        daemon.ensure_managed_codex_bin()?;
++        return Ok(true);
++    }
+     if mode == InstallMode::Missing {
+         if previous_root != root
+             || daemon.running_backend_instance(settings).await?.is_some()
+@@ -144,10 +152,22 @@ async fn prepare_from_package(
+     let source = source.context(
+         "this CLI has no complete local package; install a packaged Codex CLI or use the standalone installer",
+     )?;
++    let canonical_source = source.canonicalize()?;
+     anyhow::ensure!(
+-        !root.canonicalize()?.starts_with(source.canonicalize()?),
++        !root.canonicalize()?.starts_with(&canonical_source),
+         "CODEX_HOME must be outside the source CLI package"
+     );
++    let releases = root.join("releases");
++    if releases.try_exists()? {
++        anyhow::ensure!(
++            !releases.canonicalize()?.starts_with(&canonical_source),
++            "daemon release store must be outside the source CLI package"
++        );
++        anyhow::ensure!(
++            !releases.join("codex-package.json").try_exists()?,
++            "local package selection belongs at CODEX_HOME/release, not the managed release store"
++        );
++    }
+     let manifest_bytes = std::fs::read(source.join("codex-package.json"))?;
+     let manifest: CodexPackageManifest = serde_json::from_slice(&manifest_bytes)?;
+     let version = manifest.version.to_string();
+@@ -223,7 +243,6 @@ async fn prepare_from_package(
+     );
+     let backend = current_backend;
+     let stable = stable_version(&version).is_some();
+-    let releases = root.join("releases");
+     std::fs::create_dir_all(&releases)?;
+     let stage = tempfile::Builder::new()
+         .prefix(".staging.")
+@@ -316,7 +335,6 @@ async fn prepare_from_package(
+     }
+     let release = release.canonicalize()?;
+     let standalone = home.join("packages/standalone");
+-    let canonical_source = source.canonicalize()?;
+     let follows_latest = mode == InstallMode::Missing
+         && stable
+         && (standalone.join("current").canonicalize().ok().as_deref()
+diff --git a/codex-rs/app-server-daemon/src/prepare_install_tests.rs b/codex-rs/app-server-daemon/src/prepare_install_tests.rs
+--- a/codex-rs/app-server-daemon/src/prepare_install_tests.rs
++++ b/codex-rs/app-server-daemon/src/prepare_install_tests.rs
+@@ -156,6 +156,162 @@ async fn seeds_full_package() {
+     }
+ }
+ 
++#[tokio::test]
++async fn short_local_selection_is_not_copied_or_replaced() {
++    let temporary = tempfile::TempDir::new().expect("temporary directory");
++    let home = temporary.path().join("home");
++    std::fs::create_dir(&home).expect("home");
++    let selected = temporary.path().join("build/dist/selected");
++    let selected_binary = package(&selected, "0.160.0");
++    let current = home.join("release");
++    std::os::unix::fs::symlink(&selected, &current).expect("local selection");
++    let source = temporary.path().join("other-package");
++    let source_binary = package(&source, "0.161.0");
++    let daemon = daemon(&home);
++    assert!(
++        prepare_from_package(
++            &daemon,
++            &DaemonSettings::default(),
++            InstallMode::Missing,
++            Some(&source),
++            &source_binary,
++            |_| panic!("local selection must not request installation"),
++        )
++        .await
++        .expect("reuse local package")
++    );
++    assert_eq!(std::fs::read_link(&current).unwrap(), selected);
++    assert_eq!(
++        crate::managed_install::managed_codex_bin(&home)
++            .canonicalize()
++            .unwrap(),
++        selected_binary
++    );
++    assert!(!home.join("packages").exists());
++    let error = prepare_from_package(
++        &daemon,
++        &DaemonSettings::default(),
++        InstallMode::Replace,
++        Some(&source),
++        &source_binary,
++        |_| panic!("local selection must not request replacement"),
++    )
++    .await
++    .expect_err("local installer owns selection");
++    assert!(error.to_string().contains("local build installer"));
++    assert_eq!(std::fs::read_link(&current).unwrap(), selected);
++    assert!(!home.join("packages").exists());
++}
++
++#[tokio::test]
++async fn broken_short_selection_is_not_seeded() {
++    let temporary = tempfile::TempDir::new().expect("temporary directory");
++    let home = temporary.path().join("home");
++    std::fs::create_dir(&home).expect("home");
++    let current = home.join("release");
++    std::os::unix::fs::symlink("missing-package", &current).expect("broken selection");
++    let source = temporary.path().join("source");
++    let binary = package(&source, "0.161.0");
++    let error = prepare_from_package(
++        &daemon(&home),
++        &DaemonSettings::default(),
++        InstallMode::Missing,
++        Some(&source),
++        &binary,
++        |_| panic!("broken local selection must not request replacement"),
++    )
++    .await
++    .expect_err("broken local selection");
++    assert!(
++        error
++            .to_string()
++            .contains("repair the existing installation")
++    );
++    assert_eq!(
++        std::fs::read_link(&current).unwrap(),
++        PathBuf::from("missing-package")
++    );
++    assert!(!home.join("packages").exists());
++}
++
++#[tokio::test]
++async fn rejects_a_release_store_inside_its_source_before_staging() {
++    let temporary = tempfile::TempDir::new().expect("temporary directory");
++    let home = temporary.path().join("home");
++    let source = temporary.path().join("source");
++    let binary = package(&source, "0.161.0");
++    let root = home.join("packages/app-server-daemon");
++    std::fs::create_dir_all(&root).expect("daemon package root");
++    let releases = root.join("releases");
++    std::os::unix::fs::symlink(&source, &releases).expect("unsafe releases link");
++    let error = prepare_from_package(
++        &daemon(&home),
++        &DaemonSettings::default(),
++        InstallMode::Missing,
++        Some(&source),
++        &binary,
++        |_| panic!("missing installation must not request replacement"),
++    )
++    .await
++    .expect_err("source cannot contain its staging directory");
++    assert!(
++        error
++            .to_string()
++            .contains("release store must be outside the source CLI package")
++    );
++    assert_eq!(std::fs::read_link(&releases).unwrap(), source);
++    assert!(!root.join("current").exists());
++    let mut entries = std::fs::read_dir(&source)
++        .unwrap()
++        .map(|entry| entry.unwrap().file_name())
++        .collect::<Vec<_>>();
++    entries.sort();
++    assert_eq!(
++        entries,
++        ["bin", "codex-package.json", "codex-path", "codex-resources"]
++            .map(std::ffi::OsString::from)
++    );
++}
++
++#[tokio::test]
++async fn rejects_a_selected_package_used_as_another_clis_release_store() {
++    let temporary = tempfile::TempDir::new().expect("temporary directory");
++    let home = temporary.path().join("home");
++    let source = temporary.path().join("source");
++    let binary = package(&source, "0.161.0");
++    let selected = temporary.path().join("selected");
++    package(&selected, "0.160.0");
++    let root = home.join("packages/app-server-daemon");
++    std::fs::create_dir_all(&root).expect("daemon package root");
++    let releases = root.join("releases");
++    std::os::unix::fs::symlink(&selected, &releases).expect("selected package link");
++    let error = prepare_from_package(
++        &daemon(&home),
++        &DaemonSettings::default(),
++        InstallMode::Missing,
++        Some(&source),
++        &binary,
++        |_| panic!("missing installation must not request replacement"),
++    )
++    .await
++    .expect_err("a selected package is not a writable release store");
++    assert!(error.to_string().contains("CODEX_HOME/release"));
++    assert_eq!(std::fs::read_link(&releases).unwrap(), selected);
++    assert!(!root.join("current").exists());
++    assert_eq!(
++        std::fs::read_to_string(selected.join("bin/codex")).unwrap(),
++        "#!/bin/sh\necho 'codex 0.160.0'\n"
++    );
++    assert!(!selected.join("releases").exists());
++    assert!(std::fs::read_dir(&selected).unwrap().all(|entry| {
++        !entry
++            .unwrap()
++            .file_name()
++            .as_encoded_bytes()
++            .starts_with(b".staging.")
++    }));
++}
++
+ #[tokio::test]
+ async fn incomplete_source_fails_without_selecting_it() {
+     let temp = tempfile::TempDir::new().expect("temp");

@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"debug/elf"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ type BuildInstallOptions struct {
 	BuildVersion                                      string
 	BuildSequence                                     uint64
 	InstallRequested                                  bool
+	ReplaceDraft                                      bool
 	ToolPaths                                         [2]string
 	Deadline                                          time.Duration
 	OnLive                                            func()
@@ -39,28 +41,27 @@ type BuildInstallResult struct {
 }
 
 type buildPackageMetadata struct {
-	SchemaVersion                            int
-	RecordType, ReleaseVersion, SourceCommit string
-	Version                                  string `json:"version"`
-	Target                                   string `json:"target"`
-	Entrypoint                               string `json:"entrypoint"`
-	BuildSequence                            uint64
-	Tools                                    buildToolsPreparation
+	SchemaVersion              int
+	RecordType, ReleaseVersion string
+	Version                    string `json:"version"`
+	Target                     string `json:"target"`
+	Entrypoint                 string `json:"entrypoint"`
+	BuildSequence              uint64
+	Tools                      buildToolsPreparation
 }
 
 type inspectionToolRelease struct {
 	Name, Version string
-	Source        string
 }
 
 type buildToolsPreparation struct {
-	Ccusage, Shuck, Tokei inspectionToolRelease
+	Shuck, Tokei inspectionToolRelease
 }
 
 var packageFiles = [][2]string{
 	{"codex", "bin/codex"}, {"codex-code-mode-host", "bin/codex-code-mode-host"},
 	{"codex-voice-host", "codex-resources/voice/bin/codex-voice-host"},
-	{"ccusage", "codex-path/ccusage"}, {"shuck", "codex-path/shuck"},
+	{"shuck", "codex-path/shuck"},
 	{"tokei", "codex-path/tokei"}, {"rg", "codex-path/rg"}, {"bwrap", "codex-resources/bwrap"},
 }
 
@@ -98,8 +99,10 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 		result.Terminal, result.FailureDomain = "Pass", failureDomainNone
 		return result, nil
 	}
-	if err := validateBuildSequence(dist, options.Tag, options.BuildSequence); err != nil {
-		return result, err
+	if !options.ReplaceDraft {
+		if err := validateBuildSequence(dist, options.Tag, options.BuildSequence); err != nil {
+			return result, err
+		}
 	}
 	tools := make([]runtimeAsset, 0, 5)
 	tools = append(tools, runtimeAsset{name: "build-install.zsh", data: assets.BuildInstall(), mode: 0o700})
@@ -119,7 +122,7 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	projection, err := runProjection(projectionRequest{
 		SkillRoot: options.SkillRoot, ProjectWorkingRoot: options.WorkingRoot, ProjectScratchRoot: options.ScratchRoot, RuntimeTemporaryRoot: options.RuntimeRoot, CodexHome: options.CodexHome,
 		RecordRoot: options.RecordRoot, Source: options.source, SourceCommit: options.sourceCommit, Release: options.Tag, WorkingDirectory: "codex-rs", Arguments: []string{"/runner/build-install.zsh", options.BuildVersion},
-		OutputRoot: outputRoot, ResultFiles: []string{"codex", "codex-code-mode-host", "codex-voice-host", "ccusage", "shuck", "tokei", "rg", "bwrap", "build.stdout.log", "build.stderr.log"}, Consumer: runnerConsumer{assets: tools, environment: []string{"CARGO_NET_OFFLINE=true", "STABLE_GIT_COMMIT=" + options.sourceCommit, "CODEX_SANDBOX_NETWORK_DISABLED=1", "CCUSAGE_VERSION=" + preparation.Ccusage.Version}, networkDisabled: true},
+		OutputRoot: outputRoot, ResultFiles: []string{"codex", "codex-code-mode-host", "codex-voice-host", "shuck", "tokei", "rg", "bwrap", "build.stdout.log", "build.stderr.log"}, Consumer: runnerConsumer{assets: tools, environment: []string{"CARGO_NET_OFFLINE=true", "STABLE_GIT_COMMIT=" + options.BuildVersion, "CODEX_SANDBOX_NETWORK_DISABLED=1"}, networkDisabled: true},
 		LockHeld: true, Deadline: options.Deadline, Cancellation: options.Cancellation, OnLive: options.OnLive, AttemptIdentity: "build-install-" + options.BuildVersion,
 	})
 	defer func() {
@@ -142,8 +145,10 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	if _, err := os.Lstat(stage); !os.IsNotExist(err) {
 		return result, errors.New("BuildInstall stage exists")
 	}
-	if _, err := os.Lstat(final); !os.IsNotExist(err) {
-		return result, errors.New("BuildInstall package exists")
+	if !options.ReplaceDraft {
+		if _, err := os.Lstat(final); !os.IsNotExist(err) {
+			return result, errors.New("BuildInstall package exists")
+		}
 	}
 	if err := os.Mkdir(stage, 0o700); err != nil {
 		return result, err
@@ -163,7 +168,7 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 			return result, err
 		}
 	}
-	toolchain, err := resolveToolchainProjection(options.WorkingRoot)
+	toolchain, err := resolveToolchainProjection(options.WorkingRoot, options.source, options.RuntimeRoot)
 	if err != nil {
 		return result, err
 	}
@@ -181,12 +186,14 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	if err := validatePackagePostimage(stage, filepath.Join(toolchain.Path, "voice", "runtime"), options.CodexHome, metadata); err != nil {
 		return result, err
 	}
-	if err := os.Rename(stage, final); err != nil {
-		return result, err
-	}
-	result.PackagePath, result.ProductEffect = final, "PackagePublished"
-	if err := syncDirectory(dist); err != nil {
-		return result, err
+	if !options.ReplaceDraft {
+		if err := os.Rename(stage, final); err != nil {
+			return result, err
+		}
+		result.PackagePath, result.ProductEffect = final, "PackagePublished"
+		if err := syncDirectory(dist); err != nil {
+			return result, err
+		}
 	}
 	if options.InstallRequested {
 		if err := publishBuildSelection(dist, options, &result); err != nil {
@@ -221,7 +228,7 @@ func prepareBuildInspectionTools(options BuildInstallOptions) (preparation build
 	if err := writeRuntimeAsset(script, assets.BuildTools(), 0o700); err != nil {
 		return preparation, nil, err
 	}
-	toolchain, err := resolveToolchainProjection(options.WorkingRoot)
+	toolchain, err := resolveToolchainProjection(options.WorkingRoot, options.source, options.RuntimeRoot)
 	if err != nil {
 		return preparation, nil, err
 	}
@@ -238,10 +245,10 @@ func prepareBuildInspectionTools(options BuildInstallOptions) (preparation build
 		}
 		return preparation, nil, err
 	}
-	if _, err := readCanonicalValue(metadataPath, &preparation); err != nil || !validInspectionToolRelease(preparation.Shuck, "shuck") || !validInspectionToolRelease(preparation.Tokei, "tokei") || !validInspectionToolRelease(preparation.Ccusage, "ccusage") {
+	if _, err := readCanonicalValue(metadataPath, &preparation); err != nil || !validInspectionToolRelease(preparation.Shuck, "shuck") || !validInspectionToolRelease(preparation.Tokei, "tokei") {
 		return buildToolsPreparation{}, nil, errors.Join(err, errors.New("BuildInstall inspection tool preparation differs"))
 	}
-	for _, name := range []string{"shuck-source.tar.gz", "tokei-source.tar.gz", "ccusage-source.tar.gz", "ccusage-pricing.json"} {
+	for _, name := range []string{"shuck-source.tar.gz", "tokei-source.tar.gz"} {
 		data, err := readRegularNoFollow(filepath.Join(output, name))
 		if err != nil {
 			return buildToolsPreparation{}, nil, err
@@ -254,18 +261,21 @@ func prepareBuildInspectionTools(options BuildInstallOptions) (preparation build
 func validInspectionToolRelease(release inspectionToolRelease, name string) bool {
 	version := toolVersion{}
 	count, err := fmt.Sscanf(release.Version, "%d.%d.%d", &version.Major, &version.Minor, &version.Patch)
-	return release.Name == name && count == 3 && err == nil && version.String() == release.Version && len(release.Source) == 40
+	return release.Name == name && count == 3 && err == nil && version.String() == release.Version
 }
 
 func buildPackageMetadataFor(options BuildInstallOptions, preparation buildToolsPreparation) buildPackageMetadata {
 	return buildPackageMetadata{
 		SchemaVersion: core.SchemaVersion, RecordType: "BuildPackageMetadata", ReleaseVersion: options.Tag,
-		Version: options.BuildVersion, BuildSequence: options.BuildSequence, SourceCommit: options.sourceCommit, Tools: preparation,
+		Version: options.BuildVersion, BuildSequence: options.BuildSequence, Tools: preparation,
 		Target: nativeTarget, Entrypoint: "bin/codex",
 	}
 }
 
 func validateBuildInstall(options BuildInstallOptions) error {
+	if options.ReplaceDraft && !options.InstallRequested {
+		return errors.New("BuildInstall --replace-draft requires --install")
+	}
 	for _, path := range []string{options.SkillRoot, options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, options.RecordRoot, options.CodexHome, filepath.Join(options.WorkingRoot, "build", "dist")} {
 		if noFollowPath("build-install path", path) != nil {
 			return errors.New("invalid BuildInstall path")
@@ -293,18 +303,38 @@ func completedBuildPostimage(dist string, options BuildInstallOptions, preparati
 	final := filepath.Join(dist, options.BuildVersion)
 	info, err := os.Lstat(final)
 	if os.IsNotExist(err) {
+		if options.ReplaceDraft {
+			return false, errors.New("BuildInstall draft replacement requires an existing selected package")
+		}
 		return false, nil
 	}
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return false, errors.Join(err, errors.New("BuildInstall package postimage differs"))
 	}
 	metadata := buildPackageMetadataFor(options, preparation)
-	toolchain, toolchainErr := resolveToolchainProjection(options.WorkingRoot)
+	if options.ReplaceDraft {
+		current, err := os.Readlink(filepath.Join(dist, "current"))
+		if err != nil || current != options.BuildVersion {
+			return false, errors.Join(err, errors.New("BuildInstall draft replacement requires the selected version"))
+		}
+		var retained buildPackageMetadata
+		if _, err := readCanonicalValue(filepath.Join(final, "codex-package.json"), &retained); err != nil {
+			return false, err
+		}
+		if !validInspectionToolRelease(retained.Tools.Shuck, "shuck") || !validInspectionToolRelease(retained.Tools.Tokei, "tokei") {
+			return false, errors.New("BuildInstall retained inspection tool versions differ")
+		}
+		metadata.Tools = retained.Tools
+	}
+	toolchain, toolchainErr := resolveToolchainProjection(options.WorkingRoot, options.source, options.RuntimeRoot)
 	if toolchainErr != nil {
 		return false, toolchainErr
 	}
 	if err := validatePackagePostimage(final, filepath.Join(toolchain.Path, "voice", "runtime"), options.CodexHome, metadata); err != nil {
 		return false, err
+	}
+	if options.ReplaceDraft {
+		return false, nil
 	}
 	result.PackagePath, result.ProductEffect = final, "PackagePublished"
 	if !options.InstallRequested {
@@ -391,7 +421,7 @@ func validatePackagePostimage(root, voiceRuntime, codexHome string, metadata bui
 			}
 		}
 	}
-	for _, tool := range []inspectionToolRelease{metadata.Tools.Ccusage, metadata.Tools.Shuck, metadata.Tools.Tokei} {
+	for _, tool := range []inspectionToolRelease{metadata.Tools.Shuck, metadata.Tools.Tokei} {
 		command, err := packageCommand(root, codexHome, filepath.Join("codex-path", tool.Name), "--version")
 		if err != nil {
 			return err
@@ -403,7 +433,7 @@ func validatePackagePostimage(root, voiceRuntime, codexHome string, metadata bui
 	}
 	for _, check := range [][3]string{
 		{"bin/codex", "--version", "codex-cli " + metadata.Version},
-		{"codex-resources/voice/bin/codex-voice-host", "--build-commit", metadata.SourceCommit},
+		{"codex-resources/voice/bin/codex-voice-host", "--build-commit", metadata.Version},
 	} {
 		command, err := packageCommand(root, codexHome, check[0], check[1])
 		if err != nil {
@@ -507,14 +537,18 @@ func validateBuildSequence(dist, release string, sequence uint64) error {
 		if !entry.IsDir() {
 			continue
 		}
-		var metadata buildPackageMetadata
-		data, readErr := readJSONValue(filepath.Join(dist, entry.Name(), "codex-package.json"), &metadata)
-		if readErr == nil && strings.Contains(string(data), `"BuildSequence":`) && metadata.SchemaVersion == core.SchemaVersion && metadata.RecordType == "BuildPackageMetadata" && metadata.ReleaseVersion == release {
-			if metadata.BuildSequence >= sequence {
+		var metadata struct {
+			SchemaVersion              int
+			RecordType, ReleaseVersion string
+			BuildSequence              *uint64
+		}
+		data, readErr := readRegularNoFollow(filepath.Join(dist, entry.Name(), "codex-package.json"))
+		if readErr == nil && json.Unmarshal(data, &metadata) == nil && metadata.BuildSequence != nil && metadata.SchemaVersion == core.SchemaVersion && metadata.RecordType == "BuildPackageMetadata" && metadata.ReleaseVersion == release {
+			if *metadata.BuildSequence >= sequence {
 				prior = false
 				break
 			}
-			prior = prior || metadata.BuildSequence+1 == sequence
+			prior = prior || *metadata.BuildSequence+1 == sequence
 		}
 	}
 	if !prior {
@@ -524,6 +558,16 @@ func validateBuildSequence(dist, release string, sequence uint64) error {
 }
 
 func publishBuildSelection(dist string, options BuildInstallOptions, result *BuildInstallResult) (resultError error) {
+	mode := "install"
+	var stageInfo os.FileInfo
+	if options.ReplaceDraft {
+		mode = "replace-draft"
+		var err error
+		stageInfo, err = os.Lstat(filepath.Join(dist, "."+options.BuildVersion+".stage"))
+		if err != nil {
+			return err
+		}
+	}
 	identifier, creationError := randomID()
 	if creationError != nil {
 		return creationError
@@ -540,10 +584,25 @@ func publishBuildSelection(dist string, options BuildInstallOptions, result *Bui
 	if writeError := writeRuntimeAsset(script, assets.BuildSelect(), 0o700); writeError != nil {
 		return writeError
 	}
-	_, diagnostic, runError := runNativeProcess(attempt, script, "install", []string{dist, options.BuildVersion}, nativeEnvironment(attempt), 1<<20, "", options.Deadline, options.Cancellation, options.OnLive)
+	_, diagnostic, runError := runNativeProcess(attempt, script, mode, []string{dist, options.BuildVersion}, nativeEnvironment(attempt), 1<<20, "", options.Deadline, options.Cancellation, options.OnLive)
+	if options.ReplaceDraft {
+		final := filepath.Join(dist, options.BuildVersion)
+		finalInfo, observationError := os.Lstat(final)
+		if observationError != nil {
+			result.ProductEffect = "Unverified"
+			runError = errors.Join(runError, observationError, errors.New("build-install replacement postimage is unverified"))
+		} else if os.SameFile(stageInfo, finalInfo) {
+			result.PackagePath, result.ProductEffect = final, "PackagePublished"
+		} else {
+			runError = errors.Join(runError, errors.New("build-install package replacement did not occur"))
+		}
+	}
 	currentTarget, selectionError := os.Readlink(filepath.Join(dist, "current"))
 	if selectionError == nil && currentTarget == options.BuildVersion {
-		result.CurrentTarget, result.ProductEffect = currentTarget, "CurrentLinkChanged"
+		result.CurrentTarget = currentTarget
+		if !options.ReplaceDraft {
+			result.ProductEffect = "CurrentLinkChanged"
+		}
 	} else {
 		runError = errors.Join(runError, selectionError, errors.New("build-install current selection differs"))
 	}

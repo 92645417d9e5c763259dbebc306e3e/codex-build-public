@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"codex-build/internal/core"
@@ -21,14 +22,15 @@ type ToolchainProjection struct {
 }
 
 const nativeToolchainRoot = "build/toolchains/native/toolchain"
-const nativeVoiceVersion = "1.28.6"
-const nativeRustVersion = "1.95.0"
-const nativeNextestVersion = "0.9.131"
-const nativeSccacheVersion = "0.15.0"
-const nativeV8Version = "150.4.0"
-const nativeBazeliskVersion = "1.29.0"
-const repositoryBazelVersion = "9.0.0"
 const nativeTarget = "x86_64-unknown-linux-gnu"
+
+type toolchainRequirements struct {
+	Rust       string
+	V8         string
+	GStreamer  string
+	Opus       string
+	Components []string
+}
 
 type CacheProjection struct {
 	CargoHome        string
@@ -37,17 +39,21 @@ type CacheProjection struct {
 	SccacheDirectory string
 }
 
-func resolveToolchainProjection(projectWorkingRoot string) (ToolchainProjection, error) {
-	return resolveToolchain(projectWorkingRoot, newDeadline(core.StageDeadline(), nil))
+func resolveToolchainProjection(projectWorkingRoot, source, runtimeRoot string) (ToolchainProjection, error) {
+	return resolveToolchain(projectWorkingRoot, source, runtimeRoot, newDeadline(core.StageDeadline(), nil))
 }
 
-func resolveToolchain(projectWorkingRoot string, window deadline) (ToolchainProjection, error) {
+func resolveToolchain(projectWorkingRoot, source, runtimeRoot string, window deadline) (ToolchainProjection, error) {
+	requirements, err := readToolchainRequirements(source, runtimeRoot, window)
+	if err != nil {
+		return ToolchainProjection{}, err
+	}
 	path := filepath.Join(projectWorkingRoot, filepath.FromSlash(nativeToolchainRoot))
 	if err := noFollowPath("toolchain", path); err != nil {
 		return ToolchainProjection{}, err
 	}
 	projection := ToolchainProjection{Root: nativeToolchainRoot, Path: path}
-	cargoVersion, err := verifyBuildToolchain(path, window)
+	cargoVersion, err := verifyBuildToolchain(path, requirements, window)
 	if err != nil {
 		return ToolchainProjection{}, err
 	}
@@ -70,10 +76,33 @@ func resolveToolchain(projectWorkingRoot string, window deadline) (ToolchainProj
 	if err := verifyRepositoryFormatToolchain(path, window); err != nil {
 		return ToolchainProjection{}, err
 	}
-	if err := verifyNativeVoiceToolchain(path, projection.Target, window); err != nil {
+	if err := verifyNativeVoiceToolchain(path, projection.Target, requirements, window); err != nil {
 		return ToolchainProjection{}, err
 	}
 	return projection, window.check()
+}
+
+func readToolchainRequirements(source, runtimeRoot string, window deadline) (requirements toolchainRequirements, resultErr error) {
+	if err := noFollowPath("toolchain source", source); err != nil {
+		return requirements, err
+	}
+	attempt, err := prepareNativeToolchainAttempt(runtimeRoot)
+	if err != nil {
+		return requirements, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, removeOwnedPaths(attempt)) }()
+	resultPath := filepath.Join(attempt, "result.json")
+	data, diagnostic, err := runNativeProcess(attempt, filepath.Join(attempt, "native-toolchain.py"), "requirements", []string{source, resultPath}, nativeEnvironment(attempt), 1<<20, resultPath, window.remaining(), window.signals, nil)
+	if err != nil {
+		if message := strings.TrimSpace(diagnostic); message != "" {
+			err = errors.Join(err, errors.New(message))
+		}
+		return requirements, err
+	}
+	if err := json.Unmarshal(data, &requirements); err != nil {
+		return requirements, err
+	}
+	return requirements, window.check()
 }
 
 func commandOutput(command *exec.Cmd, window deadline) ([]byte, error) {
@@ -114,7 +143,7 @@ func verifyRepositoryFormatToolchain(root string, window deadline) error {
 	return nil
 }
 
-func verifyNativeVoiceToolchain(root, target string, window deadline) error {
+func verifyNativeVoiceToolchain(root, target string, requirements toolchainRequirements, window deadline) error {
 	if target != "x86_64-unknown-linux-gnu" {
 		return errors.New("native voice toolchain target differs")
 	}
@@ -160,7 +189,7 @@ func verifyNativeVoiceToolchain(root, target string, window deadline) error {
 	manifestVersion := struct {
 		GStreamer string `json:"gstreamer"`
 	}{}
-	if err != nil || json.Unmarshal(manifest, &manifestVersion) != nil || manifestVersion.GStreamer != nativeVoiceVersion {
+	if err != nil || json.Unmarshal(manifest, &manifestVersion) != nil || manifestVersion.GStreamer != requirements.GStreamer {
 		return errors.Join(err, errors.New("native voice toolchain version differs"))
 	}
 	pkgConfig := "/usr/bin/pkg-config"
@@ -172,22 +201,20 @@ func verifyNativeVoiceToolchain(root, target string, window deadline) error {
 		return errors.Join(err, errors.New("native voice toolchain version differs"))
 	}
 	for _, value := range versions {
-		if value != nativeVoiceVersion {
+		if value != requirements.GStreamer {
 			return errors.New("native voice toolchain version differs")
 		}
 	}
 	alsaCommand := exec.Command(pkgConfig, "--modversion", "alsa")
 	alsaCommand.Env = command.Env
 	alsa, err := commandOutput(alsaCommand, window)
-	alsaVersion := toolVersion{}
-	_, parseErr := fmt.Sscanf(strings.TrimSpace(string(alsa)), "%d.%d.%d", &alsaVersion.Major, &alsaVersion.Minor, &alsaVersion.Patch)
-	if err != nil || parseErr != nil || !alsaVersion.atLeast(1, 2, 9) {
-		return errors.Join(err, parseErr, errors.New("native voice ALSA version differs"))
+	if err != nil || strings.TrimSpace(string(alsa)) == "" {
+		return errors.Join(err, errors.New("native voice ALSA metadata is absent"))
 	}
 	opusCommand := exec.Command(pkgConfig, "--modversion", "opus")
 	opusCommand.Env = command.Env
 	opus, err := commandOutput(opusCommand, window)
-	if err != nil || strings.TrimSpace(string(opus)) != "1.6.1" {
+	if err != nil || strings.TrimSpace(string(opus)) != requirements.Opus {
 		return errors.Join(err, errors.New("native voice Opus version differs"))
 	}
 	link := exec.Command(pkgConfig, "--libs", "alsa", "gstreamer-1.0", "gstreamer-base-1.0", "gstreamer-app-1.0", "gstreamer-audio-1.0")
@@ -356,7 +383,13 @@ type toolVersion struct {
 	Patch int
 }
 
-func verifyBuildToolchain(toolchain string, window deadline) (string, error) {
+func validToolRelease(value string) bool {
+	version := toolVersion{}
+	_, err := fmt.Sscanf(value, "%d.%d.%d", &version.Major, &version.Minor, &version.Patch)
+	return err == nil && version.Major >= 0 && version.Minor >= 0 && version.Patch >= 0 && value == version.String()
+}
+
+func verifyBuildToolchain(toolchain string, requirements toolchainRequirements, window deadline) (string, error) {
 	manifest, err := readRegularNoFollow(filepath.Join(toolchain, "native-toolchain.json"))
 	versions := struct {
 		Bazelisk      string `json:"bazelisk"`
@@ -369,7 +402,7 @@ func verifyBuildToolchain(toolchain string, window deadline) (string, error) {
 		Target        string `json:"target"`
 	}{}
 	fields := map[string]json.RawMessage{}
-	if err != nil || json.Unmarshal(manifest, &versions) != nil || json.Unmarshal(manifest, &fields) != nil || len(fields) != 12 || versions.Bazelisk != nativeBazeliskVersion || versions.Cargo != nativeRustVersion || versions.CargoNextest != nativeNextestVersion || versions.Rust != nativeRustVersion || versions.RustyV8 != nativeV8Version || versions.Sccache != nativeSccacheVersion || versions.SchemaVersion != 1 || versions.Target != nativeTarget {
+	if err != nil || json.Unmarshal(manifest, &versions) != nil || json.Unmarshal(manifest, &fields) != nil || len(fields) != 12 || versions.Bazelisk == "" || versions.Cargo != requirements.Rust || versions.CargoNextest == "" || versions.Rust != requirements.Rust || versions.RustyV8 != requirements.V8 || versions.Sccache == "" || versions.SchemaVersion != 1 || versions.Target != nativeTarget {
 		return "", errors.Join(err, errors.New("native build toolchain manifest differs"))
 	}
 	for _, name := range []string{"bazelisk", "cargo", "cargo-nextest", "dotslash", "gstreamer", "just", "rust", "rusty_v8", "sccache", "schemaVersion", "target", "uv"} {
@@ -381,30 +414,30 @@ func verifyBuildToolchain(toolchain string, window deadline) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if cargo.String() != nativeRustVersion {
-		return "", fmt.Errorf("cargo %s lacks build-directory support", cargo)
+	if cargo.String() != versions.Cargo {
+		return "", errors.New("native Cargo version differs from source")
 	}
 	nextest, err := readToolVersionAt(filepath.Join(toolchain, "bin", "cargo-nextest"), "cargo-nextest", window)
 	if err != nil {
 		return "", err
 	}
-	if nextest.String() != nativeNextestVersion {
-		return "", fmt.Errorf("cargo-nextest %s lacks build-directory support", nextest)
+	if nextest.String() != versions.CargoNextest {
+		return "", errors.New("native cargo-nextest version differs")
 	}
 	bazelisk := exec.Command(filepath.Join(toolchain, "bin", "bazel"), "bazeliskVersion")
 	bazelisk.Env = []string{"HOME=/nonexistent", "PATH=/usr/bin"}
 	bazeliskOutput, err := commandOutput(bazelisk, window)
-	if err != nil || strings.TrimSpace(string(bazeliskOutput)) != "Bazelisk version: v"+nativeBazeliskVersion {
+	if err != nil || strings.TrimSpace(string(bazeliskOutput)) != "Bazelisk version: v"+versions.Bazelisk {
 		return "", errors.Join(err, errors.New("native Bazelisk version differs"))
 	}
 	sccache, err := readToolVersionAt(filepath.Join(toolchain, "bin", "sccache"), "sccache", window)
-	if err != nil || sccache.String() != nativeSccacheVersion {
+	if err != nil || sccache.String() != versions.Sccache {
 		return "", errors.Join(err, errors.New("native sccache version differs"))
 	}
 	rustc := exec.Command(filepath.Join(toolchain, "rust", "bin", "rustc"), "--version")
 	rustc.Env = []string{"PATH=/usr/bin"}
 	rustcOutput, err := commandOutput(rustc, window)
-	if err != nil || !strings.HasPrefix(string(rustcOutput), "rustc "+nativeRustVersion+" ") {
+	if err != nil || !strings.HasPrefix(string(rustcOutput), "rustc "+versions.Rust+" ") {
 		return "", errors.Join(err, errors.New("native Rust version differs"))
 	}
 	for _, path := range []string{
@@ -422,6 +455,20 @@ func verifyBuildToolchain(toolchain string, window deadline) (string, error) {
 	info, err := os.Lstat(rustSource)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.Join(err, errors.New("native Rust source component differs"))
+	}
+	components, err := readRegularNoFollow(filepath.Join(toolchain, "rust", "lib", "rustlib", "components"))
+	if err != nil {
+		return "", err
+	}
+	installed := strings.Split(string(components), "\n")
+	for _, component := range requirements.Components {
+		name := component
+		if name == "clippy" || name == "rustfmt" {
+			name += "-preview"
+		}
+		if !slices.Contains(installed, name) && !slices.Contains(installed, name+"-"+nativeTarget) {
+			return "", fmt.Errorf("native Rust component is absent: %s", component)
+		}
 	}
 	return cargo.String(), nil
 }
@@ -442,10 +489,6 @@ func readToolVersion(command *exec.Cmd, name string, window deadline) (toolVersi
 		return toolVersion{}, fmt.Errorf("invalid %s version: %w", name, err)
 	}
 	return version, nil
-}
-
-func (version toolVersion) atLeast(major, minor, patch int) bool {
-	return version.Major > major || version.Major == major && (version.Minor > minor || version.Minor == minor && version.Patch >= patch)
 }
 
 func (version toolVersion) String() string {

@@ -1074,7 +1074,7 @@ func sourceToolchain(source, projectWorkingRoot, projectScratchRoot, runtimeTemp
 	if err != nil {
 		return sourceToolchainProjection{}, err
 	}
-	toolchain, err := resolveToolchain(projectWorkingRoot, window)
+	toolchain, err := resolveToolchain(projectWorkingRoot, source, runtimeTemporaryRoot, window)
 	if err != nil {
 		return sourceToolchainProjection{}, preflightHelperError{err}
 	}
@@ -2070,7 +2070,7 @@ func reapedProjectionResult(request projectionRequest, projection sourceToolchai
 		result.FailureDomain = failureDomainHelper
 		return result
 	}
-	postToolchain, toolchainErr := resolveToolchain(request.ProjectWorkingRoot, request.window)
+	postToolchain, toolchainErr := resolveToolchain(request.ProjectWorkingRoot, request.Source, request.RuntimeTemporaryRoot, request.window)
 	if errors.Is(toolchainErr, errOperationCanceled) {
 		setProjectionCanceled(&result)
 		return result
@@ -2276,7 +2276,7 @@ func runnerEnvironment(consumer []string, codexHome string) ([]string, error) {
 			return nil, fmt.Errorf("duplicate runner environment key %s", key)
 		}
 		seen[key] = struct{}{}
-		if index >= len(base) && !listed("PROJECT_NAME CARGO_NET_OFFLINE CCUSAGE_VERSION STABLE_GIT_COMMIT CODEX_SANDBOX_NETWORK_DISABLED CODEX_SUITE_ROUND_BUDGET_MS INSTA_FORCE_PASS INSTA_UPDATE NEXTEST_EXPERIMENTAL_LIBTEST_JSON NEXTEST_TEST_THREADS", key) {
+		if index >= len(base) && !listed("PROJECT_NAME CARGO_NET_OFFLINE STABLE_GIT_COMMIT CODEX_SANDBOX_NETWORK_DISABLED CODEX_SUITE_ROUND_BUDGET_MS INSTA_FORCE_PASS INSTA_UPDATE NEXTEST_EXPERIMENTAL_LIBTEST_JSON NEXTEST_TEST_THREADS", key) {
 			return nil, fmt.Errorf("unowned runner environment key %s", key)
 		}
 	}

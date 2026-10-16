@@ -77,10 +77,12 @@ UNICODE_PAYLOAD_SYMBOLS = {
     "mermaid/src/families_tests.rs": characters("1F680"),
     "tui/src/app/agent_center_tests.rs": characters("1F469 1F4BB"),
     "tui/src/transcript_view/prompt_style_tests.rs": characters("1F469 1F4BB"),
+    "tui/src/bottom_pane/hooks_browser_view.rs": characters("1F980"),
     "tui/src/bottom_pane/selection_popup_common.rs": characters("1F44D 1F3FB 1F468 1F469 1F467 1F466"),
     "tui/src/bottom_pane/textarea.rs": characters("274C"),
     "tui/src/bottom_pane/textarea/hyperlinks_tests.rs": characters("1F469 1F4BB"),
     "tui/src/diff_render.rs": characters("1F680 2728"),
+    "tui/src/footer_selection_tests.rs": characters("1F469 1F4BB"),
     "tui/src/history_cell/search_tests.rs": characters("1F980"),
     "tui/src/streaming/render_tests.rs": characters("2728"),
 }

@@ -1,0 +1,1166 @@
+present-control-center-with-summary-tab
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-control-center-with-summary-tab
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -3,9 +3,11 @@
+ //! Static content retains its generic pager. Transcript previews share the main conversation
+ //! viewport, including its scrolling, selection, search and bounded text layouts.
+ 
++mod control_center;
+ mod scrolling;
+ mod transcript;
+ 
++pub(crate) use control_center::ControlCenter;
+ pub(crate) use transcript::TranscriptOverlay;
+ 
+ #[cfg(test)]
+@@ -40,10 +42,12 @@ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::Widget;
+ use ratatui::widgets::Wrap;
+ use scrolling::render_offset_content;
++use uuid::Uuid;
+ 
+ pub(crate) enum Overlay {
+     Transcript(TranscriptOverlay),
+     Static(StaticOverlay),
++    ControlCenter(Box<ControlCenter>),
+     Analytics(Box<crate::analytics::AnalyticsView>),
+ }
+ 
+@@ -76,6 +80,23 @@ impl Overlay {
+         Self::Static(StaticOverlay::with_title(lines, title, keymap))
+     }
+ 
++    pub(crate) fn new_control_center_loading(
++        range: crate::usage::UsageRange,
++        keymap: PagerKeymap,
++        request_id: Uuid,
++        width: u16,
++        mouse_scroll_speed: f64,
++    ) -> Self {
++        let mut overlay = ControlCenter::new(None, range, keymap, width, mouse_scroll_speed);
++        overlay.request_id = Some(request_id);
++        Self::ControlCenter(Box::new(overlay))
++    }
++
++    /// Replacing or closing the overlay invalidates its background result.
++    pub(crate) fn accepts_usage_request(&self, request_id: Uuid) -> bool {
++        matches!(self, Self::ControlCenter(overlay) if overlay.request_id == Some(request_id))
++    }
++
+     pub(crate) fn new_static_with_renderables(
+         renderables: Vec<Box<dyn Renderable>>,
+         title: String,
+@@ -88,12 +109,13 @@ impl Overlay {
+         let input = match self {
+             Overlay::Transcript(_) => tui::OverlayInput::Transcript,
+             Overlay::Static(_) => tui::OverlayInput::StaticPager,
+-            Overlay::Analytics(_) => tui::OverlayInput::Usage,
++            Overlay::ControlCenter(_) | Overlay::Analytics(_) => tui::OverlayInput::Usage,
+         };
+         tui.set_overlay_input(input)?;
+         let result = match self {
+             Overlay::Transcript(o) => o.handle_event(tui, event),
+             Overlay::Static(o) => o.handle_event(tui, event),
++            Overlay::ControlCenter(o) => o.handle_event(tui, event),
+             Overlay::Analytics(o) => o.handle_event(tui, event),
+         };
+         if result.is_err() || self.is_done() {
+@@ -107,6 +129,7 @@ impl Overlay {
+         match self {
+             Overlay::Transcript(o) => o.is_done(),
+             Overlay::Static(o) => o.is_done(),
++            Overlay::ControlCenter(o) => o.is_done(),
+             Overlay::Analytics(o) => o.is_done,
+         }
+     }
+@@ -692,6 +715,66 @@ mod tests {
+         assert_snapshot!(term.backend());
+     }
+ 
++    #[test]
++    fn control_center_keeps_short_content_visible_at_nonzero_origin() {
++        let mut overlay = ControlCenter::new(
++            None,
++            crate::usage::UsageRange::Daily,
++            default_pager_keymap(),
++            48,
++            1.0,
++        );
++        overlay.set_report(Err("visible error".into()));
++        let area = Rect::new(4, 3, 48, 10);
++        let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 20));
++        overlay.render(area, &mut buffer);
++        let text_at = |row| {
++            (area.x..area.right())
++                .map(|column| buffer[(column, row)].symbol())
++                .collect::<String>()
++        };
++        assert!(text_at(3).contains("Daily"));
++        assert!(text_at(5).contains("visible error"));
++        assert!(text_at(6).trim().is_empty());
++        assert!(text_at(7).trim().is_empty());
++        assert!(text_at(8).trim().is_empty());
++        assert!(text_at(12).contains("esc back"));
++    }
++
++    #[test]
++    fn usage_loading_keeps_navigation_and_summary_controls_available() {
++        for range in crate::usage::UsageRange::VIEWS {
++            let request_id = Uuid::new_v4();
++            let mut overlay = Overlay::new_control_center_loading(
++                range,
++                default_pager_keymap(),
++                request_id,
++                120,
++                1.0,
++            );
++            assert!(overlay.accepts_usage_request(request_id));
++            let Overlay::ControlCenter(view) = &mut overlay else {
++                unreachable!();
++            };
++            let area = Rect::new(0, 0, 120, 12);
++            let mut buffer = Buffer::empty(area);
++            view.render(area, &mut buffer);
++            let row = |y| {
++                (0..area.width)
++                    .map(|x| buffer[(x, y)].symbol())
++                    .collect::<String>()
++            };
++            assert!(row(0).contains("Summary"));
++            assert!(row(2).contains("Loading usage..."));
++            assert_eq!(view.range, range);
++            assert!(row(area.height - 1).contains("q quit"));
++            for y in 3..area.height - 1 {
++                let left = (2..77).map(|x| buffer[(x, y)].symbol()).collect::<String>();
++                assert!(left.trim().is_empty());
++            }
++        }
++    }
++
+     #[test]
+     fn pager_view_content_height_counts_renderables() {
+         let pv = pager_view(
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -0,0 +1,1006 @@
++//! One control center owns its chrome and transient report navigation.
++
++use super::PagerView;
++use crate::bottom_pane::render_filled_tab_bar;
++use crate::control_center_table::Palette;
++use crate::key_hint;
++use crate::keymap::PagerKeymap;
++use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
++use crate::render::highlight::syntax_theme_revision;
++use crate::style::footer_hint_label_style;
++use crate::style::table_separator_style;
++use crate::tui;
++use crate::tui::TuiEvent;
++use crate::usage::UsageRange;
++use crate::usage::UsageReport;
++use chrono::Datelike;
++use chrono::Duration;
++use chrono::NaiveDate;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use crossterm::event::MouseEventKind;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Constraint;
++use ratatui::layout::Layout;
++use ratatui::layout::Margin;
++use ratatui::layout::Rect;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use ratatui::widgets::Clear;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
++use std::io::Result;
++use std::sync::Arc;
++use uuid::Uuid;
++
++pub(crate) struct ControlCenter {
++    view: PagerView,
++    is_done: bool,
++    report: std::result::Result<Option<Arc<UsageReport>>, String>,
++    pub(crate) request_id: Option<Uuid>,
++    pub(crate) range: UsageRange,
++    selected_day: Option<NaiveDate>,
++    viewport_width: u16,
++    theme_revision: u64,
++    mouse_scroll_speed: f64,
++    pending_mouse_scroll: f64,
++    pub(crate) details: Vec<Line<'static>>,
++}
++
++impl ControlCenter {
++    pub(crate) fn new(
++        report: Option<Arc<UsageReport>>,
++        range: UsageRange,
++        keymap: PagerKeymap,
++        width: u16,
++        mouse_scroll_speed: f64,
++    ) -> Self {
++        let mut overlay = Self {
++            view: PagerView::new(Vec::new(), String::new(), 0, keymap),
++            is_done: false,
++            report: Ok(report),
++            request_id: None,
++            range,
++            selected_day: None,
++            viewport_width: width,
++            theme_revision: syntax_theme_revision(),
++            mouse_scroll_speed,
++            pending_mouse_scroll: 0.0,
++            details: Vec::new(),
++        };
++        overlay.refresh();
++        overlay
++    }
++
++    pub(crate) fn report(&self) -> Option<&Arc<UsageReport>> {
++        self.report.as_ref().ok()?.as_ref()
++    }
++
++    pub(crate) fn set_report(&mut self, result: std::result::Result<Arc<UsageReport>, String>) {
++        self.report = result.map(Some);
++        self.request_id = None;
++        self.selected_day = None;
++        self.refresh();
++    }
++
++    pub(super) fn is_done(&self) -> bool {
++        self.is_done
++    }
++
++    fn content_width(&self) -> u16 {
++        let inner = self.viewport_width.saturating_sub(4);
++        if self.range == UsageRange::Summary && inner >= 90 {
++            inner - 41
++        } else {
++            inner
++        }
++    }
++
++    fn refresh(&mut self) {
++        self.view.renderables = match &self.report {
++            Ok(Some(report)) => crate::usage::render_selected(
++                report,
++                self.range,
++                self.content_width(),
++                self.selected_day,
++            ),
++            Ok(None) => vec!["Loading usage...".dim().into()],
++            Err(error) => vec![format!(" Usage unavailable: {error}").dim().into()],
++        };
++        self.theme_revision = syntax_theme_revision();
++    }
++
++    fn handle_key(&mut self, key: KeyEvent) -> bool {
++        if key.kind == KeyEventKind::Release {
++            return false;
++        }
++        let next = key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE;
++        let previous = key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::SHIFT;
++        if next || previous {
++            let ranges = UsageRange::VIEWS;
++            let index = self.range.index();
++            let step = if next { 1 } else { ranges.len() - 1 };
++            self.range = ranges[(index + step) % ranges.len()];
++            self.selected_day = None;
++            self.view.scroll_offset = 0;
++            self.refresh();
++            return true;
++        }
++        if key.modifiers != KeyModifiers::NONE {
++            return false;
++        }
++        if key.code == KeyCode::Esc {
++            if self.selected_day.take().is_some() {
++                self.view.scroll_offset = 0;
++                self.refresh();
++            } else {
++                self.is_done = true;
++            }
++            return true;
++        }
++        let arrow = matches!(
++            key.code,
++            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
++        );
++        if self.range != UsageRange::Summary {
++            return arrow;
++        }
++        let Some(report) = self.report() else {
++            return arrow || key.code == KeyCode::Enter;
++        };
++        let (start, today) = crate::usage::heatmap_bounds(report, self.content_width());
++        let delta: i64 = match key.code {
++            KeyCode::Enter if self.selected_day.is_some() => return true,
++            KeyCode::Enter => -1,
++            KeyCode::Left => -7,
++            KeyCode::Right => 7,
++            KeyCode::Up => -1,
++            KeyCode::Down => 1,
++            _ => return false,
++        };
++        let (mut day, delta, lower, upper) = match self.selected_day {
++            None => (today, -1, start, today),
++            Some(day) => {
++                let week_start =
++                    day - Duration::days(i64::from(day.weekday().num_days_from_sunday()));
++                let (lower, upper) = if delta.abs() == 1 {
++                    (
++                        week_start.max(start),
++                        (week_start + Duration::days(6)).min(today),
++                    )
++                } else {
++                    (start, today)
++                };
++                (day + Duration::days(delta), delta, lower, upper)
++            }
++        };
++        while day >= lower && day <= upper {
++            if crate::usage::day_has_usage(report, day) {
++                self.selected_day = Some(day);
++                break;
++            }
++            day += Duration::days(delta);
++        }
++        self.view.scroll_offset = 0;
++        self.refresh();
++        true
++    }
++
++    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
++        let resized = self.viewport_width != area.width;
++        if resized {
++            self.viewport_width = area.width;
++            if let Some(report) = self.report() {
++                let (start, today) = crate::usage::heatmap_bounds(report, self.content_width());
++                self.selected_day = self
++                    .selected_day
++                    .filter(|day| (start..=today).contains(day));
++            }
++        }
++        if resized || self.theme_revision != syntax_theme_revision() {
++            self.refresh();
++        }
++        Clear.render(area, buf);
++        let inner = area.inner(Margin::new(2, 0));
++        let [mut tabs, rule, mut body, footer] = Layout::vertical([
++            Constraint::Length(1),
++            Constraint::Length(1),
++            Constraint::Min(0),
++            Constraint::Length(1),
++        ])
++        .areas(inner);
++        let tab_hint = hint_line(&[("tab/shift+tab", "view")]);
++        if tabs.width >= 80 {
++            let width = tab_hint.width() as u16;
++            tab_hint.render(Rect::new(tabs.right() - width, tabs.y, width, 1), buf);
++            tabs.width = tabs.width.saturating_sub(width + 2);
++        }
++        render_filled_tab_bar(
++            &UsageRange::VIEWS.map(UsageRange::label),
++            self.range.index(),
++            tabs,
++            buf,
++        );
++        Line::from("─".repeat(usize::from(rule.width)))
++            .style(table_separator_style())
++            .render(rule, buf);
++
++        let width = self.content_width();
++        let sidebar = if self.range == UsageRange::Summary {
++            crate::wrapping::word_wrap_lines(
++                self.sidebar(),
++                usize::from(if width < body.width {
++                    38
++                } else {
++                    body.width.max(1)
++                }),
++            )
++        } else {
++            Vec::new()
++        };
++        let report_height = self.view.content_height(width);
++        // Narrow screens put the same details below the report instead of hiding them.
++        let side_by_side = width < body.width;
++        let content_height = if side_by_side {
++            report_height.max(sidebar.len())
++        } else {
++            report_height + sidebar.len()
++        };
++        self.view
++            .update_last_content_height(body.height.saturating_sub(2).max(1));
++        self.view.scroll_offset = self
++            .view
++            .scroll_offset
++            .min(content_height.saturating_sub(usize::from(body.height)));
++        if side_by_side {
++            let sidebar_area = Rect::new(body.x + width + 3, body.y, 38, body.height);
++            Paragraph::new(
++                sidebar
++                    .into_iter()
++                    .skip(self.view.scroll_offset)
++                    .collect::<Vec<_>>(),
++            )
++            .render(sidebar_area, buf);
++            body.width = width;
++        } else if !sidebar.is_empty() {
++            let top = report_height
++                .saturating_sub(self.view.scroll_offset)
++                .min(usize::from(body.height)) as u16;
++            let sidebar_area = Rect::new(body.x, body.y + top, body.width, body.height - top);
++            Paragraph::new(
++                sidebar
++                    .into_iter()
++                    .skip(self.view.scroll_offset.saturating_sub(report_height))
++                    .collect::<Vec<_>>(),
++            )
++            .render(sidebar_area, buf);
++        }
++        self.view.render_content(body, buf, 0);
++        let mut hints = vec![("esc", "back"), ("r", "refresh usage cache")];
++        if self.range == UsageRange::Summary {
++            hints.extend([("p", "proxy"), ("t", "telegram")]);
++        }
++        hints.push(("q", "quit"));
++        truncate_line_with_ellipsis_if_overflow(hint_line(&hints), usize::from(footer.width))
++            .render(footer, buf);
++    }
++
++    fn sidebar(&self) -> Vec<Line<'static>> {
++        let palette = Palette::current();
++        let value = palette.intensity(16);
++        let field = |label: &str, text: String| {
++            Line::from(vec![format!("{label}: ").dim(), Span::styled(text, value)])
++        };
++        let timestamp =
++            |at: chrono::DateTime<chrono::FixedOffset>| at.format("%Y-%m-%d %H:%M:%S").to_string();
++        let report = self.report();
++        let mut lifetime = 0_u64;
++        let mut peak = 0;
++        let mut longest = 0;
++        let mut current = 0;
++        let mut last_day = None;
++        if let Some(report) = report {
++            let today = report.refreshed_at.date_naive();
++            for (date, models) in &report.rows {
++                let tokens: u64 = models.values().map(|usage| usage.tokens.total).sum();
++                lifetime += tokens;
++                peak = peak.max(tokens);
++                if tokens == 0 {
++                    continue;
++                }
++                let Ok(day) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
++                    continue;
++                };
++                if day > today {
++                    continue;
++                }
++                current = if last_day == day.pred_opt() {
++                    current + 1
++                } else {
++                    1
++                };
++                longest = longest.max(current);
++                last_day = Some(day);
++            }
++            if last_day != Some(today) && last_day != today.pred_opt() {
++                current = 0;
++            }
++        }
++        let statistic = |value: u64, suffix: &str| {
++            report.map_or_else(|| "--".into(), |_| format!("{value}{suffix}"))
++        };
++        let streak = |days| statistic(days, if days == 1 { " day" } else { " days" });
++        let mut lines = vec![
++            Line::styled("Usage", palette.model(0)),
++            field(
++                "Cache ago",
++                report
++                    .map(|report| {
++                        format_age(
++                            (chrono::Local::now().fixed_offset() - report.refreshed_at)
++                                .num_seconds()
++                                .max(0) as u64,
++                        )
++                    })
++                    .unwrap_or_else(|| "--".into()),
++            ),
++            field("Lifetime tokens", statistic(lifetime, "")),
++            field("Peak tokens", statistic(peak, "")),
++            field("Longest streak", streak(longest)),
++            field("Current streak", streak(current)),
++            field(
++                "Latest record",
++                report
++                    .and_then(|report| {
++                        report
++                            .latest_usage_at
++                            .map(|at| timestamp(at.with_timezone(report.refreshed_at.offset())))
++                    })
++                    .unwrap_or_else(|| "--".into()),
++            ),
++            Line::default(),
++        ];
++        lines.extend(self.details.clone());
++        lines
++    }
++
++    fn scroll_mouse(&mut self, kind: MouseEventKind) -> bool {
++        let direction = match kind {
++            MouseEventKind::ScrollUp => -1.0,
++            MouseEventKind::ScrollDown => 1.0,
++            _ => return false,
++        };
++        if self.pending_mouse_scroll.signum() != direction {
++            self.pending_mouse_scroll = 0.0;
++        }
++        self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
++        // Match the transcript's fractional-row and direction-reversal behavior.
++        let rounded = self.pending_mouse_scroll.round();
++        if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
++            self.pending_mouse_scroll = rounded;
++        }
++        let rows = self.pending_mouse_scroll as isize;
++        self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
++        self.view.scroll_offset = self.view.scroll_offset.saturating_add_signed(rows);
++        true
++    }
++
++    pub(super) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
++        match event {
++            TuiEvent::Key(key) if self.handle_key(key) => {
++                tui.frame_requester().schedule_frame();
++                Ok(())
++            }
++            TuiEvent::Mouse(mouse) if self.scroll_mouse(mouse.kind) => {
++                tui.frame_requester().schedule_frame();
++                Ok(())
++            }
++            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
++                tui.draw(u16::MAX, |frame| self.render(frame.area(), frame.buffer))?;
++                tui.frame_requester()
++                    .schedule_frame_in(std::time::Duration::from_secs(1));
++                Ok(())
++            }
++            TuiEvent::Key(key) => self.view.handle_key_event(tui, key),
++            _ => Ok(()),
++        }
++    }
++}
++
++fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
++    let mut line = Line::default();
++    for (key, description) in hints {
++        if !line.spans.is_empty() {
++            line.spans.push("  ".dim());
++        }
++        line.spans.extend(key_hint::key_label_spans(key));
++        line.spans.push(Span::styled(
++            format!(" {description}"),
++            footer_hint_label_style().not_bold(),
++        ));
++    }
++    line
++}
++
++fn format_age(seconds: u64) -> String {
++    let days = seconds / 86_400;
++    let hours = seconds / 3_600 % 24;
++    let minutes = seconds / 60 % 60;
++    let seconds_part = seconds % 60;
++    if days > 0 {
++        format!("{days}d{hours}h{minutes}m{seconds_part}s")
++    } else if hours > 0 {
++        format!("{hours}h{minutes}m{seconds_part}s")
++    } else if minutes > 0 {
++        format!("{minutes}m{seconds_part}s")
++    } else {
++        format!("{seconds_part}s")
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::usage::UsageRange;
++    use chrono::Local;
++
++    #[tokio::test]
++    async fn heatmap_selection_escape_then_close_and_resize_preserve_report() -> Result<()> {
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        let today = Local::now().date_naive();
++        let latest = today - Duration::days(i64::from(today.weekday().num_days_from_sunday()) + 2);
++        let mut report = crate::usage::test_report();
++        report.refreshed_at = Local::now().fixed_offset();
++        report.rows.clear();
++        report.prices.clear();
++        report.missing_prices.insert("heatmap-model".into());
++        for days in [14, 6, 2, 0] {
++            report.rows.insert(
++                (latest - Duration::days(days)).to_string(),
++                std::collections::BTreeMap::from([(
++                    "heatmap-model".into(),
++                    codex_app_server_protocol::UsageTotals {
++                        tokens: codex_app_server_protocol::UsageTokens {
++                            input: 1,
++                            total: 1,
++                            ..Default::default()
++                        },
++                        ..Default::default()
++                    },
++                )]),
++            );
++        }
++        let report = Arc::new(report);
++        let mut overlay = ControlCenter::new(
++            Some(report.clone()),
++            UsageRange::Summary,
++            crate::keymap::RuntimeKeymap::defaults().pager,
++            120,
++            1.0,
++        );
++        assert!(overlay.handle_key(KeyCode::Left.into()));
++        assert_eq!(overlay.selected_day, Some(latest));
++        assert!(overlay.handle_key(KeyCode::Left.into()));
++        assert_eq!(overlay.selected_day, Some(latest - Duration::days(14)));
++        assert!(overlay.handle_key(KeyCode::Right.into()));
++        assert_eq!(overlay.selected_day, Some(latest));
++        assert!(overlay.handle_key(KeyCode::Up.into()));
++        assert_eq!(overlay.selected_day, Some(latest - Duration::days(2)));
++        assert!(overlay.handle_key(KeyCode::Up.into()));
++        assert_eq!(overlay.selected_day, Some(latest - Duration::days(2)));
++        assert!(overlay.handle_key(KeyCode::Down.into()));
++        assert_eq!(overlay.selected_day, Some(latest));
++        let area = Rect::new(0, 0, 40, 16);
++        let mut buffer = Buffer::empty(area);
++        overlay.render(area, &mut buffer);
++        let tabs = buffer.content[..40].to_vec();
++        let labels = tabs.iter().map(|cell| cell.symbol()).collect::<String>();
++        assert!(labels.contains("Summary"));
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Down.into()))?;
++        assert_eq!(overlay.view.scroll_offset, 0);
++        assert_eq!(overlay.selected_day, Some(latest));
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Up.into()))?;
++        assert_eq!(overlay.view.scroll_offset, 0);
++        assert_eq!(overlay.selected_day, Some(latest - Duration::days(2)));
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Down.into()))?;
++        let page_height = overlay.view.page_height(area);
++        assert!(overlay.view.content_height(overlay.content_width()) > page_height);
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::PageDown.into()))?;
++        assert_eq!(overlay.view.scroll_offset, page_height);
++        overlay.render(area, &mut buffer);
++        assert!(overlay.view.scroll_offset > 0);
++        assert_eq!(&buffer.content[..40], tabs.as_slice());
++        overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::PageUp.into()))?;
++        assert_eq!(overlay.view.scroll_offset, 0);
++        assert_eq!(overlay.selected_day, Some(latest));
++        assert_eq!(overlay.content_width(), 36);
++        assert!(overlay.selected_day.is_some());
++        assert!(overlay.handle_key(KeyCode::Tab.into()));
++        assert_eq!(overlay.range, UsageRange::Daily);
++        assert_eq!(overlay.selected_day, None);
++        assert_eq!(overlay.view.scroll_offset, 0);
++        assert!(Arc::ptr_eq(overlay.report().unwrap(), &report));
++        assert!(overlay.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
++        assert_eq!(overlay.range, UsageRange::Summary);
++        assert!(overlay.handle_key(KeyCode::Up.into()));
++        assert!(overlay.selected_day.is_some());
++        assert!(overlay.handle_key(KeyCode::Esc.into()));
++        assert!(overlay.selected_day.is_none());
++        assert!(!overlay.is_done());
++        assert!(overlay.handle_key(KeyCode::Esc.into()));
++        assert!(overlay.is_done());
++        Ok(())
++    }
++
++    #[test]
++    fn theme_changes_repaint_cached_reports_without_refreshing_accounting_or_navigation() {
++        let original = crate::render::highlight::current_syntax_theme();
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors {
++                fg: (220, 230, 240),
++                bg: (20, 35, 50),
++            },
++            || {
++                crate::render::highlight::set_syntax_theme(
++                    crate::render::highlight::resolve_theme_by_name("nord", None).unwrap(),
++                );
++                let report = Arc::new(crate::usage::test_report());
++                let area = Rect::new(0, 0, 204, 10);
++                let mut overlay = ControlCenter::new(
++                    Some(Arc::clone(&report)),
++                    UsageRange::Daily,
++                    crate::keymap::RuntimeKeymap::defaults().pager,
++                    area.width,
++                    1.0,
++                );
++                overlay.view.scroll_offset = 3;
++                let mut before = Buffer::empty(area);
++                overlay.render(area, &mut before);
++                let numeric = |buffer: &Buffer| {
++                    buffer
++                        .content
++                        .iter()
++                        .find(|cell| cell.symbol() == "$")
++                        .unwrap()
++                        .fg
++                };
++                let first = numeric(&before);
++                crate::render::highlight::set_syntax_theme(
++                    crate::render::highlight::resolve_theme_by_name("github", None).unwrap(),
++                );
++                let mut after = Buffer::empty(area);
++                overlay.render(area, &mut after);
++                assert_ne!(numeric(&after), first);
++                assert_eq!(
++                    numeric(&after),
++                    Palette::current().intensity(16).fg.unwrap()
++                );
++                assert!(Arc::ptr_eq(overlay.report().unwrap(), &report));
++                assert_eq!(overlay.range, UsageRange::Daily);
++                assert_eq!(overlay.view.scroll_offset, 3);
++                assert_eq!(overlay.theme_revision, syntax_theme_revision());
++                for (before, after) in before.content[usize::from(area.width)..]
++                    .iter()
++                    .zip(&after.content[usize::from(area.width)..])
++                {
++                    assert_eq!(before.symbol(), after.symbol());
++                }
++            },
++        );
++        crate::render::highlight::set_syntax_theme(original);
++    }
++
++    #[test]
++    fn summary_sidebar_separates_usage_time_from_cache_age_and_keeps_header_controls() {
++        let mut report = crate::usage::test_report();
++        report.rows.clear();
++        report.quota.clear();
++        report.refreshed_at = Local::now().fixed_offset() - Duration::seconds(90_123);
++        let timestamp = report
++            .latest_usage_at
++            .unwrap()
++            .with_timezone(report.refreshed_at.offset())
++            .format("%Y-%m-%d %H:%M:%S")
++            .to_string();
++        let mut overlay = ControlCenter::new(
++            Some(Arc::new(report)),
++            UsageRange::Summary,
++            crate::keymap::RuntimeKeymap::defaults().pager,
++            120,
++            1.0,
++        );
++        let area = Rect::new(0, 0, 120, 24);
++        let mut buffer = Buffer::empty(area);
++        overlay.render(area, &mut buffer);
++        let row_text = |buffer: &Buffer, row| {
++            (0..120)
++                .map(|column| buffer[(column, row)].symbol())
++                .collect::<String>()
++        };
++        let tabs = row_text(&buffer, 0);
++        assert!(
++            tabs.contains("Summary") && tabs.trim_end().ends_with("view"),
++            "{tabs}"
++        );
++        assert!(!tabs.contains("Codex control center"));
++        let sidebar = overlay
++            .sidebar()
++            .iter()
++            .map(ToString::to_string)
++            .collect::<Vec<_>>();
++        assert!(!sidebar.iter().any(|line| line.starts_with("Status:")));
++        assert!(
++            sidebar
++                .iter()
++                .any(|line| line.starts_with("Cache ago: 1d1h2m"))
++        );
++        let latest = (0..23)
++            .find(|row| row_text(&buffer, *row).contains("Latest record:"))
++            .unwrap();
++        assert!(row_text(&buffer, latest).contains(&format!("Latest record: {timestamp}")));
++        assert!(!sidebar.iter().any(|line| line.starts_with("Updated:")));
++        assert_eq!(buffer[(80, 2)].symbol(), "U");
++        let footer = row_text(&buffer, 23);
++        assert!(footer.contains("esc back") && footer.contains("r refresh usage cache"));
++        assert!(footer.contains("p proxy") && footer.contains("t telegram"));
++        assert!(footer.contains("q quit"));
++        let key_column = footer.find("p proxy").unwrap() as u16;
++        assert!(
++            buffer[(key_column, 23)]
++                .modifier
++                .contains(ratatui::style::Modifier::BOLD)
++        );
++        assert!(
++            !buffer[(key_column + 2, 23)]
++                .modifier
++                .contains(ratatui::style::Modifier::BOLD)
++        );
++        for row in 0..23 {
++            assert!(!row_text(&buffer, row).contains("select day"));
++        }
++        assert!(overlay.handle_key(KeyCode::Tab.into()));
++        overlay.render(area, &mut buffer);
++        assert!(!row_text(&buffer, 4).contains(&timestamp));
++        assert!(!row_text(&buffer, 23).contains("select day"));
++        assert!(row_text(&buffer, 23).contains("q quit"));
++    }
++
++    #[test]
++    fn sidebar_statistics_use_full_history_and_count_current_streak_through_yesterday() {
++        let mut report = crate::usage::test_report();
++        report.rows.clear();
++        let today = report.refreshed_at.date_naive();
++        let mut usage = codex_app_server_protocol::UsageTotals::default();
++        usage.tokens.total = 100;
++        for ago in [400, 399, 398, 397, 4, 3, 1, 0] {
++            report.rows.insert(
++                (today - Duration::days(ago)).to_string(),
++                std::collections::BTreeMap::from([("first".into(), usage.clone())]),
++            );
++        }
++        usage.tokens.total = 50;
++        report
++            .rows
++            .get_mut(&today.to_string())
++            .unwrap()
++            .insert("second".into(), usage);
++        report.rows.insert(
++            (today - Duration::days(2)).to_string(),
++            std::collections::BTreeMap::from([("zero".into(), Default::default())]),
++        );
++        let mut overlay = ControlCenter::new(
++            Some(Arc::new(report.clone())),
++            UsageRange::Summary,
++            crate::keymap::RuntimeKeymap::defaults().pager,
++            120,
++            1.0,
++        );
++        let statistics = |overlay: &ControlCenter| {
++            overlay
++                .sidebar()
++                .iter()
++                .skip(2)
++                .take(4)
++                .map(ToString::to_string)
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(
++            statistics(&overlay),
++            [
++                "Lifetime tokens: 850",
++                "Peak tokens: 150",
++                "Longest streak: 4 days",
++                "Current streak: 2 days"
++            ]
++        );
++        report.rows.remove(&today.to_string());
++        overlay.set_report(Ok(Arc::new(report.clone())));
++        assert_eq!(statistics(&overlay)[3], "Current streak: 1 day");
++        report.rows.remove(&(today - Duration::days(1)).to_string());
++        overlay.set_report(Ok(Arc::new(report.clone())));
++        assert_eq!(statistics(&overlay)[3], "Current streak: 0 days");
++        report.rows.clear();
++        overlay.set_report(Ok(Arc::new(report)));
++        assert_eq!(statistics(&overlay)[0], "Lifetime tokens: 0");
++        overlay.set_report(Err("unavailable".into()));
++        assert_eq!(statistics(&overlay)[0], "Lifetime tokens: --");
++    }
++
++    #[test]
++    fn snapshot_age_uses_normalized_day_hour_minute_and_second_units() {
++        for (seconds, expected) in [
++            (0, "0s"),
++            (59, "59s"),
++            (60, "1m0s"),
++            (105, "1m45s"),
++            (3_600, "1h0m0s"),
++            (14_622, "4h3m42s"),
++            (86_400, "1d0h0m0s"),
++            (90_123, "1d1h2m3s"),
++        ] {
++            assert_eq!(format_age(seconds), expected);
++        }
++    }
++
++    #[tokio::test]
++    async fn mouse_wheel_uses_configured_fractional_speed_and_releases_capture_on_close()
++    -> Result<()> {
++        use super::super::Overlay;
++        use crossterm::event::MouseEvent;
++
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        let mut report = crate::usage::test_report();
++        let models = report.rows["2026-09-28"].clone();
++        for day in 1..=28 {
++            report
++                .rows
++                .insert(format!("2026-09-{day:02}"), models.clone());
++        }
++        let report = Arc::new(report);
++        let area = Rect::new(0, 0, 204, 16);
++        for (speed, deltas) in [
++            (0.1, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, -1]),
++            (0.5, vec![0, -1, 0, 0, 1]),
++            (1.5, vec![-1, -2, 1, 2]),
++            (3.0, vec![-3, 3]),
++        ] {
++            let mut view = ControlCenter::new(
++                Some(Arc::clone(&report)),
++                UsageRange::Daily,
++                crate::keymap::RuntimeKeymap::defaults().pager,
++                area.width,
++                speed,
++            );
++            view.view.scroll_offset = 40;
++            let mut overlay = Overlay::ControlCenter(Box::new(view));
++            let mut expected = 40_usize;
++            let up_events = if speed == 0.1 {
++                deltas.len()
++            } else {
++                deltas.len().div_ceil(2)
++            };
++            for (index, delta) in deltas.into_iter().enumerate() {
++                overlay.handle_event(
++                    &mut tui,
++                    TuiEvent::Mouse(MouseEvent {
++                        kind: if index < up_events {
++                            MouseEventKind::ScrollUp
++                        } else {
++                            MouseEventKind::ScrollDown
++                        },
++                        column: 10,
++                        row: 10,
++                        modifiers: KeyModifiers::NONE,
++                    }),
++                )?;
++                assert!(tui.overlay_input == tui::OverlayInput::Usage);
++                let Overlay::ControlCenter(view) = &mut overlay else {
++                    unreachable!()
++                };
++                view.render(area, &mut Buffer::empty(area));
++                expected = expected.saturating_add_signed(delta);
++                assert_eq!(view.view.scroll_offset, expected);
++                assert!(Arc::ptr_eq(view.report().unwrap(), &report));
++            }
++            overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Esc.into()))?;
++            assert!(overlay.is_done());
++            assert!(tui.overlay_input == tui::OverlayInput::Default);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn control_center_error_keeps_navigation_with_or_without_the_sidebar() {
++        let mut report = crate::usage::test_report();
++        report.latest_usage_at = None;
++        let report = Arc::new(report);
++        for width in [60, 120] {
++            let mut overlay = ControlCenter::new(
++                Some(Arc::clone(&report)),
++                UsageRange::Summary,
++                crate::keymap::RuntimeKeymap::defaults().pager,
++                width,
++                1.0,
++            );
++            overlay.set_report(Err("cache unavailable".into()));
++            let area = Rect::new(0, 0, width, 24);
++            let mut buffer = Buffer::empty(area);
++            overlay.render(area, &mut buffer);
++            let text = buffer
++                .content
++                .chunks_exact(usize::from(width))
++                .map(|row| {
++                    row.iter()
++                        .map(|cell| cell.symbol())
++                        .collect::<String>()
++                        .trim()
++                        .to_owned()
++                })
++                .collect::<Vec<_>>()
++                .join(" ");
++            assert!(
++                text.contains("Usage unavailable: cache unavailable"),
++                "{text}"
++            );
++            assert!(!overlay.is_done());
++            assert!(text.contains("Latest record: --"), "{text}");
++            assert!(text.contains("esc back"));
++        }
++    }
++
++    #[test]
++    fn usage_dashboard_closes_tables_at_both_viewport_edges() {
++        let report = Arc::new(crate::usage::test_report());
++        // A short body cuts the period table before its natural bottom border.
++        let area = Rect::new(4, 3, 204, 10);
++        let mut overlay = ControlCenter::new(
++            Some(report),
++            UsageRange::Daily,
++            crate::keymap::RuntimeKeymap::defaults().pager,
++            area.width,
++            1.0,
++        );
++        let mut buffer = Buffer::empty(Rect::new(0, 0, 220, 20));
++        let row = |buffer: &Buffer, y| {
++            (area.x..area.right())
++                .map(|x| buffer[(x, y)].symbol())
++                .collect::<String>()
++        };
++        overlay.render(area, &mut buffer);
++        let bottom = row(&buffer, area.bottom() - 3);
++        assert!(
++            bottom.trim().starts_with('└') && bottom.trim().ends_with('┘'),
++            "{bottom}"
++        );
++        assert!(row(&buffer, area.bottom() - 2).trim().is_empty());
++        overlay.view.scroll_offset = 3;
++        overlay.render(area, &mut buffer);
++        let top = row(&buffer, area.y + 2);
++        assert!(
++            top.trim().starts_with('┌') && top.trim().ends_with('┐'),
++            "{top}"
++        );
++        assert!(row(&buffer, area.bottom() - 1).contains("esc back"));
++        assert!(row(&buffer, area.y).contains("Summary"));
++    }
++
++    #[tokio::test]
++    async fn every_report_exits_with_escape_and_ignores_key_release() -> Result<()> {
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        let mut report = crate::usage::test_report();
++        report.rows.clear();
++        report.quota.clear();
++        let report = Arc::new(report);
++        for range in UsageRange::VIEWS {
++            let mut overlay = ControlCenter::new(
++                Some(report.clone()),
++                range,
++                crate::keymap::RuntimeKeymap::defaults().pager,
++                120,
++                1.0,
++            );
++            for key in [
++                KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
++                KeyCode::Char('q').into(),
++                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
++            ] {
++                overlay.handle_event(&mut tui, TuiEvent::Key(key))?;
++                assert!(!overlay.is_done());
++            }
++            for key in [
++                KeyCode::Char('w'),
++                KeyCode::Char('a'),
++                KeyCode::Char('s'),
++                KeyCode::Char('d'),
++            ] {
++                assert!(!overlay.handle_key(key.into()));
++                assert!(overlay.selected_day.is_none());
++            }
++            for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
++                assert!(overlay.handle_key(key.into()));
++                assert_eq!(overlay.view.scroll_offset, 0);
++                assert!(overlay.selected_day.is_none());
++            }
++            assert_eq!(
++                overlay.handle_key(KeyCode::Enter.into()),
++                range == UsageRange::Summary
++            );
++            assert!(overlay.handle_key(KeyCode::Esc.into()));
++            assert!(overlay.is_done());
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn constrained_pages_keep_every_usage_row_reachable_and_close_after_content() -> Result<()>
++    {
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        let mut report = crate::usage::test_report();
++        let usage = report.rows["2026-09-28"]["gpt-5.4"].clone();
++        let dates = (1..=8)
++            .map(|day| format!("2026-09-{day:02}"))
++            .collect::<Vec<_>>();
++        report.rows = dates
++            .iter()
++            .map(|day| {
++                (
++                    day.clone(),
++                    std::collections::BTreeMap::from([("gpt-5.4".into(), usage.clone())]),
++                )
++            })
++            .collect();
++        let report = Arc::new(report);
++        for body_height in 3..=10 {
++            let area = Rect::new(4, 3, 204, body_height + 3);
++            let mut buffer = Buffer::empty(Rect::new(0, 0, 220, 24));
++            let mut overlay = ControlCenter::new(
++                Some(Arc::clone(&report)),
++                UsageRange::Daily,
++                crate::keymap::RuntimeKeymap::defaults().pager,
++                area.width,
++                1.0,
++            );
++            let mut seen = std::collections::BTreeSet::new();
++            let mut previous_offset = None;
++            for _ in 0..100 {
++                overlay.render(area, &mut buffer);
++                for y in area.y + 2..area.bottom() - 1 {
++                    let line = (area.x..area.right())
++                        .map(|x| buffer[(x, y)].symbol())
++                        .collect::<String>();
++                    for day in &dates {
++                        if line.contains(day) {
++                            seen.insert(day.clone());
++                        }
++                    }
++                    if line.trim().starts_with('└') && y > area.y + 2 {
++                        let above = (area.x..area.right())
++                            .map(|x| buffer[(x, y - 1)].symbol())
++                            .collect::<String>();
++                        assert!(
++                            !above.contains('─') || above.trim().starts_with('┌'),
++                            "{above}\n{line}"
++                        );
++                    }
++                }
++                if previous_offset == Some(overlay.view.scroll_offset) {
++                    break;
++                }
++                previous_offset = Some(overlay.view.scroll_offset);
++                overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::PageDown.into()))?;
++            }
++            assert_eq!(
++                seen,
++                dates.iter().cloned().collect(),
++                "body height {body_height}"
++            );
++            overlay.handle_event(&mut tui, TuiEvent::Key(KeyCode::Home.into()))?;
++            overlay.render(area, &mut buffer);
++            assert_eq!(overlay.view.scroll_offset, 0);
++        }
++        Ok(())
++    }
++}

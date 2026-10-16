@@ -15,7 +15,6 @@ import urllib.request
 TOOLS = {
     "shuck": ("ewhauser/shuck", ("workspace", "package", "version")),
     "tokei": ("XAMPPRocky/tokei", ("package", "version")),
-    "ccusage": ("92645417d9e5c763259dbebc306e3e/ccusage", None),
 }
 SEMANTIC_RELEASE = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
@@ -46,12 +45,9 @@ def remote_source(repository, reference, name, sources_root, output):
     if remote != url or bare != "true":
         raise RuntimeError("tool source clone differs")
     subprocess.run(git + ["fetch", "--depth=1", "--no-tags", "origin", reference], check=True)
-    revision = subprocess.check_output(git + ["rev-parse", "FETCH_HEAD^{commit}"], text=True).strip()
-    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-        raise RuntimeError("tool source revision differs")
     archive = output / f"{name}-source.tar.gz"
     with archive.open("xb") as stream:
-        subprocess.run(git + ["archive", "--format=tar.gz", f"--prefix={name}/", revision], stdout=stream, check=True)
+        subprocess.run(git + ["archive", "--format=tar.gz", f"--prefix={name}/", "FETCH_HEAD^{commit}"], stdout=stream, check=True)
     extracted = output / f"{name}-source"
     extracted.mkdir()
     with tarfile.open(archive, "r:gz") as source_archive:
@@ -59,7 +55,7 @@ def remote_source(repository, reference, name, sources_root, output):
     root = extracted / name
     if not root.is_dir() or root.is_symlink():
         raise RuntimeError("release source root differs")
-    return root, revision
+    return root
 
 
 def declared_version(source, fields):
@@ -112,29 +108,12 @@ def main():
     output.mkdir()
     metadata = {}
     for name, (repository, version_fields) in TOOLS.items():
-        tag, version = latest_release(repository) if version_fields else (None, None)
-        reference = f"refs/tags/{tag}" if tag else "HEAD"
-        source, revision = remote_source(repository, reference, name, sources_root, output)
-        if version_fields:
-            if declared_version(source, version_fields) != version or not (source / "Cargo.lock").is_file():
-                raise RuntimeError(f"{name} release source version differs")
-        else:
-            version = json.loads((source / "package.json").read_text())["version"]
-            if not isinstance(version, str) or SEMANTIC_RELEASE.fullmatch("v" + version) is None or not (source / "rust/Cargo.lock").is_file():
-                raise RuntimeError("ccusage source version or Cargo lock differs")
-            locked = json.loads((source / "flake.lock").read_text())["nodes"]["litellm"]["locked"]
-            owner, repo, rev = (locked[field] for field in ("owner", "repo", "rev"))
-            if re.fullmatch(r"[0-9a-f]{40}", rev) is None:
-                raise RuntimeError("ccusage pricing revision differs")
-            url = f"https://raw.githubusercontent.com/{owner}/{repo}/{rev}/model_prices_and_context_window.json"
-            with urllib.request.urlopen(request(url), timeout=120) as response:
-                pricing = response.read()
-            if not isinstance(json.loads(pricing), dict):
-                raise RuntimeError("ccusage pricing snapshot differs")
-            (output / "ccusage-pricing.json").write_bytes(pricing)
-            source = source / "rust"
+        tag, version = latest_release(repository)
+        source = remote_source(repository, f"refs/tags/{tag}", name, sources_root, output)
+        if declared_version(source, version_fields) != version or not (source / "Cargo.lock").is_file():
+            raise RuntimeError(f"{name} release source version differs")
         fetch_locked(cargo, rustc, cargo_home, source)
-        metadata[name.title()] = {"Name": name, "Version": version, "Source": revision}
+        metadata[name.title()] = {"Name": name, "Version": version}
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
 

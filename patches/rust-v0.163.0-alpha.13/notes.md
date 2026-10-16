@@ -1,0 +1,14 @@
+- Retain account or transport conditions only when they simplify the complete implementation; otherwise prefer shared code and preserve unrelated upstream behavior.
+- Treat TUI as the default terminal interface and refer to it only as TUI.
+- Omit live status-line items whose values are unavailable or unknown; do not render placeholder text or separators for omitted items.
+- Preserve example values in status-line setup previews when live data is unavailable.
+- Keep status-line previews consistent with live values, formatting, and colors when live data is available.
+- Describe each status-line item's live unavailable-state behavior in its item description using the wording of comparable items.
+- Status-line content must use producers already present upstream; do not introduce or retain content backed only by private producers.
+- Every private Patch in every lane serves Linux only; non-Linux compatibility and compilation are outside its scope.
+- Retain a platform condition only when it simplifies the required Linux implementation compared with shared or unconditional code.
+- Preserve required Linux behavior and assertions, prefer shared code when simpler, and avoid blanket Linux gating or changes to unrelated upstream platform boundaries.
+- For project entry points, ensure and publish `REPOS_ROOT`, `PROJECT_SCRATCH_ROOT`, `PROJECT_PERSISTENT_ROOT`, `PROJECT_RUNTIME_ROOT`, `SKILLS_ROOT` and `SKILLS_SCRATCH_ROOT`.
+- Daemon management commands do not initialize project storage directories.
+- Permission profile `workspace` makes the entered cwd and the six published storage directories fully writable with no exceptions; every path outside those seven directory trees, including `TMPDIR`, is read-only.
+- Keep Workspace filesystem-root changes independent of approval and network settings.

@@ -1,0 +1,610 @@
+present-response-tab-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-response-tab-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -4,6 +4,7 @@
+ //! viewport, including its scrolling, selection, search and bounded text layouts.
+ 
+ mod control_center;
++mod response_tab;
+ mod scrolling;
+ mod transcript;
+ 
+diff --git a/codex-rs/tui/src/pager_overlay/response_tab.rs b/codex-rs/tui/src/pager_overlay/response_tab.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/pager_overlay/response_tab.rs
+@@ -0,0 +1,215 @@
++//! Response rows and contextual filter keys share one table body.
++
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use crate::control_center_table::interaction::TableInteraction;
++use crate::key_hint;
++use crate::keymap::ListAction;
++use crate::keymap::ListKeymap;
++use crate::model_catalog::ModelCatalog;
++use crate::response_history::ResponseHistory;
++use crate::response_history::ResponsePageRequest;
++use crate::response_table::HEADER_HEIGHT;
++use crate::response_table::ResponseTable;
++use crate::response_table::STATUSES;
++use crate::response_table::status_label;
++use crate::tui::FrameRequester;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Constraint;
++use ratatui::layout::Layout;
++use ratatui::layout::Rect;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::widgets::Widget;
++use std::sync::Arc;
++use std::time::Instant;
++
++pub(crate) struct ResponseTab {
++    pub(crate) history: ResponseHistory,
++    pub(crate) catalog: Arc<ModelCatalog>,
++    keymap: ListKeymap,
++    frames: FrameRequester,
++    events: AppEventSender,
++}
++
++impl ResponseTab {
++    pub(crate) fn new(
++        keymap: ListKeymap,
++        frames: FrameRequester,
++        events: AppEventSender,
++        catalog: Arc<ModelCatalog>,
++    ) -> Self {
++        let mut browser = Self {
++            history: ResponseHistory::new(),
++            catalog,
++            keymap,
++            frames,
++            events,
++        };
++        let request = browser.history.load_recent(Instant::now());
++        browser.request(request);
++        browser
++    }
++
++    pub(crate) fn request(&self, request: Option<ResponsePageRequest>) {
++        if let Some(request) = request {
++            self.events.send(AppEvent::ReadResponseAttempts {
++                request_id: request.id,
++                params: request.params,
++            });
++        }
++        self.frames.schedule_frame();
++    }
++
++    pub(crate) fn render(
++        &mut self,
++        area: Rect,
++        buffer: &mut Buffer,
++        interaction: &mut TableInteraction,
++    ) -> Vec<(Rect, Arc<str>)> {
++        let mut errors = Line::default();
++        for error in [
++            self.history.error.as_ref(),
++            self.history.persistence_error.as_ref(),
++            self.history.prices.as_ref().err(),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            if !errors.spans.is_empty() {
++                errors.push_span(" | ");
++            }
++            errors.push_span(error.clone());
++        }
++        let [error_area, list] = Layout::vertical([
++            Constraint::Length(u16::from(!errors.spans.is_empty())),
++            Constraint::Min(0),
++        ])
++        .areas(area);
++        errors.yellow().render(error_area, buffer);
++        let request = self.history.update_viewport(
++            usize::from(list.height).saturating_sub(HEADER_HEIGHT),
++            Instant::now(),
++        );
++        if request.is_some() {
++            self.request(request);
++        }
++        let rows = self.history.rows().collect::<Vec<_>>();
++        let table = ResponseTable::new(
++            &rows,
++            self.history.prices.as_ref().ok(),
++            &self.catalog,
++            Instant::now(),
++        );
++        interaction.column_offset = interaction.column_offset.min(table.max_offset(list.width));
++        if rows.is_empty() {
++            if !self.history.is_loading() {
++                Line::from("No matching responses.")
++                    .dim()
++                    .render(list, buffer);
++            }
++            Vec::new()
++        } else {
++            let end = rows
++                .len()
++                .min(self.history.scroll_top + self.history.visible_rows());
++            table.render(
++                self.history.scroll_top..end,
++                list,
++                buffer,
++                interaction.column_offset,
++            )
++        }
++    }
++
++    pub(crate) fn model_label(&self) -> &str {
++        self.history
++            .model()
++            .map_or("All", |model| self.catalog.display_name(model))
++    }
++
++    pub(crate) fn status_label(&self) -> &'static str {
++        self.history.status().map_or("All", status_label)
++    }
++
++    pub(crate) fn owns_key(key: KeyEvent) -> bool {
++        (matches!(key.code, KeyCode::Left | KeyCode::Right) && key.modifiers == KeyModifiers::NONE)
++            || TableInteraction::horizontal_key(key)
++    }
++
++    pub(crate) fn scroll_direction(&self, key: KeyEvent) -> Option<f64> {
++        if Self::owns_key(key) {
++            return None;
++        }
++        match self.keymap.action_for(key) {
++            Some(ListAction::MoveUp) => Some(-1.0),
++            Some(ListAction::MoveDown) => Some(1.0),
++            _ => None,
++        }
++    }
++
++    pub(crate) fn scroll(&mut self, rows: isize) {
++        let request = self.history.scroll_by(rows, Instant::now());
++        self.request(request);
++    }
++
++    /// Return a close request for the owning control center, never a second overlay.
++    pub(crate) fn handle_key(&mut self, key: KeyEvent, interaction: &mut TableInteraction) -> bool {
++        if key.kind == KeyEventKind::Release {
++            return false;
++        }
++        let action = self.keymap.action_for(key);
++        if Self::owns_key(key)
++            || !matches!(action, Some(ListAction::MoveDown | ListAction::PageDown))
++        {
++            self.history.cancel_scroll();
++        }
++        let now = Instant::now();
++        let request = if key_hint::plain(KeyCode::Left).is_press(key) {
++            let next = self
++                .history
++                .models
++                .iter()
++                .find(|model| {
++                    self.history
++                        .model()
++                        .is_none_or(|current| model.as_str() > current)
++                })
++                .cloned();
++            self.history.set_model(next, now)
++        } else if key_hint::plain(KeyCode::Right).is_press(key) {
++            let next = match self.history.status() {
++                None => STATUSES.first().copied(),
++                Some(status) => STATUSES
++                    .iter()
++                    .position(|candidate| *candidate == status)
++                    .and_then(|index| STATUSES.get(index + 1))
++                    .copied(),
++            };
++            self.history.set_status(next, now)
++        } else if interaction.handle_horizontal(key) {
++            None
++        } else if matches!(action, Some(ListAction::MoveLeft | ListAction::MoveRight)) {
++            interaction.scroll_columns(action == Some(ListAction::MoveRight));
++            None
++        } else if action == Some(ListAction::Cancel)
++            || key_hint::ctrl(KeyCode::Char('c')).is_press(key)
++        {
++            return true;
++        } else if let Some(action) = action {
++            self.history.navigate(action, now)
++        } else {
++            return false;
++        };
++        self.request(request);
++        false
++    }
++}
++
++#[cfg(test)]
++#[path = "response_tab_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/pager_overlay/response_tab_tests.rs b/codex-rs/tui/src/pager_overlay/response_tab_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/pager_overlay/response_tab_tests.rs
+@@ -0,0 +1,361 @@
++use super::*;
++use crate::response_timing::tests::attempt;
++use crate::response_timing::tests::page;
++use codex_models_manager::model_pricing::Prices;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use pretty_assertions::assert_eq;
++use uuid::Uuid;
++
++fn browser() -> (
++    ResponseTab,
++    TableInteraction,
++    tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++) {
++    let (events, received) = tokio::sync::mpsc::unbounded_channel();
++    (
++        ResponseTab::new(
++            crate::keymap::RuntimeKeymap::defaults().list,
++            FrameRequester::test_dummy(),
++            AppEventSender::new(events),
++            Arc::new(ModelCatalog::new(Vec::new())),
++        ),
++        TableInteraction::new(1.0, FrameRequester::test_dummy()),
++        received,
++    )
++}
++
++fn line(buffer: &Buffer, y: u16) -> String {
++    (buffer.area.x..buffer.area.right())
++        .map(|x| buffer[(x, y)].symbol())
++        .collect()
++}
++
++#[tokio::test]
++async fn response_body_keeps_shared_table_paging_without_selection_filter_or_progress_bars() {
++    let (mut browser, mut interaction, mut events) = browser();
++    let AppEvent::ReadResponseAttempts { request_id, params } = events.try_recv().unwrap() else {
++        panic!("initial page")
++    };
++    assert_eq!(params.thread_id, None);
++    let mut response = page(
++        (101..=130)
++            .map(|id| {
++                let mut row = attempt(id, Some(ResponseAttemptEnd::Completed));
++                row.requested_model = if id % 2 == 0 { "model-a" } else { "model-b" }.into();
++                row
++            })
++            .collect(),
++    );
++    response.next_cursor = Some("older".into());
++    browser
++        .history
++        .finish(request_id, Ok(response), Ok(Prices::new()), Instant::now());
++    let area = Rect::new(0, 0, 140, 20);
++    for bg in [(20, 35, 50), (250, 241, 235)] {
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors {
++                fg: (180, 220, 255),
++                bg,
++            },
++            || {
++                let mut buffer = Buffer::empty(area);
++                browser.render(area, &mut buffer, &mut interaction);
++                assert!(line(&buffer, 0).starts_with('┌'));
++                assert!(line(&buffer, 1).contains("Model"));
++                assert!(line(&buffer, 2).contains("Attempt ID"));
++                assert!(line(&buffer, 3).contains("Requested"));
++                assert!(line(&buffer, 3).contains("Served"));
++                assert!(line(&buffer, 17).contains(&Uuid::from_u128(124).to_string()));
++                assert!(line(&buffer, 18).starts_with('└'));
++                assert_eq!(buffer[(2, 7)].bg, buffer[(2, 9)].bg);
++                let text = buffer
++                    .content
++                    .iter()
++                    .map(|cell| cell.symbol())
++                    .collect::<String>();
++                assert!(!text.contains(&attempt(1, None).thread_id.unwrap().to_string()));
++                assert!(!text.contains("Type to search"));
++                for removed in [
++                    "choose columns",
++                    "scroll columns",
++                    "browse",
++                    "refresh responses",
++                    "Model: All",
++                    "1 / 30",
++                    "more",
++                ] {
++                    assert!(!text.contains(removed));
++                }
++                assert_eq!(buffer[(2, 5)].bg, ratatui::style::Color::Reset);
++                assert_eq!(buffer[(2, 5)].bg, buffer[(2, 7)].bg);
++            },
++        );
++    }
++    browser.handle_key(KeyCode::End.into(), &mut interaction);
++    assert!(matches!(
++        events.try_recv().unwrap(),
++        AppEvent::ReadResponseAttempts { .. }
++    ));
++    let mut loading = Buffer::empty(area);
++    browser.render(area, &mut loading, &mut interaction);
++    assert!(line(&loading, 0).starts_with('┌'));
++    assert!(line(&loading, 17).contains(&Uuid::from_u128(101).to_string()));
++    assert!(line(&loading, 18).starts_with('└'));
++    assert!(
++        !loading
++            .content
++            .iter()
++            .map(|cell| cell.symbol())
++            .collect::<String>()
++            .contains("more")
++    );
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 8);
++    assert_eq!(browser.history.model(), None);
++    browser.handle_key(KeyCode::Tab.into(), &mut interaction);
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 16);
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 8);
++    assert!(events.try_recv().is_err());
++}
++
++#[tokio::test]
++async fn browser_has_no_hidden_close_key_and_columns_remain_accessible_after_resize() {
++    let (mut browser, mut interaction, mut events) = browser();
++    let AppEvent::ReadResponseAttempts { request_id, .. } = events.try_recv().unwrap() else {
++        panic!("page")
++    };
++    let row = attempt(1, Some(ResponseAttemptEnd::Completed));
++    browser.history.finish(
++        request_id,
++        Ok(page(vec![row])),
++        Ok(Prices::new()),
++        Instant::now(),
++    );
++    for key in [
++        KeyCode::Char('q').into(),
++        KeyCode::Tab.into(),
++        KeyCode::BackTab.into(),
++        KeyCode::Enter.into(),
++        KeyCode::Char('r').into(),
++        KeyCode::Char('c').into(),
++        KeyCode::Char('m').into(),
++        KeyCode::Char('s').into(),
++        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
++    ] {
++        assert!(!browser.handle_key(key, &mut interaction));
++    }
++    assert!(events.try_recv().is_err());
++    for _ in 0..100 {
++        browser.handle_key(
++            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
++            &mut interaction,
++        );
++    }
++    let area = Rect::new(0, 0, 80, 16);
++    let mut buffer = Buffer::empty(area);
++    browser.render(area, &mut buffer, &mut interaction);
++    assert!(line(&buffer, 2).contains("Cost"));
++    assert!(interaction.column_offset > 0);
++    for (width, height) in [(1, 1), (10, 4), (80, 10), (600, 20)] {
++        let area = Rect::new(0, 0, width, height);
++        browser.render(area, &mut Buffer::empty(area), &mut interaction);
++    }
++    assert_eq!(interaction.column_offset, 0);
++    assert!(browser.handle_key(KeyCode::Esc.into(), &mut interaction));
++}
++
++#[tokio::test]
++async fn configured_list_bindings_own_horizontal_scrolling_and_cancel() {
++    let (mut browser, mut interaction, mut events) = browser();
++    events.try_recv().unwrap();
++    browser.history.models.insert("model-a".into());
++    let config =
++        toml::from_str("[list]\nmove_left = 'ctrl-left'\nmove_right = 'ctrl-right'\ncancel = 'q'")
++            .unwrap();
++    browser.keymap = crate::keymap::RuntimeKeymap::from_config(&config)
++        .unwrap()
++        .list;
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 8);
++    assert_eq!(browser.history.model(), None);
++    assert!(events.try_recv().is_err());
++    assert!(browser.handle_key(KeyCode::Char('q').into(), &mut interaction));
++}
++
++#[tokio::test]
++async fn arrows_cycle_combined_raw_filters_with_metadata_labels_and_no_dialog() {
++    let (mut browser, mut interaction, mut events) = browser();
++    events.try_recv().unwrap();
++    browser
++        .history
++        .models
++        .extend(["model-a".into(), "model-b".into(), "retired-model".into()]);
++    let mut alpha = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    alpha.model = "model-a".into();
++    alpha.display_name = "Friendly Alpha".into();
++    let mut beta = alpha.clone();
++    beta.model = "model-b".into();
++    beta.display_name = "Friendly Beta".into();
++    browser.catalog = Arc::new(ModelCatalog::new(vec![alpha, beta]));
++    assert_eq!(browser.model_label(), "All");
++    assert_eq!(browser.status_label(), "All");
++    browser.handle_key(KeyCode::Right.into(), &mut interaction);
++    let AppEvent::ReadResponseAttempts { params, .. } = events.try_recv().unwrap() else {
++        panic!("status page")
++    };
++    assert_eq!(params.status, Some(STATUSES[0]));
++    for (model, label) in [
++        (Some("model-a"), "Friendly Alpha"),
++        (Some("model-b"), "Friendly Beta"),
++        (Some("retired-model"), "retired-model"),
++        (None, "All"),
++    ] {
++        browser.handle_key(KeyCode::Left.into(), &mut interaction);
++        let AppEvent::ReadResponseAttempts { params, .. } = events.try_recv().unwrap() else {
++            panic!("model page")
++        };
++        assert_eq!(params.model.as_deref(), model);
++        assert_eq!(params.status, Some(STATUSES[0]));
++        assert_eq!(params.thread_id, None);
++        assert_eq!(params.cursor, None);
++        assert_eq!(browser.model_label(), label);
++    }
++    browser.handle_key(KeyCode::Left.into(), &mut interaction);
++    events.try_recv().unwrap();
++    for status in STATUSES.iter().skip(1).copied().map(Some).chain([None]) {
++        browser.handle_key(KeyCode::Right.into(), &mut interaction);
++        let AppEvent::ReadResponseAttempts { params, .. } = events.try_recv().unwrap() else {
++            panic!("status page")
++        };
++        assert_eq!(params.model.as_deref(), Some("model-a"));
++        assert_eq!(params.status, status);
++        assert_eq!(browser.status_label(), status.map_or("All", status_label));
++    }
++    assert_eq!(interaction.column_offset, 0);
++    for key in [KeyCode::Left, KeyCode::Right] {
++        browser.handle_key(
++            KeyEvent::new_with_kind(key, KeyModifiers::NONE, KeyEventKind::Release),
++            &mut interaction,
++        );
++    }
++    assert!(events.try_recv().is_err());
++    assert_eq!(browser.history.model(), Some("model-a"));
++    assert_eq!(browser.history.status(), None);
++    assert!(browser.handle_key(
++        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
++        &mut interaction
++    ));
++}
++
++#[tokio::test]
++async fn filter_arrows_override_list_bindings_and_keep_configured_non_arrow_navigation() {
++    let (mut browser, mut interaction, mut events) = browser();
++    let AppEvent::ReadResponseAttempts { request_id, .. } = events.try_recv().unwrap() else {
++        panic!("initial page")
++    };
++    browser.history.finish(
++        request_id,
++        Ok(page(vec![
++            attempt(1, Some(ResponseAttemptEnd::Completed)),
++            attempt(2, Some(ResponseAttemptEnd::Completed)),
++        ])),
++        Ok(Prices::new()),
++        Instant::now(),
++    );
++    let config =
++        toml::from_str("[list]\nmove_down = ['m', 'left', 'shift-right']\nmove_left = 'ctrl-left'\nmove_right = 's'\naccept = 'ctrl-s'\ncancel = 'q'").unwrap();
++    browser.keymap = crate::keymap::RuntimeKeymap::from_config(&config)
++        .unwrap()
++        .list;
++    browser.handle_key(KeyCode::Char('m').into(), &mut interaction);
++    assert_eq!(browser.history.scroll_top, 1);
++    for key in [
++        KeyCode::Tab.into(),
++        KeyCode::BackTab.into(),
++        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
++    ] {
++        browser.handle_key(key, &mut interaction);
++        assert_eq!(browser.history.scroll_top, 1);
++    }
++    assert_eq!(browser.scroll_direction(KeyCode::Left.into()), None);
++    assert_eq!(
++        browser.scroll_direction(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)),
++        None
++    );
++    browser.handle_key(KeyCode::Left.into(), &mut interaction);
++    assert_eq!(browser.history.model(), Some("gpt-5.4"));
++    assert_eq!(browser.history.scroll_top, 0);
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 8);
++    browser.handle_key(KeyCode::Char('s').into(), &mut interaction);
++    assert_eq!(interaction.column_offset, 16);
++    browser.handle_key(
++        KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
++        &mut interaction,
++    );
++    assert_eq!(interaction.column_offset, 8);
++    assert!(browser.handle_key(KeyCode::Char('q').into(), &mut interaction));
++}
++
++#[tokio::test]
++async fn table_cells_retain_painted_text_until_the_next_frame() {
++    let (mut browser, mut interaction, mut events) = browser();
++    let AppEvent::ReadResponseAttempts { request_id, .. } = events.try_recv().unwrap() else {
++        panic!("initial page")
++    };
++    browser.history.finish(
++        request_id,
++        Ok(page(vec![attempt(1, None)])),
++        Ok(Prices::new()),
++        Instant::now(),
++    );
++    let area = Rect::new(4, 3, 120, 16);
++    let cells = browser.render(area, &mut Buffer::empty(area), &mut interaction);
++    let first = Uuid::from_u128(1).to_string();
++    let (id_rect, text) = cells
++        .iter()
++        .find(|(_, text)| text.as_ref() == first)
++        .unwrap();
++    assert!(cells.iter().any(|(_, text)| text.as_ref() == "Attempt ID"));
++    assert!(cells.iter().any(|(_, text)| text.as_ref() == "gpt-5.4"));
++    browser.history.update(attempt(2, None), Instant::now());
++    assert_eq!(text.as_ref(), first);
++    let next = browser.render(area, &mut Buffer::empty(area), &mut interaction);
++    assert_eq!(
++        next.iter().find_map(|(rect, text)| {
++            rect.contains((id_rect.x, id_rect.y).into())
++                .then_some(text.as_ref())
++        }),
++        Some(Uuid::from_u128(2).to_string().as_str())
++    );
++    let cells = browser.render(
++        Rect::new(0, 0, 10, 4),
++        &mut Buffer::empty(Rect::new(0, 0, 10, 4)),
++        &mut interaction,
++    );
++    assert_eq!(cells.len(), 1);
++    assert_eq!(cells[0].1.as_ref(), "Time");
++    let cells = browser.render(
++        Rect::new(0, 0, 10, 2),
++        &mut Buffer::empty(Rect::new(0, 0, 10, 2)),
++        &mut interaction,
++    );
++    assert!(cells.is_empty());
++}

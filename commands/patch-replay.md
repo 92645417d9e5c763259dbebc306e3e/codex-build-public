@@ -71,7 +71,7 @@ ProjectedSchemaTransformOwner
 
 ## Unit Flat Patch And Child Patch Transport
 
-- Transport checks custody and rollback. Before reconstruction or constructing Commit or Revise, consume ReleaseRollForward's selected complete Patch boundary and PatchAcceptance's two-way source acceptance. Native Pass proves no behavioral completeness or code quality. A Git failure retains bounded stderr, rejected identity and the accepted prefix.
+- Before Apply, reconstruction, Commit or Revise, consume ReleaseRollForward's supported purpose and placement decision, PatchFormat's semantic naming rule and PatchAcceptance's applicable source review. Native transport checks custody and rollback, not semantic completeness. A Git failure retains bounded stderr, rejected identity and the accepted prefix.
 
 ```
 CurrentPatchRevision
@@ -89,15 +89,18 @@ CurrentPatchRevision
 PatchReplayLiveList
 +-- Owner: PatchReplayLiveListOwner
 +-- Consumer: IntermediatePatchPrefixConsumer
-+-- Successor: CanonicalPresentRowsSuccessor
++-- Successor: CanonicalLayoutAndDependencySuccessor
 `-- Terminal: IncompleteRollFrontierListTerminal
 ```
 
-- Live List validates clean history, discriminated metadata, path classification, Lane order, and transitions. Earlier Lane children are complete; only the last Unit may be a committed Child Patch prefix.
-- Backend and mixed admission consumes the complete responsibility Segment and PatchFormat's ordered categories; mixed rejects Flat Patches before effects.
-- Live and exported List/Apply, Commit, Revise, and Export consume PatchFormat's Lane-child order before product mutation.
+- Live List validates clean history, discriminated metadata, responsibility contracts, direct prerequisites, path classification and PatchFormat's continuous layout. Earlier Lane children are complete; only the last Unit may be a committed Child Patch prefix.
+- Live and exported List/Apply, Commit, Revise and Export consume the same Lane, CrossGroup, type, generation-impact and dependency order before product mutation.
 - List selects source kind by identity using effective roots. Live sources equal task CurrentWorktree or one exact RetainedParents path. A canonical prefix requires an exact tag declared in SourcePrefixes. Root-flag presence never selects exported custody; unrelated sources reject.
 - List accepts an earlier lane frontier without future lanes or transforms and returns canonical discriminated rows without effects.
+- Unselected List returns every admitted Flat Patch, Unit with its ordered Child Patches, and Transform without responsibility prose.
+- List may select one existing responsibility with --start-unit or --start-flat-patch using its Lane/name.
+- Selected List returns that responsibility and its direct prerequisites in Git order, including their contracts, without recursively expanding predecessors or changing source.
+- Selected List is contract navigation, not a complete inventory, dependency proof or Cross admission. OriginalPatchPurposeOwner checks those claims against authority, native behavior and private changes before transport.
 - Fork copies Current into one isolated worktree. It requires the selected open Patch and actual last terminal, not an earlier open row; retained work needs coverage comparison, with focused testing for a non-idempotent fixup fold.
 - Exported List, Apply, and Export require complete selected structures. Commit and Revise retain partial-Unit rules; an unfinished Unit cannot publish, infer children, or create a cursor.
 
@@ -122,9 +125,12 @@ DeclaredPrefixPatchSetOwner
   --start-unit <Lane>/<Unit>
 ```
 
-- For a Flat Patch, use `--start-flat-patch <Lane>/<FlatPatch>`. For initial normalization, use `--start-transform normalization/normalize-terminal-chrome-for-powerline` matching OpenTransform. It regenerates on the target before GitDiffs, without an exported Transform diff.
+- For a Flat Patch, use `--start-flat-patch <Lane>/<FlatPatch>`.
+- Initial normalization uses `--start-transform normalization/normalize-terminal-chrome-for-powerline` matching OpenTransform and `--target` matching registered CurrentWorktree.
+- Initial normalization forbids `--source` and every `--end-*` selector.
+- It generates only on the clean official-parent target before GitDiffs, without reading a predecessor worktree or export.
 - Exported-prefix Apply forbids `--lane` and every `--end-*`.
-- Retained-worktree Apply may select its first boundary with exactly one `--start-unit`, `--start-flat-patch`, or `--start-transform` and an optional matching `--end-*`.
+- Retained-worktree Apply selects a Unit, Flat Patch or generated tail with exactly one `--start-*` and an optional matching `--end-*`.
 - Commit and Revise accept only `--flat-patch` or `--unit` plus `--child-patch`; no Transform or generic selector.
 - Live Apply uses task Current target and exact retained Source. Before effects, match the selected source Unit children or unique strict suffix to ChildPatchSequence. A GitDiff conflict retains its accepted prefix.
 - Native Input refusals return bounded Blocked/Input with the rejected field, preserving task and dirty source without diagnostic-text classification.
@@ -140,6 +146,16 @@ DeclaredPrefixPatchSetOwner
 - A source-only assertion exposed by Transform output belongs to its semantic Patch, not unrelated Unit. A wrong deterministic projection belongs to the Transform script.
 - An open Unit admits Revise against its exact committed Child Patch prefix and complete declared ChildPatchSequence. A schema postimage may amend the current terminal Child Patch without inventing later children or requiring Unit completion.
 - Commit binds CurrentWorktree, the open Flat Patch or Unit, and its ChildPatchSequence. Commit and Revise reject Lane-incompatible Segment as Blocked/Input before native execution. After formatting, Commit measures the exact staged GitDiff before native commit. An empty or above-limit diff restores the input and returns its typed Product finding. Explicit current-user authority may add --skip-line-limit to this invocation, suppressing only the above-limit finding without storing or inheriting a waiver. Commit otherwise creates the Flat Patch or next declared Child Patch without a terminal match or intermediate task update. Revise remains a source-only correction. Neither accepts a snapshot attempt or generated bytes.
+- Commit supplies --purpose, --provides, --boundary and --verification only for a Flat Patch or the first Child Patch of a Unit.
+- Repeat --requires for its direct Unit:Lane/name or FlatPatch:Lane/name prerequisites; omission declares none.
+- Cross additionally requires --cross-group at the same first-commit contract owner; other Lanes and later children forbid it.
+- --segment selects the complete responsibility's none, schema, snapshot or schema-snapshot impact within PatchFormat's Lane rules.
+- All four prose flags are required together, and later Child Patches forbid the complete contract rather than duplicating it.
+- Revise without contract flags retains the original responsibility metadata while correcting source.
+- Revise may supply the same complete contract input only for its owning Flat Patch or first Child Patch, after the existing approval decision covers that change.
+- A cross contract replacement includes --cross-group with the complete replacement; omission of every contract flag retains its original group.
+- Contract replacement is checked against the unchanged earlier responsibilities before source mutation and preserves the later Child Patch suffix.
+- Complete behavior changes still use ReleaseRollForward; flags and metadata cannot authorize new or withdrawn behavior.
 - Focused Runner terminals retain automatically captured snapshots as private evidence. They never amend semantic history, and manual reconstruction never copies their postimages.
 - The selected suite excludes Established non-pass identities. Complete inventory and exact preimages precede native snapshot publication; failure publishes no accepted snapshot Transform and blocks no ordinary source edit.
 - Retain the current Runner result and diagnostics. The generation producer checks its source-bound postimage and publishes the generated tail directly, without a later acceptance chain.

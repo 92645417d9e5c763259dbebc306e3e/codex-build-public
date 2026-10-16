@@ -2,39 +2,53 @@
 
 ## Inputs
 
-- Read the selected Unit or Flat Patch, native owners and consumers, retained frontiers, Established policy and ToolchainTarget, and applicable working and source notes: version root first, then lane.
-- Consume ReleaseRollForward's complete selected responsibility and reconstruction boundary before accepting a corrective design or test premise.
+- Consume ReleaseRollForward's OriginalPatchPurposeOwner decision before any transport or source acceptance.
+- Read the complete selected Unit or Flat Patch, native owners and affected consumers, retained frontiers, Established policy and ToolchainTarget, and applicable notes in root-then-lane order.
+- Use first-commit contracts and direct prerequisite contracts as source locators, subject to that authority-first decision.
 - Historical exports remain read-only purpose evidence and unchanged transport input.
 - Authored Rust source consumes the installed lang skill's [Rust language owner](/codex/skills/lang/references/rust.md) and its `PurposeBoundRustChange`.
 
-## Linear Source Acceptance
+## Semantic Acceptance
 
-- The product agent owns semantic acceptance synchronously in the same linear Roll.
-- There is no subagent gate, dispatch handle, asynchronous finding, review queue, or review-only drain.
-- Before dependent edits, consume ReleaseRollForward's scope decision and Rust's complete construction.
-- Before source publication or post-check continuation, review the cumulative owning Unit or Flat Patch, including temporary Main changes, against its native base through lang's [Rust Semantic review](/codex/skills/lang/references/rust/post-green-review.md).
-- Compare every assigned effect with actual complete production and consumer seams, including native-supplied behavior, rather than the selected tests alone.
-- Then compare all candidate additions with that assignment, rejecting unapproved incoming duties. Rust owns structural-cost and fixture-proof decisions.
-- Every omitted effect requires existing explicit withdrawal authority; implementation rejection, shorter source and green tests grant none.
-- A test-only, no-op or truncated replacement fails this comparison even if native transport accepts its metadata and its focused checks pass.
-- The 1500-line finding is a mechanical publication ceiling, not a quality threshold or available authoring budget.
-- A final correct hunk, split Child Patches or line-limit override cannot justify a cumulatively rejected candidate.
-- A new or rewritten Patch also consumes the existing effective-configuration coverage decision for every requested entrypoint.
+- The product agent performs one synchronous review in the linear Roll, without subagents, a review queue or a second acceptance record.
+- Before dependent edits, resolve the complete assignment and Rust construction, including effective-configuration coverage for every requested entrypoint.
+- Before publication or post-check continuation, compare the cumulative responsibility with its native base through lang's [Rust Semantic review](/codex/skills/lang/references/rust/post-green-review.md).
+- Include temporary Main corrections and all Child Patches, not only the latest hunk or selected tests.
+- For each approved effect, locate the actual producer, consumer, lifecycle, failure and cleanup implementation.
+- Check that native-supplied behavior has not been claimed as a private dependency or duplicated by the candidate.
+- Reject missing effects and incoming duties outside the recovered assignment independently of compiler or test outcomes.
+- Compare an approved change with the original obligation, requested difference and complete replacement under ReleaseRollForward's disablement-versus-retirement decision.
+- For local disablement, inspect the complete activation path and cumulative diff to prove the requested absence while preserving continuing upstream implementation and its tests.
+- For authorized retirement, prove exclusive source and consumers are removed while shared and independently required behavior remain intact.
+- Missing, overlapping or contradictory ownership returns to the purpose decision before further edits.
+- A Unit that cannot be reasoned about coherently returns to responsibility design; splitting compensating code into Child Patches does not establish a sound boundary.
+- Check Purpose, Requires, Provides, Boundary, Lane, CrossGroup and Segment against the supported decision and actual implementation, not against each other as proof.
+- Review the action, object and method-or-scope parts of every selected Unit, Flat Patch and Child Patch name against PatchFormat and actual behavior.
+- At group closure or a stop before deferred consumers, review the whole approved functional relationship and its exclusions without promoting deferred features.
+- Cross acceptance requires the complete `relationships.txt` file from the current working lane and review under PatchExport's diagram contract.
+- Reject any other-lane content, including draft, even when a dependency or future integration is real.
+- Verify that one compact graph makes current cross functions and their relationships clear without reconstructing repeated fragments.
+- Missing, stale or unsupported diagram relationships return to OriginalPatchPurposeOwner before continuation or export; a present file alone proves no semantic acceptance.
+- Any counterexample returns to OriginalPatchPurposeOwner's complete dependent-decision rejection before further transport or publication.
+- Explicit withdrawal authority is required for every omitted effect; a test-only, no-op or truncated replacement cannot close it.
+- Mechanical line limits and overrides do not change this acceptance boundary.
 
 ## Responsibility Closure
 
-- Each Unit or Flat Patch closes its assigned seam, effect, consumer, cleanup, and product terminal.
-- Schema remains maximal before its generated transform.
-- Producers close construction, fixture, and direct entrypoint seams required by approved dependents before dependent authoring.
-- Missing facts, omitted obligations, borrowed behavior, compensation by another Lane child or a rejected construction block closure.
-- Preserve approved assignments and reject unapproved incoming behavior independently of compiler and test outcomes.
-- Each final Flat Patch or Child Patch is formatted and published by Commit or terminal Revise.
-- Partial ChildPatchSequence keeps its Unit open and preserves its unfinished obligations.
-- Native transport proves its declared structure, bytes, formatting, and rollback, not semantic quality.
-- Selected focused tests answer actual source questions after publication.
-- Automatic reconstruction and non-idempotent fixup folds consume their corresponding focused tests before advancement.
-- A prior failure remains evidence rather than a universal full-suite or next-Patch gate.
-- Semantic closure and Git frontier coverage remain independent of a passing check.
+- Close the complete assigned behavior and its product terminal before reducing pending work.
+- Required construction, fixture and direct-entrypoint seams belong to their producer before formal or draft dependents are authored.
+- Preserve the draft-independent formal prefix and every admitted consumer.
+- Missing evidence, borrowed behavior, cross-Patch compensation or rejected construction keeps the responsibility open.
+- Publish the first-commit contract once and retain each Child Patch's distinct source responsibility.
+- Commit or terminal Revise formats and publishes every final Patch within PatchFormat's canonical layout.
+- A partial ChildPatchSequence remains open with its unfinished obligations.
+- Report semantic acceptance, native structural admission and selected test outcomes separately.
+- Native transport proves structure, bytes, formatting and rollback only.
+- Focused tests answer source questions after publication; automatic reconstruction and non-idempotent fixup folds require their corresponding focused tests before advancement.
+- Prior failures remain evidence without creating a full-suite gate.
+- Git frontier coverage and semantic closure retain their own evidence requirements.
+- Lane closure consumes TaskWorkspace's complete admitted-inventory comparison rather than merely the subset that reached Apply.
+- An audit requested for the whole patch set includes every admitted responsibility, child, omission and approved replacement, and separates content, naming and verification findings.
 
 ## Test And Generated-Output Boundaries
 
@@ -86,6 +100,7 @@ EstablishedTargetAcceptanceOwner
 - Do not create a review task, finding registry, placeholder commit, stash, or alternate recovery topology.
 - At closure and reentry consume GitCustody's retained-frontier coverage and native reader cleanup before the next Patch or Fork.
 - Before lane or final publication, compare cumulative behavior and structural costs of every Unit and Flat Patch with current authority and approved redistributions.
+- Reuse unchanged local acceptance evidence and inspect unresolved cross-contract interactions rather than repeating complete unrelated source reads.
 - Clean Apply and unchanged order do not prove correct responsibility placement.
 - Export proves its closed-prefix publication only.
 - Complete-suite Finalize occurs only when user-selected and reports its actual outcome without granting mutation or release-completion authority.

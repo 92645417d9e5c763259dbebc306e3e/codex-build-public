@@ -1,0 +1,575 @@
+store-and-deliver-telegram-with-shared-routing
+
+Lane: cross
+
+Unit: send-notifications-through-telegram
+
+ChildPatch: store-and-deliver-telegram-with-shared-routing
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2160,6 +2160,7 @@ dependencies = [
+  "pretty_assertions",
+  "rcgen",
+  "rmcp",
++ "semver",
+  "serde",
+  "serde_json",
+  "serial_test",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -100,6 +100,7 @@ codex-utils-path-uri = { workspace = true }
+ chrono = { workspace = true }
+ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
++semver = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ sha2 = { workspace = true }
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -151,6 +151,7 @@ mod request_processors;
+ mod request_serialization;
+ mod server_request_error;
+ mod skills_watcher;
++mod telegram_http;
+ mod thread_state;
+ mod thread_status;
+ mod transport;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_store.rs b/codex-rs/app-server/src/request_processors/telegram_store.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_store.rs
+@@ -0,0 +1,131 @@
++use serde::Deserialize;
++use serde::Serialize;
++use std::io;
++use std::path::Path;
++use std::path::PathBuf;
++
++pub(super) const DEFAULT_VERSION_CHECK_INTERVAL_HOURS: u16 = 20;
++pub(super) const MIN_VERSION_CHECK_INTERVAL_HOURS: u16 = 1;
++pub(super) const MAX_VERSION_CHECK_INTERVAL_HOURS: u16 = 168;
++
++pub(super) struct TelegramStore {
++    path: PathBuf,
++}
++
++#[derive(Serialize, Deserialize)]
++pub(super) struct TelegramConfig {
++    pub(super) bot_token: String,
++    pub(super) chat_id: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub(super) github_token: Option<String>,
++    #[serde(default)]
++    pub(super) notify_version_updates: bool,
++    #[serde(default = "default_version_check_interval_hours")]
++    pub(super) version_check_interval_hours: u16,
++    #[serde(default = "default_completion_min_duration_ms")]
++    pub(super) completion_min_duration_ms: u64,
++}
++
++impl TelegramStore {
++    pub(super) fn new(codex_home: PathBuf) -> Self {
++        Self {
++            path: codex_home.join("telegram.json"),
++        }
++    }
++
++    pub(super) fn load(&self) -> io::Result<Option<TelegramConfig>> {
++        reject_symlink(&self.path)?;
++        match std::fs::read(&self.path) {
++            Ok(contents) => serde_json::from_slice(&contents)
++                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
++                .and_then(|config: TelegramConfig| {
++                    config.validate()?;
++                    Ok(config)
++                })
++                .map(Some),
++            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
++            Err(error) => Err(error),
++        }
++    }
++
++    pub(super) fn persist(&self, config: Option<&TelegramConfig>) -> io::Result<()> {
++        reject_symlink(&self.path)?;
++        if let Some(config) = config {
++            config.validate()?;
++            let contents = serde_json::to_string_pretty(config)
++                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
++            codex_core::path_utils::write_atomically(&self.path, &contents)
++        } else {
++            match std::fs::remove_file(&self.path) {
++                Ok(()) => Ok(()),
++                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
++                Err(error) => Err(error),
++            }
++        }
++    }
++}
++
++impl TelegramConfig {
++    #[cfg(test)]
++    pub(super) fn new(bot_token: String, chat_id: String) -> Self {
++        Self {
++            bot_token,
++            chat_id,
++            github_token: None,
++            notify_version_updates: false,
++            version_check_interval_hours: DEFAULT_VERSION_CHECK_INTERVAL_HOURS,
++            completion_min_duration_ms: default_completion_min_duration_ms(),
++        }
++    }
++
++    pub(super) fn configured(
++        bot_token: String,
++        chat_id: String,
++        github_token: String,
++        notify_version_updates: bool,
++        version_check_interval_hours: u16,
++    ) -> Self {
++        Self {
++            bot_token,
++            chat_id,
++            github_token: Some(github_token),
++            notify_version_updates,
++            version_check_interval_hours,
++            completion_min_duration_ms: default_completion_min_duration_ms(),
++        }
++    }
++
++    fn validate(&self) -> io::Result<()> {
++        if !(MIN_VERSION_CHECK_INTERVAL_HOURS..=MAX_VERSION_CHECK_INTERVAL_HOURS)
++            .contains(&self.version_check_interval_hours)
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "version_check_interval_hours is out of range",
++            ));
++        }
++        Ok(())
++    }
++}
++
++fn reject_symlink(path: &Path) -> io::Result<()> {
++    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "symlink rejected",
++        ));
++    }
++    Ok(())
++}
++
++fn default_completion_min_duration_ms() -> u64 {
++    30_000
++}
++
++fn default_version_check_interval_hours() -> u16 {
++    DEFAULT_VERSION_CHECK_INTERVAL_HOURS
++}
++
++#[cfg(test)]
++#[path = "telegram_store_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_store_tests.rs b/codex-rs/app-server/src/request_processors/telegram_store_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_store_tests.rs
+@@ -0,0 +1,59 @@
++use super::*;
++use std::os::unix::fs::MetadataExt;
++
++#[test]
++fn telegram_store_uses_snake_case_private_atomic_state() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let store = TelegramStore::new(home.path().to_path_buf());
++    let mut config = TelegramConfig::new("bot".to_string(), "chat".to_string());
++    config.github_token = Some("github".to_string());
++    config.notify_version_updates = true;
++    store.persist(Some(&config)).expect("persist");
++
++    let path = home.path().join("telegram.json");
++    let contents = std::fs::read_to_string(&path).expect("read");
++    assert!(contents.contains("\"bot_token\""));
++    assert!(contents.contains("\"github_token\""));
++    assert!(!contents.contains("BotToken"));
++    assert_eq!(
++        std::fs::metadata(&path).expect("metadata").mode() & 0o777,
++        0o600
++    );
++    let loaded = store.load().expect("load").expect("config");
++    assert_eq!(loaded.completion_min_duration_ms, 30_000);
++    assert_eq!(loaded.version_check_interval_hours, 20);
++    assert!(!home.path().join("telegram.json.lock").exists());
++
++    store.persist(None).expect("disable");
++    assert!(!path.exists());
++}
++
++#[test]
++fn telegram_store_rejects_out_of_range_version_intervals() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let path = home.path().join("telegram.json");
++    std::fs::write(
++        &path,
++        r#"{"bot_token":"bot","chat_id":"chat","version_check_interval_hours":0}"#,
++    )
++    .expect("write config");
++
++    let error = match TelegramStore::new(home.path().to_path_buf()).load() {
++        Err(error) => error,
++        Ok(_) => panic!("zero interval must be rejected"),
++    };
++
++    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++}
++
++#[test]
++fn telegram_store_rejects_symlinks() {
++    let home = tempfile::tempdir().expect("tempdir");
++    std::os::unix::fs::symlink("target", home.path().join("telegram.json")).expect("symlink");
++    let store = TelegramStore::new(home.path().to_path_buf());
++    let error = match store.load() {
++        Err(error) => error,
++        Ok(_) => panic!("symlink must be rejected"),
++    };
++    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++}
+diff --git a/codex-rs/app-server/src/telegram_http.rs b/codex-rs/app-server/src/telegram_http.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/telegram_http.rs
+@@ -0,0 +1,156 @@
++use codex_http_client::ClientRouteClass;
++use codex_http_client::HttpClientFactory;
++use codex_http_client::HttpResponse;
++use codex_http_client::RouteAwareClientPool;
++use codex_login::default_client::default_headers;
++use semver::Version;
++use serde::Deserialize;
++use serde::Serialize;
++use std::time::Duration;
++use url::Url;
++
++const TIMEOUT: Duration = Duration::from_secs(10);
++const GITHUB_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
++pub(crate) struct TelegramHttp {
++    pool: RouteAwareClientPool,
++    github: Url,
++    telegram: Url,
++}
++
++pub(crate) struct Destination<'a>(pub(crate) &'a str, pub(crate) &'a str);
++
++pub(crate) struct Release {
++    pub(crate) version: Version,
++    pub(crate) url: String,
++}
++
++pub(crate) struct Probe {
++    pub(crate) release: Option<Release>,
++    pub(crate) remaining: Option<u64>,
++}
++
++#[derive(Deserialize)]
++struct GitHubRelease {
++    tag_name: String,
++    html_url: String,
++    draft: bool,
++}
++
++#[derive(Serialize)]
++struct SendMessage<'a> {
++    chat_id: &'a str,
++    text: &'a str,
++}
++
++#[derive(Deserialize)]
++struct SendResult {
++    ok: bool,
++}
++
++impl TelegramHttp {
++    pub(crate) fn new(factory: HttpClientFactory) -> Self {
++        Self {
++            pool: RouteAwareClientPool::new_without_redirects_or_request_logging(
++                factory,
++                ClientRouteClass::Other,
++            ),
++            github: Url::parse("https://api.github.com").expect("valid GitHub URL"),
++            telegram: Url::parse("https://api.telegram.org").expect("valid Telegram URL"),
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn with_urls(factory: HttpClientFactory, github: Url, telegram: Url) -> Self {
++        Self {
++            pool: RouteAwareClientPool::new_without_redirects_or_request_logging(
++                factory,
++                ClientRouteClass::Other,
++            ),
++            github,
++            telegram,
++        }
++    }
++
++    pub(crate) async fn send(&self, to: Destination<'_>, text: &str) -> Result<(), ()> {
++        let mut url = self.telegram.clone();
++        url.path_segments_mut()
++            .map_err(|_| ())?
++            .clear()
++            .push(&format!("bot{}", to.0))
++            .push("sendMessage");
++        let response = self
++            .pool
++            .post(url)
++            .timeout(TIMEOUT)
++            .json(&SendMessage {
++                chat_id: to.1,
++                text,
++            })
++            .send()
++            .await
++            .map_err(|_| ())?;
++        let status = response.status().as_u16();
++        let body = bounded(response, 4096).await?;
++        let result: SendResult = serde_json::from_slice(&body).map_err(|_| ())?;
++        (status == 200 && result.ok).then_some(()).ok_or(())
++    }
++
++    pub(crate) async fn releases(&self, token: &str) -> Result<Probe, ()> {
++        if token.trim().is_empty() {
++            return Err(());
++        }
++        let mut url = self.github.clone();
++        url.path_segments_mut()
++            .map_err(|_| ())?
++            .clear()
++            .extend(["repos", "openai", "codex", "releases"]);
++        url.query_pairs_mut().append_pair("per_page", "10");
++        let response = self
++            .pool
++            .get(url)
++            .headers(default_headers())
++            .header("accept", "application/vnd.github+json")
++            .header("x-github-api-version", "2022-11-28")
++            .header("authorization", format!("Bearer {}", token.trim()))
++            .timeout(TIMEOUT)
++            .send()
++            .await
++            .map_err(|_| ())?;
++        let remaining = response
++            .headers()
++            .get("x-ratelimit-remaining")
++            .and_then(|value| value.to_str().ok()?.parse().ok());
++        if response.status().as_u16() != 200 {
++            return Err(());
++        }
++        let body = bounded(response, GITHUB_RESPONSE_LIMIT).await?;
++        let release = serde_json::from_slice::<Vec<GitHubRelease>>(&body)
++            .map_err(|_| ())?
++            .into_iter()
++            .filter(|release| !release.draft)
++            .filter_map(|release| {
++                let version: Version = release.tag_name.strip_prefix("rust-v")?.parse().ok()?;
++                Some(Release {
++                    version,
++                    url: release.html_url,
++                })
++            })
++            .max_by(|left, right| left.version.cmp(&right.version));
++        Ok(Probe { release, remaining })
++    }
++}
++
++async fn bounded(mut response: HttpResponse, limit: usize) -> Result<Vec<u8>, ()> {
++    let mut body = Vec::new();
++    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
++        if chunk.len() > limit.saturating_sub(body.len()) {
++            return Err(());
++        }
++        body.extend_from_slice(&chunk);
++    }
++    Ok(body)
++}
++
++#[cfg(test)]
++#[path = "telegram_http_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/telegram_http_tests.rs b/codex-rs/app-server/src/telegram_http_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/telegram_http_tests.rs
+@@ -0,0 +1,163 @@
++use super::*;
++use codex_http_client::OutboundProxyPolicy;
++use serde_json::Value;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::ResponseTemplate;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++use wiremock::matchers::query_param;
++
++fn factory() -> HttpClientFactory {
++    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
++}
++
++#[tokio::test]
++async fn telegram_and_github_use_the_shared_route_aware_client() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
++        .expect(1)
++        .mount(&server)
++        .await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .and(query_param("per_page", "10"))
++        .respond_with(
++            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
++                "tag_name": "rust-v9.0.0-alpha.1",
++                "html_url": "https://example.invalid/release",
++                "draft": false,
++                "prerelease": true,
++                "body": "x".repeat(200 * 1024)
++            }])),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    let base = Url::parse(&server.uri()).expect("mock URL");
++    let http = TelegramHttp::with_urls(factory(), base.clone(), base);
++
++    http.send(Destination("123:secret", "chat-1"), "hello\nworld")
++        .await
++        .expect("Telegram send");
++    let probe = http.releases("github-token").await.expect("GitHub probe");
++    assert_eq!(
++        probe.release.expect("release").version,
++        Version::parse("9.0.0-alpha.1").expect("version")
++    );
++
++    let requests = server.received_requests().await.expect("requests");
++    let telegram: Value = serde_json::from_slice(
++        requests
++            .iter()
++            .find(|request| request.method.as_str() == "POST")
++            .expect("Telegram request")
++            .body
++            .as_slice(),
++    )
++    .expect("Telegram JSON");
++    assert_eq!(telegram["chat_id"], "chat-1");
++    assert_eq!(telegram["text"], "hello\nworld");
++    let github = requests
++        .iter()
++        .find(|request| request.method.as_str() == "GET")
++        .expect("GitHub request");
++    assert_eq!(
++        github.headers["authorization"].to_str().ok(),
++        Some("Bearer github-token")
++    );
++}
++
++#[tokio::test]
++async fn release_probe_selects_the_newest_stable_or_prerelease_from_ten_results() {
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .and(query_param("per_page", "10"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
++            {
++                "tag_name": "rust-v9.0.0",
++                "html_url": "https://example.invalid/stable",
++                "draft": false
++            },
++            {
++                "tag_name": "rust-v9.1.0-alpha.1",
++                "html_url": "https://example.invalid/alpha",
++                "draft": false
++            }
++        ])))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let base = Url::parse(&server.uri()).expect("mock URL");
++    let http = TelegramHttp::with_urls(factory(), base.clone(), base);
++
++    let probe = http.releases("github-token").await.expect("GitHub probe");
++
++    assert_eq!(
++        probe.release.expect("release").version,
++        Version::parse("9.1.0-alpha.1").expect("version")
++    );
++}
++
++#[tokio::test]
++async fn secret_bearing_telegram_requests_do_not_follow_redirects() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(
++            ResponseTemplate::new(307)
++                .insert_header("location", format!("{}/redirected", server.uri())),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    Mock::given(path("/redirected"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
++        .expect(0)
++        .mount(&server)
++        .await;
++    let base = Url::parse(&server.uri()).expect("URL");
++    let http = TelegramHttp::with_urls(factory(), base.clone(), base);
++    assert!(
++        http.send(Destination("123:secret", "chat"), "notice")
++            .await
++            .is_err()
++    );
++}
++
++#[tokio::test]
++async fn telegram_and_github_reject_oversized_response_bodies() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
++            "ok": true,
++            "padding": "x".repeat(4096),
++        })))
++        .expect(1)
++        .mount(&server)
++        .await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .respond_with(
++            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
++                "tag_name": "rust-v9.0.0",
++                "html_url": "x".repeat(GITHUB_RESPONSE_LIMIT),
++                "draft": false,
++            }])),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    let base = Url::parse(&server.uri()).expect("URL");
++    let http = TelegramHttp::with_urls(factory(), base.clone(), base);
++    assert!(
++        http.send(Destination("123:secret", "chat"), "notice")
++            .await
++            .is_err()
++    );
++    assert!(http.releases("github-token").await.is_err());
++}

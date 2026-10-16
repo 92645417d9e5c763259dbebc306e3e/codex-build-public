@@ -1,0 +1,276 @@
+define-telegram-commands-in-app-server
+
+Lane: cross
+
+Unit: send-notifications-through-telegram
+
+ChildPatch: define-telegram-commands-in-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Configure Telegram delivery through the control center and notify about successful primary turns, live asynchronous questions, approval requests and new Codex releases.
+
+Requires: Unit:cross/configure-application-proxy-at-runtime, Unit:cross/host-dialogs-with-shared-resources
+
+Provides: Expose typed serialized telegram/command RPC, private atomic telegram.json storage, credential-redacted bounded delivery through shared runtime routing, independent staged masked dialog constructors using shared resources, setup that tests both services before saving, configurable release monitoring with a silent initial baseline, completion duration filtering, and successful-delivery deduplication for source-identified immediate notifications.
+
+Boundary: Preserve native terminal notification settings and approval handling independently; do not notify for historical questions, failed or interrupted turns, secondary-thread completions, legacy input tools or plan prompts. Credentials stay out of UI results and transport diagnostics, failed probes never persist partial setup, background release checks stop on shutdown, and no legacy configuration or command reader is retained. Keep configuration business here and dialog resources in their cross infrastructure owner; expose settings without a private slash command, leaving control-center hosting, layout and shortcuts to its interface consumer.
+
+Verification: Protocol command-shape and redaction tests, private store and HTTP mock tests, release baseline and cancellation tests, RPC setup and delivery tests, independent dialog setup and nested refresh tests, embedded TUI setup integration, and real event consumers covering primary completion, live and buffered questions, approvals, cancellation and exclusions.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1450,6 +1450,11 @@ client_request_definitions! {
+         serialization: global("proxy"),
+         response: v2::ProxyWriteResponse,
+     },
++    TelegramCommand => "telegram/command" {
++        params: v2::TelegramCommandParams,
++        serialization: global("telegram"),
++        response: v2::TelegramCommandResponse,
++    },
+     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
+         params: v2::ExternalAgentConfigDetectParams,
+         serialization: global("external-agent-detect"),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -33,6 +33,7 @@ mod realtime;
+ mod remote_control;
+ mod review;
+ mod rollout;
++mod telegram;
+ mod thread;
+ mod thread_attachment;
+ mod thread_data;
+@@ -76,6 +77,7 @@ pub use remote_control::*;
+ pub use review::*;
+ pub use rollout::*;
+ pub use shared::*;
++pub use telegram::*;
+ pub use thread::*;
+ pub use thread_attachment::*;
+ pub use thread_data::*;
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/telegram.rs b/codex-rs/app-server-protocol/src/protocol/v2/telegram.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/telegram.rs
+@@ -0,0 +1,139 @@
++use crate::JsonSchema;
++use crate::TS;
++use serde::Deserialize;
++use serde::Serialize;
++use std::fmt;
++
++/// Identifies the result of a Telegram command without retaining its credentials or message.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TelegramCommandKind {
++    Read,
++    Configure,
++    SetVersionSettings,
++    Disable,
++    Completion,
++    NeedsInput,
++    ProbeGithub,
++    CheckVersion,
++}
++
++#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct TelegramSetup {
++    pub bot_token: String,
++    pub chat_id: String,
++    pub github_token: String,
++    pub notify_version_updates: bool,
++    pub version_check_interval_hours: u16,
++}
++
++impl fmt::Debug for TelegramSetup {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("TelegramSetup")
++            .field("bot_token", &"<redacted>")
++            .field("chat_id", &"<redacted>")
++            .field("github_token", &"<redacted>")
++            .field("notify_version_updates", &self.notify_version_updates)
++            .field(
++                "version_check_interval_hours",
++                &self.version_check_interval_hours,
++            )
++            .finish()
++    }
++}
++
++/// Telegram configuration and delivery commands. Each command admits only its own fields.
++#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
++#[ts(tag = "kind", export_to = "v2/")]
++pub enum TelegramCommandParams {
++    Read {},
++    Configure {
++        setup: TelegramSetup,
++    },
++    #[serde(rename_all = "camelCase")]
++    #[ts(rename_all = "camelCase")]
++    SetVersionSettings {
++        notify_version_updates: bool,
++        version_check_interval_hours: u16,
++    },
++    Disable {},
++    /// Successful turn completion, subject to the saved minimum duration.
++    #[serde(rename_all = "camelCase")]
++    #[ts(rename_all = "camelCase")]
++    Completion {
++        text: String,
++        #[ts(type = "number")]
++        duration_ms: u64,
++    },
++    /// Immediate question or approval notification, deduplicated by its source event identity.
++    #[serde(rename_all = "camelCase")]
++    #[ts(rename_all = "camelCase")]
++    NeedsInput {
++        text: String,
++        notification_id: String,
++    },
++    ProbeGithub {},
++    CheckVersion {},
++}
++
++impl TelegramCommandParams {
++    pub fn kind(&self) -> TelegramCommandKind {
++        match self {
++            Self::Read {} => TelegramCommandKind::Read,
++            Self::Configure { .. } => TelegramCommandKind::Configure,
++            Self::SetVersionSettings { .. } => TelegramCommandKind::SetVersionSettings,
++            Self::Disable {} => TelegramCommandKind::Disable,
++            Self::Completion { .. } => TelegramCommandKind::Completion,
++            Self::NeedsInput { .. } => TelegramCommandKind::NeedsInput,
++            Self::ProbeGithub {} => TelegramCommandKind::ProbeGithub,
++            Self::CheckVersion {} => TelegramCommandKind::CheckVersion,
++        }
++    }
++}
++
++impl fmt::Debug for TelegramCommandParams {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let mut fields = formatter.debug_struct("TelegramCommandParams");
++        fields.field("kind", &self.kind());
++        match self {
++            Self::Configure { setup } => {
++                fields.field("setup", setup);
++            }
++            Self::SetVersionSettings {
++                notify_version_updates,
++                version_check_interval_hours,
++            } => {
++                fields.field("notify_version_updates", notify_version_updates);
++                fields.field("version_check_interval_hours", version_check_interval_hours);
++            }
++            Self::Completion { duration_ms, .. } => {
++                fields.field("text", &"<redacted>");
++                fields.field("duration_ms", duration_ms);
++            }
++            Self::NeedsInput { .. } => {
++                fields.field("text", &"<redacted>");
++                fields.field("notification_id", &"<redacted>");
++            }
++            Self::Read {} | Self::Disable {} | Self::ProbeGithub {} | Self::CheckVersion {} => {}
++        }
++        fields.finish()
++    }
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct TelegramCommandResponse {
++    pub configured: bool,
++    pub github_token_configured: bool,
++    pub notify_version_updates: bool,
++    pub version_check_interval_hours: u16,
++    pub message: Option<String>,
++}
++
++#[cfg(test)]
++#[path = "telegram_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/telegram_tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/telegram_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/telegram_tests.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++#[test]
++fn command_payloads_keep_durations_numeric_and_fields_command_specific() {
++    assert!(TelegramCommandParams::decl().contains("durationMs: number"));
++    for (command, kind) in [
++        (TelegramCommandParams::Read {}, "read"),
++        (TelegramCommandParams::Disable {}, "disable"),
++        (TelegramCommandParams::ProbeGithub {}, "probeGithub"),
++        (TelegramCommandParams::CheckVersion {}, "checkVersion"),
++    ] {
++        let wire = json!({"kind": kind});
++        assert_eq!(serde_json::to_value(&command).unwrap(), wire);
++        assert_eq!(
++            serde_json::from_value::<TelegramCommandParams>(wire).unwrap(),
++            command
++        );
++        let unexpected = json!({"kind": kind, "text": "unexpected"});
++        assert!(serde_json::from_value::<TelegramCommandParams>(unexpected).is_err());
++    }
++    let completion = TelegramCommandParams::Completion {
++        text: "Completed".into(),
++        duration_ms: 30_000,
++    };
++    let wire = json!({"kind": "completion", "text": "Completed", "durationMs": 30_000});
++    assert_eq!(serde_json::to_value(&completion).unwrap(), wire);
++    assert_eq!(
++        serde_json::from_value::<TelegramCommandParams>(wire).unwrap(),
++        completion
++    );
++    for invalid in [
++        json!({"kind": "needsInput", "text": "Missing event identity"}),
++        json!({"kind": "completion", "text": "Completed", "durationMs": "30000"}),
++        json!({"kind": "completion", "text": "Completed", "durationMs": -1}),
++    ] {
++        assert!(serde_json::from_value::<TelegramCommandParams>(invalid).is_err());
++    }
++}
++
++#[test]
++fn debug_redacts_setup_and_notification_payloads() {
++    let setup = TelegramCommandParams::Configure {
++        setup: TelegramSetup {
++            bot_token: "bot-secret".into(),
++            chat_id: "chat-secret".into(),
++            github_token: "github-secret".into(),
++            notify_version_updates: true,
++            version_check_interval_hours: 20,
++        },
++    };
++    let input = TelegramCommandParams::NeedsInput {
++        text: "private-message".into(),
++        notification_id: "private-event".into(),
++    };
++    let debug = format!("{setup:?} {input:?}");
++    for secret in [
++        "bot-secret",
++        "chat-secret",
++        "github-secret",
++        "private-message",
++        "private-event",
++    ] {
++        assert!(!debug.contains(secret));
++    }
++    assert_eq!(debug.matches("<redacted>").count(), 5);
++}

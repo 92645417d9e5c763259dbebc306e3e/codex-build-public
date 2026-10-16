@@ -1,0 +1,834 @@
+route-thread-writer-coordination-to-harness
+
+Lane: normalization
+
+Unit: route-thread-writer-locks-to-harness
+
+ChildPatch: route-thread-writer-coordination-to-harness
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Coordinate all thread writers and rollout compression under the selected harness while retaining durable thread data in home.
+
+Requires: Unit:normalization/normalize-base-roots-for-processes
+
+Provides: Carry the harness through rollout and thread-store configuration, app-server goals and TUI consumers; place writer locks, compression locks, and maintenance throttling state there with shared live-writer exclusion and isolated test fixtures.
+
+Boundary: Thread contents, database placement, compression format, and archive semantics retain their existing owners; process-root and isolated harness-fixture construction remain normalize-base-roots-for-processes responsibilities.
+
+Verification: Rollout writer_lock and compression_tests, thread-store compression_writer_tests, guardian_goal_tests and idle-unload shutdown tests verify harness-only coordination, separate roots, active-writer exclusion, goal updates and delayed thread closure.
+
+
+diff --git a/codex-rs/app-server/src/request_processors/rollout.rs b/codex-rs/app-server/src/request_processors/rollout.rs
+--- a/codex-rs/app-server/src/request_processors/rollout.rs
++++ b/codex-rs/app-server/src/request_processors/rollout.rs
+@@ -17,6 +17,7 @@ impl ThreadRequestProcessor {
+ 
+         codex_rollout::spawn_rollout_compression_worker(
+             self.config.codex_home.to_path_buf(),
++            self.config.codex_harness.to_path_buf(),
+             codex_rollout::RolloutCompressionTrigger::Rpc,
+         );
+         Ok(Some(RolloutCompressResponse {}.into()))
+diff --git a/codex-rs/app-server/src/request_processors/thread_goal_processor.rs b/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_goal_processor.rs
+@@ -44,7 +44,7 @@ impl ThreadGoalRequestProcessor {
+         goal_service: Arc<GoalService>,
+         config_manager: ConfigManager,
+     ) -> Self {
+-        let writer_locks = Arc::new(WriterLockCoordinator::new(&config.codex_home));
++        let writer_locks = Arc::new(WriterLockCoordinator::new(&config.codex_harness));
+         Self {
+             thread_manager,
+             outgoing,
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -3,6 +3,7 @@ use std::path::Path;
+ use std::path::PathBuf;
+ use std::process::ExitStatus;
+ use std::process::Stdio;
++use std::sync::Arc;
+ use std::sync::atomic::AtomicI64;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
+@@ -164,7 +165,7 @@ pub struct TestAppServer {
+     _attribution_settings_server: Option<MockServer>,
+     _owned_install_dir: Option<TempDir>,
+     _owned_codex_home: Option<TempDir>,
+-    _owned_codex_harness: TempDir,
++    _owned_codex_harness: Arc<TempDir>,
+ }
+ 
+ pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
+@@ -181,6 +182,7 @@ impl TestAppServer {
+     pub fn builder() -> TestAppServerBuilder {
+         TestAppServerBuilder {
+             codex_home: None,
++            codex_harness: None,
+             environment: TestAppServerEnvironment::Auto,
+             program: None,
+             env_overrides: Vec::new(),
+@@ -261,7 +263,7 @@ impl TestAppServer {
+ 
+     async fn new_with_program_env_and_args(
+         codex_home: &Path,
+-        codex_harness: TempDir,
++        codex_harness: Arc<TempDir>,
+         program: &Path,
+         env_overrides: &[(&str, Option<&str>)],
+         args: &[&str],
+@@ -1872,6 +1874,7 @@ impl TestAppServer {
+ /// Builder for TestAppServer.
+ pub struct TestAppServerBuilder {
+     codex_home: Option<PathBuf>,
++    codex_harness: Option<Arc<TempDir>>,
+     environment: TestAppServerEnvironment,
+     program: Option<PathBuf>,
+     env_overrides: Vec<(String, Option<String>)>,
+@@ -1897,6 +1900,12 @@ impl TestAppServerBuilder {
+         self
+     }
+ 
++    /// Uses this owned CODEX_HARNESS instead of creating a temporary one.
++    pub fn with_codex_harness(mut self, codex_harness: Arc<TempDir>) -> Self {
++        self.codex_harness = Some(codex_harness);
++        self
++    }
++
+     /// Starts app-server without the standard automatic test environment.
+     pub fn without_auto_env(mut self) -> Self {
+         self.environment = TestAppServerEnvironment::None;
+@@ -1980,6 +1989,7 @@ impl TestAppServerBuilder {
+     pub async fn build(self) -> anyhow::Result<TestAppServer> {
+         let Self {
+             codex_home,
++            codex_harness,
+             environment,
+             program,
+             mut env_overrides,
+@@ -2152,7 +2162,10 @@ impl TestAppServerBuilder {
+             .map(|(key, value)| (key.as_str(), value.as_deref()))
+             .collect::<Vec<_>>();
+         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+-        let codex_harness = TempDir::new()?;
++        let codex_harness = match codex_harness {
++            Some(codex_harness) => codex_harness,
++            None => Arc::new(TempDir::new()?),
++        };
+         let mut app_server = TestAppServer::new_with_program_env_and_args(
+             &codex_home,
+             codex_harness,
+diff --git a/codex-rs/app-server/tests/suite/v2/guardian_goal_tests.rs b/codex-rs/app-server/tests/suite/v2/guardian_goal_tests.rs
+--- a/codex-rs/app-server/tests/suite/v2/guardian_goal_tests.rs
++++ b/codex-rs/app-server/tests/suite/v2/guardian_goal_tests.rs
+@@ -1,7 +1,11 @@
+ //! Goal API edits and clears enter model history across loaded and cold-resume paths.
+ 
+ use super::*;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadGoalGetResponse;
+ use codex_app_server_protocol::ThreadGoalSetResponse;
++use codex_protocol::ThreadId;
++use codex_rollout::WriterLockCoordinator;
+ use pretty_assertions::assert_eq;
+ use test_case::test_case;
+ 
+@@ -53,6 +57,34 @@ async fn user_goal_updates_survive_resume_and_clear(unloaded: bool) -> Result<()
+         )
+         .await?;
+     let _: ThreadGoalSetResponse = app.read_response(id).await?;
++    if unloaded {
++        let coordinator = Arc::new(WriterLockCoordinator::new(app.codex_harness()));
++        let ownership = coordinator.acquire(ThreadId::from_string(&thread_id)?)?;
++        let request = app
++            .send_raw_request(
++                "thread/goal/set",
++                Some(json!({
++                    "threadId": thread_id, "objective": "Blocked writer edit.",
++                    "status": "paused", "origin": "user",
++                })),
++            )
++            .await?;
++        let error = timeout(
++            TIMEOUT,
++            app.read_stream_until_error_message(RequestId::Integer(request)),
++        )
++        .await??;
++        assert!(error.error.message.contains("already has an active writer"));
++        let request = app
++            .send_raw_request("thread/goal/get", Some(json!({"threadId": thread_id})))
++            .await?;
++        let response: ThreadGoalGetResponse = app.read_response(request).await?;
++        assert_eq!(
++            response.goal.expect("unchanged goal").objective,
++            "Automatically generated goal."
++        );
++        drop(ownership);
++    }
+     let mut resume_request = None;
+     for objective in [
+         "Send the approved report.",
+@@ -110,6 +142,7 @@ async fn user_goal_updates_survive_resume_and_clear(unloaded: bool) -> Result<()
+         timeout(TIMEOUT, app.read_notification("turn/completed")).await??;
+     assert_eq!(completed.turn.status, TurnStatus::Completed);
+     let history = mock.single_request().message_input_texts("user").join("\n");
++    assert!(!history.contains("Blocked writer edit."), "{history}");
+     assert!(
+         !history.contains("Automatically generated goal."),
+         "{history}"
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_control.rs b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+--- a/codex-rs/app-server/tests/suite/v2/remote_control.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+@@ -2,6 +2,7 @@ use codex_utils_absolute_path::test_support::PathExt;
+ use std::ffi::OsStr;
+ use std::ffi::OsString;
+ use std::io::ErrorKind;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use anyhow::Context;
+@@ -505,6 +506,7 @@ async fn stdio_eof_exits_with_remote_control_connection() -> Result<()> {
+ #[tokio::test]
+ async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -> Result<()> {
+     let codex_home = TempDir::new()?;
++    let codex_harness = Arc::new(TempDir::new()?);
+     let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
+     let config_path = codex_home.path().join("config.toml");
+     let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+@@ -531,6 +533,7 @@ async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -
+     )?;
+     let mut owner = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(Arc::clone(&codex_harness))
+         .without_auto_env()
+         .build_initialized()
+         .await?;
+@@ -549,6 +552,7 @@ async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -
+     let secondary_sqlite_home_path = secondary_sqlite_home.path().to_string_lossy();
+     let mut secondary = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(codex_harness)
+         .without_auto_env()
+         .with_env_overrides(&[(
+             "CODEX_SQLITE_HOME",
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_archive.rs b/codex-rs/app-server/tests/suite/v2/thread_archive.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_archive.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_archive.rs
+@@ -41,6 +41,7 @@ use pretty_assertions::assert_eq;
+ use serde_json::Value;
+ use serde_json::json;
+ use std::path::Path;
++use std::sync::Arc;
+ use tempfile::TempDir;
+ use tokio::time::timeout;
+ 
+@@ -59,6 +60,7 @@ fn body_contains(request: &wiremock::Request, text: &str) -> bool {
+ async fn thread_archive_rejects_owned_unmaterialized_paginated_descendant() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
++    let codex_harness = Arc::new(TempDir::new()?);
+     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+     let parent_id = create_fake_rollout(
+         codex_home.path(),
+@@ -71,6 +73,7 @@ async fn thread_archive_rejects_owned_unmaterialized_paginated_descendant() -> R
+     let parent_thread_id = ThreadId::from_string(&parent_id)?;
+     let mut owner = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(Arc::clone(&codex_harness))
+         .build_initialized()
+         .await?;
+     let ThreadStartResponse { thread: child, .. } = owner
+@@ -95,6 +98,7 @@ async fn thread_archive_rejects_owned_unmaterialized_paginated_descendant() -> R
+ 
+     let mut other = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(codex_harness)
+         .build_initialized()
+         .await?;
+     let request_id = other
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_delete.rs b/codex-rs/app-server/tests/suite/v2/thread_delete.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_delete.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_delete.rs
+@@ -34,6 +34,7 @@ use core_test_support::responses;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+ use std::path::Path;
++use std::sync::Arc;
+ use tempfile::TempDir;
+ use tokio::time::timeout;
+ 
+@@ -43,6 +44,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
+ async fn thread_delete_rejects_paginated_writer_owned_by_another_process() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
++    let codex_harness = Arc::new(TempDir::new()?);
+     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+     let thread_id = create_fake_paginated_rollout(
+         codex_home.path(),
+@@ -54,6 +56,7 @@ async fn thread_delete_rejects_paginated_writer_owned_by_another_process() -> Re
+     )?;
+     let mut owner = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(Arc::clone(&codex_harness))
+         .build_initialized()
+         .await?;
+     let _: ThreadResumeResponse = owner
+@@ -69,6 +72,7 @@ async fn thread_delete_rejects_paginated_writer_owned_by_another_process() -> Re
+ 
+     let mut other = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(codex_harness)
+         .build_initialized()
+         .await?;
+     let request_id = other
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_list.rs b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+@@ -816,6 +816,7 @@ async fn thread_list_respects_cwd_filters() -> Result<()> {
+ #[tokio::test]
+ async fn thread_list_respects_search_term_filter() -> Result<()> {
+     let codex_home = TempDir::new()?;
++    let codex_harness = TempDir::new()?;
+     std::fs::write(
+         codex_home.path().join("config.toml"),
+         r#"
+@@ -866,6 +867,7 @@ sqlite = true
+         .await?;
+     let rollout_config = codex_rollout::RolloutConfig {
+         codex_home: codex_home.path().to_path_buf(),
++        codex_harness: codex_harness.path().to_path_buf(),
+         sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+         cwd: codex_home.path().to_path_buf(),
+         model_provider_id: "mock_provider".to_string(),
+@@ -2485,6 +2487,7 @@ async fn thread_list_sort_updated_at_orders_by_mtime() -> Result<()> {
+ #[tokio::test]
+ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter() -> Result<()> {
+     let codex_home = TempDir::new()?;
++    let codex_harness = TempDir::new()?;
+     create_minimal_config(codex_home.path())?;
+ 
+     let id_old = create_fake_rollout(
+@@ -2518,6 +2521,7 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter()
+         .await?;
+     let rollout_config = codex_rollout::RolloutConfig {
+         codex_home: codex_home.path().to_path_buf(),
++        codex_harness: codex_harness.path().to_path_buf(),
+         sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+         cwd: codex_home.path().to_path_buf(),
+         model_provider_id: "mock_provider".to_string(),
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_read.rs b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_read.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+@@ -620,6 +620,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
+     let store = LocalThreadStore::new(
+         LocalThreadStoreConfig {
+             codex_home: codex_home.path().to_path_buf(),
++            codex_harness: codex_home.path().to_path_buf(),
+             sqlite,
+             default_model_provider_id: "mock_provider".to_string(),
+         },
+@@ -1719,6 +1720,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
+     let store = LocalThreadStore::new(
+         LocalThreadStoreConfig {
+             codex_home: codex_home.path().to_path_buf(),
++            codex_harness: codex_home.path().to_path_buf(),
+             sqlite,
+             default_model_provider_id: "mock_provider".to_string(),
+         },
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -137,6 +137,7 @@ use std::io::Write;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::process::Command;
++use std::sync::Arc;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ use test_case::test_case;
+@@ -330,10 +331,12 @@ async fn assert_thread_resume_rejects_writer_owned_by_another_process(
+ ) -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
++    let codex_harness = Arc::new(TempDir::new()?);
+     mock_responses_config(&server.uri()).write(codex_home.path())?;
+ 
+     let mut primary = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(Arc::clone(&codex_harness))
+         .build_initialized()
+         .await?;
+     let ThreadStartResponse { thread, .. } = primary
+@@ -360,6 +363,7 @@ async fn assert_thread_resume_rejects_writer_owned_by_another_process(
+     let secondary_sqlite_home_path = secondary_sqlite_home.path().to_string_lossy();
+     let mut secondary = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_codex_harness(codex_harness)
+         .with_env_overrides(&[(
+             "CODEX_SQLITE_HOME",
+             Some(secondary_sqlite_home_path.as_ref()),
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_timeline.rs b/codex-rs/app-server/tests/suite/v2/thread_timeline.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_timeline.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_timeline.rs
+@@ -52,6 +52,7 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() ->
+     let store = LocalThreadStore::new(
+         LocalThreadStoreConfig {
+             codex_home: codex_home.path().to_path_buf(),
++            codex_harness: codex_home.path().to_path_buf(),
+             sqlite,
+             default_model_provider_id: "mock_provider".to_string(),
+         },
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_unload.rs b/codex-rs/app-server/tests/suite/v2/thread_unload.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_unload.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_unload.rs
+@@ -38,10 +38,11 @@ async fn idle_unload_finishes_after_slow_writer_shutdown() -> Result<()> {
+ 
+     // Block the real cross-process writer-lock cleanup. Other app-server tasks,
+     // including the ten-second shutdown deadline and JSON-RPC, can still run.
+-    let coordination_lock = OpenOptions::new()
+-        .read(true)
+-        .write(true)
+-        .open(home.path().join("thread-writer-locks/.coordination.lock"))?;
++    let coordination_lock = OpenOptions::new().read(true).write(true).open(
++        client
++            .codex_harness()
++            .join("thread-writer-locks/.coordination.lock"),
++    )?;
+     coordination_lock.lock()?;
+     let unsubscribed: ThreadUnsubscribeResponse = client
+         .request(|request_id| ClientRequest::ThreadUnsubscribe {
+diff --git a/codex-rs/core/src/rollout.rs b/codex-rs/core/src/rollout.rs
+--- a/codex-rs/core/src/rollout.rs
++++ b/codex-rs/core/src/rollout.rs
+@@ -28,6 +28,10 @@ impl codex_rollout::RolloutConfigView for Config {
+         self.codex_home.as_path()
+     }
+ 
++    fn codex_harness(&self) -> &std::path::Path {
++        self.codex_harness.as_path()
++    }
++
+     fn sqlite_config(&self) -> &codex_state::SqliteConfig {
+         self.sqlite_config()
+     }
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -467,6 +467,7 @@ pub fn thread_store_from_config(
+ ) -> Arc<dyn ThreadStore> {
+     match &config.experimental_thread_store {
+         ThreadStoreConfig::Local => {
++            let codex_harness = config.codex_harness.to_path_buf();
+             let compression_enabled = config
+                 .features
+                 .enabled(Feature::LocalThreadStoreCompression);
+@@ -501,6 +502,7 @@ pub fn thread_store_from_config(
+                     if compression_enabled {
+                         codex_rollout::spawn_rollout_compression_worker(
+                             codex_home,
++                            codex_harness,
+                             codex_rollout::RolloutCompressionTrigger::Startup,
+                         );
+                     }
+@@ -508,6 +510,7 @@ pub fn thread_store_from_config(
+             } else if compression_enabled {
+                 codex_rollout::spawn_rollout_compression_worker(
+                     config.codex_home.to_path_buf(),
++                    codex_harness,
+                     codex_rollout::RolloutCompressionTrigger::Startup,
+                 );
+             }
+@@ -764,6 +767,7 @@ impl ThreadManager {
+         let thread_store: Arc<dyn ThreadStore> = Arc::new(LocalThreadStore::new(
+             LocalThreadStoreConfig {
+                 codex_home: codex_home.clone(),
++                codex_harness: codex_home.clone(),
+                 sqlite: codex_state::SqliteConfig::new_for_testing(absolute_codex_home),
+                 default_model_provider_id: OPENAI_PROVIDER_ID.to_string(),
+             },
+diff --git a/codex-rs/rollout/src/config.rs b/codex-rs/rollout/src/config.rs
+--- a/codex-rs/rollout/src/config.rs
++++ b/codex-rs/rollout/src/config.rs
+@@ -5,6 +5,7 @@ use std::sync::Arc;
+ 
+ pub trait RolloutConfigView {
+     fn codex_home(&self) -> &Path;
++    fn codex_harness(&self) -> &Path;
+     fn sqlite_config(&self) -> &SqliteConfig;
+     fn cwd(&self) -> &Path;
+     fn model_provider_id(&self) -> &str;
+@@ -14,6 +15,7 @@ pub trait RolloutConfigView {
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct RolloutConfig {
+     pub codex_home: PathBuf,
++    pub codex_harness: PathBuf,
+     pub sqlite: SqliteConfig,
+     pub cwd: PathBuf,
+     pub model_provider_id: String,
+@@ -26,6 +28,7 @@ impl RolloutConfig {
+     pub fn from_view(view: &impl RolloutConfigView) -> Self {
+         Self {
+             codex_home: view.codex_home().to_path_buf(),
++            codex_harness: view.codex_harness().to_path_buf(),
+             sqlite: view.sqlite_config().clone(),
+             cwd: view.cwd().to_path_buf(),
+             model_provider_id: view.model_provider_id().to_string(),
+@@ -39,6 +42,10 @@ impl RolloutConfigView for RolloutConfig {
+         self.codex_home.as_path()
+     }
+ 
++    fn codex_harness(&self) -> &Path {
++        self.codex_harness.as_path()
++    }
++
+     fn sqlite_config(&self) -> &SqliteConfig {
+         &self.sqlite
+     }
+@@ -61,6 +68,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
+         (*self).codex_home()
+     }
+ 
++    fn codex_harness(&self) -> &Path {
++        (*self).codex_harness()
++    }
++
+     fn sqlite_config(&self) -> &SqliteConfig {
+         (*self).sqlite_config()
+     }
+@@ -83,6 +94,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
+         self.as_ref().codex_home()
+     }
+ 
++    fn codex_harness(&self) -> &Path {
++        self.as_ref().codex_harness()
++    }
++
+     fn sqlite_config(&self) -> &SqliteConfig {
+         self.as_ref().sqlite_config()
+     }
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -40,6 +40,7 @@ use uuid::Uuid;
+ fn test_config(codex_home: &Path) -> RolloutConfig {
+     RolloutConfig {
+         codex_home: codex_home.to_path_buf(),
++        codex_harness: codex_home.to_path_buf(),
+         sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
+         cwd: codex_home.to_path_buf(),
+         model_provider_id: "test-provider".to_string(),
+diff --git a/codex-rs/rollout/src/writer_lock.rs b/codex-rs/rollout/src/writer_lock.rs
+--- a/codex-rs/rollout/src/writer_lock.rs
++++ b/codex-rs/rollout/src/writer_lock.rs
+@@ -1,5 +1,5 @@
+ //! Shared cross-process ownership for local thread writers and rollout publication.
+-//! Thread lock-file creation and removal uses the existing home coordination lock.
++//! Thread lock-file creation and removal uses the host-owned harness coordination lock.
+ 
+ use std::fs;
+ use std::fs::File;
+@@ -17,7 +17,7 @@ use tracing::warn;
+ const WRITER_LOCK_DIR: &str = "thread-writer-locks";
+ const COORDINATION_LOCK_FILE: &str = ".coordination.lock";
+ 
+-/// Coordinates writer ownership within one Codex home.
++/// Coordinates writer ownership within one Codex harness.
+ pub struct WriterLockCoordinator {
+     directory: PathBuf,
+     cleanup_attempted: AtomicBool,
+@@ -32,9 +32,9 @@ pub struct WriterLockGuard {
+ 
+ impl WriterLockCoordinator {
+     /// Uses the same lock namespace as existing local thread-store writers.
+-    pub fn new(codex_home: &Path) -> Self {
++    pub fn new(codex_harness: &Path) -> Self {
+         Self {
+-            directory: codex_home.join(WRITER_LOCK_DIR),
++            directory: codex_harness.join(WRITER_LOCK_DIR),
+             cleanup_attempted: AtomicBool::new(false),
+         }
+     }
+diff --git a/codex-rs/thread-store/src/local/compression_writer_tests.rs b/codex-rs/thread-store/src/local/compression_writer_tests.rs
+--- a/codex-rs/thread-store/src/local/compression_writer_tests.rs
++++ b/codex-rs/thread-store/src/local/compression_writer_tests.rs
+@@ -78,11 +78,12 @@ async fn wait_until(ready: impl Fn() -> bool) {
+ }
+ 
+ async fn compress(home: &Path) -> TestResult<()> {
+-    let marker = home.join(".tmp/rollout-compression.lock");
++    let marker = home.join("thread-writer-locks/rollout-compression.lock");
+     if marker.exists() {
+         fs::remove_file(&marker)?;
+     }
+     codex_rollout::spawn_rollout_compression_worker(
++        home.to_path_buf(),
+         home.to_path_buf(),
+         codex_rollout::RolloutCompressionTrigger::Startup,
+     );
+diff --git a/codex-rs/thread-store/src/local/create_thread.rs b/codex-rs/thread-store/src/local/create_thread.rs
+--- a/codex-rs/thread-store/src/local/create_thread.rs
++++ b/codex-rs/thread-store/src/local/create_thread.rs
+@@ -22,6 +22,7 @@ pub(super) async fn create_thread(
+         })?;
+     let config = RolloutConfig {
+         codex_home: store.config.codex_home.clone(),
++        codex_harness: store.config.codex_harness.clone(),
+         sqlite: store.config.sqlite.clone(),
+         cwd,
+         model_provider_id: params.metadata.model_provider.clone(),
+diff --git a/codex-rs/thread-store/src/local/list_threads.rs b/codex-rs/thread-store/src/local/list_threads.rs
+--- a/codex-rs/thread-store/src/local/list_threads.rs
++++ b/codex-rs/thread-store/src/local/list_threads.rs
+@@ -50,6 +50,7 @@ pub(super) async fn list_threads(
+     let state_db = store.state_db().await;
+     let rollout_config = RolloutConfig {
+         codex_home: store.config.codex_home.clone(),
++        codex_harness: store.config.codex_harness.clone(),
+         sqlite: store.config.sqlite.clone(),
+         cwd: store.config.codex_home.clone(),
+         model_provider_id: store.config.default_model_provider_id.clone(),
+diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -104,6 +104,7 @@ pub(super) async fn resume_thread(
+         })?;
+     let config = RolloutConfig {
+         codex_home: store.config.codex_home.clone(),
++        codex_harness: store.config.codex_harness.clone(),
+         sqlite: store.config.sqlite.clone(),
+         cwd,
+         model_provider_id: params.metadata.model_provider.clone(),
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -234,6 +234,7 @@ impl LiveWriterLocks {
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct LocalThreadStoreConfig {
+     pub codex_home: PathBuf,
++    pub codex_harness: PathBuf,
+     pub sqlite: SqliteConfig,
+     /// Provider used only when older local metadata does not contain one.
+     pub default_model_provider_id: String,
+@@ -243,6 +244,7 @@ impl LocalThreadStoreConfig {
+     pub fn from_config(config: &impl codex_rollout::RolloutConfigView) -> Self {
+         Self {
+             codex_home: config.codex_home().to_path_buf(),
++            codex_harness: config.codex_harness().to_path_buf(),
+             sqlite: config.sqlite_config().clone(),
+             default_model_provider_id: config.model_provider_id().to_string(),
+         }
+@@ -260,7 +262,7 @@ impl std::fmt::Debug for LocalThreadStore {
+ impl LocalThreadStore {
+     /// Create a local store using an already initialized state DB handle.
+     pub fn new(config: LocalThreadStoreConfig, state_db: Option<StateDbHandle>) -> Self {
+-        let writer_lock_coordinator = Arc::new(WriterLockCoordinator::new(&config.codex_home));
++        let writer_lock_coordinator = Arc::new(WriterLockCoordinator::new(&config.codex_harness));
+         Self {
+             config,
+             live_recorders: Arc::new(Mutex::new(HashMap::new())),
+@@ -1493,7 +1495,10 @@ mod tests {
+     #[tokio::test]
+     async fn discard_thread_drops_unmaterialized_live_writer() {
+         let home = TempDir::new().expect("temp dir");
+-        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
++        let harness = TempDir::new().expect("harness");
++        let mut config = test_config(home.path());
++        config.codex_harness = harness.path().to_path_buf();
++        let store = LocalThreadStore::new(config, /*state_db*/ None);
+         for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+             let thread_id = ThreadId::default();
+             let mut params = create_thread_params(thread_id);
+@@ -1523,11 +1528,12 @@ mod tests {
+             }
+             assert!(!rollout_path.exists());
+ 
+-            let lock_path = home
++            let lock_path = harness
+                 .path()
+                 .join("thread-writer-locks")
+                 .join(format!("{thread_id}.lock"));
+             assert!(lock_path.exists());
++            assert!(!home.path().join("thread-writer-locks").exists());
+             store
+                 .discard_thread(thread_id)
+                 .await
+diff --git a/codex-rs/thread-store/src/local/revert_thread.rs b/codex-rs/thread-store/src/local/revert_thread.rs
+--- a/codex-rs/thread-store/src/local/revert_thread.rs
++++ b/codex-rs/thread-store/src/local/revert_thread.rs
+@@ -161,6 +161,7 @@ async fn create_replacement_recorder(
+ ) -> ThreadStoreResult<RolloutRecorder> {
+     let config = RolloutConfig {
+         codex_home: store.config.codex_home.clone(),
++        codex_harness: store.config.codex_harness.clone(),
+         sqlite: store.config.sqlite.clone(),
+         cwd: source_meta.cwd.clone(),
+         model_provider_id: source_meta
+diff --git a/codex-rs/thread-store/src/local/rollout_migration.rs b/codex-rs/thread-store/src/local/rollout_migration.rs
+--- a/codex-rs/thread-store/src/local/rollout_migration.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration.rs
+@@ -332,7 +332,7 @@ impl LocalThreadStore {
+         let maintenance_guard = match options.mode {
+             RolloutMigrationMode::DryRun => None,
+             RolloutMigrationMode::Apply => Some(
+-                codex_rollout::try_acquire_rollout_maintenance_lock(&self.config.codex_home)
++                codex_rollout::try_acquire_rollout_maintenance_lock(&self.config.codex_harness)
+                     .map_err(migration_error)?
+                     .ok_or_else(|| ThreadStoreError::Conflict {
+                         message: "rollout compression or another migration is already running"
+diff --git a/codex-rs/thread-store/src/local/rollout_migration/startup.rs b/codex-rs/thread-store/src/local/rollout_migration/startup.rs
+--- a/codex-rs/thread-store/src/local/rollout_migration/startup.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration/startup.rs
+@@ -205,7 +205,7 @@ async fn run_startup_migration(
+ ) -> ThreadStoreResult<RolloutMigrationReport> {
+     loop {
+         let Some(maintenance_guard) =
+-            codex_rollout::try_acquire_rollout_maintenance_lock(&store.config.codex_home)
++            codex_rollout::try_acquire_rollout_maintenance_lock(&store.config.codex_harness)
+                 .map_err(migration_error)?
+         else {
+             tokio::time::sleep(MAINTENANCE_RETRY_DELAY).await;
+diff --git a/codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs b/codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs
+--- a/codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration/startup_tests.rs
+@@ -97,6 +97,7 @@ async fn indexed_store(home: &Path) -> LocalThreadStore {
+     let config = test_config(home);
+     let rollout_config = RolloutConfig {
+         codex_home: config.codex_home.clone(),
++        codex_harness: config.codex_harness.clone(),
+         sqlite: config.sqlite.clone(),
+         cwd: home.to_path_buf(),
+         model_provider_id: config.default_model_provider_id.clone(),
+diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+--- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+@@ -301,6 +301,7 @@ async fn indexed_store(home: &Path) -> LocalThreadStore {
+     let config = test_config(home);
+     let rollout_config = RolloutConfig {
+         codex_home: config.codex_home.clone(),
++        codex_harness: config.codex_harness.clone(),
+         sqlite: config.sqlite.clone(),
+         cwd: home.to_path_buf(),
+         model_provider_id: config.default_model_provider_id.clone(),
+diff --git a/codex-rs/thread-store/src/local/search_threads.rs b/codex-rs/thread-store/src/local/search_threads.rs
+--- a/codex-rs/thread-store/src/local/search_threads.rs
++++ b/codex-rs/thread-store/src/local/search_threads.rs
+@@ -69,6 +69,7 @@ pub(super) async fn search_threads(
+     let state_db = store.state_db().await;
+     let rollout_config = RolloutConfig {
+         codex_home: store.config.codex_home.clone(),
++        codex_harness: store.config.codex_harness.clone(),
+         sqlite: store.config.sqlite.clone(),
+         cwd: store.config.codex_home.clone(),
+         model_provider_id: store.config.default_model_provider_id.clone(),
+diff --git a/codex-rs/thread-store/src/local/test_support.rs b/codex-rs/thread-store/src/local/test_support.rs
+--- a/codex-rs/thread-store/src/local/test_support.rs
++++ b/codex-rs/thread-store/src/local/test_support.rs
+@@ -13,6 +13,7 @@ use super::LocalThreadStoreConfig;
+ pub(super) fn test_config(codex_home: &Path) -> LocalThreadStoreConfig {
+     LocalThreadStoreConfig {
+         codex_home: codex_home.to_path_buf(),
++        codex_harness: codex_home.to_path_buf(),
+         sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
+         default_model_provider_id: "test-provider".to_string(),
+     }
+diff --git a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
+--- a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
++++ b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
+@@ -119,6 +119,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
+     let sqlite = codex_state::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+     let rollout_config = RolloutConfig {
+         codex_home: codex_home.clone(),
++        codex_harness: codex_home.clone(),
+         sqlite: sqlite.clone(),
+         cwd: codex_home.clone(),
+         model_provider_id: "test-provider".to_string(),
+diff --git a/codex-rs/thread-store/src/local/update_thread_metadata.rs b/codex-rs/thread-store/src/local/update_thread_metadata.rs
+--- a/codex-rs/thread-store/src/local/update_thread_metadata.rs
++++ b/codex-rs/thread-store/src/local/update_thread_metadata.rs
+@@ -903,6 +903,7 @@ async fn update_rollout_metadata(
+         None => RolloutRecorder::new_with_writer_lock(
+             &RolloutConfig {
+                 codex_home: store.config.codex_home.clone(),
++                codex_harness: store.config.codex_harness.clone(),
+                 sqlite: store.config.sqlite.clone(),
+                 cwd: metadata.meta.cwd.clone(),
+                 model_provider_id: store.config.default_model_provider_id.clone(),
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -4375,6 +4375,7 @@ terminal_visualization_instructions = true
+             std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60),
+         ))?;
+     codex_rollout::spawn_rollout_compression_worker(
++        home.clone(),
+         home.clone(),
+         codex_rollout::RolloutCompressionTrigger::Startup,
+     );
+diff --git a/codex-rs/tui/src/app_server_session/rollout_history.rs b/codex-rs/tui/src/app_server_session/rollout_history.rs
+--- a/codex-rs/tui/src/app_server_session/rollout_history.rs
++++ b/codex-rs/tui/src/app_server_session/rollout_history.rs
+@@ -189,7 +189,7 @@ impl AppServerSession {
+                         // regardless of the server's migration feature settings.
+                         rollout_maintenance_guard =
+                             codex_rollout::try_acquire_rollout_maintenance_lock(
+-                                config.codex_home.as_path(),
++                                config.codex_harness.as_path(),
+                             )
+                             .ok()
+                             .flatten();
+diff --git a/codex-rs/tui/src/app_server_session/rollout_history_tests.rs b/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
+--- a/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
++++ b/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
+@@ -17,6 +17,7 @@ use tempfile::TempDir;
+ async fn build_config(temp_dir: &TempDir) -> Config {
+     ConfigBuilder::default()
+         .codex_home(temp_dir.path().to_path_buf())
++        .codex_harness(temp_dir.path().join("harness"))
+         .build()
+         .await
+         .expect("config should build")
+@@ -351,9 +352,10 @@ async fn cached_legacy_resume_revalidates_history_across_migration_settings() ->
+                 .enable(Feature::BackgroundPaginatedRolloutMigration)?;
+         }
+         // Keep the real startup worker from migrating the legacy fixture before selection.
+-        let maintenance_guard =
+-            codex_rollout::try_acquire_rollout_maintenance_lock(codex_home.path())?
+-                .expect("acquire rollout maintenance lock");
++        let maintenance_guard = codex_rollout::try_acquire_rollout_maintenance_lock(
++            resume_config.codex_harness.as_path(),
++        )?
++        .expect("acquire rollout maintenance lock");
+         let mut app_server =
+             Box::pin(crate::start_embedded_app_server_for_picker(&startup_config)).await?;
+         app_server.remember_thread_history_mode(legacy_thread_id, ThreadHistoryMode::Legacy);
+@@ -372,7 +374,10 @@ async fn cached_legacy_resume_revalidates_history_across_migration_settings() ->
+             // Resume must acquire its guard before waiting for metadata revalidation.
+             assert!(resume.as_mut().now_or_never().is_none());
+             assert!(
+-                codex_rollout::try_acquire_rollout_maintenance_lock(codex_home.path())?.is_none()
++                codex_rollout::try_acquire_rollout_maintenance_lock(
++                    resume_config.codex_harness.as_path()
++                )?
++                .is_none()
+             );
+             resume.await?
+         };
+@@ -398,11 +403,11 @@ async fn rollout_maintenance_contention_disables_cached_legacy_resume_shortcut()
+         )
+         .expect("create paginated rollout"),
+     )?;
+-    let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+-    app_server.remember_thread_history_mode(thread_id, ThreadHistoryMode::Legacy);
+     let _maintenance_guard =
+-        codex_rollout::try_acquire_rollout_maintenance_lock(codex_home.path())?
++        codex_rollout::try_acquire_rollout_maintenance_lock(config.codex_harness.as_path())?
+             .expect("acquire rollout maintenance lock");
++    let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
++    app_server.remember_thread_history_mode(thread_id, ThreadHistoryMode::Legacy);
+     let next_request_id = app_server.next_request_id;
+ 
+     let resumed = app_server

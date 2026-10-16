@@ -1,0 +1,853 @@
+record-model-requests-through-native-lifecycle
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: record-model-requests-through-native-lifecycle
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs b/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs
+--- a/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs
+@@ -447,6 +447,7 @@ mod tests {
+     use app_test_support::encode_id_token;
+     use codex_exec_server::EnvironmentManager;
+     use codex_model_provider_info::ModelProviderInfo;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
+     use core_test_support::responses::WebSocketConnectionConfig;
+     use core_test_support::responses::ev_assistant_message;
+     use core_test_support::responses::ev_completed;
+@@ -528,6 +529,7 @@ mod tests {
+             ]])
+             .await;
+             let (home, threads, config) = probe_runtime(server.uri()).await?;
++            let mut observations = threads.response_attempt_receiver();
+             let tasks = TaskTracker::new();
+             let result = tokio::time::timeout(
+                 Duration::from_secs(10),
+@@ -572,6 +574,29 @@ mod tests {
+             );
+             assert!(threads.list_thread_ids().await.is_empty());
+             assert!(!home.path().join("sessions").exists());
++            let mut ended = Vec::new();
++            while let Ok(record) = observations.try_recv() {
++                if record.end_reason.is_some() {
++                    ended.push(record);
++                }
++            }
++            assert_eq!(ended.len(), 1);
++            let probe = &ended[0];
++            assert_eq!(probe.request_kind, "probe");
++            assert_eq!(probe.requested_model, "gpt-5.4");
++            assert!(probe.thread_id.is_some());
++            assert!(probe.turn_id.is_some());
++            assert_eq!(probe.response_id.as_deref(), Some("probe"));
++            assert_eq!(
++                probe.end_reason,
++                Some(if terminal == "response.completed" {
++                    ResponseAttemptEnd::Completed
++                } else {
++                    ResponseAttemptEnd::Failed
++                })
++            );
++            assert!(probe.sent_payload_bytes.is_some());
++            assert!(probe.received_payload_bytes > 0);
+         }
+         Ok(())
+     }
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -38,6 +38,7 @@ mod tool_metadata;
+ 
+ use crate::CodexResponsesHeaders;
+ use crate::response_metrics::ResponseAttemptContext;
++use crate::response_metrics::ResponseAttemptTracker;
+ use crate::response_metrics::ResponseMetrics;
+ use crate::tools::ExecutedToolCalls;
+ use async_channel::Sender;
+@@ -102,6 +103,7 @@ use codex_protocol::protocol::InternalSessionSource;
+ use codex_protocol::protocol::ResponsesStreamConnectionStatusEvent;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
++use codex_protocol::protocol::ThreadSource;
+ use codex_protocol::protocol::W3cTraceContext;
+ use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_rollout_trace::InferenceTraceAttempt;
+@@ -688,7 +690,7 @@ impl ModelClient {
+         let mut websocket_session = self.take_cached_websocket_session();
+         if websocket_session.auth_owner_generation != auth_owner_generation {
+             // Drop the old owner's cache before this turn can establish fresh routing state.
+-            websocket_session.reset(Some("other"));
++            websocket_session.reset(Some("auth_owner_changed"));
+             websocket_session.auth_owner_generation = auth_owner_generation;
+         }
+         ModelClientSession {
+@@ -1725,11 +1727,11 @@ impl ModelClientSession {
+         let connection_key = ResponsesConnectionKey::new(&api_provider, auth_revision);
+         let runtime_proxy_generation = codex_http_client::runtime_proxy_generation();
+         let reset_reason = match self.websocket_session.connection.as_ref() {
+-            Some(_)
+-                if self.websocket_session.responses_headers != *responses_headers
+-                    || self.websocket_session.connection_key.as_ref() != Some(&connection_key) =>
+-            {
+-                Some("other")
++            Some(_) if self.websocket_session.responses_headers != *responses_headers => {
++                Some("response_headers_changed")
++            }
++            Some(_) if self.websocket_session.connection_key.as_ref() != Some(&connection_key) => {
++                Some("connection_key_changed")
+             }
+             Some(_)
+                 if self.websocket_session.runtime_proxy_generation != runtime_proxy_generation =>
+@@ -1749,7 +1751,7 @@ impl ModelClientSession {
+ 
+         if needs_new || owner_changed {
+             self.websocket_session.reset(if owner_changed {
+-                Some("other")
++                Some("auth_owner_changed")
+             } else {
+                 reset_reason
+             });
+@@ -1785,6 +1787,38 @@ impl ModelClientSession {
+                 "websocket connection is unavailable".to_string(),
+             ))
+     }
++
++    fn start_response_attempt(
++        &self,
++        model_info: &ModelInfo,
++        effort: &Option<ReasoningEffortConfig>,
++        metadata: &CodexResponsesMetadata,
++    ) -> Arc<ResponseAttemptTracker> {
++        let request_kind = if matches!(
++            metadata.thread_source.as_ref(),
++            Some(ThreadSource::Feature(feature)) if feature == "weekly_reset_probe"
++        ) {
++            "probe"
++        } else {
++            match metadata.request_kind {
++                Some(CodexResponsesRequestKind::Compaction(_)) => "compaction",
++                Some(CodexResponsesRequestKind::Memory) => "memory",
++                Some(CodexResponsesRequestKind::Turn | CodexResponsesRequestKind::Prewarm)
++                | None => "generation",
++            }
++        };
++        self.client.state.response_metrics.start(
++            ResponseAttemptContext {
++                thread_id: Some(self.client.state.thread_id),
++                turn_id: metadata.turn_id.clone(),
++                request_kind: request_kind.into(),
++                requested_model: model_info.slug.clone(),
++                reasoning_effort: effort.as_ref().map(ToString::to_string),
++            },
++            tokio::time::Instant::now(),
++            chrono::Utc::now().timestamp(),
++        )
++    }
+ }
+ 
+ impl ResponsesHttpExecutor<'_> {
+@@ -2042,10 +2076,19 @@ impl ModelClientSession {
+         let mut provider_auth_recovery_attempted = false;
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
++            let observer = (!warmup)
++                .then(|| self.start_response_attempt(model_info, &effort, responses_metadata));
++            let fail_setup = |error: CodexErr| {
++                if let Some(observer) = &observer {
++                    observer.ended(ResponseAttemptEnd::SetupFailed, tokio::time::Instant::now());
++                }
++                error
++            };
+             let client_setup = self
+                 .client
+                 .current_client_setup(ClientRouting::Workspace)
+-                .await?;
++                .await
++                .map_err(fail_setup)?;
+             let include_internal = self
+                 .client
+                 .state
+@@ -2063,15 +2106,18 @@ impl ModelClientSession {
+             );
+             request_auth_context.uses_codex_backend =
+                 self.client.uses_codex_backend(client_setup.auth.as_ref());
+-            let mut request = self.client.build_responses_request(
+-                prompt,
+-                model_info,
+-                effort.clone(),
+-                summary,
+-                service_tier.clone(),
+-                responses_metadata,
+-                include_internal,
+-            )?;
++            let mut request = self
++                .client
++                .build_responses_request(
++                    prompt,
++                    model_info,
++                    effort.clone(),
++                    summary,
++                    service_tier.clone(),
++                    responses_metadata,
++                    include_internal,
++                )
++                .map_err(fail_setup)?;
+             if is_guardian_reviewer(&responses_headers) {
+                 request.service_tier = None;
+             }
+@@ -2079,7 +2125,11 @@ impl ModelClientSession {
+                 client_setup.auth.as_ref(),
+                 prompt.cyber_access_program,
+                 self.client.api_key_cyber_access_programs,
+-            )?;
++            )
++            .map_err(fail_setup)?;
++            if let Some(observer) = &observer {
++                observer.configured(&request);
++            }
+             let mut websocket_metadata = responses_metadata.clone();
+             websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                 client_setup.auth.as_ref(),
+@@ -2093,7 +2143,7 @@ impl ModelClientSession {
+             } else {
+                 session_telemetry_for_request(session_telemetry, &request)
+             };
+-            match self
++            let connection_result = self
+                 .websocket_connection(WebsocketConnectParams {
+                     session_telemetry,
+                     api_provider: client_setup.api_provider,
+@@ -2105,8 +2155,13 @@ impl ModelClientSession {
+                     request_route_telemetry: RequestRouteTelemetry::for_endpoint("/responses"),
+                     responses_headers: &responses_headers,
+                 })
+-                .await
++                .await;
++            if connection_result.is_err()
++                && let Some(observer) = &observer
+             {
++                observer.ended(ResponseAttemptEnd::SetupFailed, tokio::time::Instant::now());
++            }
++            match connection_result {
+                 Ok(_) => {}
+                 Err(err @ ApiError::Transport(TransportError::Http { status, .. }))
+                     if status == StatusCode::UPGRADE_REQUIRED =>
+@@ -2282,7 +2337,9 @@ impl ModelClientSession {
+                     ws_request,
+                     self.websocket_session.connection_reused(),
+                     Some(Arc::clone(&self.turn_state)),
+-                    None,
++                    observer
++                        .as_ref()
++                        .map(|observer| Arc::clone(observer) as Arc<dyn ResponseObserver>),
+                 )
+                 .await;
+             if let Some(original_item_ids) = original_item_ids {
+@@ -2293,6 +2350,9 @@ impl ModelClientSession {
+             self.websocket_session.last_request = Some(request);
+             self.websocket_session.last_response_from_untraced_warmup = warmup;
+             let stream_result = stream_result.map_err(|err| {
++                if let Some(observer) = &observer {
++                    observer.ended(ResponseAttemptEnd::SendFailed, tokio::time::Instant::now());
++                }
+                 let response_debug_context = extract_response_debug_context_from_api_error(&err);
+                 let err = self.client.state.provider.map_api_error(err);
+                 inference_trace_attempt.record_failed(
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -45,6 +45,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::W3cTraceContext;
++use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_protocol::user_input::UserInput;
+ use codex_rollout_trace::ConversationPart;
+ use codex_rollout_trace::InferenceTraceContext;
+@@ -71,13 +72,19 @@ use futures::StreamExt;
+ use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
++use std::collections::BTreeMap;
+ use std::sync::Arc;
++use std::sync::Mutex;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ use tracing::Instrument;
+ use tracing_test::traced_test;
+ 
+ const MODEL: &str = "gpt-5.4";
++
++#[path = "client_websockets_recording_tests.rs"]
++mod response_recording;
++
+ const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+ const USER_AGENT_HEADER: &str = "user-agent";
+ const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+@@ -119,6 +126,7 @@ struct WebsocketTestHarness {
+     codex_home: TempDir,
+     auth_manager: Arc<AuthManager>,
+     client: ModelClient,
++    response_records: Arc<Mutex<BTreeMap<uuid::Uuid, ResponseAttempt>>>,
+     outbound_proxy_policy: OutboundProxyPolicy,
+     session_id: SessionId,
+     thread_id: ThreadId,
+@@ -128,6 +136,18 @@ struct WebsocketTestHarness {
+     session_telemetry: SessionTelemetry,
+ }
+ 
++impl WebsocketTestHarness {
++    fn response_attempts(&self) -> Vec<ResponseAttempt> {
++        self.response_records
++            .lock()
++            .unwrap()
++            .values()
++            .rev()
++            .cloned()
++            .collect()
++    }
++}
++
+ fn responses_metadata(
+     harness: &WebsocketTestHarness,
+     turn_id: Option<&str>,
+@@ -1138,7 +1158,7 @@ async fn responses_websocket_reconnects_after_account_switch() {
+         assert_continuation_metrics(
+             &harness.session_telemetry,
+             &[
+-                (["full", "other", "generation"], 1),
++                (["full", "auth_owner_changed", "generation"], 1),
+                 (["full", "no_previous_request", "generation"], 1),
+                 (["incremental", "incremental", "generation"], 3),
+             ],
+@@ -2861,8 +2881,12 @@ async fn websocket_harness_with_provider_options_and_auth(
+     .with_metrics(metrics);
+     let effort = None;
+     let summary = ReasoningSummary::Auto;
++    let response_records = Arc::new(Mutex::new(BTreeMap::new()));
++    let records = Arc::clone(&response_records);
+     let client = ModelClient::new(
+-        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
++        Arc::new(codex_core::ResponseMetrics::new(move |record| {
++            records.lock().unwrap().insert(record.attempt_id, record);
++        })),
+         client_auth_manager,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+@@ -2890,6 +2914,7 @@ async fn websocket_harness_with_provider_options_and_auth(
+         codex_home,
+         auth_manager,
+         client,
++        response_records,
+         outbound_proxy_policy,
+         session_id,
+         thread_id,
+diff --git a/codex-rs/core/tests/suite/client_websockets_recording_tests.rs b/codex-rs/core/tests/suite/client_websockets_recording_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/tests/suite/client_websockets_recording_tests.rs
+@@ -0,0 +1,287 @@
++use super::*;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use core_test_support::responses::ev_output_text_delta;
++use core_test_support::responses::ev_reasoning_item;
++use core_test_support::responses::ev_reasoning_item_added;
++use core_test_support::responses::ev_reasoning_summary_text_delta;
++use core_test_support::responses::mount_response_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::sse_response;
++use core_test_support::responses::start_mock_server;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++
++fn personal_auth(plan: &str) -> CodexAuth {
++    CodexAuth::from_external_chatgpt_tokens("header.e30.signature", "selected-account", Some(plan))
++        .unwrap()
++}
++
++#[tokio::test]
++async fn incomplete_responses_preserve_reported_usage_and_the_original_error() {
++    skip_if_no_network!();
++    for auth in [personal_auth("plus"), CodexAuth::from_api_key("dummy")] {
++        for usage in [
++            json!({
++                "input_tokens": 100,
++                "input_tokens_details": {"cached_tokens": 60},
++                "output_tokens": 20,
++                "output_tokens_details": {"reasoning_tokens": 15},
++                "total_tokens": 120
++            }),
++            Value::Null,
++        ] {
++            let server = start_websocket_server(vec![vec![vec![
++                ev_response_created("incomplete"),
++                ev_output_text_delta("partial answer"),
++                json!({"type": "response.incomplete", "response": {
++                    "id": "incomplete", "model": "served-model", "usage": usage,
++                    "incomplete_details": {"reason": "max_output_tokens"}
++                }}),
++            ]]])
++            .await;
++            let harness = websocket_harness_with_provider_options_and_auth(
++                websocket_provider(&server),
++                false,
++                false,
++                &[],
++                Some(auth.clone()),
++            )
++            .await;
++            let mut session = harness.client.new_session();
++            let mut stream = session
++                .stream(
++                    &prompt_with_input(vec![message_item("hello")]),
++                    &harness.model_info,
++                    &harness.session_telemetry,
++                    harness.effort.clone(),
++                    harness.summary,
++                    None,
++                    &turn_metadata(&harness, Some("turn-incomplete")),
++                    &InferenceTraceContext::disabled(),
++                )
++                .await
++                .unwrap();
++            let mut failure = None;
++            while let Some(event) = stream.next().await {
++                match event {
++                    Ok(ResponseEvent::Completed { .. }) => panic!("incomplete response completed"),
++                    Ok(_) => {}
++                    Err(error) => {
++                        failure = Some(error);
++                        break;
++                    }
++                }
++            }
++            let error = failure.expect("native incomplete error");
++            let codex_protocol::error::CodexErrorDetails::ResponseIncomplete(incomplete) =
++                error.details()
++            else {
++                panic!("unexpected error: {error:?}");
++            };
++            assert_eq!(incomplete.reason, "max_output_tokens");
++            assert_eq!(incomplete.response_id.as_deref(), Some("incomplete"));
++            assert_eq!(
++                incomplete
++                    .token_usage
++                    .as_ref()
++                    .map(|usage| usage.total_tokens),
++                usage.is_object().then_some(120)
++            );
++            let rows = harness.response_attempts();
++            assert_eq!(rows.len(), 1);
++            assert_eq!(rows[0].response_id.as_deref(), Some("incomplete"));
++            assert_eq!(rows[0].end_reason, Some(ResponseAttemptEnd::Incomplete));
++            assert_eq!(rows[0].served_model.as_deref(), Some("served-model"));
++            assert_eq!(rows[0].tokens.input, usage.is_object().then_some(100));
++            assert_eq!(rows[0].tokens.cache_read, usage.is_object().then_some(60));
++            assert_eq!(rows[0].tokens.output, usage.is_object().then_some(20));
++            assert_eq!(rows[0].tokens.reasoning, usage.is_object().then_some(15));
++            assert!(rows[0].sent_payload_bytes.is_some());
++            assert!(rows[0].received_payload_bytes > 0);
++            server.shutdown().await;
++        }
++    }
++}
++
++#[tokio::test]
++async fn http_retries_do_not_create_response_records() {
++    skip_if_no_network!();
++    let server = start_mock_server().await;
++    let mut completed = ev_completed("http-response");
++    completed["response"]["usage"] = json!({
++        "input_tokens": 100, "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
++        "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 15}, "total_tokens": 120
++    });
++    let events = vec![
++        ev_response_created("http-response"),
++        ev_output_text_delta("answer"),
++        completed,
++    ];
++    let requests = mount_response_sequence(
++        &server,
++        vec![
++            wiremock::ResponseTemplate::new(503),
++            sse_response(sse(events)),
++        ],
++    )
++    .await;
++    let mut provider =
++        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
++    provider.supports_websockets = false;
++    provider.request_max_retries = Some(1);
++    let harness = websocket_harness_with_provider_options_and_auth(
++        provider,
++        false,
++        false,
++        &[],
++        Some(CodexAuth::from_api_key("dummy")),
++    )
++    .await;
++    let mut session = harness.client.new_session();
++    let mut stream = session
++        .stream(
++            &prompt_with_input(vec![message_item("private input")]),
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            None,
++            &turn_metadata(&harness, Some("turn-http")),
++            &InferenceTraceContext::disabled(),
++        )
++        .await
++        .unwrap();
++    let mut output = String::new();
++    while let Some(event) = stream.next().await {
++        if let ResponseEvent::OutputTextDelta(delta) = event.unwrap() {
++            output.push_str(&delta);
++        }
++    }
++    assert_eq!(output, "answer");
++    assert_eq!(requests.requests().len(), 2);
++    assert!(harness.response_attempts().is_empty());
++}
++
++#[tokio::test]
++async fn prewarm_is_unrecorded_and_committed_output_retains_native_reasoning_order() {
++    skip_if_no_network!();
++    let mut warm = ev_completed("warm");
++    warm["response"]["usage"] = json!({"input_tokens": 13318, "output_tokens": 0,
++        "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 13318});
++    let mut completed = ev_completed("r1");
++    completed["response"]["usage"] = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
++        "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 15}, "total_tokens": 120});
++    let server = start_websocket_server(vec![vec![
++        vec![
++            ev_response_created("warm"),
++            json!({"type": "codex.rate_limits", "rate_limits": {
++            "secondary": {"used_percent": 42, "window_minutes": 10080, "reset_at": 1700000000}}}),
++            warm,
++        ],
++        vec![
++            ev_response_created("r1"),
++            ev_reasoning_item_added("reasoning", &[]),
++            json!({"type": "response.reasoning_summary_part.added", "summary_index": 0}),
++            ev_reasoning_summary_text_delta("First paragraph"),
++            ev_reasoning_summary_text_delta("\n\nSecond paragraph"),
++            ev_reasoning_item("reasoning", &["First paragraph\n\nSecond paragraph"], &[]),
++            ev_output_text_delta("Complete answer"),
++            ev_assistant_message("answer", "Complete answer"),
++            completed,
++        ],
++    ]])
++    .await;
++    let harness = websocket_harness_with_provider_options_and_auth(
++        websocket_provider(&server),
++        false,
++        false,
++        &[],
++        Some(personal_auth("plus")),
++    )
++    .await;
++    let mut session = harness.client.new_session();
++    let prompt = prompt_with_input(vec![message_item("hello")]);
++    session
++        .prewarm_websocket(
++            &prompt,
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            None,
++            &prewarm_metadata(&harness, None),
++        )
++        .await
++        .unwrap();
++    assert!(harness.response_attempts().is_empty());
++    let mut stream = session
++        .stream(
++            &prompt,
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            None,
++            &turn_metadata(&harness, Some("turn-1")),
++            &InferenceTraceContext::disabled(),
++        )
++        .await
++        .unwrap();
++    let mut output = Vec::new();
++    while let Some(event) = stream.next().await {
++        match event.unwrap() {
++            ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { .. }) => {
++                output.push("reasoning started".into())
++            }
++            ResponseEvent::ReasoningSummaryPartAdded { summary_index: 0 } => {
++                output.push("summary started".into())
++            }
++            ResponseEvent::ReasoningSummaryDelta {
++                delta,
++                summary_index: 0,
++            } => output.push(delta),
++            ResponseEvent::OutputItemDone(ResponseItem::Reasoning { .. }) => {
++                output.push("reasoning done".into())
++            }
++            ResponseEvent::OutputTextDelta(delta) => output.push(delta),
++            ResponseEvent::OutputItemDone(ResponseItem::Message { .. }) => {
++                output.push("answer done".into())
++            }
++            ResponseEvent::Completed { .. } => output.push("response done".into()),
++            _ => {}
++        }
++    }
++    assert_eq!(
++        output,
++        vec![
++            "reasoning started",
++            "summary started",
++            "First paragraph",
++            "\n\nSecond paragraph",
++            "reasoning done",
++            "Complete answer",
++            "answer done",
++            "response done"
++        ]
++    );
++    let rows = harness.response_attempts();
++    assert_eq!(rows.len(), 1);
++    assert_eq!(rows[0].response_id.as_deref(), Some("r1"));
++    assert_eq!(rows[0].request_kind, "generation");
++    assert_eq!(rows[0].end_reason, Some(ResponseAttemptEnd::Completed));
++    assert_eq!(
++        rows[0].tokens,
++        codex_protocol::response_metrics::ResponseTokenCounts {
++            input: Some(100),
++            cache_read: Some(60),
++            cache_write: Some(10),
++            output: Some(20),
++            reasoning: Some(15),
++        }
++    );
++    assert_eq!(server.handshakes().len(), 1);
++    let requests = server.single_connection();
++    assert_eq!(requests[0].body_json()["generate"], false);
++    assert_eq!(requests[1].body_json()["previous_response_id"], "warm");
++    server.shutdown().await;
++}
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
+@@ -36,6 +36,7 @@ use codex_model_provider::ProviderAuthScope;
+ use codex_model_provider::ResolvedResponsesProvider;
+ use codex_model_provider::ResponsesConnectionKey;
+ use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_websocket_client::WebSocketConnector;
+ use http::HeaderMap;
+ use http::HeaderValue;
+@@ -541,18 +542,38 @@ impl ConnectionLease {
+     pub(super) async fn stream_request(
+         &self,
+         request: &ResponsesApiRequest,
++        turn_id: &str,
+     ) -> Result<ResponseStream, ApiError> {
+         match &self.connection {
+             Connection::Websocket(connection) => {
+-                connection
++                let observer =
++                    self.pool
++                        .config
++                        .response_recording
++                        .as_ref()
++                        .map(|(metrics, thread_id)| {
++                            metrics.record_request(
++                                Some(*thread_id),
++                                Some(turn_id.to_owned()),
++                                "guardian",
++                                request,
++                            )
++                        });
++                let result = connection
+                     .connection
+                     .stream_request(
+                         ResponsesWsRequest::ResponseCreate(request.into()),
+                         /*connection_reused*/ true,
+                         /*turn_state*/ None,
+-                        /*observer*/ None,
++                        observer.clone(),
+                     )
+-                    .await
++                    .await;
++                if result.is_err()
++                    && let Some(observer) = &observer
++                {
++                    observer.ended(ResponseAttemptEnd::SendFailed, Instant::now());
++                }
++                result
+             }
+             Connection::Http(client) => {
+                 // The SSE idle timeout starts after headers arrive. Bound that wait too.
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool_cancellation_tests.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool_cancellation_tests.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool_cancellation_tests.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool_cancellation_tests.rs
+@@ -59,8 +59,14 @@ async fn cancelled_classifiers_interrupt_and_reuse_only_completed_streams() -> R
+         .await;
+         // Offer one socket: another classification can use it only if cancellation returned it.
+         let metrics = Arc::new(RecordingMetrics::default());
++        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
++        let observed = Arc::clone(&observations);
++        let response_metrics = Arc::new(codex_core::ResponseMetrics::new(move |record| {
++            observed.lock().unwrap().push(record);
++        }));
+         let mut config = sampler_config(proxy_websocket_servers(&[&server]).await?);
+         config.metrics = Some(metrics.clone());
++        config.response_recording = Some((response_metrics, ThreadId::new()));
+         let sampler = Arc::new(connect_sampler(config).await?);
+         let pending_sampler = Arc::clone(&sampler);
+         let pending =
+@@ -101,6 +107,22 @@ async fn cancelled_classifiers_interrupt_and_reuse_only_completed_streams() -> R
+             sampler.connections.idle_connections.lock().unwrap().len(),
+             usize::from(close_timeout.is_none())
+         );
++        let ended: Vec<_> = observations
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|record| {
++                record.response_id.as_deref() == Some("stale") && record.end_reason.is_some()
++            })
++            .cloned()
++            .collect();
++        assert_eq!(ended.len(), 1);
++        assert_eq!(ended[0].request_kind, "guardian");
++        assert_eq!(
++            ended[0].end_reason
++                == Some(codex_protocol::response_metrics::ResponseAttemptEnd::Completed),
++            expected_tokens.is_some()
++        );
+         drop(permits);
+         if close_timeout.is_none() {
+             assert_eq!(sampler.sample(sample_request("fresh")).await?, "low");
+@@ -156,7 +178,7 @@ async fn cancellation_preserves_unused_sockets_and_backpressured_completion() ->
+         )
+         .request;
+     // Cancel before this current-thread runtime can dispatch, then reuse its only socket.
+-    let stream = lease.stream_request(&request).await?;
++    let stream = lease.stream_request(&request, "stale").await?;
+     drop(PendingResponse::new(stream, lease, /*metrics*/ None));
+     let cleanup = pool
+         .classifications
+@@ -164,7 +186,7 @@ async fn cancellation_preserves_unused_sockets_and_backpressured_completion() ->
+     drop(tokio::time::timeout(Duration::from_secs(/*secs*/ 2), cleanup).await??);
+     let lease = pool.lease().await?;
+     assert_eq!(lease.thread_id, thread_id);
+-    let mut stream = lease.stream_request(&request).await?;
++    let mut stream = lease.stream_request(&request, "stale").await?;
+     // Consume Created and leave exactly a full channel of output before completion.
+     let consumed = output_events
+         .checked_sub(stream.rx_event.max_capacity())
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+@@ -325,7 +325,7 @@ impl SamplingExecution {
+                 biased;
+                 _ = &mut owner_changed => return Err(account_changed_error()),
+                 _ = mode.superseded() => return Err(LunaSamplerError::Superseded),
+-                stream = lease.stream_request(&self.request) => stream,
++                stream = lease.stream_request(&self.request, &self.turn_id) => stream,
+             } {
+                 Ok(stream) => stream,
+                 Err(error) => {
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
+@@ -387,11 +387,17 @@ async fn sampler_records_token_usage_after_returning_an_early_classification() -
+     connections.push(vec![events]);
+     let server = responses::start_websocket_server(connections).await;
+     let metrics = Arc::new(RecordingMetrics::default());
++    let (response_tx, mut response_updates) = tokio::sync::mpsc::unbounded_channel();
++    let response_metrics = Arc::new(codex_core::ResponseMetrics::new(move |record| {
++        let _ = response_tx.send(record);
++    }));
++    let owning_thread = ThreadId::new();
+     let mut config = sampler_config(format!(
+         "http://{}/v1",
+         server.uri().trim_start_matches("ws://")
+     ));
+     config.metrics = Some(metrics.clone());
++    config.response_recording = Some((Arc::clone(&response_metrics), owning_thread));
+     let sampler = connect_sampler(config).await?;
+ 
+     assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
+@@ -442,6 +448,31 @@ async fn sampler_records_token_usage_after_returning_an_early_classification() -
+         )
+         .await
+         .body_json();
++    let row = tokio::time::timeout(Duration::from_secs(2), async {
++        loop {
++            let row = response_updates.recv().await.unwrap();
++            if row.end_reason.is_some() {
++                break row;
++            }
++        }
++    })
++    .await?;
++    assert_eq!(row.thread_id, Some(owning_thread));
++    assert_eq!(
++        row.turn_id.as_deref(),
++        request["client_metadata"]["turn_id"].as_str()
++    );
++    assert_eq!(row.request_kind, "guardian");
++    assert_eq!(row.response_id.as_deref(), Some("response-1"));
++    assert_eq!(
++        row.end_reason,
++        Some(codex_protocol::response_metrics::ResponseAttemptEnd::Completed)
++    );
++    assert_eq!(row.tokens.input, Some(37));
++    assert_eq!(row.tokens.output, Some(0));
++    assert!(row.sent_payload_bytes.is_some());
++    assert!(row.ttfb_ms.is_some() && row.ttfc_ms.is_some());
++    assert!(response_updates.try_recv().is_err());
+     let input: Vec<ResponseItem> = serde_json::from_value(request["input"].clone())?;
+     let estimated = input
+         .iter()
+@@ -459,6 +490,32 @@ async fn sampler_records_token_usage_after_returning_an_early_classification() -
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn http_classifier_does_not_record_response_metrics() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = responses::start_mock_server().await;
++    let response = responses::mount_sse_once(
++        &server,
++        responses::sse(vec![
++            ev_output_text_delta("low"),
++            ev_completed_with_tokens("http-score", 37),
++        ]),
++    )
++    .await;
++    let (response_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
++    let metrics = Arc::new(codex_core::ResponseMetrics::new(move |record| {
++        let _ = response_tx.send(record);
++    }));
++    let thread_id = ThreadId::new();
++    let mut config = sampler_config(format!("{}/v1", server.uri()));
++    config.response_recording = Some((Arc::clone(&metrics), thread_id));
++    let sampler = LunaSampler::new(config);
++    assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
++    response.single_request();
++    assert!(updates.try_recv().is_err());
++    Ok(())
++}
++
+ struct RefreshableAuth(std::sync::Mutex<&'static str>);
+ impl ExternalAuth for RefreshableAuth {
+     fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {

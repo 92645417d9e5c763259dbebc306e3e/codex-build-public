@@ -21,7 +21,7 @@
 - Consume an existing exported patch set without running export or changing product source.
 - Resolve the public target as the authenticated GitHub user's `codex-build-public` repository through `gh`.
 - Require that target to exist and be public.
-- Use `<REPOS_ROOT>/codex-build-public` as its dedicated local checkout.
+- Use `~/projects/codex-build-public` as its dedicated local checkout.
 - Require an existing checkout to be clean, including ignored and untracked content, before snapshot replacement.
 
 ## Snapshot Layout

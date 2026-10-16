@@ -1,0 +1,243 @@
+retry-websocket-capacity-at-five-minute-boundaries
+
+Lane: mixed
+
+Unit: recover-websocket-requests-without-http-fallback
+
+ChildPatch: retry-websocket-capacity-at-five-minute-boundaries
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -3,6 +3,8 @@
+ //! Server advice controls timing without extending configured retry limits.
+ 
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use crate::client::ModelClientSession;
+ use crate::context::ContentFilterGuidance;
+@@ -10,6 +12,8 @@ use crate::context::ContextualUserFragment;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
+ use crate::session::turn_context::TurnContext;
++use chrono::DateTime;
++use chrono::Local;
+ use codex_client::RetryOperation;
+ use codex_features::Feature;
+ use codex_http_client::RetryAfter;
+@@ -22,6 +26,7 @@ use tracing::warn;
+ 
+ const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+ const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
++const ALIGNED_WEBSOCKET_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub(crate) enum ResponsesStreamRequest {
+@@ -52,6 +57,30 @@ pub(crate) struct ExhaustedResponseRetry {
+     pub(crate) retry_at: Option<tokio::time::Instant>,
+ }
+ 
++fn aligned_capacity_retry_eligible(
++    max_retries: u64,
++    personal_websocket: bool,
++    err: &CodexErr,
++) -> bool {
++    max_retries == 5
++        && personal_websocket
++        && matches!(err.details(), CodexErrorDetails::ServerOverloaded)
++}
++
++fn delay_until_next_five_minute_boundary(now: SystemTime) -> Duration {
++    let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
++        return ALIGNED_WEBSOCKET_RETRY_INTERVAL;
++    };
++    let interval_millis = ALIGNED_WEBSOCKET_RETRY_INTERVAL.as_millis();
++    let remainder = elapsed.as_millis() % interval_millis;
++    let delay_millis = if remainder == 0 {
++        interval_millis
++    } else {
++        interval_millis - remainder
++    };
++    Duration::from_millis(u64::try_from(delay_millis).expect("bounded by five minutes"))
++}
++
+ /// Returns `Ok(())` when the caller should retry the request loop, or the original error when
+ /// it is terminal or the retry budget is exhausted.
+ pub(crate) async fn handle_response_stream_error(
+@@ -64,6 +93,34 @@ pub(crate) async fn handle_response_stream_error(
+     request: ResponsesStreamRequest,
+ ) -> Result<(), CodexErr> {
+     let turn_context = &step_context.turn;
++    // Keep sampling recovery within the existing error boundary; the sampling
++    // caller already owns cancellation, preemption and retry timing.
++    if matches!(request, ResponsesStreamRequest::Sampling)
++        && aligned_capacity_retry_eligible(
++            max_retries,
++            client_session.personal_chatgpt_websocket_enabled(),
++            &err,
++        )
++    {
++        let now = SystemTime::now();
++        let delay = delay_until_next_five_minute_boundary(now);
++        let retry_clock = DateTime::<Local>::from(now + delay).format("%H:%M");
++        warn!(
++            turn_id = %turn_context.sub_id,
++            ?delay,
++            error = %err,
++            "personal websocket model capacity reached; waiting for aligned retry"
++        );
++        sess.send_event(
++            turn_context,
++            EventMsg::Warning(WarningEvent {
++                message: format!("External model limit reached. Retrying at {retry_clock}."),
++            }),
++        )
++        .await;
++        tokio::time::sleep(delay).await;
++        return Ok(());
++    }
+     if matches!(request, ResponsesStreamRequest::Sampling)
+         && matches!(err.details(), CodexErrorDetails::ContentFilter)
+     {
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -1,18 +1,131 @@
+ use super::ResponsesStreamRequest;
+ use super::ResponsesStreamRetryState;
++use super::aligned_capacity_retry_eligible;
++use super::delay_until_next_five_minute_boundary;
+ use super::handle_response_stream_error;
+ use super::log_retry;
+ use crate::realtime_history::RealtimeHistoryState;
+ use crate::session::step_context::StepContext;
+ use crate::session::tests::make_session_and_context;
++use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
++use codex_async_utils::OrCancelExt;
+ use codex_http_client::RetryAfter;
++use codex_login::CodexAuth;
++use codex_model_provider_info::ModelProviderInfo;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::CodexErrorDetails;
++use codex_protocol::protocol::CreditsSnapshot;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::RateLimitSnapshot;
++use codex_protocol::protocol::RateLimitWindow;
+ use std::sync::Arc;
+ use std::time::Duration;
++use std::time::UNIX_EPOCH;
+ use tokio::sync::Mutex;
+ use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
+ use tracing_test::internal::MockWriter;
+ 
++fn quota_snapshot(primary_used: f64, secondary_used: f64) -> RateLimitSnapshot {
++    RateLimitSnapshot {
++        limit_id: Some("codex".to_string()),
++        limit_name: None,
++        normal_model_slug: None,
++        primary: Some(RateLimitWindow {
++            used_percent: primary_used,
++            window_minutes: Some(5 * 60),
++            resets_at: None,
++        }),
++        secondary: Some(RateLimitWindow {
++            used_percent: secondary_used,
++            window_minutes: Some(7 * 24 * 60),
++            resets_at: None,
++        }),
++        credits: Some(CreditsSnapshot {
++            has_credits: true,
++            unlimited: false,
++            balance: Some("100".to_string()),
++        }),
++        individual_limit: None,
++        spend_control_reached: None,
++        plan_type: None,
++        rate_limit_reached_type: None,
++    }
++}
++
++#[test]
++fn capacity_retry_uses_strict_five_minute_boundaries() {
++    let now = UNIX_EPOCH + Duration::from_secs(6 * 60 * 60 + 21 * 60 + 10);
++    assert_eq!(
++        delay_until_next_five_minute_boundary(now),
++        Duration::from_secs(3 * 60 + 50)
++    );
++    let boundary = UNIX_EPOCH + Duration::from_secs(7 * 60 * 60);
++    assert_eq!(
++        delay_until_next_five_minute_boundary(boundary),
++        Duration::from_secs(5 * 60)
++    );
++}
++
++#[test]
++fn capacity_retry_requires_personal_websocket_and_default_budget() {
++    let overload = CodexErr::ServerOverloaded;
++    assert!(aligned_capacity_retry_eligible(5, true, &overload));
++    assert!(!aligned_capacity_retry_eligible(2, true, &overload));
++    assert!(!aligned_capacity_retry_eligible(5, false, &overload));
++    assert!(!aligned_capacity_retry_eligible(
++        5,
++        true,
++        &CodexErr::Stream("disconnected".to_string())
++    ));
++}
++
++#[tokio::test]
++async fn capacity_wait_emits_one_warning_and_remains_cancellable() {
++    let auth =
++        CodexAuth::from_external_chatgpt_tokens("header.e30.signature", "account", Some("plus"))
++            .expect("personal account auth");
++    let (session, turn_context, events) =
++        make_session_and_context_with_auth_and_config_and_rx(auth, Vec::new(), |config| {
++            config.model_provider = ModelProviderInfo::create_openai_provider(None)
++        })
++        .await;
++    let mut client_session = session.services.model_client.new_session();
++    let step_context = StepContext::for_test(turn_context);
++    let mut retry_state = ResponsesStreamRetryState::default();
++    let cancellation = CancellationToken::new();
++    tokio::time::pause();
++    let wait = async {
++        handle_response_stream_error(
++            &mut retry_state,
++            5,
++            CodexErr::ServerOverloaded,
++            &mut client_session,
++            &session,
++            &step_context,
++            ResponsesStreamRequest::Sampling,
++        )
++        .or_cancel(&cancellation)
++        .await?
++    };
++    tokio::pin!(wait);
++    let event = tokio::select! {
++        event = events.recv() => event.expect("capacity warning event"),
++        result = &mut wait => panic!("capacity wait ended before its warning: {result:?}"),
++    };
++    assert!(matches!(event.msg, EventMsg::Warning(warning)
++        if warning.message.starts_with("External model limit reached. Retrying at ")));
++    assert!(events.try_recv().is_err());
++    assert!(futures::poll!(&mut wait).is_pending());
++    cancellation.cancel();
++    let result: Result<(), CodexErr> = wait.await;
++    assert!(matches!(
++        result.expect_err("cancelled capacity wait").details(),
++        CodexErrorDetails::TurnAborted
++    ));
++    assert!(events.try_recv().is_err());
++}
++
+ #[tokio::test]
+ async fn sampling_retry_logs_stream_error_context() {
+     let (_session, turn_context) = make_session_and_context().await;

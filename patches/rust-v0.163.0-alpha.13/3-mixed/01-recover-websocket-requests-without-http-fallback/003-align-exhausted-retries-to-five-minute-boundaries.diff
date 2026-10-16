@@ -1,0 +1,341 @@
+align-exhausted-retries-to-five-minute-boundaries
+
+Lane: mixed
+
+Unit: recover-websocket-requests-without-http-fallback
+
+ChildPatch: align-exhausted-retries-to-five-minute-boundaries
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -1,6 +1,7 @@
+ //! Shared retry and transport fallback decisions for Responses requests.
+ //! Content-filter guidance is recorded for sampling requests before retry decisions.
+-//! Server advice controls timing without extending configured retry limits.
++//! Eligible personal WebSocket sampling uses aligned capacity waits and connection retry cycles.
++//! Other requests keep server-advised timing and configured retry limits.
+ 
+ use std::time::Duration;
+ use std::time::SystemTime;
+@@ -81,6 +82,25 @@ fn delay_until_next_five_minute_boundary(now: SystemTime) -> Duration {
+     Duration::from_millis(u64::try_from(delay_millis).expect("bounded by five minutes"))
+ }
+ 
++fn aligned_connection_cycle_eligible(
++    retries: u64,
++    max_retries: u64,
++    personal_websocket: bool,
++    err: &CodexErr,
++) -> bool {
++    max_retries == 5
++        && retries >= max_retries
++        && personal_websocket
++        && matches!(
++            err.details(),
++            CodexErrorDetails::ConnectionFailed(_)
++                | CodexErrorDetails::UnexpectedStatus(_)
++                | CodexErrorDetails::Stream(_)
++                | CodexErrorDetails::RequestTimeout
++                | CodexErrorDetails::Timeout
++        )
++}
++
+ /// Returns `Ok(())` when the caller should retry the request loop, or the original error when
+ /// it is terminal or the retry budget is exhausted.
+ pub(crate) async fn handle_response_stream_error(
+@@ -121,6 +141,33 @@ pub(crate) async fn handle_response_stream_error(
+         tokio::time::sleep(delay).await;
+         return Ok(());
+     }
++    if matches!(request, ResponsesStreamRequest::Sampling)
++        && aligned_connection_cycle_eligible(
++            retry_state.retries,
++            max_retries,
++            client_session.personal_chatgpt_websocket_enabled(),
++            &err,
++        )
++    {
++        let now = SystemTime::now();
++        let delay = delay_until_next_five_minute_boundary(now);
++        let retry_clock = DateTime::<Local>::from(now + delay).format("%H:%M");
++        warn!(
++            turn_id = %turn_context.sub_id,
++            ?delay,
++            error = %err,
++            "personal websocket connection retries exhausted; waiting for aligned retry"
++        );
++        sess.notify_stream_error(
++            turn_context,
++            format!("Reconnecting at {retry_clock} after {max_retries} retries"),
++            err,
++        )
++        .await;
++        tokio::time::sleep(delay).await;
++        retry_state.retries = 0;
++        return Ok(());
++    }
+     if matches!(request, ResponsesStreamRequest::Sampling)
+         && matches!(err.details(), CodexErrorDetails::ContentFilter)
+     {
+@@ -153,6 +200,7 @@ pub(crate) async fn handle_response_stream_error(
+         .enabled(Feature::UnboundedConnectionRetries)
+         && matches!(request, ResponsesStreamRequest::Sampling)
+         && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
++        && !(max_retries == 5 && client_session.personal_chatgpt_websocket_enabled())
+         && !turn_context.session_source.is_internal()
+         && !turn_context.provider.info().is_amazon_bedrock()
+     {
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -1,6 +1,7 @@
+ use super::ResponsesStreamRequest;
+ use super::ResponsesStreamRetryState;
+ use super::aligned_capacity_retry_eligible;
++use super::aligned_connection_cycle_eligible;
+ use super::delay_until_next_five_minute_boundary;
+ use super::handle_response_stream_error;
+ use super::log_retry;
+@@ -19,6 +20,7 @@ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::RateLimitSnapshot;
+ use codex_protocol::protocol::RateLimitWindow;
+ use std::sync::Arc;
++use std::task::Poll;
+ use std::time::Duration;
+ use std::time::UNIX_EPOCH;
+ use tokio::sync::Mutex;
+@@ -126,6 +128,228 @@ async fn capacity_wait_emits_one_warning_and_remains_cancellable() {
+     assert!(events.try_recv().is_err());
+ }
+ 
++#[test]
++fn websocket_connection_cycle_requires_personal_account_after_five_retries() {
++    for disconnect in [
++        CodexErr::Stream("websocket closed".to_string()),
++        unexpected_service_unavailable(),
++    ] {
++        for retries in 0..5 {
++            assert!(!aligned_connection_cycle_eligible(
++                retries,
++                5,
++                true,
++                &disconnect
++            ));
++        }
++        assert!(aligned_connection_cycle_eligible(5, 5, true, &disconnect));
++        assert!(!aligned_connection_cycle_eligible(5, 5, false, &disconnect));
++        assert!(!aligned_connection_cycle_eligible(2, 2, true, &disconnect));
++    }
++    assert!(!aligned_connection_cycle_eligible(
++        5,
++        5,
++        true,
++        &CodexErr::InternalServerError
++    ));
++}
++
++#[tokio::test]
++async fn connection_cycle_resets_the_budget_only_after_the_wait() {
++    for (cancel, http_failure) in [(false, false), (true, false), (false, true), (true, true)] {
++        let auth = CodexAuth::from_external_chatgpt_tokens(
++            "header.e30.signature",
++            "account",
++            Some("plus"),
++        )
++        .expect("personal account auth");
++        let (session, turn_context, events) =
++            make_session_and_context_with_auth_and_config_and_rx(auth, Vec::new(), |config| {
++                config.model_provider = ModelProviderInfo::create_openai_provider(None)
++            })
++            .await;
++        session
++            .record_rate_limits_info(quota_snapshot(100.0, 100.0))
++            .await;
++        let mut client_session = session.services.model_client.new_session();
++        let step_context = StepContext::for_test(turn_context);
++        let cancellation = CancellationToken::new();
++        let mut retry_state = ResponsesStreamRetryState {
++            retries: 5,
++            ..Default::default()
++        };
++        tokio::time::pause();
++        let result: Result<(), CodexErr> = {
++            let wait = async {
++                handle_response_stream_error(
++                    &mut retry_state,
++                    5,
++                    if http_failure {
++                        unexpected_service_unavailable()
++                    } else {
++                        CodexErr::Stream("websocket closed".to_string())
++                    },
++                    &mut client_session,
++                    &session,
++                    &step_context,
++                    ResponsesStreamRequest::Sampling,
++                )
++                .or_cancel(&cancellation)
++                .await?
++            };
++            tokio::pin!(wait);
++            let event = tokio::select! {
++                event = events.recv() => event.expect("connection retry event"),
++                result = &mut wait => panic!("connection wait ended before its event: {result:?}"),
++            };
++            assert!(matches!(event.msg, EventMsg::StreamError(error)
++                if error.message.starts_with("Reconnecting at ")
++                    && error.message.ends_with(" after 5 retries")));
++            assert!(futures::poll!(&mut wait).is_pending());
++            if cancel {
++                cancellation.cancel();
++            } else {
++                tokio::time::advance(Duration::from_secs(5 * 60)).await;
++            }
++            wait.await
++        };
++        if cancel {
++            assert!(matches!(
++                result.expect_err("cancelled connection wait").details(),
++                CodexErrorDetails::TurnAborted
++            ));
++            assert_eq!(retry_state.retries, 5);
++        } else {
++            result.expect("aligned connection retry");
++            assert_eq!(retry_state.retries, 0);
++        }
++        assert!(events.try_recv().is_err());
++        tokio::time::resume();
++    }
++}
++
++fn unexpected_service_unavailable() -> CodexErr {
++    codex_api::map_api_error(codex_api::ApiError::Transport(codex_api::TransportError::Http {
++        status: http::StatusCode::SERVICE_UNAVAILABLE,
++        url: None,
++        headers: None,
++        body: Some(
++            r#"{"error":{"message":"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists."}}"#.to_string(),
++        ),
++        retry_after: None,
++    }))
++}
++
++#[tokio::test]
++async fn unexpected_http_status_restarts_each_exhausted_connection_cycle() {
++    let auth =
++        CodexAuth::from_external_chatgpt_tokens("header.e30.signature", "account", Some("plus"))
++            .expect("personal account auth");
++    let (session, turn_context, events) =
++        make_session_and_context_with_auth_and_config_and_rx(auth, Vec::new(), |config| {
++            config.model_provider = ModelProviderInfo::create_openai_provider(None)
++        })
++        .await;
++    let mut client_session = session.services.model_client.new_session();
++    let step_context = StepContext::for_test(turn_context);
++    let mut retry_state = ResponsesStreamRetryState::default();
++    let error = unexpected_service_unavailable();
++    assert!(matches!(
++        error.details(),
++        CodexErrorDetails::UnexpectedStatus(_)
++    ));
++    assert!(!aligned_capacity_retry_eligible(5, true, &error));
++    tokio::time::pause();
++
++    for _ in 0..2 {
++        for retry in 1..=5 {
++            handle_response_stream_error(
++                &mut retry_state,
++                5,
++                unexpected_service_unavailable(),
++                &mut client_session,
++                &session,
++                &step_context,
++                ResponsesStreamRequest::Sampling,
++            )
++            .await
++            .expect("ordinary connection retry");
++            assert_eq!(retry_state.retries, retry);
++            assert!(matches!(events.try_recv().expect("retry event").msg,
++                EventMsg::StreamError(error) if error.message == format!("Reconnecting... {retry}/5")));
++            assert!(events.try_recv().is_err());
++        }
++        {
++            let wait = handle_response_stream_error(
++                &mut retry_state,
++                5,
++                unexpected_service_unavailable(),
++                &mut client_session,
++                &session,
++                &step_context,
++                ResponsesStreamRequest::Sampling,
++            );
++            tokio::pin!(wait);
++            let event = tokio::select! {
++                event = events.recv() => event.expect("aligned connection retry event"),
++                result = &mut wait => panic!("connection cycle ended before its wait: {result:?}"),
++            };
++            assert!(matches!(event.msg, EventMsg::StreamError(error)
++                if error.message.starts_with("Reconnecting at ")
++                    && error.message.ends_with(" after 5 retries")));
++            assert!(futures::poll!(&mut wait).is_pending());
++            tokio::time::advance(Duration::from_secs(5 * 60)).await;
++            wait.await.expect("next connection cycle");
++        }
++        assert_eq!(retry_state.retries, 0);
++        assert!(events.try_recv().is_err());
++        assert!(session.services.model_client.responses_websocket_enabled());
++    }
++}
++
++#[tokio::test]
++async fn aligned_websocket_waits_do_not_change_remote_compaction() {
++    let auth =
++        CodexAuth::from_external_chatgpt_tokens("header.e30.signature", "account", Some("plus"))
++            .expect("personal account auth");
++    let (session, turn_context, events) =
++        make_session_and_context_with_auth_and_config_and_rx(auth, Vec::new(), |config| {
++            config.model_provider = ModelProviderInfo::create_openai_provider(None)
++        })
++        .await;
++    let mut client_session = session.services.model_client.new_session();
++    let step_context = StepContext::for_test(turn_context);
++    for err in [
++        CodexErr::ServerOverloaded,
++        CodexErr::Stream("websocket closed".to_string()),
++        unexpected_service_unavailable(),
++    ] {
++        let expected_error = err.to_string();
++        let mut retry_state = ResponsesStreamRetryState {
++            retries: 5,
++            ..Default::default()
++        };
++        let retry = handle_response_stream_error(
++            &mut retry_state,
++            5,
++            err,
++            &mut client_session,
++            &session,
++            &step_context,
++            ResponsesStreamRequest::RemoteCompactionV2,
++        );
++        tokio::pin!(retry);
++        let Poll::Ready(result) = futures::poll!(&mut retry) else {
++            panic!("remote compaction must not enter a sampling-only retry wait");
++        };
++        assert_eq!(
++            result.expect_err("exhausted remote compaction").to_string(),
++            expected_error
++        );
++        assert!(events.try_recv().is_err());
++    }
++}
++
+ #[tokio::test]
+ async fn sampling_retry_logs_stream_error_context() {
+     let (_session, turn_context) = make_session_and_context().await;

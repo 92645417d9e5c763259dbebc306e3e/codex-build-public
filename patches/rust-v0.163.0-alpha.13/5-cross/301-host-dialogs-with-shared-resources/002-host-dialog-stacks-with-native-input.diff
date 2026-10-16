@@ -1,0 +1,326 @@
+host-dialog-stacks-with-native-input
+
+Lane: cross
+
+Unit: host-dialogs-with-shared-resources
+
+ChildPatch: host-dialog-stacks-with-native-input
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/list_selection_view.rs b/codex-rs/tui/src/bottom_pane/list_selection_view.rs
+--- a/codex-rs/tui/src/bottom_pane/list_selection_view.rs
++++ b/codex-rs/tui/src/bottom_pane/list_selection_view.rs
+@@ -352,7 +352,7 @@ pub(crate) struct ListSelectionView {
+     active_tab_idx: Option<usize>,
+     state: ScrollState,
+     completion: Option<ViewCompletion>,
+-    pub(super) dismiss_after_child_accept: bool,
++    pub(crate) dismiss_after_child_accept: bool,
+     pub(super) app_event_tx: AppEventSender,
+     is_searchable: bool,
+     search_toggle_key: Option<KeyBinding>,
+diff --git a/codex-rs/tui/src/dialog/mod.rs b/codex-rs/tui/src/dialog/mod.rs
+--- a/codex-rs/tui/src/dialog/mod.rs
++++ b/codex-rs/tui/src/dialog/mod.rs
+@@ -3,6 +3,10 @@
+ //! Control Center supplies current preferences without borrowing the ordinary input-area
+ //! host. Native text and list widgets retain their editing and selection behavior.
+ 
++mod stack;
++
++pub(crate) use stack::DialogStack;
++
+ use crate::app_event_sender::AppEventSender;
+ use crate::bottom_pane::ListSelectionView;
+ use crate::bottom_pane::SelectionViewParams;
+diff --git a/codex-rs/tui/src/dialog/stack.rs b/codex-rs/tui/src/dialog/stack.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/dialog/stack.rs
+@@ -0,0 +1,203 @@
++//! Centered settings dialogs retained over the Control Center backdrop.
++
++use super::DialogResources;
++use crate::bottom_pane::BottomPaneView;
++use crate::bottom_pane::CancellationEvent;
++use crate::bottom_pane::CenteredView;
++use crate::bottom_pane::ChatComposer;
++use crate::bottom_pane::SelectionViewParams;
++use crate::bottom_pane::ViewCompletion;
++use crate::key_hint::KeyBinding;
++use crate::tui::FrameRequester;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use std::ops::Deref;
++use std::time::Instant;
++
++pub(crate) struct DialogStack {
++    views: Vec<Box<dyn BottomPaneView>>,
++    frame_requester: FrameRequester,
++    key_chord_reset_requested: bool,
++}
++
++// The host can inspect retained views, but focus and completion stay with the stack.
++impl Deref for DialogStack {
++    type Target = [Box<dyn BottomPaneView>];
++
++    fn deref(&self) -> &Self::Target {
++        &self.views
++    }
++}
++
++impl DialogStack {
++    pub(crate) fn new(frame_requester: FrameRequester) -> Self {
++        Self {
++            views: Vec::new(),
++            frame_requester,
++            key_chord_reset_requested: false,
++        }
++    }
++
++    pub(crate) fn centered_view(&self) -> Option<CenteredView<'_>> {
++        self.views.last().map(|view| CenteredView(view.as_ref()))
++    }
++
++    pub(crate) fn take_key_chord_reset(&mut self) -> bool {
++        std::mem::take(&mut self.key_chord_reset_requested)
++    }
++
++    pub(crate) fn push(&mut self, view: Box<dyn BottomPaneView>) {
++        self.views.push(view);
++        self.focus_changed();
++    }
++
++    fn clear(&mut self) {
++        if !self.views.is_empty() {
++            self.views.clear();
++            self.focus_changed();
++        }
++    }
++
++    fn focus_changed(&mut self) {
++        self.key_chord_reset_requested = true;
++        self.schedule_active_frame();
++        self.frame_requester.schedule_frame();
++    }
++
++    fn pop_with_completion(&mut self, completion: Option<ViewCompletion>) {
++        self.views.pop();
++        match completion {
++            Some(ViewCompletion::Accepted) => {
++                while self
++                    .views
++                    .last()
++                    .is_some_and(|view| view.dismiss_after_child_accept())
++                {
++                    self.views.pop();
++                }
++            }
++            Some(ViewCompletion::Cancelled) => {
++                if let Some(view) = self.views.last_mut() {
++                    view.clear_dismiss_after_child_accept();
++                }
++            }
++            None => {}
++        }
++        self.focus_changed();
++    }
++
++    pub(crate) fn handle_key_event(&mut self, key: KeyEvent, activation_key: Option<KeyBinding>) {
++        if key.kind == KeyEventKind::Release {
++            return;
++        }
++        let Some(view) = self.views.last_mut() else {
++            return;
++        };
++        let prefer_esc = key.code == KeyCode::Esc && view.prefer_esc_to_handle_key_event();
++        let cancelled = key.code == KeyCode::Esc
++            && !prefer_esc
++            && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
++            && view.is_complete();
++        if !cancelled {
++            view.handle_key_event_with_activation_key(key, activation_key);
++        }
++        let complete = view.is_complete();
++        let completion = view.completion();
++        let in_paste_burst = view.is_in_paste_burst();
++        if complete {
++            self.pop_with_completion(completion);
++        }
++        if (!complete && in_paste_burst)
++            || (cancelled
++                && self
++                    .views
++                    .last()
++                    .is_some_and(|view| view.is_in_paste_burst()))
++        {
++            self.frame_requester
++                .schedule_frame_in(ChatComposer::recommended_paste_flush_delay());
++        }
++        self.frame_requester.schedule_frame();
++    }
++
++    pub(crate) fn on_ctrl_c(&mut self) -> CancellationEvent {
++        let Some(view) = self.views.last_mut() else {
++            return CancellationEvent::NotHandled;
++        };
++        let result = view.on_ctrl_c();
++        let complete = view.is_complete();
++        let completion = view.completion();
++        if matches!(result, CancellationEvent::Handled) {
++            if complete {
++                self.pop_with_completion(completion);
++            }
++            self.frame_requester.schedule_frame();
++        }
++        result
++    }
++
++    /// Return whether completion cleared the stack, allowing its host to restore its input.
++    pub(crate) fn handle_paste(&mut self, text: String) -> bool {
++        let Some(view) = self.views.last_mut() else {
++            return false;
++        };
++        let changed = view.handle_paste(text);
++        let complete = view.is_complete();
++        if complete {
++            self.clear();
++        }
++        if changed || complete {
++            self.frame_requester.schedule_frame();
++        }
++        complete
++    }
++
++    /// Return whether the active view completed and cleared its retained stack.
++    pub(crate) fn pre_draw_tick(&mut self, now: Instant) -> bool {
++        let Some(view) = self.views.last_mut() else {
++            return false;
++        };
++        let changed = view.pre_draw_tick(now);
++        let complete = view.is_complete();
++        if complete {
++            self.clear();
++        }
++        if changed || complete {
++            self.key_chord_reset_requested = true;
++            self.frame_requester.schedule_frame();
++        }
++        self.schedule_active_frame();
++        complete
++    }
++
++    fn schedule_active_frame(&self) {
++        if let Some(delay) = self.views.last().and_then(|view| view.next_frame_delay()) {
++            self.frame_requester.schedule_frame_in(delay);
++        }
++    }
++
++    pub(crate) fn replace_selection_if_present(
++        &mut self,
++        view_id: &'static str,
++        params: SelectionViewParams,
++        resources: DialogResources<'_>,
++    ) -> bool {
++        let Some(index) = self
++            .views
++            .iter()
++            .rposition(|view| view.view_id() == Some(view_id))
++        else {
++            return false;
++        };
++        let mut view = resources.selection_view(params);
++        view.dismiss_after_child_accept = self.views[index].dismiss_after_child_accept();
++        self.views[index] = Box::new(view);
++        if index + 1 == self.views.len() {
++            self.focus_changed();
++        } else {
++            self.frame_requester.schedule_frame();
++        }
++        true
++    }
++}
+diff --git a/codex-rs/tui/src/dialog/tests.rs b/codex-rs/tui/src/dialog/tests.rs
+--- a/codex-rs/tui/src/dialog/tests.rs
++++ b/codex-rs/tui/src/dialog/tests.rs
+@@ -1,5 +1,12 @@
+ use super::*;
++use crate::bottom_pane::SelectionItem;
++use crate::keymap::KeymapContext;
++use crate::keymap::KeymapContextSet;
++use crate::render::renderable::Renderable;
++use crossterm::event::KeyCode;
+ use pretty_assertions::assert_eq;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
+ use ratatui::text::Line;
+ 
+ #[test]
+@@ -38,3 +45,62 @@ fn custom_and_noncancelable_popup_hints_keep_their_policy() {
+         assert_eq!(params.footer_hint, expected);
+     }
+ }
++
++#[test]
++fn standalone_dialog_host_preserves_backdrop_input_and_nested_navigation() {
++    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
++    let app_event_tx = AppEventSender::new(tx);
++    let mut keymap = RuntimeKeymap::defaults();
++    keymap.list.cancel = vec![crate::key_hint::plain(KeyCode::F(2))];
++    let frame_requester = FrameRequester::test_dummy();
++    let resources = DialogResources {
++        app_event_tx: &app_event_tx,
++        keymap: &keymap,
++        frame_requester: &frame_requester,
++        vim_enabled: false,
++    };
++    let mut stack = DialogStack::new(resources.frame_requester.clone());
++    stack.push(Box::new(resources.selection_view(SelectionViewParams {
++        title: Some("Settings".into()),
++        view_id: Some("settings"),
++        items: vec![SelectionItem {
++            name: "Edit".into(),
++            ..Default::default()
++        }],
++        ..SelectionViewParams::picker()
++    })));
++    let (submitted_tx, submitted_rx) = std::sync::mpsc::channel();
++    stack.push(Box::new(resources.text_prompt(CustomPromptView::new(
++        "Alias".into(),
++        "Enter alias".into(),
++        String::new(),
++        None,
++        Box::new(move |text| submitted_tx.send(text).unwrap()),
++    ))));
++    assert!(stack.take_key_chord_reset());
++    assert!(!stack.take_key_chord_reset());
++    assert_eq!(
++        stack.last().unwrap().keymap_contexts(),
++        KeymapContextSet::new(KeymapContext::Editor)
++    );
++    stack.handle_key_event(KeyEvent::from(KeyCode::Char('r')), None);
++    stack.handle_paste("oute".into());
++    let area = Rect::new(7, 3, 80, 20);
++    let mut buffer = Buffer::empty(area);
++    for cell in &mut buffer.content {
++        cell.set_symbol(".");
++    }
++    let dialog = stack.centered_view().unwrap();
++    dialog.render(area, &mut buffer);
++    assert_eq!(buffer[(area.x, area.y)].symbol(), ".");
++    let (x, y) = dialog
++        .cursor_pos(area)
++        .expect("text dialog owns the cursor");
++    assert!(area.contains((x, y).into()));
++    stack.handle_key_event(KeyEvent::from(KeyCode::Enter), None);
++    assert_eq!(submitted_rx.try_recv(), Ok("route".into()));
++    assert_eq!(stack.len(), 1);
++    assert_eq!(stack.last().unwrap().view_id(), Some("settings"));
++    stack.handle_key_event(KeyEvent::from(KeyCode::F(2)), None);
++    assert!(stack.is_empty());
++}

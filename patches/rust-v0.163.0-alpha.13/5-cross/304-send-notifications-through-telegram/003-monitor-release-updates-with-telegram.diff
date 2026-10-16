@@ -1,0 +1,440 @@
+monitor-release-updates-with-telegram
+
+Lane: cross
+
+Unit: send-notifications-through-telegram
+
+ChildPatch: monitor-release-updates-with-telegram
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -567,6 +567,7 @@ mod proxy_processor;
+ mod remote_control_processor;
+ mod rollout;
+ mod search;
++mod telegram_processor;
+ mod thread_attachments;
+ mod thread_enrichment;
+ mod thread_fork_goal;
+@@ -602,6 +603,7 @@ pub(crate) use proxy_processor::ProxyProcessor;
+ pub(crate) use proxy_processor::initialize_runtime_proxy;
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
++pub(crate) use telegram_processor::TelegramProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+ pub(crate) use thread_processor::ThreadRequestProcessor;
+ pub(crate) use thread_processor::ThreadResumeTarget;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_processor.rs b/codex-rs/app-server/src/request_processors/telegram_processor.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_processor.rs
+@@ -0,0 +1,214 @@
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_http_client::HttpClientFactory;
++use semver::Version;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::sync::Mutex;
++use tokio::sync::mpsc;
++use tokio::task::JoinHandle;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++
++use crate::error_code::internal_error;
++use crate::telegram_http::Destination;
++use crate::telegram_http::TelegramHttp;
++
++#[path = "telegram_store.rs"]
++mod store;
++use store::DEFAULT_VERSION_CHECK_INTERVAL_HOURS;
++use store::TelegramConfig;
++use store::TelegramStore;
++
++const MANUAL_VERSION_CHECK_MIN_INTERVAL: Duration = Duration::from_secs(30);
++
++pub(crate) struct TelegramProcessor {
++    inner: Arc<Inner>,
++    wake: mpsc::Sender<()>,
++    cancel: CancellationToken,
++    _task: JoinHandle<()>,
++}
++
++struct Inner {
++    store: TelegramStore,
++    http: TelegramHttp,
++    version: Mutex<VersionMonitor>,
++}
++
++#[derive(Default)]
++struct VersionMonitor {
++    baseline: Option<Version>,
++    last_attempt: Option<Instant>,
++}
++
++struct VersionCheck {
++    performed: bool,
++    version: Option<Version>,
++}
++
++impl TelegramProcessor {
++    pub(crate) fn new(codex_home: PathBuf, factory: HttpClientFactory) -> Self {
++        Self::with_http(codex_home, TelegramHttp::new(factory))
++    }
++
++    fn with_http(codex_home: PathBuf, http: TelegramHttp) -> Self {
++        let inner = Arc::new(Inner {
++            store: TelegramStore::new(codex_home),
++            http,
++            version: Mutex::new(VersionMonitor::default()),
++        });
++        let cancel = CancellationToken::new();
++        let (wake, mut wakes) = mpsc::channel(1);
++        let worker_inner = Arc::clone(&inner);
++        let worker_cancel = cancel.clone();
++        let task = tokio::spawn(async move {
++            loop {
++                let delay = tokio::select! {
++                    _ = worker_cancel.cancelled() => break,
++                    delay = worker_inner.version_delay() => delay,
++                };
++                let force = tokio::select! {
++                    _ = worker_cancel.cancelled() => break,
++                    _ = tokio::time::sleep(delay) => false,
++                    wake = wakes.recv() => {
++                        if wake.is_none() {
++                            break;
++                        }
++                        true
++                    },
++                };
++                tokio::select! {
++                    _ = worker_cancel.cancelled() => break,
++                    _ = worker_inner.check_version(force) => {},
++                }
++            }
++        });
++        Self {
++            inner,
++            wake,
++            cancel,
++            _task: task,
++        }
++    }
++
++    pub(crate) fn shutdown(&self) {
++        self.cancel.cancel();
++    }
++}
++
++impl Drop for TelegramProcessor {
++    fn drop(&mut self) {
++        self.shutdown();
++    }
++}
++
++impl Inner {
++    fn load(&self) -> Result<Option<TelegramConfig>, JSONRPCErrorError> {
++        self.store.load().map_err(storage_error)
++    }
++
++    async fn seed_version_baseline(&self, probe: crate::telegram_http::Probe) {
++        *self.version.lock().await = VersionMonitor {
++            baseline: probe.release.map(|release| release.version),
++            last_attempt: Some(Instant::now()),
++        };
++    }
++
++    async fn version_delay(&self) -> Duration {
++        let Some(config) = self.load().ok().flatten() else {
++            return version_interval_duration(DEFAULT_VERSION_CHECK_INTERVAL_HOURS);
++        };
++        if !config.notify_version_updates || config.github_token.is_none() {
++            return version_interval_duration(config.version_check_interval_hours);
++        }
++        let interval = version_interval_duration(config.version_check_interval_hours);
++        self.version
++            .lock()
++            .await
++            .last_attempt
++            .map_or(Duration::ZERO, |last| {
++                interval.saturating_sub(last.elapsed())
++            })
++    }
++
++    async fn check_version(&self, force: bool) -> Result<VersionCheck, JSONRPCErrorError> {
++        let Some(config) = self.load()? else {
++            return Ok(VersionCheck {
++                performed: false,
++                version: None,
++            });
++        };
++        if !config.notify_version_updates || config.github_token.is_none() {
++            return Ok(VersionCheck {
++                performed: false,
++                version: None,
++            });
++        }
++        let mut monitor = self.version.lock().await;
++        let minimum_interval = if force {
++            MANUAL_VERSION_CHECK_MIN_INTERVAL
++        } else {
++            version_interval_duration(config.version_check_interval_hours)
++        };
++        if monitor
++            .last_attempt
++            .is_some_and(|last| last.elapsed() < minimum_interval)
++        {
++            return Ok(VersionCheck {
++                performed: false,
++                version: monitor.baseline.clone(),
++            });
++        }
++        monitor.last_attempt = Some(Instant::now());
++        let probe = self
++            .http
++            .releases(config.github_token.as_deref().expect("checked token"))
++            .await
++            .map_err(|_| internal_error("GitHub version check failed"))?;
++        if let Some(candidate) = probe.release {
++            let Some(baseline) = monitor.baseline.as_ref() else {
++                monitor.baseline = Some(candidate.version);
++                return Ok(VersionCheck {
++                    performed: true,
++                    version: monitor.baseline.clone(),
++                });
++            };
++            if candidate.version > *baseline {
++                let channel = if candidate.version.pre.is_empty() {
++                    "stable"
++                } else {
++                    "prerelease"
++                };
++                let text = format!(
++                    "Codex update available\nPrevious: {}\nLatest: {}\nChannel: {channel}\n{}",
++                    baseline, candidate.version, candidate.url,
++                );
++                self.http
++                    .send(Destination(&config.bot_token, &config.chat_id), &text)
++                    .await
++                    .map_err(|_| internal_error("Telegram version notification failed"))?;
++                monitor.baseline = Some(candidate.version);
++            }
++        }
++        Ok(VersionCheck {
++            performed: true,
++            version: monitor.baseline.clone(),
++        })
++    }
++
++    async fn reset_version_baseline(&self) {
++        *self.version.lock().await = VersionMonitor::default();
++    }
++}
++
++fn storage_error(_: std::io::Error) -> JSONRPCErrorError {
++    internal_error("Telegram configuration operation failed")
++}
++
++fn version_interval_duration(hours: u16) -> Duration {
++    Duration::from_secs(u64::from(hours) * 60 * 60)
++}
++
++#[cfg(test)]
++#[path = "telegram_processor_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs b/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs
+@@ -0,0 +1,184 @@
++use super::*;
++use codex_http_client::OutboundProxyPolicy;
++use std::path::Path;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++use url::Url;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::Respond;
++use wiremock::ResponseTemplate;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++
++async fn processor(server: &MockServer, home: &Path) -> TelegramProcessor {
++    let base = Url::parse(&server.uri()).expect("mock URL");
++    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
++    TelegramProcessor::with_http(
++        home.to_path_buf(),
++        TelegramHttp::with_urls(factory, base.clone(), base),
++    )
++}
++
++struct ReleaseSequence {
++    calls: AtomicUsize,
++}
++
++impl Respond for ReleaseSequence {
++    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
++        let version = match self.calls.fetch_add(1, Ordering::SeqCst) {
++            0 => "1.0.0",
++            _ => "1.1.0",
++        };
++        ResponseTemplate::new(200).set_body_json(serde_json::json!([{
++            "tag_name": format!("rust-v{version}"),
++            "html_url": format!("https://example.invalid/{version}"),
++            "draft": false
++        }]))
++    }
++}
++
++#[tokio::test]
++async fn first_release_is_a_silent_baseline_and_later_release_notifies() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .respond_with(ReleaseSequence {
++            calls: AtomicUsize::new(0),
++        })
++        .expect(2)
++        .mount(&server)
++        .await;
++    Mock::given(method("POST"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let store = TelegramStore::new(home.path().to_path_buf());
++    let mut config = TelegramConfig::new("123:secret".to_string(), "chat".to_string());
++    config.github_token = Some("github-token".to_string());
++    config.notify_version_updates = true;
++    store.persist(Some(&config)).expect("persist config");
++    let base = Url::parse(&server.uri()).expect("mock URL");
++    let inner = Inner {
++        store,
++        http: TelegramHttp::with_urls(
++            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++            base.clone(),
++            base,
++        ),
++        version: Mutex::new(VersionMonitor::default()),
++    };
++
++    let baseline = inner.check_version(true).await.expect("establish baseline");
++    assert!(baseline.performed);
++    assert_eq!(baseline.version, Some(Version::new(1, 0, 0)));
++    inner.version.lock().await.last_attempt =
++        Some(Instant::now() - MANUAL_VERSION_CHECK_MIN_INTERVAL);
++    let update = inner.check_version(true).await.expect("notify update");
++    assert!(update.performed);
++    assert_eq!(update.version, Some(Version::new(1, 1, 0)));
++
++    let requests = server.received_requests().await.expect("requests");
++    let telegram = requests
++        .iter()
++        .find(|request| request.method.as_str() == "POST")
++        .expect("Telegram notification");
++    let body: serde_json::Value = serde_json::from_slice(&telegram.body).expect("Telegram JSON");
++    assert!(body["text"].as_str().is_some_and(|text| {
++        text.contains("Previous: 1.0.0") && text.contains("Latest: 1.1.0")
++    }));
++}
++
++#[tokio::test]
++async fn repeated_manual_checks_share_the_recent_attempt_gate() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .respond_with(ResponseTemplate::new(503))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let store = TelegramStore::new(home.path().to_path_buf());
++    let mut config = TelegramConfig::new("123:secret".to_string(), "chat".to_string());
++    config.github_token = Some("github-token".to_string());
++    config.notify_version_updates = true;
++    store.persist(Some(&config)).expect("persist config");
++    let base = Url::parse(&server.uri()).expect("mock URL");
++    let inner = Inner {
++        store,
++        http: TelegramHttp::with_urls(
++            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++            base.clone(),
++            base,
++        ),
++        version: Mutex::new(VersionMonitor::default()),
++    };
++
++    assert!(inner.check_version(true).await.is_err());
++    assert!(
++        !inner
++            .check_version(true)
++            .await
++            .expect("recent attempt")
++            .performed
++    );
++}
++
++#[tokio::test]
++async fn shutdown_cancels_an_in_flight_version_request() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/repos/openai/codex/releases"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .set_body_json(serde_json::json!([]))
++                .set_delay(Duration::from_secs(60)),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    let mut config = TelegramConfig::new("123:secret".to_string(), "chat".to_string());
++    config.github_token = Some("github-token".to_string());
++    config.notify_version_updates = true;
++    TelegramStore::new(home.path().to_path_buf())
++        .persist(Some(&config))
++        .expect("persist");
++    let mut processor = processor(&server, home.path()).await;
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while server
++            .received_requests()
++            .await
++            .expect("requests")
++            .is_empty()
++        {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("version request started");
++    processor.shutdown();
++    tokio::time::timeout(Duration::from_secs(5), &mut processor._task)
++        .await
++        .expect("worker stopped before HTTP timeout")
++        .expect("worker joined");
++}
++
++#[tokio::test]
++async fn dropping_processor_releases_its_background_owner() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let server = MockServer::start().await;
++    let processor = processor(&server, home.path()).await;
++    let inner = Arc::downgrade(&processor.inner);
++    drop(processor);
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while inner.upgrade().is_some() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("worker owner released on drop");
++}

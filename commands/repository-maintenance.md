@@ -56,6 +56,7 @@ BazelModuleAcquisitionOwner
 - RepositoryMaintenance admits only the exact release MainWorktree or numbered fork branch while allowing its unstaged tracked dependency-owner postimage; RepositoryFormatting owns its separate tracked-input admission, while tests, replay, suites, and export retain clean-source admission.
 - The maintenance source projection rejects active Git sequencing state, and its preimage disables rename folding before rejecting staged changes including intent-to-add index entries, untracked, deleted, nondependency, and preexisting `MODULE.bazel.lock` changes before product execution.
 - Admission expands RepositoryMaintenanceSupport and requires manifest-selected `bin/just`, manifest-selected Bazelisk at `bin/bazel`, and the exact source `.bazelversion` before creating an attempt or changing source bytes.
+- Require `.bazelversion` to declare one semantic release without comparing it with a skill-owned release number.
 - The Bazel payload is only `/toolchain/bin/just bazel-lock-update`; callers cannot select another recipe, argv, shell, direct Bazel command, host executable, PATH fallback, or source-independent maintenance effect.
 - A networked support phase binds the selected source read-only and runs fixed Bazel `--batch mod deps --lockfile_mode=off` to acquire its source-pinned release and module artifacts into the fresh attempt home.
 - The product phase reuses only that attempt home, disables network, binds source writable and Git metadata read-only, and executes the sole repository recipe.

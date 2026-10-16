@@ -16,7 +16,8 @@ from itertools import groupby
 from operator import itemgetter
 
 
-LANES = "bugfix normalization backend mixed frontend draft".split()
+LANES = "bugfix normalization backend mixed frontend cross draft".split()
+CONTRACT_FIELDS = ("Purpose", "Requires", "Provides", "Boundary", "Verification")
 join = os.path.join
 dir_name = os.path.dirname
 base_name = os.path.basename
@@ -24,18 +25,6 @@ REGULAR = stat.S_IFREG
 DIRECTORY = stat.S_IFDIR
 SYMLINK = stat.S_IFLNK
 TRANSFORM = "ExecutableTransform"
-SEGMENTS = ("none", "non-schema", "schema", "snapshot")
-RESPONSIBILITY_ORDER = {
-    "backend": (
-        ("Unit", "none"),
-        ("Unit", "non-schema"),
-        ("Unit", "schema"),
-        ("FlatPatch", "schema"),
-        ("FlatPatch", "non-schema"),
-        ("FlatPatch", "none"),
-    ),
-    "mixed": (("Unit", "none"), ("Unit", "non-schema"), ("Unit", "schema")),
-}
 SCHEMA_ROOT = "codex-rs/app-server-protocol/schema"
 PROTOCOL_ROOT = "codex-rs/app-server-protocol/src"
 SCHEMA_OUTPUTS = ("json", "typescript", "precomputed")
@@ -117,11 +106,9 @@ def roll_require(value, unit, field, expected, actual):
     return value
 
 def lane_segments(lane):
-    if lane in ("backend", "mixed"):
-        return ("none", "non-schema", "schema")
-    if lane == "draft":
-        return ("none", "schema")
-    return ("none",)
+    if lane in ("backend", "mixed", "cross", "draft"):
+        return ("none", "schema", "snapshot", "schema-snapshot")
+    return ("none", "snapshot")
 
 def generated_schema_path(path):
     return any(path.startswith(f"{SCHEMA_ROOT}/{output}/") for output in SCHEMA_OUTPUTS)
@@ -222,8 +209,8 @@ def git_path(path):
     must(isinstance(path, str) and path and not path.startswith("/") and "\0" not in path and ".." not in path.split("/"))
     return path
 
-def formal(value, lane="", patch_kind=""):
-    return re.fullmatch(r"[a-z][a-z0-9]*" if lane == "draft" and patch_kind == "Unit" else r"(?![0-9]+-)[a-z0-9]+(?:-[a-z0-9]+)+", value) and all((lane, value) != (metadata[0], metadata[2]) for metadata in TRANSFORM_METADATA)
+def formal(value, lane=""):
+    return re.fullmatch(r"(?![0-9]+-)[a-z0-9]+(?:-[a-z0-9]+)+", value) and all((lane, value) != (metadata[0], metadata[2]) for metadata in TRANSFORM_METADATA)
 
 def lane_path(lane):
     return f"{LANES.index(lane)}-{lane}"
@@ -245,6 +232,28 @@ def fields(repository, commit):
         raise CommitMetadataError(commit, "Commit", "malformed")
     return metadata_fields(repository.bytes("show", "-s", "--format=%B", commit).removesuffix(b"\n"), commit)
 
+def contract_fields(lane):
+    return (*CONTRACT_FIELDS, "CrossGroup") if lane == "cross" else CONTRACT_FIELDS
+
+def validate_contract(contract, lane, identity):
+    names = contract_fields(lane)
+    if not isinstance(contract, dict) or set(contract) != set(names):
+        raise LaneStructureError(identity, "Contract", names, contract)
+    for name in names:
+        value = contract[name]
+        if name == "Requires":
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value) and len(value) == len(set(value))
+            expected = "unique direct prerequisite selectors"
+        elif name == "CrossGroup":
+            valid = isinstance(value, str) and formal(value)
+            expected = "a semantic hyphenated cross group name"
+        else:
+            valid = isinstance(value, str) and bool(value) and value == value.strip() and value.isascii() and value.isprintable()
+            expected = "nonempty printable ASCII text without surrounding whitespace"
+        if not valid:
+            raise LaneStructureError(identity, name, expected, value)
+    return contract
+
 def metadata_fields(message, identity):
     try:
         lines = message.decode().splitlines(keepends=True)
@@ -256,10 +265,12 @@ def metadata_fields(message, identity):
         "Transform": ("Lane", "Transform", "TransformPatch", "Form", "Segment"),
     }
     labels = [line.split(": ", 1)[0] for line in lines[1:] if line.endswith("\n") and ": " in line]
-    kind = next((name for name, names in variants.items() if labels == list(names)), "")
+    kind = next((name for name, names in variants.items() if labels == list(names) or name != "Transform" and labels in ([*names, *CONTRACT_FIELDS], [*names, *CONTRACT_FIELDS, "CrossGroup"])), "")
     if not kind:
         raise CommitMetadataError(identity, "Message", "malformed discriminant")
-    names = variants[kind]
+    base_names = variants[kind]
+    has_contract = len(labels) > len(base_names)
+    names = labels
     if len(lines) != 2 * len(names) + 1 or lines[1::2] != ["\n"] * len(names) or not all(line.endswith("\n") for line in lines):
         raise CommitMetadataError(identity, "Message", "malformed")
     values = []
@@ -270,14 +281,21 @@ def metadata_fields(message, identity):
         values.append(line[len(prefix):-1])
     lane = values[0]
     group, patch = (values[1], values[1]) if kind == "FlatPatch" else values[1:3]
-    form, segment = values[-2:]
+    form, segment = values[len(base_names) - 2:len(base_names)]
     metadata = (lane, kind, group, patch, form, segment)
     git_diff = form == "GitDiff" and segment in lane_segments(lane)
-    valid = lane in LANES and formal(patch) and (kind != "Transform" and git_diff and formal(group, lane, kind) and (kind == "FlatPatch" or group != patch) or metadata in TRANSFORM_METADATA)
+    valid = lane in LANES and formal(patch) and (kind != "Transform" and git_diff and formal(group, lane) and (kind == "FlatPatch" or group != patch) or metadata in TRANSFORM_METADATA)
     if not valid or lines[0] != patch + "\n":
         field = "Subject" if lines[0] != patch + "\n" else "Message"
         raise CommitMetadataError(identity, field, "malformed")
-    return metadata
+    contract = None
+    if has_contract:
+        contract = dict(zip(names[len(base_names):], values[len(base_names):]))
+        contract["Requires"] = [] if contract["Requires"] == "none" else contract["Requires"].split(", ")
+        validate_contract(contract, lane, identity)
+    if kind == "FlatPatch" and contract is None:
+        raise LaneStructureError(identity, "Contract", "one complete responsibility contract", "absent")
+    return (*metadata, contract)
 
 def root_inventory(path, parent, missing=False):
     path, parent = os.path.abspath(path), os.path.abspath(parent)
@@ -302,8 +320,8 @@ def root_inventory(path, parent, missing=False):
     files.sort()
     return tuple(files)
 
-def release_notes(root, lanes=LANES):
-    notes = {}
+def release_documents(root, lanes=LANES):
+    documents = {}
     for relative in ("notes.md", *(join(lane_path(lane), "notes.md") for lane in lanes)):
         path = join(root, relative)
         if not os.path.lexists(path):
@@ -314,10 +332,22 @@ def release_notes(root, lanes=LANES):
         must(not data or text.endswith("\n"))
         must("\r" not in text and "\x00" not in text)
         must(all(re.fullmatch(r"- \S.*", line) for line in text.splitlines()))
-        notes[relative] = data
-    return notes
+        documents[relative] = data
+    diagram = join(lane_path("cross"), "relationships.txt")
+    path = join(root, diagram)
+    if "cross" in lanes and os.path.lexists(path):
+        roll_require(kind(path, REGULAR) and os.path.realpath(path) == path and stat.S_IMODE(os.lstat(path).st_mode) == 0o644, path, "CrossDiagram", "regular 0644 ASCII graph", "invalid file")
+        data = regular_bytes(path)
+        roll_require(data.strip() and data.isascii() and data.endswith(b"\n") and b"\r" not in data and b"\x00" not in data, path, "CrossDiagram", "nonempty ASCII graph with a final newline", "invalid content")
+        documents[diagram] = data
+    return documents
 
-def working_release_notes(root):
+def require_cross_diagram(documents, lanes):
+    if "cross" in lanes:
+        diagram = join(lane_path("cross"), "relationships.txt")
+        roll_require(diagram in documents, diagram, "CrossDiagram", "reviewed cross relationship diagram", "absent")
+
+def working_release_documents(root):
     if not os.path.lexists(root):
         return {}
     must(kind(root, DIRECTORY) and os.path.realpath(root) == root)
@@ -327,8 +357,9 @@ def working_release_notes(root):
         path = join(root, name)
         must(name in {lane_path(lane) for lane in LANES})
         must(kind(path, DIRECTORY) and os.path.realpath(path) == path)
-        must(set(os.listdir(path)) <= {"notes.md"})
-    return release_notes(root)
+        allowed = {"notes.md", "relationships.txt"} if name == lane_path("cross") else {"notes.md"}
+        must(set(os.listdir(path)) <= allowed)
+    return release_documents(root)
 
 def changed(repository, start=None, end=None, *, attributes=None, index=None):
     return [os.fsdecode(item) for item in repository.bytes("diff", *(("--cached",) if start is None else (start, end)), "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", attributes=attributes, index=index).split(b"\0") if item]
@@ -354,7 +385,7 @@ def source_change_class(paths, unit):
 
 def validate_protocol_segment(paths, lane, segment, unit):
     protocol = any(path == PROTOCOL_ROOT or path.startswith(PROTOCOL_ROOT + "/") for path in paths)
-    roll_require(not protocol or lane in ("backend", "mixed", "draft") and segment == "schema", unit, "Segment", "schema for protocol source in backend, mixed, or draft", f"{lane}/{segment}")
+    roll_require(not protocol or lane in ("backend", "mixed", "cross", "draft") and segment in ("schema", "schema-snapshot"), unit, "Segment", "schema impact for protocol source in backend, mixed, cross or draft", f"{lane}/{segment}")
 
 def change_class(repository, lane, form, segment, start=None, end=None, *, attributes=None, index=None):
     paths = set(changed(repository, start, end, attributes=attributes, index=index))
@@ -389,14 +420,18 @@ def native_commit(repository, *arguments):
     repository.run("commit", "--quiet", "--no-verify", *arguments)
     must(repository.clean() and commit_identity(repository, "HEAD"))
 
-def metadata_commit(repository, lane, kind, group, patch, form, segment, title="", amend=False, allow_empty=False):
+def metadata_commit(repository, lane, kind, group, patch, form, segment, title="", amend=False, allow_empty=False, contract=None):
     labels = {"FlatPatch": (("FlatPatch", group),), "Unit": (("Unit", group), ("ChildPatch", patch)), "Transform": (("Transform", group), ("TransformPatch", patch))}[kind]
     paragraphs = [("Lane", lane), *labels, ("Form", form), ("Segment", segment)]
-    arguments = ("--amend", "--no-edit") if amend else tuple(item for pair in (("-m", title or patch), *( ("-m", f"{name}: {value}") for name, value in paragraphs)) for item in pair)
+    if contract is not None:
+        paragraphs.extend((name, ", ".join(contract[name]) or "none" if name == "Requires" else contract[name]) for name in contract_fields(lane))
+    arguments = tuple(item for pair in (("-m", title or patch), *( ("-m", f"{name}: {value}") for name, value in paragraphs)) for item in pair)
+    if amend:
+        arguments = ("--amend", *arguments)
     if allow_empty:
         arguments = ("--allow-empty", *arguments)
     native_commit(repository, *arguments)
-    must(fields(repository, "HEAD") == (lane, kind, group, patch, form, segment))
+    must(fields(repository, "HEAD") == (lane, kind, group, patch, form, segment, contract))
 
 def first_parent(repository, base, head="HEAD"):
     must(repository.ok("merge-base", "--is-ancestor", base, head) and repository.text("rev-list", "--merges", "--count", f"{base}..{head}") == "0")
@@ -407,12 +442,13 @@ def validate_history(rows, complete=False, partial=False):
     must(rows and rows[0][2:8] == NORMALIZATION_TRANSFORM)
     must(rows[0][8] == "normalization-transform")
     ordinary = [row for row in rows if row[6] == "GitDiff"]
-    last, structures, lane_orders = -1, set(), {}
+    last, structures = -1, set()
+    layout, scopes = None, set()
+    flat_seen, impact_seen, impact_closed = False, False, False
     for (lane, kind, group), grouped in groupby(ordinary, itemgetter(2, 3, 4)):
         members = list(grouped)
         identity, rank = (lane, kind, group), LANES.index(lane)
         must(identity not in structures and rank >= last)
-        structures.add(identity)
         last = rank
         if lane == "bugfix" and kind != "FlatPatch":
             raise LaneStructureError(f"{lane}/{group}", "PatchKind", "FlatPatch", kind)
@@ -420,19 +456,30 @@ def validate_history(rows, complete=False, partial=False):
         roll_require(transport_complete((lane, kind, group, members), trailing_partial), f"{lane}/{group}", "PatchStructure", "one Flat Patch or a Unit with at least two Child Patches", [member[5] for member in members])
         segment = members[0][7]
         must(segment in lane_segments(lane))
-        if lane in RESPONSIBILITY_ORDER:
-            order = RESPONSIBILITY_ORDER[lane]
-            category = (kind, segment)
-            if category not in order:
-                raise LaneStructureError(f"{lane}/{group}", "PatchKind", "Unit", kind)
-            position = order.index(category)
-            expected = order
+        contract = members[0][9]
+        if contract is None or any(member[9] is not None for member in members[1:]):
+            raise LaneStructureError(f"{lane}/{group}", "Contract", "one contract on the first commit only", "missing or repeated")
+        scope = (lane, contract.get("CrossGroup", ""))
+        if scope != layout:
+            if scope in scopes:
+                raise LaneStructureError(f"{lane}/{group}", "CrossGroup", "one consecutive region per cross group", scope[1])
+            scopes.add(scope)
+            layout = scope
+            flat_seen, impact_seen, impact_closed = False, False, False
+        if kind == "Unit" and flat_seen:
+            raise LaneStructureError(f"{lane}/{group}", "PatchKindOrder", "all Units before Flat Patches in the Lane or cross group", kind)
+        flat_seen = flat_seen or kind == "FlatPatch"
+        if segment == "none":
+            impact_closed = impact_closed or impact_seen
         else:
-            position = 0 if lane in ("bugfix", "draft") else int(kind == "FlatPatch")
-            expected = "Units before Flat Patches"
-        if position < lane_orders.get(lane, 0):
-            raise LaneStructureError(f"{lane}/{group}", "LaneOrder", expected, (kind, segment))
-        lane_orders[lane] = position
+            if impact_closed:
+                raise LaneStructureError(f"{lane}/{group}", "SegmentOrder", "one continuous generation-impact region in the Lane or cross group", segment)
+            impact_seen = True
+        available = {f"{prior_kind}:{prior_lane}/{prior_name}" for prior_lane, prior_kind, prior_name in structures}
+        for prerequisite in contract["Requires"]:
+            if prerequisite not in available:
+                raise LaneStructureError(f"{lane}/{group}", "Requires", "an earlier complete Unit or Flat Patch", prerequisite)
+        structures.add(identity)
     tail = [row for row in rows[1:] if row[6] == TRANSFORM]
     must(not tail or ordinary and rows[-len(tail):] == tail)
     segments = [row[7] for row in tail]
@@ -444,29 +491,40 @@ def validate_history(rows, complete=False, partial=False):
     must("schema" not in segments or required)
     must("snapshot" not in segments or ("schema" in segments) == required)
     must(not complete or "snapshot" in segments)
+    projected_patch_rows(ordinary)
     return rows
 
 def schema_required(rows):
-    return any(row[6] == "GitDiff" and row[7] == "schema" for row in rows)
+    return any(row[6] == "GitDiff" and row[7] in ("schema", "schema-snapshot") for row in rows)
 
 def history_rows(source, base, head="HEAD"):
     rows = []
     for commit in first_parent(source, base, head):
         try:
-            lane, kind, group, patch, form, segment = fields(source, commit)
+            lane, kind, group, patch, form, segment, contract = fields(source, commit)
         except CommitMetadataError as error:
             raise RollInputError(error.commit, error.field, "canonical commit metadata", error.problem) from error
         parent = f"{commit}^"
         classification = change_class(source, lane, form, segment, parent, commit, attributes=parent)
-        rows.append((commit, parent, lane, kind, group, patch, form, segment, classification))
+        rows.append((commit, parent, lane, kind, group, patch, form, segment, classification, contract))
     return rows
 
 def projected_patch_rows(rows):
-    projected, indexes = [], {}
+    projected, indexes, cross_groups = [], {}, []
     for (lane, kind, group), grouped in groupby(rows, itemgetter(2, 3, 4)):
         members = list(grouped)
-        indexes[lane] = indexes.get(lane, 0) + 1
-        structure_path = f"{indexes[lane]:02d}-{group}"
+        cross_group = members[0][9]["CrossGroup"] if lane == "cross" else ""
+        scope = (lane, cross_group)
+        indexes[scope] = indexes.get(scope, 0) + 1
+        roll_require(indexes[scope] <= 99, f"{lane}/{group}", "MemberOrdinal", "01 through 99 in the Lane or cross group", indexes[scope])
+        ordinal = f"{indexes[scope]:02d}"
+        if lane == "cross":
+            if cross_group not in cross_groups:
+                cross_groups.append(cross_group)
+            roll_require(len(cross_groups) <= 9, f"{lane}/{group}", "CrossGroupOrdinal", "1 through 9", len(cross_groups))
+            ordinal = f"{cross_groups.index(cross_group) + 1}{ordinal}"
+        structure_path = f"{ordinal}-{group}"
+        roll_require(len(members) <= 999, f"{lane}/{group}", "ChildPatchOrdinal", "001 through 999", len(members))
         for patch_index, row in enumerate(members, 1):
             patch = row[5]
             name = f"{lane_path(lane)}/{structure_path}/{patch_index:03d}-{patch}.diff" if kind == "Unit" else f"{lane_path(lane)}/{structure_path}.diff"
@@ -474,7 +532,7 @@ def projected_patch_rows(rows):
     return tuple(projected)
 
 def git_diff_finding(row, artifact, data, enforce_limit=True):
-    _, _, lane, patch_kind, group, patch, _, _, _ = row
+    lane, patch_kind, group, patch = row[2:6]
     lines = len(data.splitlines())
     output = "EmptyGitDiff" if not data else "OversizeGitDiff" if enforce_limit and lines > MAXIMUM_DIFF_LINES else ""
     if not output:
@@ -544,9 +602,11 @@ def write_project(root, projected):
 def project_matches_export(source, base, export, head="HEAD"):
     projected, findings = project(source, base, head, publication=False)
     must(not findings)
-    lanes = {name.split("/", 1)[0] for name, _ in projected}
-    notes = release_notes(export, [lane for lane in LANES if lane_path(lane) in lanes])
-    expected = tuple(sorted([name for name, _ in projected] + list(notes)))
+    lane_directories = {name.split("/", 1)[0] for name, _ in projected}
+    lanes = [lane for lane in LANES if lane_path(lane) in lane_directories]
+    documents = release_documents(export, lanes)
+    require_cross_diagram(documents, lanes)
+    expected = tuple(sorted([name for name, _ in projected] + list(documents)))
     must(root_inventory(export, dir_name(export)) == expected)
     for name, data in projected:
         must(regular_bytes(join(export, name)) == data)
@@ -1238,24 +1298,18 @@ def transport_export_rows(root, predecessor, current_tag=""):
     must(re.fullmatch(r"rust-v[0-9A-Za-z._-]+", predecessor) and not predecessor.endswith(("-prev", ".pending")))
     if current_tag:
         must(re.fullmatch(r"rust-v[0-9A-Za-z._-]+", current_tag))
-    rows, counts, active, patch_count = [], {}, None, 0
-    notes = release_notes(root)
-    pattern = r"([0-9]+)-([a-z-]+)/([0-9]{2})-([a-z0-9-]+)(?:/([0-9]{3})-([a-z0-9-]+))?\.diff"
+    rows = []
+    documents = release_documents(root)
+    pattern = r"([0-9]+)-([a-z-]+)/([0-9]{2,3})-([a-z0-9-]+)(?:/([0-9]{3})-([a-z0-9-]+))?\.diff"
     for relative in root_inventory(root, private.path):
-        if relative in notes:
+        if relative in documents:
             continue
         match = re.fullmatch(pattern, relative)
         must(match)
         kind = "Unit" if match[5] else "FlatPatch"
-        must(match[2] in LANES and int(match[1]) == LANES.index(match[2]) and formal(match[4], match[2], kind))
-        lane, structure = match[2], (match[2], int(match[3]), match[4])
-        if structure != active:
-            counts[lane] = counts.get(lane, 0) + 1
-            must(structure[1] == counts[lane])
-            active, patch_count = structure, 0
-        patch_count += 1
-        patch = match[6] or structure[2]
-        must(not match[5] or int(match[5]) == patch_count and formal(patch) and patch != structure[2])
+        must(match[2] in LANES and int(match[1]) == LANES.index(match[2]) and formal(match[4], match[2]))
+        lane, group, patch = match[2], match[4], match[6] or match[4]
+        must(not match[5] or formal(patch) and patch != group)
         data = regular_bytes(join(root, relative))
         message, separator, _ = data.partition(b"\n\ndiff --git ")
         roll_require(separator, relative, "GitDiff", "canonical commit metadata followed by a patch body", "missing metadata or patch body")
@@ -1263,31 +1317,37 @@ def transport_export_rows(root, predecessor, current_tag=""):
             metadata = metadata_fields(message, relative)
         except CommitMetadataError as error:
             raise RollInputError(relative, error.field, "canonical exported commit metadata", error.problem) from error
-        roll_require(metadata[:4] == (lane, kind, structure[2], patch) and metadata[4] == "GitDiff", relative, "PatchIdentity", (lane, kind, structure[2], patch, "GitDiff"), metadata[:5])
+        roll_require(metadata[:4] == (lane, kind, group, patch) and metadata[4] == "GitDiff", relative, "PatchIdentity", (lane, kind, group, patch, "GitDiff"), metadata[:5])
         lines = data.splitlines()
         must(data and not any(line.startswith(b"index ") or invalid_diff_line(line) for line in lines))
         paths = [line.split("\t", 2)[2] for line in private.run("apply", "--numstat", data=data).stdout.decode().splitlines()]
         validate_protocol_segment(paths, lane, metadata[5], relative)
-        classification = source_change_class(paths, f"{lane}/{structure[2]}")
-        rows.append((join(root, relative), "", *metadata, classification))
+        classification = source_change_class(paths, f"{lane}/{group}")
+        rows.append((join(root, relative), "", *metadata[:6], classification, metadata[6]))
     groups = transport_groups(rows)
     must(groups)
-    must(all(path == "notes.md" or dir_name(path) in {lane_path(group[0]) for group in groups} for path in notes))
-    return validate_history([("", "", *NORMALIZATION_TRANSFORM, "normalization-transform"), *rows])
+    lanes = {group[0] for group in groups}
+    require_cross_diagram(documents, lanes)
+    must(all(path == "notes.md" or dir_name(path) in {lane_path(lane) for lane in lanes} for path in documents))
+    history = validate_history([("", "", *NORMALIZATION_TRANSFORM, "normalization-transform", None), *rows])
+    for row, relative in projected_patch_rows(rows):
+        roll_require(row[0] == join(root, relative), row[0], "ArtifactPath", relative, os.path.relpath(row[0], root))
+    return history
 
 def transport_source_rows(repository):
     rows, depth = [], 0
     while True:
         commit = "HEAD" if depth == 0 else f"HEAD~{depth}"
         try:
-            rows.append((commit, f"{commit}^", *fields(repository, commit), None))
+            metadata = fields(repository, commit)
+            rows.append((commit, f"{commit}^", *metadata[:6], None, metadata[6]))
         except CommitMetadataError:
             break
         depth += 1
     must(rows)
     rows.reverse()
     for index, row in enumerate(rows):
-        rows[index] = row[:8] + (change_class(repository, row[2], row[6], row[7], row[1], row[0], attributes=row[1]),)
+        rows[index] = row[:8] + (change_class(repository, row[2], row[6], row[7], row[1], row[0], attributes=row[1]), row[9])
     return validate_history(rows, partial=True)
 
 def transport_write_result(path, value):
@@ -1540,15 +1600,20 @@ def source_prefix_preimage(root):
     return tuple((path, stat.S_IMODE(os.lstat(join(root, path)).st_mode), regular_bytes(join(root, path))) for path in root_inventory(root, dir_name(root)))
 
 def transport_apply(arguments):
-    must(len(arguments) == 16)
-    source_path, target_path, tag, start_selector, end_value, rustfmt, asset_root, predecessor, child_patch_sequence, source_custody, endpoint, working, scratch, runtime, deadline, output = arguments
+    must(len(arguments) == 15)
+    source_path, target_path, tag, start_selector, end_value, rustfmt, asset_root, predecessor, child_patch_sequence, endpoint, working, scratch, runtime, deadline, output = arguments
     target = transport_repository(target_path, True)
-    source = None if predecessor else transport_repository(source_path, True)
-    must((source is None or source.path != target.path) and kind(rustfmt, REGULAR) and source_custody == ("exported" if predecessor else "retained"))
+    source = transport_repository(source_path, True) if source_path and not predecessor else None
+    must((source is None or source.path != target.path) and kind(rustfmt, REGULAR))
     must(kind(endpoint, REGULAR) and os.path.realpath(endpoint) == endpoint and all(os.path.isabs(path) for path in (working, scratch, runtime)))
     formatter = (endpoint, working, scratch, runtime, tag, deadline)
     source_before = source_prefix_preimage(source_path) if predecessor else None
-    source_rows = transport_export_rows(source_path, predecessor, tag) if predecessor else transport_source_rows(source)
+    if predecessor:
+        source_rows = transport_export_rows(source_path, predecessor, tag)
+    elif source:
+        source_rows = transport_source_rows(source)
+    else:
+        source_rows = [("", "", *NORMALIZATION_TRANSFORM, "normalization-transform", None)]
     source_bytes = {join(source_path, path): data for path, mode, data in source_before} if predecessor else None
     if predecessor:
         must(source_prefix_preimage(source_path) == source_before and not end_value)
@@ -1735,12 +1800,19 @@ def transport_config_schema(arguments):
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 def transport_list(arguments):
-    must(len(arguments) == 4)
-    source_path, tag, predecessor, output = arguments
+    must(len(arguments) == 5)
+    source_path, tag, predecessor, selector, output = arguments
     rows = transport_export_rows(source_path, predecessor, tag) if predecessor else transport_rows(transport_repository(source_path, True), tag, partial=True)[1]
-    transport_write_result(output, {"Rows": transport_patch_records(rows), "Result": "Listed"})
+    groups = transport_groups(rows)
+    if selector:
+        selected = next((group for group in groups if transport_group_selector(group) == selector), None)
+        if selected is None or selected[1] == "Transform":
+            raise LaneStructureError(selector, "Selection", "an existing Unit or Flat Patch", selector)
+        visible = {selector, *selected[3][0][9]["Requires"]}
+        groups = [group for group in groups if transport_group_selector(group) in visible]
+    transport_write_result(output, {"Rows": [transport_patch_record(group, bool(selector)) for group in groups], "Result": "Listed"})
 
-def transport_patch_record(group):
+def transport_patch_record(group, include_contract=False):
     lane, kind, name, members = group
     record = {"Form": members[0][6], "Kind": kind, "Lane": lane, "Segment": members[0][7]}
     if kind == "FlatPatch":
@@ -1749,6 +1821,8 @@ def transport_patch_record(group):
         record.update(Unit=name, ChildPatches=[row[5] for row in members])
     else:
         record.update(Transform=name, TransformPatch=members[0][5])
+    if include_contract:
+        record["Contract"] = members[0][9]
     return record
 
 def transport_patch_records(rows):
@@ -1811,7 +1885,7 @@ def transport_apply_unit(source, target, members, rustfmt, asset_root, formatter
                 return "Patch Rust formatting failed"
             target.run("add", "-A")
             change_class(target, row[2], row[6], row[7])
-            metadata_commit(target, *row[2:8])
+            metadata_commit(target, *row[2:8], contract=row[9])
             applied += 1
         failure = transport_chrome(target, asset_root, True)
         if failure:
@@ -1834,16 +1908,16 @@ def transport_replay_materialized(target, members, patches, artifacts, rustfmt):
         finding = git_diff_finding(row, artifact, staged_patch_bytes(target, "HEAD"))
         if finding:
             return False, finding
-        metadata_commit(target, *row[2:8])
+        metadata_commit(target, *row[2:8], contract=row[9])
     return True, None
 
 def transport_revise(arguments):
-    must(len(arguments) == 13)
-    target_path, tag, lane, patch_kind, group, patch, form, segment, rustfmt, asset_root, child_patch_sequence, terminal_selector, output = arguments
+    must(len(arguments) == 14)
+    target_path, tag, lane, patch_kind, group, patch, form, segment, rustfmt, asset_root, child_patch_sequence, terminal_selector, contract_data, output = arguments
     target = transport_repository(target_path, False)
     metadata = (lane, patch_kind, group, patch, form, segment)
     identity = f"{lane}/{group}"
-    git_diff = form == "GitDiff" and patch_kind in ("FlatPatch", "Unit") and lane in LANES and formal(group, lane, patch_kind) and formal(patch) and (patch_kind == "Unit") == bool(child_patch_sequence) and segment in lane_segments(lane)
+    git_diff = form == "GitDiff" and patch_kind in ("FlatPatch", "Unit") and lane in LANES and formal(group, lane) and formal(patch) and (patch_kind == "Unit") == bool(child_patch_sequence) and segment in lane_segments(lane)
     must(kind(rustfmt, REGULAR) and git_diff)
     _, rows = transport_rows(target, tag, partial=True)
     groups = transport_groups(rows)
@@ -1853,6 +1927,14 @@ def transport_revise(arguments):
     selected = [position for position, row in enumerate(reviewed[3]) if row[2:8] == metadata]
     must(transport_complete(reviewed, partial=patch_kind == "Unit") and len(selected) == 1)
     patch_index = selected[0]
+    contract = reviewed[3][patch_index][9]
+    if contract_data:
+        if patch_index != 0:
+            raise LaneStructureError(identity, "Contract", "replacement on the first commit only", patch)
+        contract = validate_contract(json.loads(contract_data, object_pairs_hook=unique_json_object), lane, identity)
+        original = reviewed[3][patch_index]
+        prospective = [(*row[:9], contract) if row is original else row for row in rows]
+        validate_history(prospective, partial=True)
     must(source_change_class(changed_paths(target), identity) == "source")
     declared = child_patch_sequence.split(", ") if child_patch_sequence else []
     committed = [row[5] for row in reviewed[3]]
@@ -1897,7 +1979,7 @@ def transport_revise(arguments):
             restore_original()
             transport_write_result(output, finding)
             return
-        metadata_commit(target, *metadata, amend=True)
+        metadata_commit(target, *metadata, amend=True, contract=contract)
         replayed, finding = transport_replay_materialized(target, suffix, patches, suffix_artifacts, rustfmt)
         if not replayed:
             restore_original()
@@ -1932,20 +2014,19 @@ def transport_revise(arguments):
         raise
 
 def transport_commit(arguments):
-    must(len(arguments) == 12)
+    must(len(arguments) == 13)
     target = transport_repository(arguments[0])
-    tag, lane, patch_kind, group, patch, form, segment, rustfmt, child_patch_sequence, skip_line_limit, output = arguments[1:]
+    tag, lane, patch_kind, group, patch, form, segment, rustfmt, child_patch_sequence, skip_line_limit, contract_data, output = arguments[1:]
     must(kind(rustfmt, REGULAR) and form == "GitDiff" and skip_line_limit in ("true", "false"))
     metadata = (lane, patch_kind, group, patch, form, segment)
     identity = f"{lane}/{group}"
+    contract = validate_contract(json.loads(contract_data, object_pairs_hook=unique_json_object), lane, identity) if contract_data else None
     result = {**transport_result_identity(patch_kind, lane, group, patch), "Result": "Committed"}
     def reject(field, expected, actual):
         transport_write_result(output, {**result, "Result": "Input", "Output": str(RollInputError(identity, field, expected, actual))})
-    if lane == "mixed" and patch_kind != "Unit":
-        return reject("PatchKind", "Unit", patch_kind)
-    if lane == "draft" and patch_kind == "Unit" and not formal(group, lane, patch_kind):
-        return reject("UnitName", "[a-z][a-z0-9]*", group)
-    must(patch_kind in ("FlatPatch", "Unit") and lane in LANES and formal(group, lane, patch_kind) and formal(patch) and (patch_kind == "FlatPatch") == (group == patch) and segment in lane_segments(lane))
+    if not formal(group, lane):
+        return reject("UnitName" if patch_kind == "Unit" else "FlatPatchName", "a nonreserved hyphenated lowercase name without an ordinal", group)
+    must(patch_kind in ("FlatPatch", "Unit") and lane in LANES and formal(patch) and (patch_kind == "FlatPatch") == (group == patch) and segment in lane_segments(lane))
     declared = child_patch_sequence.split(", ") if child_patch_sequence else []
     must(patch_kind == "FlatPatch" and not declared or patch_kind == "Unit" and len(declared) >= 2 and len(declared) == len(set(declared)) and all(formal(child) for child in declared))
     _, rows = transport_rows(target, tag, partial=True)
@@ -1957,12 +2038,13 @@ def transport_commit(arguments):
     current = [row[5] for row in group_rows]
     must(patch_kind == "FlatPatch" or current == declared[:len(current)])
     if clean and rows and rows[-1][2:8] == metadata:
+        if rows[-1][9] != contract:
+            return reject("Contract", "the committed contract", contract)
         transport_write_result(output, result)
         return
     must(not clean)
     paths = changed_paths(target)
-    if segment != "schema" and any(path == PROTOCOL_ROOT or path.startswith(PROTOCOL_ROOT + "/") for path in paths):
-        return reject("Segment", "schema for protocol source", segment)
+    validate_protocol_segment(paths, lane, segment, identity)
     if same_group:
         must(patch_kind == "Unit" and patch not in current and current + [patch] == declared[:len(current) + 1])
     else:
@@ -1970,12 +2052,12 @@ def transport_commit(arguments):
         must(patch_kind == "FlatPatch" or patch == declared[0])
     classification = source_change_class(paths, identity)
     must(classification == "source")
-    prospective = rows + [("new", "HEAD", *metadata, classification)]
+    prospective = rows + [("new", "HEAD", *metadata, classification, contract)]
     validate_history(prospective, partial=True)
     snapshot = transport_dirty_snapshot(target, identity)
 
     def restore_input():
-        revision = "HEAD^" if target.clean() and fields(target, "HEAD") == metadata else "HEAD"
+        revision = "HEAD^" if target.clean() and fields(target, "HEAD") == (*metadata, contract) else "HEAD"
         transport_restore_dirty(target, revision, snapshot, identity)
 
     signal.signal(signal.SIGTERM, transport_interrupt)
@@ -1994,7 +2076,7 @@ def transport_commit(arguments):
             restore_input()
             transport_write_result(output, finding)
             return
-        metadata_commit(target, *metadata)
+        metadata_commit(target, *metadata, contract=contract)
         transport_rows(target, tag, partial=True)
         transport_write_result(output, result)
     except BaseException:
@@ -2055,12 +2137,13 @@ def transport_export(arguments):
     before = export_preimage(private, tag) if private else None
     lane_directories = {name.split("/", 1)[0] for name, _ in projected}
     lanes = [lane for lane in LANES if lane_path(lane) in lane_directories]
-    notes_root = join(scratch, "lane-notes", tag)
-    notes = release_notes(notes_root, lanes)
-    missing_notes = {"notes.md", *(join(lane_path(lane), "notes.md") for lane in lanes)} - notes.keys()
+    documents_root = join(scratch, "lane-notes", tag)
+    documents = release_documents(documents_root, lanes)
+    require_cross_diagram(documents, lanes)
+    missing_notes = {"notes.md", *(join(lane_path(lane), "notes.md") for lane in lanes)} - documents.keys()
     if missing_notes:
-        raise RuntimeError("missing working notes under " + notes_root + ": " + ", ".join(sorted(missing_notes)))
-    projected = tuple(sorted((*projected, *notes.items())))
+        raise RuntimeError("missing working notes under " + documents_root + ": " + ", ".join(sorted(missing_notes)))
+    projected = tuple(sorted((*projected, *documents.items())))
     clone_seed = ""
     if private is None:
         working_repository = transport_repository(working)
@@ -2099,7 +2182,7 @@ def transport_export(arguments):
         must((previous_contents if exists(previous) else None) == dict(staged_before[1])[tag])
         must(source.clean() and source.text("rev-parse", "HEAD") == head)
         must(export_preimage(private, tag) == before if private else not exists(private_root))
-        must(release_notes(notes_root, lanes) == notes)
+        must(release_documents(documents_root, lanes) == documents)
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
             if private:
@@ -2359,30 +2442,30 @@ def release_baseline_start(arguments):
     must((source_before is None and not exists(source_root) or source_before is not None and source_prefix_preimage(source_root) == source_before) and regular_bytes(task_path) == task_before and regular_bytes(index_path) == index_before)
     transport_write_result(output, {"Bootstrap": bootstrap, "PredecessorTag": predecessor, "Ready": False, "Result": "Started"})
 
-def release_retire_notes(working, scratch, tag):
-    notes_root = join(scratch, "lane-notes", tag)
-    if not os.path.lexists(notes_root):
+def release_retire_documents(working, scratch, tag):
+    documents_root = join(scratch, "lane-notes", tag)
+    if not os.path.lexists(documents_root):
         return
-    notes = working_release_notes(notes_root)
+    documents = working_release_documents(documents_root)
     published = join(working, "build", "patches", "private", tag)
     if exists(published):
         private = transport_repository(dir_name(published))
         must(private.branch() == "main" and valid_export_commit(private, tag))
-    published_notes = release_notes(published)
-    if any(data != published_notes.get(path, b"") for path, data in notes.items()):
-        raise RuntimeError("working notes differ from the final export; cleanup retained drafts")
-    must(working_release_notes(notes_root) == notes)
-    for relative, data in sorted(notes.items()):
-        path = join(notes_root, relative)
+    published_documents = release_documents(published)
+    if any(data != published_documents.get(path, b"") for path, data in documents.items()):
+        raise RuntimeError("working documents differ from the final export; cleanup retained drafts")
+    must(working_release_documents(documents_root) == documents)
+    for relative, data in sorted(documents.items()):
+        path = join(documents_root, relative)
         must(regular_bytes(path) == data)
         os.unlink(path)
         sync_parent(path)
-    if os.path.lexists(notes_root):
-        must(working_release_notes(notes_root) == {})
-        for directory in sorted(os.listdir(notes_root)):
-            os.rmdir(join(notes_root, directory))
-        os.rmdir(notes_root)
-        sync_parent(notes_root)
+    if os.path.lexists(documents_root):
+        must(working_release_documents(documents_root) == {})
+        for directory in sorted(os.listdir(documents_root)):
+            os.rmdir(join(documents_root, directory))
+        os.rmdir(documents_root)
+        sync_parent(documents_root)
 
 def release_baseline_cleanup(arguments):
     repository, working, scratch, records, tag, task_path, predecessor, main_path, upstream_path, task_before, index_path, index, index_before, next_index, output = release_inputs(arguments)
@@ -2391,7 +2474,7 @@ def release_baseline_cleanup(arguments):
     baselines, _ = release_read(join(scratch, "tasks", "rust-suite-baselines.json"))
     value = baselines.get(tag, {})
     must(set(value) == {"Established"} and value["Established"]["Selection"]["Tag"] == tag)
-    release_retire_notes(working, scratch, predecessor)
+    release_retire_documents(working, scratch, predecessor)
     transport_write_result(output, {"PredecessorTag": predecessor, "Result": "Cleaned"})
 
 def cleanup_temporary_roots(working, scratch, records, runtime):
@@ -2473,7 +2556,7 @@ def release_cleanup(arguments):
     must(private.branch() == "main" and valid_export_commit(private, tag))
     project_matches_export(main, transport_base(main, tag), join(private.path, tag))
     must(regular_bytes(index_path) == index_before)
-    release_retire_notes(working, scratch, tag)
+    release_retire_documents(working, scratch, tag)
     if next_text.encode() != index_before:
         release_replace(index_path, index_before, next_text.encode())
     if task_before:

@@ -1,0 +1,154 @@
+load-readable-models-from-cache-snapshot
+
+Lane: cross
+
+Unit: synchronize-model-catalog-with-official-membership
+
+ChildPatch: load-readable-models-from-cache-snapshot
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+Purpose: Serve personal-account model lists promptly from readable same-account snapshots and announce official online model membership changes in the TUI.
+
+Requires: Unit:cross/materialize-model-catalog-from-local-file
+
+Provides: Expose unfiltered cache snapshots for caller validation; prefer readable same-identity snapshots for Plus, Pro and ProLite ChatGPT model lists while retaining invalidation; observe successful applied online membership before local overlays; compare successive same-identity observations in the existing refresh worker and broadcast added and removed slugs; show one live TUI warning per nonempty delta without replay duplication.
+
+Boundary: Native provider requirements, auth identity, refresh admission, discovery opt-outs, failure policy, cadence and worker lifetime remain intact; other account types retain fresh-cache behavior; local catalog overlays and instruction files remain with their owners; cache reads and local edits do not become online observations, and notifications do not enter exec output.
+
+Verification: Cache and models-manager tests cover stale versions, identities, invalidation, scope and official-only observations; app-server model-list startup, refresh worker and broadcast tests cover prompt cached responses and deltas; TUI tests cover warning transcript and popup rendering, replay suppression and mode scope.
+
+CrossGroup: model-catalog
+
+
+diff --git a/codex-rs/core/tests/suite/injected_models_cache.rs b/codex-rs/core/tests/suite/injected_models_cache.rs
+--- a/codex-rs/core/tests/suite/injected_models_cache.rs
++++ b/codex-rs/core/tests/suite/injected_models_cache.rs
+@@ -82,6 +82,24 @@ impl ModelsCache for TestModelsCache {
+         })
+     }
+ 
++    fn load_any(
++        &self,
++    ) -> ModelsCacheFuture<'_, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
++        Box::pin(async move {
++            if self.load_error {
++                Err(ModelsCacheError::new("test load failure"))
++            } else {
++                Ok(self
++                    .stored_entries
++                    .lock()
++                    .expect("stored entries lock should not be poisoned")
++                    .last()
++                    .cloned()
++                    .or_else(|| self.entry.clone()))
++            }
++        })
++    }
++
+     fn store<'a>(
+         &'a self,
+         entry: &'a ModelsCacheEntry,
+diff --git a/codex-rs/models-manager/src/cache.rs b/codex-rs/models-manager/src/cache.rs
+--- a/codex-rs/models-manager/src/cache.rs
++++ b/codex-rs/models-manager/src/cache.rs
+@@ -33,6 +33,11 @@ pub trait ModelsCache: fmt::Debug + Send + Sync {
+         client_version: &'a str,
+     ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>>;
+ 
++    /// Read a persisted entry without freshness or client-version filtering.
++    /// Callers must validate its provider/auth identity before using it.
++    fn load_any(&self)
++    -> ModelsCacheFuture<'_, Result<Option<ModelsCacheEntry>, ModelsCacheError>>;
++
+     /// Stores `entry`, replacing the snapshot for this cache implementation's lookup identity.
+     ///
+     /// The implementation derives that identity from its own configuration and the entry metadata.
+@@ -73,7 +78,8 @@ pub struct ModelsCacheEntry {
+     pub etag: Option<String>,
+     /// Client version for which this catalog was returned.
+     ///
+-    /// The models manager rejects entries whose value is absent or differs from its current version.
++    /// Fresh-cache reads reject absent or mismatched versions. Snapshot reads preserve this value
++    /// so their caller can apply its own version policy.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub client_version: Option<String>,
+     /// Opaque provider and auth identity. Unscoped legacy entries are cache misses.
+@@ -150,6 +156,12 @@ impl ModelsCache for FileModelsCache {
+         )
+     }
+ 
++    fn load_any(
++        &self,
++    ) -> ModelsCacheFuture<'_, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
++        Box::pin(async move { load_file(&self.cache_path).await.map_err(cache_error) })
++    }
++
+     fn store<'a>(
+         &'a self,
+         entry: &'a ModelsCacheEntry,
+@@ -249,3 +261,7 @@ async fn save_file(cache_path: &PathBuf, cache: &ModelsCacheEntry) -> Result<(),
+ fn cache_error(error: impl fmt::Display) -> ModelsCacheError {
+     ModelsCacheError::new(error.to_string())
+ }
++
++#[cfg(test)]
++#[path = "cache_tests.rs"]
++mod tests;
+diff --git a/codex-rs/models-manager/src/cache_tests.rs b/codex-rs/models-manager/src/cache_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/models-manager/src/cache_tests.rs
+@@ -0,0 +1,29 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use tempfile::tempdir;
++
++#[tokio::test]
++async fn load_any_preserves_stale_versioned_identity_for_caller_validation() {
++    let codex_home = tempdir().expect("temp dir");
++    let cache = FileModelsCache::new(
++        codex_home.path().join("models_cache.json"),
++        Duration::from_secs(60),
++    );
++    let entry = ModelsCacheEntry {
++        fetched_at: Utc::now() - chrono::Duration::hours(1),
++        etag: None,
++        client_version: Some("old-version".to_string()),
++        identity: Some("provider/account".to_string()),
++        models: Vec::new(),
++    };
++    cache.store(&entry).await.expect("write cache");
++
++    assert!(
++        cache
++            .load("new-version")
++            .await
++            .expect("fresh read")
++            .is_none()
++    );
++    assert_eq!(cache.load_any().await.expect("snapshot read"), Some(entry));
++}
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -154,6 +154,17 @@ impl ModelsCache for TestModelsCache {
+         })
+     }
+ 
++    fn load_any(
++        &self,
++    ) -> ModelsCacheFuture<'_, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
++        Box::pin(async move {
++            if self.load_error {
++                return Err(ModelsCacheError::new("test load failure"));
++            }
++            Ok(self.entry.lock().expect("cache entry lock").clone())
++        })
++    }
++
+     fn store<'a>(
+         &'a self,
+         entry: &'a ModelsCacheEntry,

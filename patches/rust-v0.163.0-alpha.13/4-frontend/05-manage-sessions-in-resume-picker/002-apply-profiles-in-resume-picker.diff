@@ -1,0 +1,1503 @@
+apply-profiles-in-resume-picker
+
+Lane: frontend
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: apply-profiles-in-resume-picker
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -976,16 +976,28 @@ impl TurnRequestProcessor {
+             .await?;
+ 
+         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
++            let (reply, applied) = oneshot::channel();
+             self.submit_core_op(
+                 request_id,
+                 thread.as_ref(),
+                 Op::ThreadSettings {
+                     thread_settings,
+-                    reply: None,
++                    reply: Some(reply),
+                 },
+             )
+             .await
+             .map_err(|err| internal_error(format!("failed to update thread settings: {err}")))?;
++            applied
++                .await
++                .map_err(|_| internal_error("thread settings operation ended before replying"))?
++                .map_err(|err| {
++                    internal_error(format!("failed to update thread settings: {err}"))
++                })?;
++            // The change-only notification cannot acknowledge an unchanged update.
++            // Checkpoint under Core's persistence permit before reporting success.
++            thread.checkpoint_thread_settings().await.map_err(|err| {
++                internal_error(format!("failed to persist thread settings: {err}"))
++            })?;
+         }
+ 
+         Ok(ThreadSettingsUpdateResponse {})
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -1,3 +1,4 @@
++use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::path::Path;
+@@ -72,9 +73,39 @@ use tracing::warn;
+ use unicode_width::UnicodeWidthStr;
+ use uuid::Uuid;
+ 
++#[cfg(test)]
++fn test_picker() -> (PickerState, Arc<std::sync::Mutex<Vec<PickerLoadRequest>>>) {
++    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
++    let sink = Arc::clone(&requests);
++    let state = PickerState::new(
++        FrameRequester::test_dummy(),
++        Arc::new(move |request| sink.lock().unwrap().push(request)),
++        ProviderFilter::Any,
++        true,
++        None,
++        SessionPickerAction::Resume,
++    );
++    (state, requests)
++}
++
++#[cfg(test)]
++fn test_row(thread_id: ThreadId) -> Row {
++    Row {
++        path: None,
++        preview: "session".into(),
++        thread_id: Some(thread_id),
++        thread_name: None,
++        created_at: None,
++        updated_at: None,
++        cwd: None,
++        git_branch: None,
++    }
++}
++
+ mod archive;
+ mod layout;
+ mod page_loading;
++mod profiles;
+ mod title_generation;
+ 
+ #[cfg(test)]
+@@ -198,6 +229,13 @@ enum PickerLoadRequest {
+     Unarchive {
+         thread_id: ThreadId,
+     },
++    ApplyProfile {
++        thread_id: ThreadId,
++        codex_home: PathBuf,
++        slot: u8,
++        archived: bool,
++        is_current: bool,
++    },
+ }
+ 
+ #[derive(Clone)]
+@@ -318,6 +356,12 @@ enum BackgroundEvent {
+         thread_id: ThreadId,
+         result: std::io::Result<SessionTarget>,
+     },
++    ProfileApplied {
++        thread_id: ThreadId,
++        status: SessionStatus,
++        thread: Option<Box<Thread>>,
++        result: std::io::Result<()>,
++    },
+ }
+ 
+ #[derive(Clone)]
+@@ -478,6 +522,7 @@ async fn run_resume_picker_with_launch_context(
+     };
+     run_session_picker_with_loader(
+         tui,
++        uses_remote_filesystem,
+         options,
+         spawn_app_server_page_loader(
+             uses_remote_filesystem,
+@@ -540,6 +585,7 @@ pub async fn run_fork_picker_with_app_server(
+     };
+     run_session_picker_with_loader(
+         tui,
++        uses_remote_filesystem,
+         options,
+         spawn_app_server_page_loader(
+             uses_remote_filesystem,
+@@ -557,6 +603,7 @@ pub async fn run_fork_picker_with_app_server(
+ 
+ async fn run_session_picker_with_loader(
+     tui: &mut Tui,
++    uses_remote_filesystem: bool,
+     options: SessionPickerRunOptions,
+     picker_loader: PickerLoader,
+     bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
+@@ -582,10 +629,24 @@ async fn run_session_picker_with_loader(
+     state.launch_context = options.launch_context;
+     state.initial_page_mode = options.initial_page_mode;
+     state.start_initial_load();
++    if matches!(state.action, SessionPickerAction::Resume)
++        && !uses_remote_filesystem
++        && let Some(persistence) = &state.view_persistence
++    {
++        match profiles::load(&persistence.codex_home).await {
++            Ok(profiles) => {
++                state.profile_names = profiles
++                    .into_iter()
++                    .map(|(slot, profile)| (slot, profile.name))
++                    .collect();
++            }
++            Err(error) => state.inline_error = Some(format!("Could not load profiles: {error:#}")),
++        }
++    }
+     state.request_frame();
+ 
+     if let Ok(size) = alt.tui.terminal.size() {
+-        let list_height = usize::from(layout::areas(Rect::from(size)).list.height);
++        let list_height = usize::from(layout::areas(Rect::from(size), &state).list.height);
+         state.update_viewport(list_height, list_viewport_width(size.width));
+         state.ensure_minimum_rows_for_view(list_height);
+     }
+@@ -633,7 +694,7 @@ async fn run_session_picker_with_loader(
+                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
+                         let list_width = list_viewport_width(screen_size.width);
+                         let list_height =
+-                            usize::from(layout::areas(Rect::from(screen_size)).list.height);
++                            usize::from(layout::areas(Rect::from(screen_size), &state).list.height);
+                         state.update_viewport(list_height, list_width);
+                         state.ensure_minimum_rows_for_view(list_height);
+                         draw_picker(alt.tui, &state, screen_size)?;
+@@ -809,6 +870,49 @@ fn spawn_app_server_page_loader(
+                         .map_err(std::io::Error::other);
+                     let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
+                 }
++                PickerLoadRequest::ApplyProfile {
++                    thread_id,
++                    codex_home,
++                    slot,
++                    mut archived,
++                    is_current,
++                } => {
++                    let mut result = profiles::apply(
++                        &mut app_server,
++                        thread_id,
++                        &codex_home,
++                        slot,
++                        &mut archived,
++                        is_current,
++                    )
++                    .await
++                    .map_err(std::io::Error::other);
++                    // Read only the changed session, including effects committed before an error.
++                    let thread = match app_server.thread_read(thread_id, false).await {
++                        Ok(thread) => Some(Box::new(thread)),
++                        Err(error) => {
++                            result = Err(std::io::Error::other(match result {
++                                Ok(()) => format!(
++                                    "profile saved, but could not refresh session: {error:#}"
++                                ),
++                                Err(previous) => {
++                                    format!("{previous}; could not refresh session: {error:#}")
++                                }
++                            }));
++                            None
++                        }
++                    };
++                    let _ = bg_tx.send(BackgroundEvent::ProfileApplied {
++                        thread_id,
++                        status: if archived {
++                            SessionStatus::Archived
++                        } else {
++                            SessionStatus::Active
++                        },
++                        thread,
++                        result,
++                    });
++                }
+             }
+         }
+         if let Err(err) = app_server.shutdown().await {
+@@ -888,6 +992,8 @@ struct PickerState {
+     action: SessionPickerAction,
+     sort_key: ThreadSortKey,
+     inline_error: Option<String>,
++    profile_pending: Option<(ThreadId, u8)>,
++    profile_names: BTreeMap<u8, String>,
+     archive_state: archive::ArchiveState,
+     expanded_thread_id: Option<ThreadId>,
+     transcript_previews: HashMap<ThreadId, TranscriptPreviewState>,
+@@ -1000,10 +1106,10 @@ enum SeenRowKey {
+ 
+ impl Row {
+     fn seen_key(&self) -> Option<SeenRowKey> {
+-        if let Some(path) = self.path.clone() {
+-            return Some(SeenRowKey::Path(path));
++        if let Some(thread_id) = self.thread_id {
++            return Some(SeenRowKey::Thread(thread_id));
+         }
+-        self.thread_id.map(SeenRowKey::Thread)
++        self.path.clone().map(SeenRowKey::Path)
+     }
+ 
+     fn display_preview(&self) -> &str {
+@@ -1090,6 +1196,8 @@ impl PickerState {
+             action,
+             sort_key: ThreadSortKey::UpdatedAt,
+             inline_error: None,
++            profile_pending: None,
++            profile_names: BTreeMap::new(),
+             archive_state: archive::ArchiveState::default(),
+             expanded_thread_id: None,
+             transcript_previews: HashMap::new(),
+@@ -1265,6 +1373,11 @@ impl PickerState {
+         // runtime keymap below.
+         let allow_plain_char_navigation = !is_plain_text_key_event(key);
+         match key {
++            KeyEvent {
++                code: KeyCode::Char(digit @ '0'..='9'),
++                modifiers: KeyModifiers::ALT,
++                ..
++            } => self.request_profile(digit as u8 - b'0'),
+             KeyEvent {
+                 code: KeyCode::Char('c'),
+                 modifiers,
+@@ -1321,7 +1434,8 @@ impl PickerState {
+                 self.toggle_density().await;
+             }
+             _ if self.keymap.list.accept.is_pressed(key)
+-                && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
++                && (!matches!(self.archive_state, archive::ArchiveState::Idle)
++                    || self.profile_pending.is_some()) => {}
+             _ if self.keymap.list.accept.is_pressed(key) => {
+                 if let Some(row) = self.filtered_rows.get(self.selected) {
+                     let path = row.path.clone();
+@@ -1428,6 +1542,7 @@ impl PickerState {
+                 self.set_query(new_query);
+             }
+             _ if self.archive_shortcut_available()
++                && self.profile_pending.is_none()
+                 && crate::key_hint::ctrl(KeyCode::Char('a')).is_press(key) =>
+             {
+                 self.request_archive_for_selected_session();
+@@ -1605,6 +1720,15 @@ impl PickerState {
+             BackgroundEvent::Unarchive { thread_id, result } => {
+                 return Ok(self.handle_unarchive_result(thread_id, result));
+             }
++            BackgroundEvent::ProfileApplied {
++                thread_id,
++                status,
++                thread,
++                result,
++            } => {
++                self.apply_session_mutation(thread_id, status, thread.map(|thread| *thread));
++                self.finish_profile(thread_id, result);
++            }
+         }
+         Ok(None)
+     }
+@@ -1668,6 +1792,10 @@ impl PickerState {
+ 
+     fn apply_filter(&mut self) {
+         self.chord_matcher.cancel();
++        let selected_key = self
++            .filtered_rows
++            .get(self.selected)
++            .and_then(Row::seen_key);
+         let base_iter = self
+             .all_rows
+             .iter()
+@@ -1678,6 +1806,14 @@ impl PickerState {
+             let q = self.query.to_lowercase();
+             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
+         }
++        if let Some(selected_key) = selected_key
++            && let Some(index) = self
++                .filtered_rows
++                .iter()
++                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
++        {
++            self.selected = index;
++        }
+         if self.selected >= self.filtered_rows.len() {
+             self.selected = self.filtered_rows.len().saturating_sub(1);
+         }
+@@ -1721,8 +1857,9 @@ impl PickerState {
+             return;
+         }
+         self.query = new_query;
+-        self.selected = 0;
+         self.apply_filter();
++        self.selected = 0;
++        self.ensure_selected_visible();
+         if self.query.is_empty() {
+             self.search_state = SearchState::Idle;
+             return;
+@@ -1741,23 +1878,9 @@ impl PickerState {
+     }
+ 
+     fn clear_query_preserving_selection(&mut self) {
+-        let selected_key = self
+-            .filtered_rows
+-            .get(self.selected)
+-            .and_then(Row::seen_key);
+         self.query.clear();
+         self.search_state = SearchState::Idle;
+         self.apply_filter();
+-        if let Some(selected_key) = selected_key
+-            && let Some(index) = self
+-                .filtered_rows
+-                .iter()
+-                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
+-        {
+-            self.selected = index;
+-            self.ensure_selected_visible();
+-            self.request_frame();
+-        }
+     }
+ 
+     fn continue_search_if_needed(&mut self) {
+@@ -2580,10 +2703,18 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
+         });
+     }
+ 
+-    vec![
++    let mut lines = vec![
+         hint_line_for_row(&first_row_hints, width),
+         hint_line_for_row(&second_row_hints, width),
+-    ]
++    ];
++    if matches!(state.action, SessionPickerAction::Resume) {
++        lines.extend(profiles::hint_lines(
++            &state.profile_names,
++            width,
++            state.profile_pending.map(|(_, slot)| slot),
++        ));
++    }
++    lines
+ }
+ 
+ fn hint_line_for_row(hints: &[PickerFooterHint], width: u16) -> Line<'static> {
+diff --git a/codex-rs/tui/src/resume_picker/archive.rs b/codex-rs/tui/src/resume_picker/archive.rs
+--- a/codex-rs/tui/src/resume_picker/archive.rs
++++ b/codex-rs/tui/src/resume_picker/archive.rs
+@@ -1,18 +1,4 @@
+-use codex_protocol::ThreadId;
+-use crossterm::event::KeyCode;
+-use crossterm::event::KeyEvent;
+-use crossterm::event::KeyModifiers;
+-
+-use super::LoadTrigger;
+-use super::PickerLoadRequest;
+-use super::PickerState;
+-use super::Row;
+-use super::SearchState;
+-use super::SessionPickerAction;
+-use super::SessionPickerLaunchContext;
+-use super::SessionSelection;
+-use super::SessionStatus;
+-use super::SessionTarget;
++use super::*;
+ use crate::keymap::KeymapContext;
+ 
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+@@ -92,39 +78,63 @@ impl PickerState {
+             return;
+         }
+ 
+-        let selected_key = self
+-            .filtered_rows
+-            .get(self.selected)
+-            .filter(|row| row.thread_id != Some(thread_id))
+-            .and_then(Row::seen_key);
+-
+-        self.all_rows.retain(|row| row.thread_id != Some(thread_id));
+-        // Keep the seen-row key as a tombstone so an older page that is already
+-        // in flight cannot put the archived session back into the picker.
+-        self.transcript_previews.remove(&thread_id);
+-        self.transcript_cells.remove(&thread_id);
+-        if self.expanded_thread_id == Some(thread_id) {
+-            self.expanded_thread_id = None;
+-        }
+-        if self.pending_transcript_open == Some(thread_id) {
+-            self.pending_transcript_open = None;
+-            if let Some(cancellation) = self.pending_transcript_cancellation.take() {
+-                let _ = cancellation.send(());
+-            }
+-            self.transcript_loading_frame_shown = false;
+-        }
+         self.inline_error = None;
+-        self.apply_filter();
++        self.apply_session_mutation(thread_id, SessionStatus::Archived, None);
++    }
+ 
+-        if let Some(selected_key) = selected_key
+-            && let Some(selected) = self
+-                .filtered_rows
++    pub(super) fn apply_session_mutation(
++        &mut self,
++        thread_id: ThreadId,
++        status: SessionStatus,
++        thread: Option<Thread>,
++    ) {
++        // Native Archive owns descendant effects. The picker lists resumable root
++        // sources, never SubAgent threads, so only this row can be visible here.
++        if status == self.status {
++            let Some(thread) = thread else { return };
++            let Some(index) = self
++                .all_rows
+                 .iter()
+-                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
+-        {
+-            self.selected = selected;
+-            self.ensure_selected_visible();
++                .position(|row| row.thread_id == Some(thread_id))
++            else {
++                // A filter switch owns its new listing; do not insert a row outside that listing.
++                return;
++            };
++            self.thread_history_modes
++                .insert(thread_id, thread.history_mode);
++            let Some(row) = row_from_app_server_thread(thread) else {
++                return;
++            };
++            if let Some(cwd) = &row.cwd {
++                self.local_cwd_matches
++                    .insert(cwd.clone(), self.row_matches_local_cwd(&row));
++            }
++            self.all_rows[index] = row;
++            self.all_rows.sort_by_key(|row| {
++                std::cmp::Reverse(match self.sort_key {
++                    ThreadSortKey::CreatedAt => row.created_at,
++                    _ => row.updated_at,
++                })
++            });
++        } else {
++            self.all_rows.retain(|row| row.thread_id != Some(thread_id));
++            self.thread_history_modes.remove(&thread_id);
++            self.transcript_previews.remove(&thread_id);
++            self.transcript_cells.remove(&thread_id);
++            if self.expanded_thread_id == Some(thread_id) {
++                self.expanded_thread_id = None;
++            }
++            if self.pending_transcript_open == Some(thread_id) {
++                self.pending_transcript_open = None;
++                if let Some(cancellation) = self.pending_transcript_cancellation.take() {
++                    let _ = cancellation.send(());
++                }
++                self.transcript_loading_frame_shown = false;
++            }
+         }
++        // A page requested before this mutation must not restore an old path or old metadata.
++        self.seen_rows.insert(SeenRowKey::Thread(thread_id));
++        self.apply_filter();
+         if self.filtered_rows.is_empty()
+             && !self.query.is_empty()
+             && self.pagination.next_cursor.is_some()
+@@ -172,3 +182,7 @@ impl PickerState {
+ #[cfg(test)]
+ #[path = "archive_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "mutation_tests.rs"]
++mod mutation_tests;
+diff --git a/codex-rs/tui/src/resume_picker/layout.rs b/codex-rs/tui/src/resume_picker/layout.rs
+--- a/codex-rs/tui/src/resume_picker/layout.rs
++++ b/codex-rs/tui/src/resume_picker/layout.rs
+@@ -23,12 +23,13 @@ pub(super) struct PickerAreas {
+     footer: Rect,
+ }
+ 
+-pub(super) fn areas(area: Rect) -> PickerAreas {
+-    const FIXED_CHROME_ROWS: u16 = 7;
++pub(super) fn areas(area: Rect, state: &PickerState) -> PickerAreas {
+     const MIN_LIST_ROWS: u16 = 6;
++    let footer_rows = 1 + super::footer_hint_lines(state, area.width).len().max(3) as u16;
++    let fixed_chrome_rows = 3 + footer_rows;
+     let gaps = area
+         .height
+-        .saturating_sub(FIXED_CHROME_ROWS + MIN_LIST_ROWS)
++        .saturating_sub(fixed_chrome_rows + MIN_LIST_ROWS)
+         .min(/*other*/ 3);
+     let [header, _, toolbar, _, search, _, list, footer] = Layout::vertical([
+         Constraint::Length(1),
+@@ -37,8 +38,8 @@ pub(super) fn areas(area: Rect) -> PickerAreas {
+         Constraint::Length(u16::from(gaps >= 2)),
+         Constraint::Length(1),
+         Constraint::Length(u16::from(gaps >= 1)),
+-        Constraint::Min(area.height.saturating_sub(FIXED_CHROME_ROWS + gaps)),
+-        Constraint::Length(4),
++        Constraint::Min(area.height.saturating_sub(fixed_chrome_rows + gaps)),
++        Constraint::Length(footer_rows),
+     ])
+     .areas(area);
+     PickerAreas {
+@@ -57,7 +58,7 @@ pub(super) fn render(frame: &mut crate::custom_terminal::Frame, state: &PickerSt
+         search,
+         list,
+         footer,
+-    } = areas(frame.area());
++    } = areas(frame.area(), state);
+     let chrome = |area: Rect| {
+         Rect::new(
+             area.x.saturating_add(/*rhs*/ 1),
+diff --git a/codex-rs/tui/src/resume_picker/mutation_tests.rs b/codex-rs/tui/src/resume_picker/mutation_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/resume_picker/mutation_tests.rs
+@@ -0,0 +1,52 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn mutations_keep_large_list_selection_cursor_and_stale_page_tombstones() {
++    for (listed, changed) in [
++        (SessionStatus::Active, SessionStatus::Archived),
++        (SessionStatus::Archived, SessionStatus::Active),
++    ] {
++        let (mut state, requests) = test_picker();
++        state.status = listed;
++        let rows = (0..2_000)
++            .map(|index| Row {
++                path: Some(PathBuf::from(format!("/sessions/{index}"))),
++                ..test_row(ThreadId::new())
++            })
++            .collect::<Vec<_>>();
++        let removed = rows[1_000].clone();
++        let selected = rows[1_500].clone();
++        state.ingest_page(PickerPage {
++            rows,
++            history_modes: HashMap::new(),
++            next_cursor: Some(PageCursor::AppServer("older".into())),
++            num_scanned_files: 2_000,
++            reached_scan_cap: false,
++        });
++        state.selected = 1_500;
++        state.scroll_top = 1_490;
++        state.apply_session_mutation(removed.thread_id.unwrap(), changed, None);
++        assert_eq!(state.filtered_rows.len(), 1_999);
++        assert_eq!(state.filtered_rows[state.selected], selected);
++        assert_eq!(state.scroll_top, 1_490);
++        assert_eq!(state.pagination.num_scanned_files, 2_000);
++        assert!(
++            matches!(&state.pagination.next_cursor, Some(PageCursor::AppServer(cursor)) if cursor == "older")
++        );
++        assert!(requests.lock().unwrap().is_empty());
++
++        let mut changed_path = removed.clone();
++        changed_path.path = Some(PathBuf::from("/another/path"));
++        state.ingest_page(PickerPage {
++            rows: vec![removed, changed_path],
++            history_modes: HashMap::new(),
++            next_cursor: None,
++            num_scanned_files: 2,
++            reached_scan_cap: false,
++        });
++        assert_eq!(state.filtered_rows.len(), 1_999);
++        assert_eq!(state.filtered_rows[state.selected], selected);
++        assert!(requests.lock().unwrap().is_empty());
++    }
++}
+diff --git a/codex-rs/tui/src/resume_picker/profile_tests.rs b/codex-rs/tui/src/resume_picker/profile_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/resume_picker/profile_tests.rs
+@@ -0,0 +1,526 @@
++use super::*;
++use crate::legacy_core::config::ConfigBuilder;
++use app_test_support::create_fake_paginated_rollout;
++use codex_app_server_protocol::ThreadResumeParams;
++use codex_app_server_protocol::ThreadResumeResponse;
++use codex_app_server_protocol::ThreadUnsubscribeParams;
++use codex_app_server_protocol::ThreadUnsubscribeResponse;
++use codex_app_server_protocol::ThreadUnsubscribeStatus;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ThreadSettingsSnapshot;
++use codex_rollout::RolloutItem;
++use codex_rollout::RolloutRecorder;
++use core_test_support::responses;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn create_profile_rollout(home: &Path, preview: &str) -> ThreadId {
++    let id = create_fake_paginated_rollout(
++        home,
++        "2025-01-05T12-00-00",
++        "2025-01-05T12:00:00Z",
++        preview,
++        Some("profile-test"),
++        None,
++    )
++    .expect("create paginated profile fixture");
++    ThreadId::from_string(&id).expect("fixture thread ID")
++}
++
++async fn apply(
++    server: &mut AppServerSession,
++    thread_id: ThreadId,
++    home: &Path,
++    slot: u8,
++    archived: &mut bool,
++    is_current: bool,
++) -> Result<()> {
++    tokio::time::timeout(
++        std::time::Duration::from_secs(20),
++        super::apply(server, thread_id, home, slot, archived, is_current),
++    )
++    .await?
++}
++
++async fn listed_profile(
++    server: &mut AppServerSession,
++    thread_id: ThreadId,
++    status: SessionStatus,
++) -> Result<Thread> {
++    let Some(name) = server.thread_read(thread_id, false).await?.name else {
++        panic!("profile fixture must remain named");
++    };
++    let mut params = thread_list_params(
++        None,
++        None,
++        status,
++        ProviderFilter::Any,
++        ThreadSortKey::UpdatedAt,
++        false,
++        false,
++    );
++    params.search_term = Some(name);
++    Ok(server
++        .thread_list(params)
++        .await?
++        .data
++        .into_iter()
++        .find(|thread| thread.id == thread_id.to_string())
++        .expect("saved session must appear in the requested native listing"))
++}
++
++fn saved_settings(items: &[RolloutItem]) -> &ThreadSettingsSnapshot {
++    items
++        .iter()
++        .rev()
++        .find_map(|item| match item {
++            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
++                Some(&event.thread_settings)
++            }
++            _ => None,
++        })
++        .expect("native settings checkpoint")
++}
++
++#[test]
++fn profiles_preserve_omitted_settings_and_reject_invalid_slots() -> Result<()> {
++    let profiles = parse_profiles(
++        r#"{"0":{"name":"review","title":"review changes"},"9":{"name":"deep","reasoning_effort":"high"}}"#,
++    )?;
++    assert!(profiles[&0].model.is_none());
++    assert!(profiles[&0].cwd.is_none());
++    assert_eq!(profiles[&9].reasoning_effort, Some(ReasoningEffort::High));
++    assert!(!profiles[&0].archive.unwrap_or(false));
++    let archive_only = parse_profiles(
++        r#"{"2":{"name":"archive","archive":true},"8":{"name":"restore","archive":false}}"#,
++    )?;
++    assert_eq!(archive_only[&2].archive, Some(true));
++    assert_eq!(archive_only[&8].archive, Some(false));
++    for invalid in [
++        r#"{"10":{"name":"bad","title":"invalid"}}"#,
++        r#"{"01":{"name":"bad","title":"invalid"}}"#,
++        r#"{"1":{"name":"bad"}}"#,
++        r#"{"1":{"name":"bad","title":" "}}"#,
++        r#"{"1":{"name":"bad","cwd":"relative"}}"#,
++        r#"{"1":{"name":"bad","reasoning_effort":""}}"#,
++        r#"{"1":{"name":"bad","modle":"misspelled"}}"#,
++        r#"{"1":{"name":"bad","archive":"true"}}"#,
++    ] {
++        assert!(parse_profiles(invalid).is_err(), "{invalid}");
++    }
++    Ok(())
++}
++
++#[test]
++fn profiles_skip_invalid_names_without_losing_valid_entries() -> Result<()> {
++    for entry in [
++        json!({"archive": true}),
++        json!({"name": null, "archive": true}),
++        json!({"name": 12, "archive": true}),
++        json!({"name": "", "archive": true}),
++        json!({"name": "two words", "archive": true}),
++        json!({"name": " padded ", "archive": true}),
++        json!({"name": "line\nbreak", "archive": true}),
++        json!({"name": "control\u{1b}", "archive": true}),
++    ] {
++        let profiles = parse_profiles(
++            &json!({
++                "0": {"name": "subora", "title": "subora translation", "archive": true},
++                "1": entry,
++                "9": {"name": "restore", "archive": false},
++            })
++            .to_string(),
++        )?;
++        assert_eq!(profiles.keys().copied().collect::<Vec<_>>(), vec![0, 9]);
++        assert_eq!(profiles[&0].name, "subora");
++        assert_eq!(profiles[&0].title.as_deref(), Some("subora translation"));
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn alt_digits_apply_to_the_selected_session_without_typing_or_resuming() -> Result<()> {
++    let (mut state, requests) = test_picker();
++    let thread_id = ThreadId::new();
++    state.view_persistence = Some(SessionPickerViewPersistence {
++        codex_home: PathBuf::from("/tmp/profile-home"),
++    });
++    state.filtered_rows.push(test_row(thread_id));
++    // Remote pickers do not load profiles; absent shortcuts must submit no request.
++    state
++        .handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT))
++        .await?;
++    assert!(requests.lock().unwrap().is_empty());
++    assert_eq!(state.profile_pending, None);
++    state.profile_names = (0..=9)
++        .map(|slot| (slot, format!("profile{slot}")))
++        .collect();
++    for slot in 0..=9 {
++        state.status = if slot % 2 == 0 {
++            SessionStatus::Active
++        } else {
++            SessionStatus::Archived
++        };
++        state.profile_pending = None;
++        let selection = state
++            .handle_key(KeyEvent::new(
++                KeyCode::Char(char::from(b'0' + slot)),
++                KeyModifiers::ALT,
++            ))
++            .await?;
++        assert!(selection.is_none());
++        assert_eq!(state.query, "");
++        assert_eq!(state.profile_pending, Some((thread_id, slot)));
++        let footer = footer_hint_lines(&state, 220);
++        assert_eq!(footer.len(), 3);
++        assert_eq!(
++            footer.last().unwrap().to_string().trim(),
++            format!("saving to profile profile{slot}")
++        );
++        assert!(matches!(
++            requests.lock().unwrap().pop(),
++            Some(PickerLoadRequest::ApplyProfile { thread_id: target, slot: selected, .. })
++                if target == thread_id && selected == slot
++        ));
++    }
++    assert!(
++        state
++            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
++            .await?
++            .is_none()
++    );
++    state.finish_profile(thread_id, Ok(()));
++    assert!(
++        footer_hint_lines(&state, 400)
++            .last()
++            .unwrap()
++            .to_string()
++            .contains("alt+9 apply profile profile9")
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn profile_settings_survive_reopen_without_a_model_turn() -> Result<()> {
++    let mock = responses::start_mock_server().await;
++    let home = tempfile::tempdir()?;
++    let cwd = tempfile::tempdir()?;
++    std::fs::write(
++        home.path().join("config.toml"),
++        format!(
++            "model = 'gpt-5.5'\nmodel_provider = 'profile-test'\n[model_providers.profile-test]\nname = 'OpenAI'\nbase_url = '{}/v1'\nwire_api = 'responses'\nrequest_max_retries = 0\nstream_max_retries = 0\n",
++            mock.uri(),
++        ),
++    )?;
++    let config = ConfigBuilder::default()
++        .codex_home(home.path().to_path_buf())
++        .codex_harness(home.path().join("harness"))
++        .build()
++        .await?;
++    let mut thread_id = create_profile_rollout(home.path(), "Existing conversation");
++    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
++    let mut inherited = Vec::new();
++    for _ in 0..6 {
++        let fork = server
++            .fork_thread(
++                &crate::local_settings::LocalSettings::from(&config),
++                config.clone(),
++                thread_id,
++            )
++            .await?;
++        server.thread_archive(thread_id).await?;
++        let archived = server.thread_read(thread_id, false).await?;
++        let path = archived.path.expect("archived ancestor path");
++        let bytes = std::fs::read(&path)?;
++        inherited.push((path, bytes));
++        thread_id = fork.session.thread_id;
++    }
++    // Ancestor resolution must not repeatedly scan unrelated conversations.
++    for _ in 0..2_048 {
++        create_profile_rollout(home.path(), "Unrelated conversation");
++    }
++    std::fs::write(
++        home.path().join(PROFILE_FILE),
++        serde_json::to_vec(&json!({
++            "3": {
++                "name": "inspect",
++                "cwd": cwd.path(),
++                "model": "gpt-6-luna",
++                "reasoning_effort": "high",
++                "title": "inspect saved changes"
++            }
++        }))?,
++    )?;
++    let before = server.thread_read(thread_id, false).await?;
++    let path = before.path.clone().expect("saved rollout path");
++    let original = std::fs::read(&path)?;
++    let (mut picker, requests) = test_picker();
++    picker.all_rows = vec![row_from_app_server_thread(before).unwrap()];
++    picker.apply_filter();
++    apply(&mut server, thread_id, home.path(), 3, &mut false, false).await?;
++    server
++        .thread_set_name(thread_id, "before repeat".into())
++        .await?;
++    apply(&mut server, thread_id, home.path(), 3, &mut false, false).await?;
++    let updated = server.thread_read(thread_id, false).await?;
++    assert_eq!(updated.name.as_deref(), Some("inspect saved changes"));
++    assert_eq!(updated.cwd.as_path(), cwd.path());
++    picker.apply_session_mutation(thread_id, SessionStatus::Active, Some(updated.clone()));
++    assert_eq!(
++        picker.filtered_rows[picker.selected].thread_id,
++        Some(thread_id)
++    );
++    assert_eq!(
++        picker.filtered_rows[0].thread_name.as_deref(),
++        Some("inspect saved changes")
++    );
++    assert_eq!(picker.filtered_rows[0].cwd.as_deref(), Some(cwd.path()));
++    picker.filter_mode = SessionFilterMode::Cwd;
++    picker.filter_cwd = Some(home.path().to_path_buf());
++    picker.local_filter_cwd = Some(home.path().to_path_buf());
++    picker.apply_session_mutation(thread_id, SessionStatus::Active, Some(updated));
++    assert!(
++        picker.filtered_rows.is_empty(),
++        "changed cwd must obey the current filter"
++    );
++    assert!(requests.lock().unwrap().is_empty());
++    server.shutdown().await?;
++
++    let history = RolloutRecorder::get_rollout_history(&path).await?;
++    let settings = saved_settings(history.get_rollout_items());
++    assert_eq!(settings.cwd.as_path(), cwd.path());
++    assert_eq!(settings.model, "gpt-6-luna");
++    assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::High));
++
++    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
++    let response: ThreadResumeResponse = server
++        .request_handle()
++        .request_typed(ClientRequest::ThreadResume {
++            request_id: RequestId::String("reopen-profile".into()),
++            params: ThreadResumeParams {
++                thread_id: thread_id.to_string(),
++                exclude_turns: true,
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(response.cwd.as_path(), cwd.path());
++    assert_eq!(response.model, "gpt-6-luna");
++    assert_eq!(response.reasoning_effort, Some(ReasoningEffort::High));
++    assert_eq!(
++        response.thread.name.as_deref(),
++        Some("inspect saved changes")
++    );
++    // A fresh process seeds its notification baseline from the persisted values.
++    server
++        .thread_set_name(thread_id, "before fresh repeat".into())
++        .await?;
++    apply(&mut server, thread_id, home.path(), 3, &mut false, true).await?;
++    assert_eq!(
++        server.thread_read(thread_id, false).await?.name.as_deref(),
++        Some("inspect saved changes")
++    );
++    // Applying settings to the current session must preserve its existing subscription.
++    let detached: ThreadUnsubscribeResponse = server
++        .request_handle()
++        .request_typed(ClientRequest::ThreadUnsubscribe {
++            request_id: RequestId::String("unsubscribe-after-profile".into()),
++            params: ThreadUnsubscribeParams {
++                thread_id: thread_id.to_string(),
++            },
++        })
++        .await?;
++    assert_eq!(detached.status, ThreadUnsubscribeStatus::Unsubscribed);
++    std::fs::write(
++        home.path().join(PROFILE_FILE),
++        serde_json::to_vec(&json!({
++            "3": {"name": "archive", "archive": true},
++            "4": {"name": "quick", "model": "gpt-6-luna", "reasoning_effort": "low", "title": "quick archive", "archive": true},
++            "5": {"name": "restore", "title": "restored by default"},
++            "6": {"name": "rename", "title": "renamed while archived", "archive": true},
++            "7": {"name": "cwd", "cwd": cwd.path(), "model": "gpt-6-luna", "reasoning_effort": "low", "archive": false}
++        }))?,
++    )?;
++    let current_error = apply(&mut server, thread_id, home.path(), 3, &mut false, true)
++        .await
++        .unwrap_err();
++    assert!(current_error.to_string().contains("Use /archive"));
++    apply(&mut server, thread_id, home.path(), 3, &mut false, false).await?;
++    listed_profile(&mut server, thread_id, SessionStatus::Archived).await?;
++    // An archived session can receive settings and return to archived without opening in the TUI.
++    apply(&mut server, thread_id, home.path(), 4, &mut true, false).await?;
++    // Repeat matching settings while unloaded and still rename and archive.
++    apply(&mut server, thread_id, home.path(), 5, &mut true, false).await?;
++    let saved = listed_profile(&mut server, thread_id, SessionStatus::Active).await?;
++    assert_eq!(saved.name.as_deref(), Some("restored by default"));
++    apply(&mut server, thread_id, home.path(), 4, &mut false, false).await?;
++    let mut archived = true;
++    tokio::time::timeout(std::time::Duration::from_secs(30), async {
++        for _ in 0..60 {
++            apply(&mut server, thread_id, home.path(), 4, &mut archived, false).await?;
++            assert!(archived);
++        }
++        Ok::<_, color_eyre::Report>(())
++    })
++    .await??;
++    let saved = listed_profile(&mut server, thread_id, SessionStatus::Archived).await?;
++    assert_eq!(saved.name.as_deref(), Some("quick archive"));
++    let history = RolloutRecorder::get_rollout_history(saved.path.as_ref().unwrap()).await?;
++    let settings = saved_settings(history.get_rollout_items());
++    assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::Low));
++    apply(&mut server, thread_id, home.path(), 6, &mut true, false).await?;
++    let renamed = listed_profile(&mut server, thread_id, SessionStatus::Archived).await?;
++    assert_eq!(renamed.name.as_deref(), Some("renamed while archived"));
++    // Settings and archive state change without changing an omitted title.
++    apply(&mut server, thread_id, home.path(), 7, &mut archived, false).await?;
++    assert!(!archived);
++    let saved = listed_profile(&mut server, thread_id, SessionStatus::Active).await?;
++    assert_eq!(saved.name.as_deref(), Some("renamed while archived"));
++    assert_eq!(saved.cwd.as_path(), cwd.path());
++    let history = RolloutRecorder::get_rollout_history(saved.path.as_ref().unwrap()).await?;
++    let settings = saved_settings(history.get_rollout_items());
++    assert_eq!(settings.cwd.as_path(), cwd.path());
++    assert_eq!(settings.model, "gpt-6-luna");
++    assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::Low));
++    assert!(
++        !history
++            .get_rollout_items()
++            .iter()
++            .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))))
++    );
++    for (path, bytes) in inherited {
++        assert_eq!(std::fs::read(path)?, bytes);
++    }
++    let current = std::fs::read(saved.path.as_ref().unwrap())?;
++    assert!(current.starts_with(&original));
++    server.shutdown().await?;
++    assert!(
++        responses::received_responses_requests(&mock)
++            .await
++            .is_empty()
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn configured_profile_hints_are_sorted_grouped_and_wrap_only_at_width() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    assert!(load(home.path()).await?.is_empty());
++    std::fs::write(
++        home.path().join(PROFILE_FILE),
++        r#"{"9":{"name":"omega","archive":false},"0":{"name":"alpha","archive":true},"2":{"name":"beta","title":"named"}}"#,
++    )?;
++    let names = load(home.path())
++        .await?
++        .into_iter()
++        .map(|(slot, profile)| (slot, profile.name))
++        .collect::<BTreeMap<_, _>>();
++    assert_eq!(names.keys().copied().collect::<Vec<_>>(), vec![0, 2, 9]);
++    let wide = hint_lines(&names, 100, None);
++    assert_eq!(wide.len(), 1);
++    assert_eq!(
++        wide[0].to_string().trim(),
++        "alt+0 apply profile alpha   alt+2 apply profile beta   alt+9 apply profile omega"
++    );
++    let wrapped = hint_lines(&names, 60, None);
++    assert_eq!(wrapped.len(), 2);
++    assert!(wrapped[0].to_string().contains("alt+0 apply profile alpha"));
++    assert!(wrapped[0].to_string().contains("alt+2 apply profile beta"));
++    assert!(wrapped[1].to_string().contains("alt+9 apply profile omega"));
++    assert!(wrapped.iter().all(|line| line.width() <= 60));
++    let (mut state, _) = test_picker();
++    state.profile_names = (0..=9).map(|slot| (slot, format!("p{slot}"))).collect();
++    let lines = footer_hint_lines(&state, 50);
++    assert_eq!(lines.len(), 7);
++    assert!(!lines[1].to_string().contains("alt+"));
++    assert!(lines[2].to_string().contains("alt+0"));
++    assert!(lines[6].to_string().contains("alt+9"));
++    let list = layout::areas(Rect::new(0, 0, 50, 30), &state).list;
++    assert!(list.bottom() + lines.len() as u16 <= 30);
++    state.action = SessionPickerAction::Fork;
++    assert_eq!(footer_hint_lines(&state, 50).len(), 2);
++    Ok(())
++}
++
++#[test]
++fn profile_names_follow_the_theme_with_ten_stable_slot_colors() {
++    let original = current_syntax_theme();
++    let names = (0..=9)
++        .map(|slot| (slot, format!("p{slot}")))
++        .collect::<BTreeMap<_, _>>();
++    let mut previous = None;
++    for (theme_name, foreground, background) in [
++        ("catppuccin-mocha", (205, 214, 244), (30, 30, 46)),
++        ("catppuccin-latte", (76, 79, 105), (239, 241, 245)),
++    ] {
++        crate::render::highlight::set_syntax_theme(
++            crate::render::highlight::resolve_theme_by_name(theme_name, None).unwrap(),
++        );
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors {
++                fg: foreground,
++                bg: background,
++            },
++            || {
++                let colors = hint_lines(&names, 300, None)
++                    .into_iter()
++                    .flat_map(|line| line.spans)
++                    .filter(|span| names.values().any(|name| name == span.content.as_ref()))
++                    .map(|span| span.style.fg.unwrap())
++                    .collect::<Vec<_>>();
++                assert_eq!(colors.len(), 10);
++                assert_eq!(colors.iter().unique().count(), 10);
++                assert!(!colors.contains(&Color::Reset));
++                if let Some(previous) = &previous {
++                    assert_ne!(&colors, previous);
++                }
++                let sparse = BTreeMap::from([(9, "p9".to_string())]);
++                let last = hint_lines(&sparse, 80, None)
++                    .pop()
++                    .unwrap()
++                    .spans
++                    .pop()
++                    .unwrap();
++                assert_eq!(last.content, "p9");
++                assert_eq!(last.style.fg, Some(colors[9]));
++                let pending = hint_lines(&names, 80, Some(9));
++                assert_eq!(pending.len(), 1);
++                assert_eq!(pending[0].to_string().trim(), "saving to profile p9");
++                assert_eq!(pending[0].spans.last().unwrap().style.fg, Some(colors[9]));
++                previous = Some(colors);
++            },
++        );
++    }
++    crate::render::highlight::set_syntax_theme(original);
++}
++
++#[test]
++fn profile_failure_preserves_incremental_effects_and_retains_the_error() {
++    let (mut state, requests) = test_picker();
++    let thread_id = ThreadId::new();
++    state.profile_names = BTreeMap::from([(2, "inspect".into())]);
++    state.profile_pending = Some((thread_id, 2));
++    state.status = SessionStatus::Archived;
++    state.all_rows = vec![test_row(thread_id)];
++    state.apply_filter();
++    state.apply_session_mutation(thread_id, SessionStatus::Active, None);
++    state.finish_profile(
++        thread_id,
++        Err(std::io::Error::other("settings applied, archive failed")),
++    );
++    assert_eq!(state.profile_pending, None);
++    assert_eq!(
++        footer_hint_lines(&state, 220)
++            .last()
++            .unwrap()
++            .to_string()
++            .trim(),
++        "alt+2 apply profile inspect"
++    );
++    assert_eq!(
++        state.inline_error.as_deref(),
++        Some("Could not apply profile: settings applied, archive failed")
++    );
++    assert!(state.filtered_rows.is_empty());
++    assert!(requests.lock().unwrap().is_empty());
++}
+diff --git a/codex-rs/tui/src/resume_picker/profiles.rs b/codex-rs/tui/src/resume_picker/profiles.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/resume_picker/profiles.rs
+@@ -0,0 +1,256 @@
++//! Apply saved-session profiles through settings, rename and archive APIs.
++
++use super::*;
++use crate::render::highlight::convert_syntect_color;
++use crate::render::highlight::current_syntax_theme;
++use crate::render::highlight::foreground_style_for_scopes_with_theme;
++use codex_app_server_protocol::ThreadSettingsUpdateParams;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use color_eyre::eyre::WrapErr;
++use color_eyre::eyre::eyre;
++use itertools::Itertools;
++use serde::Deserialize;
++use std::collections::BTreeMap;
++
++const PROFILE_FILE: &str = "resume-profiles.json";
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct ResumeProfile {
++    pub(super) name: String,
++    cwd: Option<AbsolutePathBuf>,
++    model: Option<String>,
++    reasoning_effort: Option<ReasoningEffort>,
++    title: Option<String>,
++    archive: Option<bool>,
++}
++
++fn parse_profiles(contents: &str) -> Result<BTreeMap<u8, ResumeProfile>> {
++    let entries: BTreeMap<String, serde_json::Value> = serde_json::from_str(contents)?;
++    let mut profiles = BTreeMap::new();
++    for (key, entry) in entries {
++        let [digit @ b'0'..=b'9'] = key.as_bytes() else {
++            return Err(eyre!(
++                "profile slot must be a single digit from 0 to 9: {key}"
++            ));
++        };
++        let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
++            continue;
++        };
++        if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
++            continue;
++        }
++        let profile: ResumeProfile = serde_json::from_value(entry)?;
++        for (field, value) in [("model", &profile.model), ("title", &profile.title)] {
++            if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
++                return Err(eyre!("profile {key} has an empty {field}"));
++            }
++        }
++        if profile.cwd.is_none()
++            && profile.model.is_none()
++            && profile.reasoning_effort.is_none()
++            && profile.title.is_none()
++            && profile.archive.is_none()
++        {
++            return Err(eyre!("profile {key} has no settings"));
++        }
++        profiles.insert(*digit - b'0', profile);
++    }
++    Ok(profiles)
++}
++
++pub(super) async fn load(codex_home: &Path) -> Result<BTreeMap<u8, ResumeProfile>> {
++    let path = codex_home.join(PROFILE_FILE);
++    let contents = match tokio::fs::read_to_string(&path).await {
++        Ok(contents) => contents,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
++        Err(error) => {
++            return Err(error).wrap_err_with(|| format!("could not read {}", path.display()));
++        }
++    };
++    parse_profiles(&contents).wrap_err_with(|| format!("invalid {}", path.display()))
++}
++
++pub(super) async fn apply(
++    app_server: &mut AppServerSession,
++    thread_id: ThreadId,
++    codex_home: &Path,
++    slot: u8,
++    archived: &mut bool,
++    is_current: bool,
++) -> Result<()> {
++    let mut profiles = load(codex_home).await?;
++    let profile = profiles.remove(&slot).ok_or_else(|| {
++        eyre!(
++            "profile {slot} is not defined in {}",
++            codex_home.join(PROFILE_FILE).display()
++        )
++    })?;
++    let target_archived = profile.archive.unwrap_or(false);
++    if is_current && target_archived {
++        return Err(eyre!(
++            "Use /archive to archive the current session and exit."
++        ));
++    }
++    let needs_settings =
++        profile.cwd.is_some() || profile.model.is_some() || profile.reasoning_effort.is_some();
++    // Restore once before mutations, or to satisfy the requested final state.
++    if *archived && (!target_archived || needs_settings || profile.title.is_some()) {
++        app_server
++            .thread_unarchive(thread_id)
++            .await
++            .wrap_err("could not restore the session before applying its profile")?;
++        *archived = false;
++    }
++    if needs_settings {
++        app_server
++            .thread_settings_update(ThreadSettingsUpdateParams {
++                thread_id: thread_id.to_string(),
++                cwd: profile.cwd.map(AbsolutePathBuf::into_path_buf),
++                model: profile.model,
++                effort: profile.reasoning_effort,
++                ..Default::default()
++            })
++            .await?
++            .then_some(())
++            .ok_or_else(|| eyre!("this server does not support persistent thread settings"))?;
++    }
++    if let Some(title) = profile.title {
++        app_server
++            .thread_set_name(thread_id, title)
++            .await
++            .wrap_err("profile settings applied, but the title could not be saved")?;
++    }
++    if target_archived && !*archived {
++        app_server
++            .thread_archive(thread_id)
++            .await
++            .wrap_err("profile values applied, but the session could not be archived")?;
++        *archived = true;
++    }
++    Ok(())
++}
++
++impl PickerState {
++    pub(super) fn request_profile(&mut self, slot: u8) {
++        if !matches!(self.action, SessionPickerAction::Resume)
++            || self.profile_pending.is_some()
++            || !matches!(self.archive_state, archive::ArchiveState::Idle)
++        {
++            return;
++        }
++        let Some(thread_id) = self
++            .filtered_rows
++            .get(self.selected)
++            .and_then(|row| row.thread_id)
++        else {
++            return;
++        };
++        let Some(persistence) = &self.view_persistence else {
++            return;
++        };
++        if !self.profile_names.contains_key(&slot) {
++            return;
++        }
++        self.profile_pending = Some((thread_id, slot));
++        (self.picker_loader)(PickerLoadRequest::ApplyProfile {
++            thread_id,
++            codex_home: persistence.codex_home.clone(),
++            slot,
++            archived: self.status == SessionStatus::Archived,
++            is_current: matches!(self.launch_context, SessionPickerLaunchContext::ExistingSession { current_thread_id: Some(current) } if current == thread_id),
++        });
++        self.request_frame();
++    }
++
++    pub(super) fn finish_profile(&mut self, thread_id: ThreadId, result: std::io::Result<()>) {
++        if !self
++            .profile_pending
++            .is_some_and(|(pending, _)| pending == thread_id)
++        {
++            return;
++        }
++        self.profile_pending = None;
++        if let Err(error) = result {
++            self.inline_error = Some(format!("Could not apply profile: {error}"));
++        }
++        self.request_frame();
++    }
++}
++
++pub(super) fn hint_lines(
++    names: &BTreeMap<u8, String>,
++    width: u16,
++    pending: Option<u8>,
++) -> Vec<Line<'static>> {
++    let theme = current_syntax_theme();
++    let colors = [
++        "entity.name.type",
++        "string",
++        "constant.numeric",
++        "keyword",
++        "entity.name.function",
++        "variable.parameter",
++        "storage.modifier",
++    ]
++    .into_iter()
++    .filter_map(|scope| foreground_style_for_scopes_with_theme(&theme, &[scope])?.fg)
++    .chain(
++        theme
++            .scopes
++            .iter()
++            .filter_map(|item| item.style.foreground)
++            .chain(theme.settings.foreground)
++            .filter_map(convert_syntect_color),
++    )
++    .map(|color| readable_color_on(color, None))
++    .unique()
++    .take(10)
++    .collect::<Vec<_>>();
++    let mut lines = Vec::new();
++    let mut line = Line::default();
++    for (slot, name) in names {
++        if pending.is_some_and(|pending| pending != *slot) {
++            continue;
++        }
++        let mut spans = if pending.is_some() {
++            vec!["saving to profile ".set_style(footer_hint_label_style())]
++        } else {
++            let key = format!("alt+{slot}");
++            let mut spans = crate::key_hint::key_label_spans(&key);
++            spans.push(" apply profile ".set_style(footer_hint_label_style()));
++            spans
++        };
++        let color = colors
++            .iter()
++            .cycle()
++            .nth(usize::from(*slot))
++            .copied()
++            .unwrap_or(Color::Reset);
++        spans.push(Span::styled(name.clone(), Style::default().fg(color)));
++        let hint = Line::from(spans);
++        if !line.spans.is_empty()
++            && line.width() + FOOTER_HINT_GAP + hint.width() > usize::from(width)
++        {
++            lines.push(line);
++            line = Line::default();
++        }
++        let gap = if line.spans.is_empty() {
++            FOOTER_HINT_LEFT_PADDING
++        } else {
++            FOOTER_HINT_GAP
++        };
++        line.spans
++            .push(" ".repeat(gap).set_style(footer_hint_label_style()));
++        line.spans.extend(hint.spans);
++    }
++    if !line.spans.is_empty() {
++        lines.push(line);
++    }
++    lines
++}
++
++#[cfg(test)]
++#[path = "profile_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/resume_picker_color_tests.rs b/codex-rs/tui/src/resume_picker_color_tests.rs
+--- a/codex-rs/tui/src/resume_picker_color_tests.rs
++++ b/codex-rs/tui/src/resume_picker_color_tests.rs
+@@ -187,7 +187,7 @@ fn compact_picker_keeps_metadata_and_labeled_primary_actions() {
+                 let mut terminal = Terminal::with_options(backend).expect("terminal");
+                 let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
+                 terminal.set_viewport_area(area);
+-                let list = layout::areas(area).list;
++                let list = layout::areas(area, &state).list;
+                 state.update_viewport(usize::from(list.height), list_viewport_width(width));
+                 {
+                     let mut frame = terminal.get_frame();
+@@ -289,7 +289,7 @@ async fn narrow_toolbar_keeps_keyboard_focused_control_visible() {
+                         let mut terminal = Terminal::with_options(backend).expect("terminal");
+                         let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
+                         terminal.set_viewport_area(area);
+-                        let list = layout::areas(area).list;
++                        let list = layout::areas(area, &state).list;
+                         state.update_viewport(usize::from(list.height), list_viewport_width(width));
+                         let mut frame = terminal.get_frame();
+                         layout::render(&mut frame, &state);
+diff --git a/docs/examples/resume-profiles.json b/docs/examples/resume-profiles.json
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/resume-profiles.json
+@@ -0,0 +1,23 @@
++{
++  "0": {
++    "name": "quick",
++    "model": "gpt-6-luna",
++    "reasoning_effort": "low"
++  },
++  "1": {
++    "name": "review",
++    "cwd": "/home/user/project",
++    "model": "gpt-6-astra",
++    "reasoning_effort": "high",
++    "title": "review project changes",
++    "archive": false
++  },
++  "8": {
++    "name": "archive",
++    "archive": true
++  },
++  "9": {
++    "name": "restore",
++    "archive": false
++  }
++}
+diff --git a/docs/resume-profiles.md b/docs/resume-profiles.md
+new file mode 100644
+--- /dev/null
++++ b/docs/resume-profiles.md
+@@ -0,0 +1,46 @@
++# Resume Profiles
++
++- Save profiles in `resume-profiles.json` directly under your Codex home directory.
++- Profiles are available for local sessions, including the local daemon, and are not loaded or offered when using a remote filesystem.
++- Use an object keyed by single digits from `0` through `9`.
++- Each profile requires a `name` containing one nonempty word without whitespace or control characters.
++- Entries with a missing, non-string, empty or multiword name are skipped.
++- `name` labels the shortcut and does not change the session title.
++- Each profile can set `cwd`, `model`, `reasoning_effort`, `title`, and `archive`.
++- Omitted model, effort, directory and title fields preserve the session's current values.
++- `archive` defaults to `false`, leaving the session unarchived after application.
++- Set `archive` to `true` to archive after the other profile values have been saved.
++- A named profile containing only `archive` as an action is valid.
++- `cwd` must be an absolute local path.
++- `model` must be available from the session's existing provider.
++- `reasoning_effort` uses the same values as the ordinary model settings.
++- A supplied `title` replaces the current name and must not be blank.
++- The example configuration is in [resume-profiles.json](/harness/repos/codex/main-worktree/source/docs/examples/resume-profiles.json).
++
++# Applying A Profile
++
++- In `codex resume`, select an active or archived session and press its configured `Alt+0` through `Alt+9` shortcut.
++- The footer lists configured digits in ascending order on a separate line, fitting multiple shortcuts before wrapping at the available width.
++- Each shortcut shows its profile name, such as `alt+1 apply profile subora`.
++- During application, the profile shortcut rows show only `saving to profile <name>` for the selected profile.
++- The ordinary profile shortcuts return after success or failure.
++- Profile names use distinct readable foreground colors from the active theme when available.
++- Slot colors remain stable when other slots are absent.
++- Themes with fewer than ten distinct readable colors reuse their available colors.
++- Configured shortcut hints are loaded when the picker opens.
++- The selected profile is reread from disk for each application.
++- The picker applies the profile immediately and stays open.
++- Profile application uses the existing thread settings, rename, archive and restore APIs.
++- Model, effort or directory changes attach to the thread only while applying settings.
++- Applying settings or a title to an archived session first restores it because those native APIs require an unarchived thread.
++- A title-only or archive-only profile does not attach to the thread.
++- It submits no user message and starts no model turn.
++- Settings are saved using the existing thread-settings checkpoint in the session rollout.
++- Settings completion is acknowledged even when the requested values already match, including after a fresh process restores the session.
++- Names use the existing thread-name persistence mechanism.
++- Already applied restores, settings and names remain applied if a later operation fails.
++- The picker updates the changed session in place, preserving selection, filters and pagination without rereading unrelated sessions.
++- Native Archive still archives spawned descendants, which are excluded from the picker's session sources.
++- Errors from profile application or targeted metadata reads remain visible in the picker.
++- Archiving the currently open conversation remains restricted to `/archive`.
++- This does not change global model defaults or permissions profiles.

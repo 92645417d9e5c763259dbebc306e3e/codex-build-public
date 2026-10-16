@@ -26,7 +26,8 @@ TopLevelReleaseTermOwner
 
 - Baseline maps to `release-baseline` and BaselineEstablishedAndCleanupComplete.
 - Roll selects ReleaseRollForward for the sole task. Automatic Roll follows every declared Patch; an explicit interactive Unit, Flat Patch, or Lane stop consumes its requested read-only exploration before handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
-- Before BuildInstall, resolve the requested package-only or installation terminal from user intent; ask only when it is ambiguous.
+- Before BuildInstall, consume TaskWorkspace's pending-obligation decision.
+- Resolve the requested package-only or installation terminal from user intent; ask only when it is ambiguous.
 - Install selects `build-install --install`, without a home-link, candidate or export predecessor.
 - Package-only omits `--install` only when publication without activation fulfills the request.
 - BuildInstall's handoff must fulfill that selected terminal.
@@ -57,7 +58,7 @@ TopLevelReleaseTermOwner
 - Its committed-Patch Product failure enters temporary Main fixup only after declared Patch completion and Main convergence; other findings return to the owning Patch. No automatic second complete run follows.
 - User-authorized internal bypass records the missing public route with SILK before Roll resumes; its topic grants no authority.
 - RepairFailedReleaseVerification consumes Rust's read-only diagnostic evidence through the release's original-purpose selection. A refuted candidate returns to complete owning-Patch reconstruction, not another local test or fixture fix. ReleaseRollForward owns its scope decision and continuation.
-- PrepareNativeToolchain publishes fixed Rust, Cargo, Bazel, build, repository, V8, and voice tools before consumers. If a projected consumer's exact fixed-root admission fails before its product process starts, route through that same producer and shared admission, then resume the unchanged complete invocation once; failed preparation stops without host fallback or a product attempt.
+- PrepareNativeToolchain resolves the selected release source's requirements and publishes its Rust, Cargo, Bazel launcher, build, repository, V8, and voice tools before consumers. If a projected consumer's exact fixed-root admission fails before its product process starts, route through that same producer and shared admission, then resume the unchanged complete invocation once; failed preparation stops without host fallback or a product attempt.
 - EnterRollWorkspace requires empty root AGENTS.override.md at Attached before Roll; Baseline and Fork create it in each canonical worktree, and Cleanup preserves it.
 - A user request to read a Markdown basename without a directory, such as `1.md`, resolves to `build/docs/1.md` under cwd; an explicit path remains explicit. Read only the named document rather than enumerating or opening its siblings.
 - Long commands use RunnerEnv's self-contained startup and progress notices. A nonterminal yield continues the same handle at its longest permitted wait up to twenty-five minutes, without commentary or polling. After an interrupted full Finalize, reenter with --resume on unchanged source and selection; omitting it selects a fresh full run and is not recovery. Baseline reenters release-baseline. Only a separately selected fresh check replaces current diagnostics.
@@ -77,7 +78,7 @@ PublicInvocationConstruction
 +-- baseline-coverage: ReleaseRoots Unit or Flat Patch for automatic addition, or user-selected align at any Roll frontier; complete covered compile-only and helper selections
 +-- build-install: parser-owned help and direct BuildInstall entry
 +-- sync: parser-owned help and explicitly selected public snapshot publication
-+-- native-toolchain: project scratch runtime roots
++-- native-toolchain: project scratch runtime roots source release and capability-selected auxiliary versions
 +-- patch-replay: skill scratch runtime roots mode tag active task and record root; PatchReplay owns exact exported Apply argv
 +-- Fork: optional parent NNN and a free numbered Git worktree name
 +-- Internal: runner-child-exec belongs to ProjectedRunner

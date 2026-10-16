@@ -65,13 +65,13 @@ func runPublicSync(options publicSyncOptions, result publicSyncResult, cancellat
 	if !core.ValidReleaseTag("rust-v"+options.Version) || !core.ValidReleaseTag(options.PatchTag) {
 		return result, errors.New("sync requires --version RELEASE_VERSION and --patch-tag rust-vRELEASE_TAG")
 	}
-	repositories := os.Getenv("REPOS_ROOT")
-	if repositories == "" {
-		return result, errors.New("sync requires REPOS_ROOT")
+	userHome, homeError := os.UserHomeDir()
+	if homeError != nil {
+		return result, homeError
 	}
 	privateRoot := filepath.Join(options.WorkingRoot, "build", "patches", "private")
-	result.PublicRoot = filepath.Join(repositories, core.PublicSyncRepositoryName)
-	for _, root := range []string{options.SkillRoot, options.WorkingRoot, options.RuntimeRoot, repositories, privateRoot, result.PublicRoot, filepath.Join(privateRoot, options.PatchTag)} {
+	result.PublicRoot = filepath.Join(userHome, "projects", core.PublicSyncRepositoryName)
+	for _, root := range []string{options.SkillRoot, options.WorkingRoot, options.RuntimeRoot, userHome, privateRoot, result.PublicRoot, filepath.Join(privateRoot, options.PatchTag)} {
 		if pathError := noFollowPath("sync root", root); pathError != nil {
 			return result, pathError
 		}

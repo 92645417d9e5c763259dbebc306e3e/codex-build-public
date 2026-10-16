@@ -1,0 +1,135 @@
+present-websocket-retry-warnings-in-tui
+
+Lane: mixed
+
+Unit: recover-websocket-requests-without-http-fallback
+
+ChildPatch: present-websocket-retry-warnings-in-tui
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1806,6 +1806,101 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+     assert!(chat.active_cell_is_stream_tail());
+ }
+ 
++#[tokio::test]
++async fn overload_warning_is_one_visible_tui_record_with_upstream_retry_status() {
++    let message = "External model limit reached. Retrying at 14:05.";
++    for (fullscreen, warning_first) in [(true, true), (true, false), (false, true), (false, false)]
++    {
++        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++        chat.local_settings.tui.fullscreen_transcript = fullscreen;
++        handle_turn_started(&mut chat, "turn-1");
++        assert!(chat.warning_display_state.startup_complete);
++        drain_insert_history(&mut rx);
++        let retry = ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                misalignment: None,
++                message: "Reconnecting... 1/5".into(),
++                codex_error_info: Some(CodexErr::ServerOverloaded.to_codex_protocol_error().into()),
++                additional_details: Some("The server is overloaded.".into()),
++            },
++            will_retry: true,
++            thread_id: "thread-1".into(),
++            turn_id: "turn-1".into(),
++        });
++        let warning = ServerNotification::Warning(WarningNotification {
++            thread_id: Some("thread-1".into()),
++            message: message.into(),
++        });
++        for notification in if warning_first {
++            [warning, retry]
++        } else {
++            [retry, warning]
++        } {
++            chat.handle_server_notification(notification, /*replay_kind*/ None);
++        }
++        let cells: Vec<Arc<dyn HistoryCell>> = std::iter::from_fn(|| rx.try_recv().ok())
++            .filter_map(|event| match event {
++                AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(cells.len(), 1, "one warning event retains one cell");
++        assert_eq!(history_cell::warning_count(&cells), 1);
++        assert_eq!(
++            history_cell::warning_entries(&cells),
++            vec![history_cell::WarningEntry {
++                id: history_cell::WarningId::Message(message.into()),
++                source: "Warning".into(),
++                details: message.into(),
++            }]
++        );
++        for mode in [
++            history_cell::HistoryRenderMode::Rich,
++            history_cell::HistoryRenderMode::Raw,
++        ] {
++            let visible = cells[0].display_lines_for_mode(/*width*/ 80, mode);
++            if fullscreen {
++                assert!(lines_to_single_string(&visible).contains(message));
++                match mode {
++                    history_cell::HistoryRenderMode::Rich => {
++                        assert!(visible[0].to_string().starts_with("! "));
++                        assert_eq!(visible, cells[0].transcript_lines(/*width*/ 80));
++                    }
++                    history_cell::HistoryRenderMode::Raw => {
++                        assert_eq!(visible, cells[0].raw_lines());
++                    }
++                }
++            } else {
++                assert!(visible.is_empty(), "legacy warning policy is unchanged");
++            }
++        }
++        assert!(lines_to_single_string(&cells[0].transcript_lines(/*width*/ 80)).contains(message));
++        if warning_first {
++            assert_eq!(
++                chat.status_state.current_status.header,
++                "Reconnecting... 1/5"
++            );
++            assert_eq!(
++                chat.status_state.current_status.details.as_deref(),
++                Some("The server is overloaded.")
++            );
++            assert_eq!(
++                chat.status_state.retry_status_header.as_deref(),
++                Some("Working")
++            );
++        } else {
++            // Upstream restores the original status on a non-retry notification.
++            assert_eq!(chat.status_state.current_status.header, "Working");
++            assert_eq!(chat.status_state.current_status.details, None);
++            assert!(chat.status_state.retry_status_header.is_none());
++        }
++        assert!(chat.turn_lifecycle.agent_turn_running);
++        chat.open_warnings(&cells);
++        assert!(super::helpers::render_bottom_popup(&chat, /*width*/ 80).contains(message));
++        assert!(drain_insert_history_transcript(&mut rx).is_empty());
++    }
++}
++
+ #[tokio::test]
+ async fn live_app_server_rate_limit_error_renders_upstream_message() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -556,7 +556,12 @@ impl ChatWidget {
+         if !self.warning_display_state.should_display(&message) {
+             return;
+         }
+-        self.add_to_history(history_cell::new_warning_event(message));
++        let warning = if self.local_settings.tui.fullscreen_transcript {
++            history_cell::new_usage_warning_event(message)
++        } else {
++            history_cell::new_warning_event(message)
++        };
++        self.add_to_history(warning);
+         self.request_redraw();
+     }
+ 

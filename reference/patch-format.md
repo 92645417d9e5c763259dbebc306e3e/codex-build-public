@@ -3,19 +3,31 @@
 ## Physical Inventory
 
 - Canonical history is `Lane -> Flat Patch` or `Lane -> Unit -> Child Patch`. A Unit has at least two ordered distinct Child Patches. Each Flat Patch and Child Patch is one commit and GitDiff; no single-Patch Unit exists.
-- Canonical ordinary Lane order is bugfix, normalization, backend, mixed, frontend, and draft.
-- Their directory names are `0-bugfix`, `1-normalization`, `2-backend`, `3-mixed`, `4-frontend`, and `5-draft` in that order.
+- Canonical ordinary Lane order is bugfix, normalization, backend, mixed, frontend, cross, and draft.
+- Their directory names are `0-bugfix`, `1-normalization`, `2-backend`, `3-mixed`, `4-frontend`, `5-cross`, and `6-draft` in that order.
 - Upstream remains the official baseline role, not a Patch Lane or exported directory.
 - The initial normalization ExecutableTransform remains the first history row before all ordinary Lanes, including bugfix.
 - Commit metadata is discriminated: GitDiff commits name either `FlatPatch` or both `Unit` and `ChildPatch`; ExecutableTransform commits name `Transform` and `TransformPatch`. Generic Unit-as-Patch metadata is invalid.
-- Draft Unit names are single words; Flat Patch names stay hyphenated and equal their Patch field in every Lane, including draft.
-- Exported files are diff artifacts ending only in `.diff`. Flat Patch uses `<lane>/<ordinal>-<flat-patch>.diff`; each Child Patch uses `<lane>/<ordinal>-<unit>/<child-ordinal>-<child-patch>.diff`. No artifact ends in `.patch`.
+- Unit, Flat Patch and Child Patch names use three semantic parts in every Lane: action, object, and method or scope.
+- Each semantic part may contain multiple hyphenated words.
+- Names use the ordinary lowercase hyphenated grammar without export ordinals.
+- For example, `report-usage-via-session-files` separates into `report`, `usage`, and `via-session-files`.
+- Semantic acceptance identifies those parts from the complete responsibility rather than requiring exactly three words or a fixed preposition.
+- Before transport or authoring, identify each name's action, concrete object and method or scope from its assigned effect.
+- A noun-only label or an unsupported semantic part fails review even when native lexical admission passes.
+- Native transport validates lexical form rather than claiming to recognize those meanings.
+- Reserved Transform and CrossGroup names retain their existing naming contracts.
+- An authorized rename preserves behavior, responsibility boundaries and child order while updating native metadata and direct references through existing Git custody.
+- Flat Patch names equal their Patch field in every Lane, including draft.
+- Exported semantic Patches end only in `.diff`. Flat Patch uses `<lane>/<ordinal>-<flat-patch>.diff`; each Child Patch uses `<lane>/<ordinal>-<unit>/<child-ordinal>-<child-patch>.diff`. No Patch artifact ends in `.patch`.
+- Ordinary Lane-child ordinals have two digits and start at 01, except cross ordinals, which have three digits under Cross Groups below.
+- Child Patch ordinals have three digits and start at 001 inside each Unit.
 - Each exported GitDiff contains its native canonical commit message followed by its patch body, preserving the declared Lane, Patch identity, Form, and Segment without a sidecar.
 - Export readers admit only that current form and require its metadata to match its semantic artifact path.
 - A is immutable and B projects it; GitDiffs retain headers, modes, hunks, and bytes, while invalid forms stay unexported.
 - Targets retain accepted prefixes; another source supplies only the selected Unit or Flat Patch.
 - Commits, not records, order work; List, Apply, Commit, and Export recheck history.
-- Exports regenerate GitDiffs plus root and lane notes into an absent staged tag. Lane-child ordinals derive from Git history; tag-prev is outside the projection.
+- Exports regenerate GitDiffs plus root and lane notes and the cross relationship diagram into an absent staged tag. Lane-child ordinals derive from Git history; tag-prev is outside the projection.
 - Each Patch's one commit and GitDiff contains semantic source only; editing an earlier committed child uses Fork.
 - Every Patch retains name, commit, diff bytes, and position. No operation combines or splits Patches. Structure changes require explicit current-user approval.
 - File moves, upstream adaptation, or matching metadata cannot transfer behavior between Units, Flat Patches, or Child Patches.
@@ -31,12 +43,11 @@ PatchGitDiffLineAdmission
 
 - A snapshot forces no separate Patch, Unit, Child Patch, or line exemption. At most one `regenerate-snapshots` Transform ends the current history and remains unexported.
 - Commit appends one declared Child Patch or creates one Flat Patch. Rebuilding a Unit preserves one commit per Child Patch.
-- Lanes other than backend, mixed, bugfix, and draft place Units before Flat Patches.
-- Backend and mixed use the responsibility order below.
+- Within each ordinary Lane, all Units precede all Flat Patches; cross applies this rule within each consecutive CrossGroup instead of across unrelated groups.
+- Draft follows the same layout rules and has no type-order exemption.
 - Bugfix admits Flat Patches only.
-- Draft permits any Unit and Flat Patch order.
-- Live history, prospective source changes, and exported prefixes share this Lane-child ordering admission.
-- PatchReplay returns bounded Blocked/Input for invalid Lane-child order before product source or private export mutation.
+- Live history, prospective changes and exported prefixes share Lane, CrossGroup, type, generation-impact and direct-predecessor admission.
+- PatchReplay returns bounded Blocked/Input for invalid dependencies before product source or private export mutation.
 - Complete assigned-behavior and Rust semantic acceptance precede the mechanical line check. Its ceiling authorizes neither compensating growth nor feature deletion, and splitting a rejected design does not resolve it.
 - Patch authoring measures the staged GitDiff before commit. Commit measures its new Flat Patch or Child Patch, while Revise measures the amended Patch and each later Child Patch it regenerates. Empty or oversized output restores the exact pre-operation input and returns Product Required without publishing any Patch commit.
 - Projection measures every canonical Git diff body against the 1500-line limit.
@@ -47,32 +58,94 @@ PatchGitDiffLineAdmission
 - The source reader validates paths, metadata-derived sequences, patch syntax, and bytes. Apply does not reimpose authoring size policy on retained input or add a legacy import mode.
 - Retained-directory comparison uses exact canonical bytes; a new export reapplies current publication policy.
 
-## Responsibility Order
+## Responsibility Classification
 
-```
-Backend
-+-- 1: non-app-server Unit
-+-- 2: non-schema app-server Unit
-+-- 3: schema app-server Unit
-+-- 4: schema app-server Flat Patch
-+-- 5: non-schema app-server Flat Patch
-`-- 6: non-app-server Flat Patch
-```
+- ReleaseRollForward's OriginalPatchPurposeOwner makes the single semantic classification decision before metadata or transport.
+- Current user decisions fix observable behavior, explicit group members, exclusions, and maturity; metadata records the resulting assignment.
+- Backend owns a complete non-presentation feature and its interfaces.
+- Mixed owns a feature with one backend responsibility paired with one frontend responsibility.
+- Frontend owns presentation using complete existing interfaces without adding a backend feature.
+- Cross owns an approved non-one-to-one functional relationship among backend producers and frontend consumers that must change together to deliver the assigned behavior.
+- Count independently assigned feature responsibilities, not functions, events, API calls, files, schema types, snapshots, or graph edges.
+- Without that functional relationship, retain independent responsibilities in their applicable ordinary Lanes.
+- An explicit user-defined group is a fixed scope boundary, not a seed for dependency closure or automatic member discovery.
+- A member must contribute to that group's assigned producer-consumer behavior; sharing infrastructure with a member is insufficient.
+- Recording an independent feature or calling its utility does not move that feature into the recorder's or caller's group.
+- A shared widget qualifies only when the assigned features require coordinated changes to its observable behavior.
+- Neither a real private dependency nor generation impact establishes group membership.
+- Bugfix and normalization retain their existing purposes before formal feature Lanes.
+- Backend, mixed, frontend and cross form the formal prefix; draft retains unfinished or unpromoted features.
+- An approved future integration informs the functional boundary without implementing it or promoting its draft consumers.
+- The complete formal prefix must build and preserve its approved behavior and tests without draft.
+- Draft may consume complete formal interfaces; shared interfaces have one actual owner without merging otherwise independent features.
+- Moving an interface or integration requires approved responsibility redistribution and preservation of every admitted consumer.
 
-```
-Mixed
-+-- 1: non-app-server Unit
-+-- 2: non-schema app-server Unit
-`-- 3: schema app-server Unit
-```
+## Direct Prerequisites
 
-- Mixed admits Units only, keeping each cross-frontend/backend responsibility in its complete Child Patch sequence.
-- A complete Unit or Flat Patch declares its responsibility through Segment rather than inferring app-server ownership from touched files.
-- Segment `none` denotes a non-app-server responsibility in backend and mixed.
-- Segment `non-schema` denotes an app-server responsibility without an assigned protocol-source change.
-- Segment `schema` denotes an app-server responsibility with an assigned protocol-source change.
-- Every Child Patch in a Unit keeps that Unit's declared Segment, including children that only implement or present its protocol.
-- Categories never reorder Child Patches within a Unit or merge distinct Lane children.
+- Requires names only private behavior that the consumer actually needs for its approved outcome.
+- Establish the native upstream behavior first, then identify the prerequisite Patch's required behavioral addition or change and its actual consumer.
+- An existing API call is not evidence that the private Patch touching its implementation supplies that API or the behavior this caller requires.
+- Verify each asserted private dependency against the relevant native implementation and private delta before retaining or publishing it.
+- Declare every proven direct prerequisite; omit merely transitive predecessors unless their behavior is also used directly.
+- Upstream behavior and mandatory generated transforms are not private prerequisites.
+- Each prerequisite uses an existing typed selector for an earlier complete Unit or Flat Patch, such as Unit:backend/serve-models-and-announce-changes.
+- Earlier-only admission excludes self-dependencies, missing or later producers, cycles and formal-to-draft dependencies without a separate graph store.
+- A missing required seam returns to its actual responsibility owner; it does not authorize speculative interfaces or a new group member.
+- Dependency order and canonical layout must both hold.
+- Preserve predecessor-relative order unless an approved change requires adjustment.
+- Incompatibility returns to ReleaseRollForward's responsibility decision without automatic merging, splitting, reclassification, or weakened metadata.
+- Native admission checks these declarations structurally; it cannot establish their semantic truth.
+
+## Cross Groups
+
+- The cross lane requires one `relationships.txt` ASCII graph describing every approved group under PatchExport's Cross Relationship Diagram contract.
+- The diagram is a reviewed explanation of user-authorized functional relationships, not a Patch, Unit, group directory, metadata source or executable dependency graph.
+- Each cross responsibility declares one semantic hyphenated CrossGroup name in its first-commit contract.
+- A CrossGroup groups related complete responsibilities without becoming a Unit, Patch, commit, directory, dependency selector or separate stored object.
+- All responsibilities of one CrossGroup are consecutive; a closed group cannot reappear.
+- First appearance assigns group digits 1 through 9 in Git order.
+- Within a group, complete Units and Flat Patches receive member numbers 01 through 99 in Git order.
+- The exported three-digit Lane-child ordinal concatenates the group digit and member number, so the first group starts at 101 and the next at 201.
+- Members retain their own names, contracts, direct dependencies and Child Patch boundaries.
+- Each group independently applies Unit-before-Flat-Patch order and the generation-impact region below.
+- CrossGroup encodes the already justified membership; its name and ordinal supply no admission evidence.
+- Native transport derives ordinals from the sole commit metadata and rejects exhausted widths instead of widening or wrapping names.
+
+## Continuous Generation Impact
+
+- Segment describes the generation impact of the complete Unit or Flat Patch, never an individual child or generated payload.
+- The admitted values are none, schema, snapshot and schema-snapshot.
+- Schema impact means the responsibility changes app-server protocol source or another generator input that changes the app-server schema postimage.
+- Snapshot impact means the responsibility changes a snapshot-producing behavior or its expectation such that authoritative snapshot regeneration is required.
+- A responsibility affecting both declares schema-snapshot; every Child Patch retains the same declaration.
+- Backend, mixed, cross and draft admit all four values; bugfix, normalization and frontend admit only none or snapshot.
+- In each ordinary Lane, or independently inside each CrossGroup, affected responsibilities occupy one continuous region.
+- Within that region, actual direct dependencies determine responsibility order without a generation-impact category rank.
+- Segment none may appear before or after that region, never inside it.
+- Unit-before-Flat-Patch order applies across the whole same scope, including the affected region and its surrounding none responsibilities.
+- Review actual generators, output producers, assertions and callers to assign impact before publishing the responsibility contract.
+- Helpers check declared continuity and reject protocol-source changes without schema impact; they do not infer semantic snapshot impact from paths or test results.
+- The source layout makes generation responsibility observable but creates no per-region generator, transform commit or test gate.
+
+## Responsibility Contract
+
+- Every Flat Patch commit and the first Child Patch of every Unit appends exactly Purpose, Requires, Provides, Boundary and Verification to its ordinary metadata in that order.
+- Cross appends CrossGroup after Verification at that same owner; every other Lane forbids that field.
+- Subsequent Child Patches and generated transforms contain no responsibility fields.
+- Each field is one nonempty printable ASCII-English line, separated by the same blank-line convention as existing metadata.
+- Purpose states the approved observable outcome.
+- Requires lists unique direct typed selectors separated by comma-space, or the exact value none when no private predecessor is required.
+- Provides states the complete behavior and interfaces owned by this responsibility, including applicable lifecycle and failure semantics.
+- Boundary states what remains with its producers, consumers or other owners.
+- Verification names the relevant source or test entrypoints and observable assertions rather than a stored result or a mandatory rerun command.
+- Keep these fields concise without dropping required behavior or packing unrelated obligations into shorthand.
+- Native Git owns the sole contract copy; exported GitDiff metadata projects those exact fields.
+- Contract changes follow the same Unit or Flat Patch authority and Git boundary as source changes.
+- Apply and Unit-local suffix replay preserve each contract at its original first-commit owner.
+- Revise retains the existing contract unless an authorized complete replacement is supplied for its owning commit.
+- Bare ordinary histories without their required contracts are not admitted as a second format.
+- Historical noncanonical patches remain read-only purpose evidence, never compatibility inputs.
+- No sidecar, dependency database, contract version, reverse-dependency ledger or automatic reorder route is introduced.
 
 ## Metadata And Schema Terminals
 
@@ -83,17 +156,18 @@ GeneratedSchemaTerminalOwner
 `-- UnexportedTransformCommitThenAncestorConvergence
 ```
 
-- Every commit uses exactly one metadata shape above plus `Lane`, `Form`, and `Segment`; malformed or mixed discriminants are Blocked.
+- Every commit uses exactly one metadata shape above plus Lane, Form and Segment, with responsibility fields only at their declared owner; malformed or mixed discriminants are Blocked.
 - Helper commits use nobody, epoch, exact subject, and fields.
 - Generated commits follow all ordinary Patches: schema when required, then snapshot. Their Lane identifies the current source frontier, not a permanent place among that lane's Patches.
 - Transform names are reserved; unexported `ExecutableTransform` uses Segment `schema` or `snapshot`.
-- Backend and mixed permit `none`, `non-schema`, and `schema` for ordinary GitDiffs.
-- Draft permits `none` or `schema`; all other source lanes use `none`.
-- A GitDiff touching protocol source must belong to backend, mixed, or draft with Segment `schema`.
-- Cumulative schema generation is required only when an ordinary Patch declares Segment `schema`.
+- Ordinary Segment values and continuous placement follow Continuous Generation Impact.
+- A GitDiff touching protocol source must belong to backend, mixed, cross or draft with Segment schema or schema-snapshot.
+- Cumulative schema generation is required exactly when an ordinary responsibility declares schema or schema-snapshot.
+- Snapshot-impact metadata changes source placement only; authoritative snapshot generation remains selected Finalize's responsibility.
 - A temporary schema tip is no Unit, Flat Patch, exported artifact, suffix member, or accepted lane terminal. A failed transform, test, or restoration blocks replay.
 - Generated tails are not pending semantic work or proof that a patch set can never grow. Retained-parent coverage compares ordinary Lane children; generated tail does not require another product identity or historical acceptance record.
-- Initial terminal-chrome covers `.rs` and `.snap`; each generation consumes RepositoryFormatting before comparison, and the two complete formatted postimages must agree before the single transform commit.
+- Initial terminal-chrome consumes only current target source and covers `.rs` and `.snap`.
+- Each generation consumes RepositoryFormatting before comparison, and the two complete formatted postimages must agree before the single transform commit.
 
 ```
 TerminalChromeNormalizationOwner
@@ -119,6 +193,8 @@ TerminalChromeNormalizationOwner
 - Preserve legacy TXT assets and complete TUI empty-state and welcome Braille across module paths through source ownership.
 - The composer sparkle producer and its tests retain the eight sparse dots when present in the selected font, without a source-only exception.
 - Unicode input and grapheme fixtures remain unchanged.
+- Rendered-selection U+1F469 and U+1F4BB remain source-owned hyperlink and clipboard payload.
+- Hook-browser status-title U+1F980 remains source-owned payload.
 - Only Markdown math owners, the two streaming math tests, and snapshots attributed to those sources bypass script normalization and unknown-symbol checking.
 - Other Markdown and Mermaid sources and snapshots receive ordinary replacement, rounded-corner conversion, and unknown-symbol checking.
 - Product code owns any decision to disable math rendering; the transform does not rewrite math renderer logic or test selectors.
