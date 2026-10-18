@@ -1,0 +1,473 @@
+bind-response-observers-to-model-clients
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: bind-response-observers-to-model-clients
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -37,6 +37,8 @@ use std::sync::atomic::Ordering;
+ mod tool_metadata;
+ 
+ use crate::CodexResponsesHeaders;
++use crate::response_metrics::ResponseAttemptContext;
++use crate::response_metrics::ResponseMetrics;
+ use crate::tools::ExecutedToolCalls;
+ use async_channel::Sender;
+ use codex_api::AgentIdentityTelemetry;
+@@ -55,6 +57,7 @@ use codex_api::ReasoningContext;
+ use codex_api::RequestTelemetry;
+ use codex_api::ReqwestTransport;
+ use codex_api::ResponseCreateWsRequest;
++use codex_api::ResponseObserver;
+ use codex_api::ResponsesApiRequest;
+ use codex_api::ResponsesClient as ApiResponsesClient;
+ use codex_api::ResponsesOptions as ApiResponsesOptions;
+@@ -100,6 +103,7 @@ use codex_protocol::protocol::ResponsesStreamConnectionStatusEvent;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::W3cTraceContext;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_rollout_trace::InferenceTraceAttempt;
+ use codex_rollout_trace::InferenceTraceContext;
+ use codex_tools::ToolSpec;
+@@ -135,6 +139,7 @@ use crate::context::ContextualUserFragment;
+ use crate::cyber_access_program;
+ use crate::feedback_tags;
+ use crate::responses_metadata::CodexResponsesMetadata;
++use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_metadata::subagent_header_value;
+ use crate::util::emit_feedback_auth_recovery_tags;
+ use codex_feedback::FeedbackRequestTags;
+@@ -222,6 +227,7 @@ struct ModelClientState {
+     disable_websockets: AtomicBool,
+     agent_identity_session_fallback: AgentIdentitySessionFallback,
+     cached_websocket_session: StdMutex<WebsocketSession>,
++    response_metrics: Arc<ResponseMetrics>,
+     /// Last full tool list used for sampling, retained across turns and connection resets.
+     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
+ }
+@@ -544,6 +550,7 @@ impl ModelClient {
+     /// HTTP client factory must come from the effective session configuration so every transport
+     /// observes the resolved outbound proxy policy.
+     pub fn new(
++        response_metrics: Arc<ResponseMetrics>,
+         auth_manager: Option<Arc<AuthManager>>,
+         agent_identity_policy: AgentIdentityAuthPolicy,
+         thread_id: ThreadId,
+@@ -602,6 +609,7 @@ impl ModelClient {
+                 disable_websockets: AtomicBool::new(false),
+                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
++                response_metrics,
+                 last_inference_tools: StdMutex::new(None),
+             }),
+             agent_identity_policy,
+@@ -690,6 +698,10 @@ impl ModelClient {
+         }
+     }
+ 
++    pub(crate) fn response_metrics(&self) -> Arc<ResponseMetrics> {
++        Arc::clone(&self.state.response_metrics)
++    }
++
+     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+         self.state.provider.auth_manager()
+     }
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -123,6 +123,7 @@ fn test_model_client_with_thread_id(
+ ) -> ModelClient {
+     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+     ModelClient::new(
++        Arc::new(crate::ResponseMetrics::new(|_| {})),
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+@@ -2253,6 +2254,7 @@ fn model_client_with_counting_attestation(
+         )
+     };
+     let model_client = ModelClient::new(
++        Arc::new(crate::ResponseMetrics::new(|_| {})),
+         auth_manager,
+         AgentIdentityAuthPolicy::JwtOnly,
+         ThreadId::new(),
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -103,6 +103,7 @@ pub(crate) async fn run_codex_thread_interactive(
+     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
+     thread_extension_init.insert(isolation);
+     let spawn_result = Session::spawn(SessionSpawnArgs {
++        response_metrics: parent_session.services.model_client.response_metrics(),
+         startup: Some(Arc::clone(&startup)),
+         config,
+         allow_provider_model_fallback: false,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -482,6 +482,7 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation<'_> {
+ }
+ 
+ pub(crate) struct SessionSpawnArgs {
++    pub(crate) response_metrics: Arc<crate::ResponseMetrics>,
+     pub(crate) startup: Option<Arc<startup::SessionStartup>>,
+     pub(crate) config: Config,
+     pub(crate) allow_provider_model_fallback: bool,
+@@ -598,6 +599,7 @@ impl Session {
+     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+         args.config.validate_windows_mxc_requirement()?;
+         let SessionSpawnArgs {
++            response_metrics,
+             startup,
+             config,
+             allow_provider_model_fallback,
+@@ -965,6 +967,7 @@ impl Session {
+         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+ 
+         let session = Box::pin(Session::new(
++            response_metrics,
+             startup.clone(),
+             session_configuration,
+             &environment_selections,
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -849,6 +849,7 @@ impl Session {
+     #[instrument(name = "session_init", level = "info", skip_all)]
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) async fn new(
++        response_metrics: Arc<crate::ResponseMetrics>,
+         startup: Option<Arc<super::startup::SessionStartup>>,
+         mut session_configuration: SessionConfiguration,
+         environment_selections: &[TurnEnvironmentSelection],
+@@ -1103,6 +1104,7 @@ impl Session {
+             thread_id.to_string(),
+             thread_extension_init,
+         );
++        thread_extension_data.insert((Arc::clone(&response_metrics), thread_id));
+         thread_extension_data.insert(crate::context::GuardianReviewEvidence::default());
+         // Kick off independent async setup tasks in parallel to reduce startup latency.
+         //
+@@ -1844,6 +1846,7 @@ impl Session {
+                 attestation_provider: attestation_provider.clone(),
+                 time_provider,
+                 model_client: ModelClient::new(
++                    response_metrics,
+                     Some(Arc::clone(&auth_manager)),
+                     if config.features.enabled(Feature::UseAgentIdentity) {
+                         AgentIdentityAuthPolicy::ChatGptAuth
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -629,10 +629,11 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
+         tc.trace_id.as_deref(),
+         Some("00000000000000000000000000000011")
+     );
++    let response_metrics = sess.services.model_client.response_metrics();
+     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+     let handle = tokio::spawn(async move {
+         let _ = startup_prewarm_rx.await;
+-        Ok(test_model_client_session())
++        Ok(test_model_client_session(response_metrics))
+     });
+ 
+     sess.set_session_startup_prewarm(
+@@ -785,10 +786,11 @@ async fn request_mcp_server_elicitation_waits_for_user_response(source: SessionS
+ #[tokio::test]
+ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
+     let (sess, tc, rx) = make_session_and_context_with_rx().await;
++    let response_metrics = sess.services.model_client.response_metrics();
+     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+     let handle = tokio::spawn(async move {
+         let _ = startup_prewarm_rx.await;
+-        Ok(test_model_client_session())
++        Ok(test_model_client_session(response_metrics))
+     });
+ 
+     sess.set_session_startup_prewarm(
+@@ -847,10 +849,13 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
+     assert!(duration_ms.is_some());
+ }
+ 
+-fn test_model_client_session() -> crate::client::ModelClientSession {
++fn test_model_client_session(
++    response_metrics: Arc<crate::ResponseMetrics>,
++) -> crate::client::ModelClientSession {
+     let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000001")
+         .expect("test thread id should be valid");
+     crate::client::ModelClient::new(
++        response_metrics,
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+@@ -7109,6 +7114,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+         model_client: ModelClient::new(
++            Arc::new(crate::ResponseMetrics::new(|_| {})),
+             Some(auth_manager.clone()),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+@@ -7332,6 +7338,7 @@ async fn make_session_with_config_and_rx(
+     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+ 
+     let session = Session::new(
++        Arc::new(crate::ResponseMetrics::new(|_| {})),
+         /*startup*/ None,
+         session_configuration,
+         &default_environments,
+@@ -7469,6 +7476,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
+ 
+     let history_initialization = HistoryInitialization::from_history(&initial_history);
+     let session = Session::new(
++        Arc::new(crate::ResponseMetrics::new(|_| {})),
+         /*startup*/ None,
+         session_configuration,
+         &default_environments,
+@@ -9413,6 +9421,7 @@ where
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+         model_client: ModelClient::new(
++            Arc::new(crate::ResponseMetrics::new(|_| {})),
+             Some(Arc::clone(&auth_manager)),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+diff --git a/codex-rs/core/src/session/tests/guardian_tests.rs b/codex-rs/core/src/session/tests/guardian_tests.rs
+--- a/codex-rs/core/src/session/tests/guardian_tests.rs
++++ b/codex-rs/core/src/session/tests/guardian_tests.rs
+@@ -1288,6 +1288,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
+     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
+     thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+     let (session, io) = Session::spawn(SessionSpawnArgs {
++        response_metrics: Arc::new(crate::ResponseMetrics::new(|_| {})),
+         startup: None,
+         config,
+         allow_provider_model_fallback: false,
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -426,6 +426,8 @@ pub(crate) struct ThreadManagerState {
+     tui_mcp_rebinding: RwLock<()>,
+     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
+     thread_created_tx: broadcast::Sender<ThreadId>,
++    response_metrics: Arc<crate::ResponseMetrics>,
++    response_updates: broadcast::Sender<codex_protocol::response_metrics::ResponseAttempt>,
+     thread_id_generator: ThreadIdGenerator,
+     agent_control_factory: Option<AgentControlFactory>,
+     auth_manager: Arc<AuthManager>,
+@@ -563,6 +565,12 @@ impl ThreadManager {
+         let codex_home = config.codex_home.clone();
+         let restriction_product = session_source.restriction_product();
+         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
++        let (response_updates, _) = broadcast::channel(1024);
++        let response_tx = response_updates.clone();
++        let response_metrics = Arc::new(crate::ResponseMetrics::new(move |record| {
++            // Notifications need no receiver while the manager runs without a UI.
++            let _ = response_tx.send(record);
++        }));
+         let skills_service = Arc::new(HostSkillsService::new_with_restriction_product(
+             codex_home.clone(),
+             config.bundled_skills_enabled(),
+@@ -596,6 +604,8 @@ impl ThreadManager {
+                 tui_mcp_rebinding: RwLock::new(()),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
++                response_metrics,
++                response_updates,
+                 thread_id_generator: default_thread_id_generator(),
+                 agent_control_factory: None,
+                 models_manager,
+@@ -755,6 +765,11 @@ impl ThreadManager {
+             Err(err) => panic!("test codex_home should be absolute: {err}"),
+         };
+         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
++        let (response_updates, _) = broadcast::channel(1024);
++        let response_tx = response_updates.clone();
++        let response_metrics = Arc::new(crate::ResponseMetrics::new(move |record| {
++            let _ = response_tx.send(record);
++        }));
+         let restriction_product = SessionSource::Exec.restriction_product();
+         let skills_service = Arc::new(HostSkillsService::new_with_restriction_product(
+             absolute_codex_home.clone(),
+@@ -786,6 +801,8 @@ impl ThreadManager {
+                 tui_mcp_rebinding: RwLock::new(()),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
++                response_metrics,
++                response_updates,
+                 thread_id_generator: default_thread_id_generator(),
+                 agent_control_factory: None,
+                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
+@@ -821,6 +838,17 @@ impl ThreadManager {
+         self.state.session_source.clone()
+     }
+ 
++    /// Shared response accounting, including detached internal requests.
++    pub fn response_metrics(&self) -> Arc<crate::ResponseMetrics> {
++        Arc::clone(&self.state.response_metrics)
++    }
++
++    pub fn response_attempt_receiver(
++        &self,
++    ) -> broadcast::Receiver<codex_protocol::response_metrics::ResponseAttempt> {
++        self.state.response_updates.subscribe()
++    }
++
+     pub fn auth_manager(&self) -> Arc<AuthManager> {
+         self.state.auth_manager.clone()
+     }
+@@ -2372,6 +2400,7 @@ impl ThreadManagerState {
+         let attachment_source =
+             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
+         let spawn_result = Session::spawn(SessionSpawnArgs {
++            response_metrics: Arc::clone(&self.response_metrics),
+             startup,
+             config,
+             allow_provider_model_fallback,
+diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
+--- a/codex-rs/core/tests/responses_headers.rs
++++ b/codex-rs/core/tests/responses_headers.rs
+@@ -126,6 +126,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
+     );
+ 
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+@@ -273,6 +274,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
+     );
+ 
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+@@ -405,6 +407,7 @@ async fn responses_respects_model_info_overrides_from_config() {
+     );
+ 
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -1752,6 +1752,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
+         SessionSource::Exec,
+     );
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+             "unused-api-key",
+         ))),
+@@ -3255,6 +3256,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
+     );
+ 
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         /*auth_manager*/ None,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -2862,6 +2862,7 @@ async fn websocket_harness_with_provider_options_and_auth(
+     let effort = None;
+     let summary = ReasoningSummary::Auto;
+     let client = ModelClient::new(
++        Arc::new(codex_core::ResponseMetrics::new(|_| {})),
+         client_auth_manager,
+         AgentIdentityAuthPolicy::JwtOnly,
+         thread_id,
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler.rs
+@@ -27,6 +27,7 @@ use codex_login::AgentIdentityAuthPolicy;
+ use codex_model_provider::SharedModelProvider;
+ use codex_model_provider::WorkspaceRoutingContext;
+ use codex_protocol::ResponseItemId;
++use codex_protocol::ThreadId;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::ResponseItem;
+@@ -70,6 +71,8 @@ pub struct LunaSamplerConfig {
+     pub luna_compaction_hash: Option<String>,
+     /// Complete input allowance resolved for the classifier model.
+     pub max_input_tokens: usize,
++    /// Response observation publisher and the owning Codex thread's identity.
++    pub response_recording: Option<(Arc<codex_core::ResponseMetrics>, ThreadId)>,
+     /// Host-provided metrics capability with the owning session's attribution.
+     pub metrics: Option<Arc<dyn ExtensionMetrics>>,
+ }
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler_tests.rs
+@@ -228,6 +228,7 @@ pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerCo
+         service_tier: None,
+         luna_compaction_hash: None,
+         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
++        response_recording: None,
+         metrics: None,
+     }
+ }
+@@ -597,6 +598,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
+         service_tier: None,
+         luna_compaction_hash: None,
+         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
++        response_recording: None,
+         metrics: None,
+     })
+     .await?;
+@@ -865,6 +867,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events()
+         service_tier: None,
+         luna_compaction_hash: None,
+         max_input_tokens: codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS,
++        response_recording: None,
+         metrics: None,
+     })
+     .await?;
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/startup.rs b/codex-rs/ext/guardian-v2/src/async_scorer/startup.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/startup.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/startup.rs
+@@ -81,6 +81,10 @@ pub(super) async fn sampler_config(
+     auth_manager: Arc<AuthManager>,
+     manager: Option<Arc<ThreadManager>>,
+ ) -> LunaSamplerConfig {
++    let response_recording = input
++        .thread_store
++        .get::<(Arc<codex_core::ResponseMetrics>, codex_protocol::ThreadId)>()
++        .map(|recording| recording.as_ref().clone());
+     let luna_model = if let Some(thread_manager) = manager {
+         let mut model_config = input.config.to_models_manager_config();
+         model_config.model_context_window = None;
+@@ -126,6 +130,7 @@ pub(super) async fn sampler_config(
+         service_tier: input.config.service_tier.clone(),
+         luna_compaction_hash,
+         max_input_tokens,
++        response_recording,
+         metrics: input.extension_metrics.clone(),
+     }
+ }
+diff --git a/codex-rs/memories/write/src/runtime.rs b/codex-rs/memories/write/src/runtime.rs
+--- a/codex-rs/memories/write/src/runtime.rs
++++ b/codex-rs/memories/write/src/runtime.rs
+@@ -323,6 +323,7 @@ impl MemoryStartupContext {
+         let session_id = SessionId::from(self.thread_id);
+         let session_id_string = session_id.to_string();
+         let model_client = ModelClient::new(
++            self.thread_manager.response_metrics(),
+             Some(Arc::clone(&self.auth_manager)),
+             AgentIdentityAuthPolicy::JwtOnly,
+             self.thread_id,

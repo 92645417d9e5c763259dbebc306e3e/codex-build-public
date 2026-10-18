@@ -63,7 +63,7 @@ func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResu
 		return result, err
 	}
 	defer releaseCargoLock(lock)
-	attempt, err := prepareNativeToolchainAttempt(options.RuntimeRoot)
+	attempt, err := prepareNativeToolchainAttempt(filepath.Join(options.WorkingRoot, "build", "tmp"))
 	if err != nil {
 		result.FailureDomain = failureDomainHelper
 		return result, err
@@ -102,12 +102,12 @@ func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResu
 	return result, nil
 }
 
-func prepareNativeToolchainAttempt(runtimeRoot string) (string, error) {
+func prepareNativeToolchainAttempt(temporaryRoot string) (string, error) {
 	id, err := randomID()
 	if err != nil {
 		return "", err
 	}
-	root := filepath.Join(runtimeRoot, "native-toolchain", id)
+	root := filepath.Join(temporaryRoot, "native-toolchain", id)
 	if err := ensureDirectoryNoFollow(root, 0o700); err != nil {
 		return "", err
 	}

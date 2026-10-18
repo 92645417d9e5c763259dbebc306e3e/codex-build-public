@@ -3,6 +3,10 @@
 ## Admission
 
 - Invoke installed `build-install` alone using parser-owned `--help` after TaskWorkspace reconciles pending obligations and RouteEntry selects the effect on clean registered MainWorktree.
+- An indexed Roll consumes the same native source-coverage admission before tool acquisition, completed-package reuse, compilation or selection.
+- During explicit draft quick iteration, coverage consumes the task's canonical terminal reachable from clean Main while the existing draft owner verifies the temporary suffix.
+- Coverage neither parses temporary fixup subjects nor changes the actual Main source selected for building.
+- An independent Install without an active Roll retains its existing package and launch-entry contract.
 - Unrelated probes and skill maintenance follow the product terminal.
 - Caller-home release links are user-owned; the helper's dist selection does not depend on them.
 - Dist selection neither reads nor writes caller-home release links.
@@ -20,6 +24,7 @@ BuildInstallPublicationOwner
 - Under CargoLock, prepare the latest semantic shuck and tokei releases in retained bare remote clones at `PROJECT_SCRATCH_ROOT/tool-sources/{shuck,tokei}.git`.
 - Archive each selected commit.
 - Validate the source version and Cargo lock before fetching its locked dependencies with the fixed toolchain.
+- The existing tool preparation owner derives its private source extraction, HOME and temporary files beneath the effective working root at build/tmp/build-tools and removes that exact attempt after consumption or failure.
 - Caller-supplied inspection-tool binaries are not build inputs.
 - Before package admission, match Main's locked V8 version to the GNU toolchain. Authenticate its remote two-file checksum manifest against Main's pinned release-manifest digest, then verify the existing archive and bindings. Keep no checksum state and never substitute a target or download unverified build inputs.
 - Build only in ProjectedRunner, keeping Main at 0.0.0 and stamping the full BuildVersion once in the private overlay's workspace.package version, inherited by all workspace crates including CLI.

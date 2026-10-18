@@ -10,13 +10,14 @@
 
 ## Semantic Acceptance
 
-- The product agent performs one synchronous review in the linear Roll, without subagents, a review queue or a second acceptance record.
+- The product agent performs cumulative source acceptance synchronously in the linear Roll.
 - Before dependent edits, resolve the complete assignment and Rust construction, including effective-configuration coverage for every requested entrypoint.
 - Before publication or post-check continuation, compare the cumulative responsibility with its native base through lang's [Rust Semantic review](/codex/skills/lang/references/rust/post-green-review.md).
 - Include temporary Main corrections and all Child Patches, not only the latest hunk or selected tests.
 - For each approved effect, locate the actual producer, consumer, lifecycle, failure and cleanup implementation.
 - Check that native-supplied behavior has not been claimed as a private dependency or duplicated by the candidate.
-- Reject missing effects and incoming duties outside the recovered assignment independently of compiler or test outcomes.
+- For performance-motivated additions, consume ReleaseRollForward's measured-benefit decision against the actual consumer and reject narrower-workload, incomplete-result or unmeasured claims.
+- Reject missing effects, incoming duties and new or relocated Patches outside the separately authorized structural assignment, independently of compiler or test outcomes.
 - Compare an approved change with the original obligation, requested difference and complete replacement under ReleaseRollForward's disablement-versus-retirement decision.
 - For local disablement, inspect the complete activation path and cumulative diff to prove the requested absence while preserving continuing upstream implementation and its tests.
 - For authorized retirement, prove exclusive source and consumers are removed while shared and independently required behavior remain intact.
@@ -33,6 +34,18 @@
 - Explicit withdrawal authority is required for every omitted effect; a test-only, no-op or truncated replacement cannot close it.
 - Mechanical line limits and overrides do not change this acceptance boundary.
 
+## User-Selected Batch Review
+
+- Read the indexed task's SubagentReview setting before selecting subagents for a requested review.
+- A yes value permits one fresh read-only leaf subagent to review a selected group of at least two distinct Units or Flat Patches.
+- A no value keeps the review in the product agent.
+- Multiple Child Patches in one Unit do not satisfy the group requirement.
+- Keep source authoring, testing, Git effects, publication, installation and final acceptance in the product agent.
+- Supply the reviewer's exact scope, requirements, complete relevant source and history, applicable notes, verification evidence and excluded locators through the native task message.
+- Return findings to the existing product owner and its ordinary Unit or Flat Patch correction boundary.
+- Retain the native reviewer handle until completion and drain it before any successor that depends on its result.
+- The setting selects no automatic per-Unit dispatch, additional review gate, review queue or task progress state.
+
 ## Responsibility Closure
 
 - Close the complete assigned behavior and its product terminal before reducing pending work.
@@ -44,6 +57,7 @@
 - A partial ChildPatchSequence remains open with its unfinished obligations.
 - Report semantic acceptance, native structural admission and selected test outcomes separately.
 - Native transport proves structure, bytes, formatting and rollback only.
+- Closure and successful checks do not approve entry into another Unit or Lane; consume ReleaseRollForward's boundary decision before that successor.
 - Focused tests answer source questions after publication; automatic reconstruction and non-idempotent fixup folds require their corresponding focused tests before advancement.
 - Prior failures remain evidence without creating a full-suite gate.
 - Git frontier coverage and semantic closure retain their own evidence requirements.

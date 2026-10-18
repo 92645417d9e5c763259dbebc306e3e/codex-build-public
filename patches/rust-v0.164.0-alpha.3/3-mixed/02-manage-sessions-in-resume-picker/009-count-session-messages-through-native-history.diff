@@ -1,0 +1,587 @@
+count-session-messages-through-native-history
+
+Lane: mixed
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: count-session-messages-through-native-history
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -860,6 +860,11 @@ client_request_definitions! {
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadReadResponse,
+     },
++    ThreadMessageCountRead => "thread/messageCount/read" {
++        params: v2::ThreadMessageCountReadParams,
++        serialization: None,
++        response: v2::ThreadMessageCountReadResponse,
++    },
+     #[experimental("thread/readState/update")]
+     ThreadReadStateUpdate => "thread/readState/update" {
+         params: v2::ThreadReadStateUpdateParams,
+@@ -2691,6 +2696,14 @@ mod tests {
+         };
+         assert_eq!(thread_items_list.serialization_scope(), None);
+ 
++        let thread_message_count_read = ClientRequest::ThreadMessageCountRead {
++            request_id: request_id(),
++            params: v2::ThreadMessageCountReadParams {
++                thread_id: "thread-1".to_string(),
++            },
++        };
++        assert_eq!(thread_message_count_read.serialization_scope(), None);
++
+         let mcp_resource_read = ClientRequest::McpResourceRead {
+             request_id: request_id(),
+             params: v2::McpResourceReadParams {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -1722,6 +1722,23 @@ pub struct ThreadReadResponse {
+     pub read_state: Option<ThreadReadState>,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadMessageCountReadParams {
++    pub thread_id: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadMessageCountReadResponse {
++    /// User and assistant messages in native visible history, including all assistant phases.
++    /// Reasoning, tool activity and other non-message items are excluded.
++    #[ts(type = "number")]
++    pub message_count: u64,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1543,6 +1543,11 @@ impl MessageProcessor {
+             ClientRequest::ThreadRead { params, .. } => {
+                 self.thread_processor.thread_read(&request_id, params).await
+             }
++            ClientRequest::ThreadMessageCountRead { params, .. } => {
++                self.thread_processor
++                    .thread_message_count_read(params)
++                    .await
++            }
+             ClientRequest::ThreadReadStateUpdate { params, .. } => {
+                 self.thread_processor.thread_read_state_update(params).await
+             }
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -19,6 +19,8 @@ use codex_app_server_protocol::SelectedCapabilityRoot;
+ use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
+ use codex_app_server_protocol::ThreadItemsListAnchor;
+ use codex_app_server_protocol::ThreadItemsListCursor;
++use codex_app_server_protocol::ThreadMessageCountReadParams;
++use codex_app_server_protocol::ThreadMessageCountReadResponse;
+ use codex_app_server_protocol::ThreadRevertParams;
+ use codex_app_server_protocol::ThreadRevertResponse;
+ use codex_app_server_protocol::ThreadRevertedNotification;
+@@ -900,6 +902,90 @@ impl ThreadRequestProcessor {
+         Ok(Some(response.into()))
+     }
+ 
++    pub(crate) async fn thread_message_count_read(
++        &self,
++        params: ThreadMessageCountReadParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let thread_id = ThreadId::from_string(&params.thread_id)
++            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
++        let history_mode = self
++            .read_stored_thread_for_read(thread_id, /*include_history*/ false)
++            .await
++            .map_err(thread_read_view_error)?
++            .ok_or_else(|| invalid_request(format!("no rollout found for thread id {thread_id}")))?
++            .history_mode;
++        let message_count = match history_mode {
++            ThreadHistoryMode::Legacy => {
++                let items = self
++                    .load_thread_turns_list_history(thread_id)
++                    .await
++                    .map_err(thread_read_view_error)?;
++                // Native rollout reading already offloads decoding. Reconstructing the legacy
++                // message view must also leave the async executor available to other requests.
++                tokio::task::spawn_blocking(move || {
++                    build_legacy_api_turns_from_rollout_items(&items)
++                        .into_iter()
++                        .flat_map(|turn| turn.items)
++                        .filter(|item| {
++                            matches!(
++                                item,
++                                ThreadItem::UserMessage { .. } | ThreadItem::AgentMessage { .. }
++                            )
++                        })
++                        .count() as u64
++                })
++                .await
++                .map_err(|err| internal_error(format!("failed to count thread messages: {err}")))?
++            }
++            ThreadHistoryMode::Paginated => {
++                let mut cursor = None;
++                let mut count = 0;
++                loop {
++                    let page = self
++                        .thread_store
++                        .list_items(StoreListItemsParams {
++                            item_ids: None,
++                            thread_id,
++                            turn_id: None,
++                            include_archived: true,
++                            position: cursor.map(StoreListItemsPosition::Cursor),
++                            page_size: THREAD_ITEMS_MAX_LIMIT,
++                            sort_direction: StoreSortDirection::Asc,
++                            sort_key: StoreItemSortKey::CreatedAtOrdinal,
++                            after_updated_at_ordinal: None,
++                        })
++                        .await
++                        .map_err(paginated_history_list_error)?;
++                    let next_cursor = page.next_cursor;
++                    count += tokio::task::spawn_blocking(move || {
++                        page.items.into_iter().try_fold(0_u64, |count, item| {
++                            let item = deserialize_stored_thread_item(item)?;
++                            Ok::<_, JSONRPCErrorError>(
++                                count
++                                    + u64::from(matches!(
++                                        item,
++                                        ThreadItem::UserMessage { .. }
++                                            | ThreadItem::AgentMessage { .. }
++                                    )),
++                            )
++                        })
++                    })
++                    .await
++                    .map_err(|err| {
++                        internal_error(format!("failed to count thread messages: {err}"))
++                    })??;
++                    let Some(next_cursor) = next_cursor else {
++                        break count;
++                    };
++                    cursor = Some(next_cursor);
++                }
++            }
++        };
++        Ok(Some(
++            ThreadMessageCountReadResponse { message_count }.into(),
++        ))
++    }
++
+     pub(crate) async fn thread_turns_list(
+         &self,
+         params: ThreadTurnsListParams,
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_read.rs b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_read.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+@@ -33,12 +33,16 @@ use codex_app_server_protocol::ThreadItemsReadParams;
+ use codex_app_server_protocol::ThreadItemsReadResponse;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadListResponse;
++use codex_app_server_protocol::ThreadMessageCountReadParams;
++use codex_app_server_protocol::ThreadMessageCountReadResponse;
+ use codex_app_server_protocol::ThreadNameUpdatedNotification;
+ use codex_app_server_protocol::ThreadReadParams;
+ use codex_app_server_protocol::ThreadReadResponse;
+ use codex_app_server_protocol::ThreadResumeInitialTurnsPageParams;
+ use codex_app_server_protocol::ThreadResumeParams;
+ use codex_app_server_protocol::ThreadResumeResponse;
++use codex_app_server_protocol::ThreadRevertParams;
++use codex_app_server_protocol::ThreadRevertResponse;
+ use codex_app_server_protocol::ThreadSearchOccurrencesParams;
+ use codex_app_server_protocol::ThreadSearchOccurrencesResponse;
+ use codex_app_server_protocol::ThreadSetNameParams;
+@@ -63,11 +67,17 @@ use codex_exec_server::EnvironmentManager;
+ use codex_feedback::CodexFeedback;
+ use codex_protocol::items::AgentMessageContent;
+ use codex_protocol::items::AgentMessageItem;
++use codex_protocol::items::FunctionCallOutputItem;
++use codex_protocol::items::ReasoningItem;
+ use codex_protocol::items::TurnItem as CoreTurnItem;
+ use codex_protocol::items::UserMessageItem;
+ use codex_protocol::models::BaseInstructions;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::FunctionCallOutputBody;
+ use codex_protocol::models::MessagePhase;
++use codex_protocol::models::ResponseItem;
+ use codex_protocol::protocol::AgentMessageEvent;
++use codex_protocol::protocol::AgentReasoningEvent;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::ItemCompletedEvent;
+ use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
+@@ -241,6 +251,303 @@ async fn thread_read_can_include_turns() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn message_count_read_reconstructs_legacy_dialogue_without_raw_response_duplicates()
++-> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let (store, thread_id) = message_count_store(
++        codex_home.path(),
++        codex_protocol::protocol::ThreadHistoryMode::Legacy,
++    )
++    .await?;
++    let mut items = vec![
++        paginated_turn_started("legacy-turn"),
++        RolloutItem::ResponseItem(
++            ResponseItem::Message {
++                encrypted_content: None,
++                status: None,
++                id: None,
++                role: "user".into(),
++                content: vec![ContentItem::InputText {
++                    text: "question".into(),
++                }],
++                phase: None,
++                internal_chat_message_metadata_passthrough: None,
++            }
++            .into(),
++        ),
++        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
++            message: "question".into(),
++            ..Default::default()
++        })),
++        RolloutItem::EventMsg(EventMsg::AgentReasoning(AgentReasoningEvent {
++            text: "not a dialogue message".into(),
++        })),
++        paginated_completed_item(
++            thread_id,
++            "legacy-turn",
++            CoreTurnItem::FunctionCallOutput(FunctionCallOutputItem {
++                id: "tool-output".into(),
++                name: "shell".into(),
++                namespace: None,
++                output: FunctionCallOutputBody::Text("not a dialogue message".into()),
++            }),
++        ),
++    ];
++    for phase in [
++        Some(MessagePhase::Commentary),
++        Some(MessagePhase::PartialAnswer),
++        Some(MessagePhase::FinalAnswer),
++        None,
++    ] {
++        items.push(RolloutItem::ResponseItem(
++            ResponseItem::Message {
++                encrypted_content: None,
++                status: None,
++                id: None,
++                role: "assistant".into(),
++                content: vec![ContentItem::OutputText {
++                    text: "answer".into(),
++                    annotations: None,
++                    logprobs: None,
++                }],
++                phase: phase.clone(),
++                internal_chat_message_metadata_passthrough: None,
++            }
++            .into(),
++        ));
++        items.push(RolloutItem::EventMsg(EventMsg::AgentMessage(
++            AgentMessageEvent {
++                message: "answer".into(),
++                phase,
++                memory_citation: None,
++                delivery: None,
++                questions: None,
++            },
++        )));
++    }
++    items.push(paginated_turn_completed("legacy-turn"));
++    store
++        .append_items(AppendThreadItemsParams { thread_id, items })
++        .await?;
++    store.shutdown_thread(thread_id).await?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build_initialized()
++        .await?;
++    let response: ThreadMessageCountReadResponse = mcp
++        .request(|request_id| ClientRequest::ThreadMessageCountRead {
++            request_id,
++            params: ThreadMessageCountReadParams {
++                thread_id: thread_id.to_string(),
++            },
++        })
++        .await?;
++    assert_eq!(response.message_count, 5);
++    Ok(())
++}
++
++#[tokio::test]
++async fn message_count_read_pages_visible_history_and_respects_fork_revert_boundaries() -> Result<()>
++{
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let (store, thread_id) = message_count_store(
++        codex_home.path(),
++        codex_protocol::protocol::ThreadHistoryMode::Paginated,
++    )
++    .await?;
++    let mut items = vec![paginated_turn_started("first-turn")];
++    for (turn_id, user_id) in [("first-turn", "first-user"), ("second-turn", "second-user")] {
++        if turn_id == "second-turn" {
++            items.push(paginated_turn_completed("first-turn"));
++            items.push(paginated_turn_started("second-turn"));
++        }
++        items.push(paginated_completed_item(
++            thread_id,
++            turn_id,
++            CoreTurnItem::UserMessage(UserMessageItem {
++                id: user_id.into(),
++                client_id: None,
++                content: vec![codex_protocol::user_input::UserInput::Text {
++                    text: format!("question for {turn_id}"),
++                    text_elements: Vec::new(),
++                }],
++            }),
++        ));
++        for (index, phase) in [
++            Some(MessagePhase::Commentary),
++            Some(MessagePhase::PartialAnswer),
++            Some(MessagePhase::FinalAnswer),
++            None,
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            items.push(paginated_completed_item(
++                thread_id,
++                turn_id,
++                CoreTurnItem::AgentMessage(AgentMessageItem {
++                    id: format!("{turn_id}-agent-{index}"),
++                    content: vec![AgentMessageContent::Text {
++                        text: "answer".into(),
++                    }],
++                    phase,
++                    memory_citation: None,
++                    delivery: None,
++                    questions: None,
++                }),
++            ));
++        }
++        // Both turns exceed a native item page, independently of the summary items.
++        for index in 0..128 {
++            items.push(paginated_completed_item(
++                thread_id,
++                turn_id,
++                CoreTurnItem::AgentMessage(AgentMessageItem {
++                    id: format!("{turn_id}-commentary-{index}"),
++                    content: vec![AgentMessageContent::Text {
++                        text: "progress".into(),
++                    }],
++                    phase: Some(MessagePhase::Commentary),
++                    memory_citation: None,
++                    delivery: None,
++                    questions: None,
++                }),
++            ));
++        }
++        items.push(paginated_completed_item(
++            thread_id,
++            turn_id,
++            CoreTurnItem::Reasoning(ReasoningItem {
++                id: format!("{turn_id}-reasoning"),
++                summary_text: vec!["not a dialogue message".into()],
++                raw_content: Vec::new(),
++            }),
++        ));
++        items.push(paginated_completed_item(
++            thread_id,
++            turn_id,
++            CoreTurnItem::FunctionCallOutput(FunctionCallOutputItem {
++                id: format!("{turn_id}-tool-output"),
++                name: "shell".into(),
++                namespace: None,
++                output: FunctionCallOutputBody::Text("not a dialogue message".into()),
++            }),
++        ));
++        // A later snapshot of an existing message is still one message.
++        items.push(paginated_completed_item(
++            thread_id,
++            turn_id,
++            CoreTurnItem::AgentMessage(AgentMessageItem {
++                id: format!("{turn_id}-agent-0"),
++                content: vec![AgentMessageContent::Text {
++                    text: "updated commentary".into(),
++                }],
++                phase: Some(MessagePhase::Commentary),
++                memory_citation: None,
++                delivery: None,
++                questions: None,
++            }),
++        ));
++    }
++    items.push(paginated_turn_completed("second-turn"));
++    store
++        .append_items(AppendThreadItemsParams { thread_id, items })
++        .await?;
++    store.shutdown_thread(thread_id).await?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build_initialized()
++        .await?;
++    let count: ThreadMessageCountReadResponse = mcp
++        .request(|request_id| ClientRequest::ThreadMessageCountRead {
++            request_id,
++            params: ThreadMessageCountReadParams {
++                thread_id: thread_id.to_string(),
++            },
++        })
++        .await?;
++    assert_eq!(count.message_count, 266);
++    let fork: ThreadForkResponse = mcp
++        .request(|request_id| ClientRequest::ThreadFork {
++            request_id,
++            params: ThreadForkParams {
++                thread_id: thread_id.to_string(),
++                exclude_turns: true,
++                ..Default::default()
++            },
++        })
++        .await?;
++    let fork_id = fork.thread.id;
++    let count: ThreadMessageCountReadResponse = mcp
++        .request(|request_id| ClientRequest::ThreadMessageCountRead {
++            request_id,
++            params: ThreadMessageCountReadParams {
++                thread_id: fork_id.clone(),
++            },
++        })
++        .await?;
++    assert_eq!(count.message_count, 266);
++    let _: ThreadRevertResponse = mcp
++        .request(|request_id| ClientRequest::ThreadRevert {
++            request_id,
++            params: ThreadRevertParams {
++                thread_id: fork_id.clone(),
++                before_turn_id: "second-turn".into(),
++            },
++        })
++        .await?;
++    for (id, expected) in [(fork_id, 133), (thread_id.to_string(), 266)] {
++        let count: ThreadMessageCountReadResponse = mcp
++            .request(|request_id| ClientRequest::ThreadMessageCountRead {
++                request_id,
++                params: ThreadMessageCountReadParams { thread_id: id },
++            })
++            .await?;
++        assert_eq!(count.message_count, expected);
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn message_count_read_reports_invalid_and_missing_threads_instead_of_zero() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build_initialized()
++        .await?;
++    for thread_id in [
++        "invalid-thread".to_string(),
++        codex_protocol::ThreadId::new().to_string(),
++    ] {
++        let id = mcp
++            .send_request(
++                "thread/messageCount/read",
++                Some(serde_json::to_value(ThreadMessageCountReadParams {
++                    thread_id,
++                })?),
++            )
++            .await?;
++        let error = timeout(
++            DEFAULT_READ_TIMEOUT,
++            mcp.read_stream_until_error_message(RequestId::Integer(id)),
++        )
++        .await??;
++        assert_eq!(error.error.code, -32600);
++        assert!(!error.error.message.is_empty());
++    }
++    Ok(())
++}
++
+ /// Preserves a file-backed image and causal root across completion and a cold history read.
+ #[test_case::test_case(ThreadHistoryMode::Legacy; "legacy")]
+ #[test_case::test_case(ThreadHistoryMode::Paginated; "paginated")]
+@@ -2549,6 +2856,56 @@ async fn read_items_page(
+     to_response(response)
+ }
+ 
++async fn message_count_store(
++    codex_home: &Path,
++    history_mode: codex_protocol::protocol::ThreadHistoryMode,
++) -> Result<(LocalThreadStore, codex_protocol::ThreadId)> {
++    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.abs());
++    let state_db = codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".into()).await?;
++    let store = LocalThreadStore::new(
++        LocalThreadStoreConfig {
++            codex_home: codex_home.to_path_buf(),
++            codex_harness: codex_home.to_path_buf(),
++            sqlite,
++            default_model_provider_id: "mock_provider".into(),
++        },
++        Some(state_db),
++    );
++    let thread_id = codex_protocol::ThreadId::new();
++    store
++        .create_thread(CreateThreadParams {
++            creator_user_id: None,
++            creator_account_id: None,
++            session_id: thread_id.into(),
++            thread_id,
++            extra_config: None,
++            forked_from_id: None,
++            parent_thread_id: None,
++            source: ProtocolSessionSource::Cli,
++            thread_source: None,
++            originator: "test_originator".into(),
++            base_instructions: BaseInstructions::default(),
++            dynamic_tools: Vec::new(),
++            selected_capability_roots: Vec::new(),
++            multi_agent_version: None,
++            history_mode,
++            history_base: None,
++            subagent_history_start_ordinal: None,
++            initial_window_id: Uuid::now_v7().to_string(),
++            runtime_workspace_roots: None,
++            metadata: ThreadPersistenceMetadata {
++                cwd: Some(codex_home.to_path_buf()),
++                model_provider: "mock_provider".into(),
++                memory_mode: ThreadMemoryMode::Enabled,
++            },
++        })
++        .await?;
++    store
++        .persist_thread(thread_id, PersistContext::Standard)
++        .await?;
++    Ok((store, thread_id))
++}
++
+ fn paginated_turn_started(turn_id: &str) -> RolloutItem {
+     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+         turn_attribution: None,

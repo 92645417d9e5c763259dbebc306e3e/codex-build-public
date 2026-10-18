@@ -30,7 +30,11 @@ CanonicalGlobalReleaseRoleOwner
 - The open task names Current and retained parent frontiers across context restoration; worktree names never select direction.
 - Before Fork, OpenUnit, OpenFlatPatch or OpenTransform names the historical edit and one terminal field names Current's actual last row. An inserted Patch may be absent from Git; forward append still stays on Current. Every fork is Current or RetainedParents. Adoption publishes those paths, the open selection and actual pre-authoring terminal.
 - When Current is Main with no retained parents, omit the complete RetainedParents line. A present blank value, none, or empty-list spelling is not the no-parent form. Every task-named Current fork retains at least one exact parent.
-- GitCustody convergence precedes the next Unit, Flat Patch or Fork after closure and on reentry. Remove covered intermediate parents without waiting for Main coverage; full retained-frontier coverage promotes Current to Main. RetainedParents lists needed sources or readers, never failed-generation history.
+- GitCustody convergence precedes the next selection after closure and on reentry.
+- A selected retained Apply range retains its source readers until the invocation returns, then consumes convergence before another range, rewrite or Fork.
+- Remove covered intermediate parents without waiting for Main coverage.
+- Full retained-frontier coverage promotes Current to Main.
+- RetainedParents lists needed sources or readers, never failed-generation history.
 
 ```
 SelectedForkConvergenceTaskBoundary
@@ -61,7 +65,7 @@ ClosedPatchTaskReductionOwner
 ```
 
 - Apply conflict retains the successful prefix and selected open Patch; conflict alone selects no approval stop.
-- Consume ReleaseRollForward's scope and cost selection before dependent work.
+- Consume ReleaseRollForward's scope, measured-benefit and boundary-approval decisions before dependent work.
 - Missing evidence and an explicit pause still stop their dependent successor.
 - Every release anchor ends with an empty or populated `## Additional Instructions` section reserved for user-added bullets.
 - Keep this heading last when creating or updating the anchor, including when its bullets have been consumed.
@@ -98,6 +102,14 @@ ClosedPatchTaskReductionOwner
 - Recover completed behavior from its source, current decisions, and relevant history rather than retaining its implementation contract in the anchor.
 - A compact Git inventory and selected contracts narrow source navigation after authority recovery; a short-context return does not change that order.
 - Derive the first unresolved action from ReleaseRollForward's complete typed inventory comparison rather than the lane label or last successful operation.
+- SourcePatchChanges optionally names unique typed Unit:Lane/name or FlatPatch:Lane/name selectors joined by comma-space.
+- Omit SourcePatchChanges when no approved source-structure difference exists.
+- A selector belongs there only after current-user authority establishes its withdrawal, replacement, rename, relocation or changed Child Patch boundaries.
+- Each selector must exist in a declared canonical source inventory.
+- The field exempts only that historical structure from native source coverage, never its surviving behavioral obligations or the approval requirement.
+- Keep the establishing user decision and any unresolved replacement work beside its affected pending scope.
+- Do not copy the complete source inventory, completion state or helper findings into this field.
+- Native Git and canonical sources remain the only Patch inventories.
 - Preserve the complete declared future order and unresolved work on other Patches.
 - Git owns completed order.
 - Native results own test evidence.
@@ -105,6 +117,8 @@ ClosedPatchTaskReductionOwner
 - With no selected open Patch, omit its fields.
 - Reread the postimage to ensure prose and fields choose the same remaining action before continuing.
 - Closure consumes direct cumulative semantic acceptance and GitCustody convergence before publishing the task and invoking its successor.
+- When that successor leaves the approved Unit or crosses a Lane, retain the concrete proposal and required user decision instead of treating task publication as approval.
+- Preserve established approval for unchanged work inside the same Unit without introducing an approval field or another state owner.
 - Before closing a lane, compare every admitted source Unit, Flat Patch and ordered Child Patch in that lane with its accepted current Git responsibility and the authorized disposition of every difference.
 - Any missing or unexplained entry forbids lane crossing, a completion claim or removal of its pending work.
 - A shorter closed prefix may still be exported without closing its unfinished lane.
@@ -114,19 +128,30 @@ ClosedPatchTaskReductionOwner
 - Explain rejected Apply inputs and the reason for reconstruction, followed by the committed Child Patch rewrite order and observed outcomes.
 - Distinguish verified results, missing historical evidence and remaining work with its next action; final Git alone cannot prove failed attempts or test outcomes.
 - An explanation-only request keeps reconciliation read-only and reports stale task text as such; a pause or stop suspends the active Roll successor.
-- An open Unit names unique ordered ChildPatchSequence. An open Flat Patch names itself, and an open Transform names TransformPatch. Each also names CurrentWorktree and retained Sources. Apply copies only that declared structure.
+- An open Unit names unique ordered ChildPatchSequence. An open Flat Patch names itself, and an open Transform names TransformPatch. Each also names CurrentWorktree and retained Sources.
+- The open selection binds Apply's first responsibility; an explicitly bounded unchanged retained range consumes later complete source members through PatchReplay.
+- Retained Apply mechanically publishes the actual terminal and next selected open responsibility at each completed range boundary while preserving pending prose and Additional Instructions.
+- Its completed endpoint has no open selection until the product owner reconciles the remaining work and selects the next authorized action.
 - Publish the selected Patch, complete Unit sequence, adopted topology, pre-authoring terminal, cause and successor before authoring. Keep that selection through Unit-local reset, rebase and final Child Commits. At the completed source boundary publish its actual terminal before a selected test; retain unresolved verification or behavior. No per-Child transition or premature Unit closure follows a partial prefix. A handoff during authoring preserves the unfinished selection and truthful continuation.
 - Candidates before topology resolution are unordered; declared order survives reduction.
-- Roll executes the reconciled order only while its assignment remains supported by OriginalPatchPurposeOwner; an explicit interactive pause selects read-only exploration on clean Current.
+- Roll executes the reconciled order only while its assignment and boundary entry are authorized; an explicit pause selects read-only exploration on clean Current.
 - Preserve the complete approved purpose and its establishing source or user decision. Candidate rejection does not cancel requirements; task wording, repair hypotheses and tests cannot replace or narrow them.
 - Record findings and any selected complete reconstruction against their assigned Unit or Flat Patch. Retain every unmet obligation and its original authority until implemented or explicitly withdrawn; a shorter or passing replacement cannot clear it. Tree-wide plans retain unresolved requirements only.
 - The rewrite start decision records actual Main, proposed start, and disposition of existing Lane children and suffix sources before Fork or reset. Desired state never replaces observed facts.
 - Derive later-release behavior from current decisions, predecessor Patches, and history, but bind it only to its current upstream implementation owner. Task reduction cannot withdraw the obligation or retain a retired path; a nonunique map returns to ReleaseRollForward.
-- Roll remains linear with no subagent, dispatch, reviewer wait, or review-only task reentry.
+- Every release anchor records SubagentReview as yes or no.
+- Initialize the setting to no unless the user explicitly selects yes.
+- Change an existing setting only at the user's direction.
+- Preserve the choice through task reconciliation, Fork, promotion and tag replacement.
+- The field grants only PatchAcceptance's review permission and stores no review progress or acceptance state.
+- Roll implementation remains linear in the product agent.
 - A direct material finding uses actual Git and the existing Unit or Flat Patch correction boundary. Preserve later work and never restore saved task bytes or falsify its frontier.
 - The task has no completed list, archive, event log, checkpoint, cursor, helper progress, test verdict, reviewer state, Roll mode or second representation.
 - Explicit Cleanup removes drained execution records and logs, preserving tasks/rust-suite-baselines.json as baseline comparison facts. Selected release retirement also removes the closed task and published lane-note working set while retaining Main and UpstreamBaseline. Next-tag Baseline cleanup retires its primary predecessor's published working notes. Source restoration and temporary cleanup leave final patches, binaries and reusable build inputs untouched.
-- EditNamedTask publishes the sole release-roll-<Tag>.md before baseline, at Fork adoption and through reconciliation above. Temporary Main fixup retains its focused-tested fold plan until absorbed. Finalize and Prepare synchronize only the generated-tail terminal by exact preimage; semantic pending instructions remain the product agent's responsibility.
+- EditNamedTask publishes the sole release-roll-<Tag>.md before baseline, at Fork adoption and through reconciliation above.
+- Temporary Main fixup retains its focused-tested fold plan until absorbed.
+- PatchReplay synchronizes retained-range fields and generated-tail terminals through their declared exact-preimage owners.
+- Semantic pending instructions remain the product agent's responsibility.
 - ActiveTask contains zero or one release task. OtherTasks is always empty and OverallTask keeps its independent existing role. The task survives each selected roll stop until explicit retirement. No semantic-version ordering or next-task selector exists.
 - Each task declares SourcePrefixes as one or more unique release tags joined by comma-space. The first is the primary predecessor and differs from the task tag. Further entries may name older, newer completed, or same-tag retained canonical prefixes. They provide read-only purpose evidence and exact unchanged transport input for the declared next Patch; they do not authorize changing its responsibility.
 - Before replacing the sole task for a user-selected newer tag, report pending work and carry every unresolved obligation, approved deferral and controlling user boundary into the replacement.

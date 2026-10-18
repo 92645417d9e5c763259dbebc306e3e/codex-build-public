@@ -11,8 +11,14 @@ PatchReplayTaskAnchor
 ```
 
 - Every public PatchReplay invocation requires `--active-task` with the exact absolute path named by the sole current TaskIndex ActiveTask; CLI admission writes that the flag is required, while execution reports when its value does not name the current indexed task and rejects an absent, unindexed, or non-regular task before native transport or topology effects.
-- PatchReplay reads the task's exact original bytes before the selected operation and reports an unreadable or changed task distinctly after its native terminal, without initializing a missing TaskIndex or creating another task representation.
-- Fork, Prepare, Apply, Revise, Finalize, Commit, List, and Export consume this same anchor; callers cannot omit, infer, reconstruct, migrate, or substitute it, and the anchor never becomes helper state or native transport input.
+- PatchReplay reads the task's exact original bytes before the selected operation without initializing a missing TaskIndex or creating another task representation.
+- Retained-source Apply owns the mechanical field updates defined below inside its existing native transport loop.
+- Other modes require unchanged task bytes except for their declared generated-terminal publication.
+- Unreadable task input, unexpected byte changes and failed publication stop the owning operation with their actual effects retained.
+- Fork, Prepare, Apply, Revise, Finalize, Commit, List, and Export consume this same anchor; callers cannot omit, infer, reconstruct, migrate, or substitute it.
+- Native source coverage consumes only the anchor's declared source and structure decisions.
+- Retained Apply receives exact original task bytes solely as the preimage for its native field publication.
+- Pending prose never selects transport or becomes helper state.
 - Config-schema requires Target CurrentWorktree and identical open and terminal Unit-or-Flat-Patch discriminants; a Unit also supplies its committed ChildPatchSequence.
 - Fork selects an available numbered branch and worktree path from Git's current inventory. Consumed forks do not reserve old numbers, and test-record retention is independent.
 - After argument structure and shared public admission, Apply, Commit, and Revise derive rustfmt at --project-working-root/build/toolchains/native/toolchain/rust/bin/rustfmt. The public CLI accepts no formatter override. Validate the complete no-follow path and require an existing executable regular file before reading task evidence, invalidating schema results, creating a native attempt, or invoking Git. Failure returns the existing Input/Blocked result with the derived path. NativeToolchain alone prepares a missing toolchain; replay performs no acquisition, PATH search, or full-toolchain execution probe. General path validation still permits absent output paths.
@@ -72,6 +78,7 @@ ProjectedSchemaTransformOwner
 ## Unit Flat Patch And Child Patch Transport
 
 - Before Apply, reconstruction, Commit or Revise, consume ReleaseRollForward's supported purpose and placement decision, PatchFormat's semantic naming rule and PatchAcceptance's applicable source review. Native transport checks custody and rollback, not semantic completeness. A Git failure retains bounded stderr, rejected identity and the accepted prefix.
+- The caller must obtain ReleaseRollForward's explicit user approval for each crossed Unit or Lane boundary before transport; a retained-source range cannot bypass that decision by crossing several boundaries in one call.
 
 ```
 CurrentPatchRevision
@@ -103,6 +110,11 @@ PatchReplayLiveList
 - Selected List is contract navigation, not a complete inventory, dependency proof or Cross admission. OriginalPatchPurposeOwner checks those claims against authority, native behavior and private changes before transport.
 - Fork copies Current into one isolated worktree. It requires the selected open Patch and actual last terminal, not an earlier open row; retained work needs coverage comparison, with focused testing for a non-idempotent fixup fold.
 - Exported List, Apply, and Export require complete selected structures. Commit and Revise retain partial-Unit rules; an unfinished Unit cannot publish, infer children, or create a cursor.
+- Apply, Commit and Revise consume ReleaseRollForward's native source-coverage admission inside the same native operation before source effects.
+- Native admission reads SourcePrefixes and approved SourcePatchChanges from the exact active task.
+- A public live List returns its Rows with Blocked/Input when that target contains an unexplained source gap.
+- Selected contract navigation cannot replace the complete inventory consumed by coverage admission.
+- Internal Fork inventory remains structural so a missing predecessor can still enter its existing backward-correction route.
 
 ```
 DeclaredPrefixPatchSetOwner
@@ -131,8 +143,22 @@ DeclaredPrefixPatchSetOwner
 - It generates only on the clean official-parent target before GitDiffs, without reading a predecessor worktree or export.
 - Exported-prefix Apply forbids `--lane` and every `--end-*`.
 - Retained-worktree Apply selects a Unit, Flat Patch or generated tail with exactly one `--start-*` and an optional matching `--end-*`.
+- The end selector is inclusive and bounds the already approved unchanged source range before the next planned rewrite or unapproved boundary.
+- Omission of an end selector continues to select only the start responsibility.
 - Commit and Revise accept only `--flat-patch` or `--unit` plus `--child-patch`; no Transform or generic selector.
 - Live Apply uses task Current target and exact retained Source. Before effects, match the selected source Unit children or unique strict suffix to ChildPatchSequence. A GitDiff conflict retains its accepted prefix.
+- The initial open selection and ChildPatchSequence bind the first selected responsibility; later range members consume their complete canonical source structure.
+- Retained Apply consumes the exact task preimage admitted by the public boundary and rechecks it before each Unit or Flat Patch.
+- After completing that responsibility, publish one exact-preimage task postimage before transporting the next member.
+- Set the terminal discriminant from the actual accepted Git rows.
+- Set the open discriminant and its child sequence to the next member inside the selected range.
+- When the selected range completes, remove the open selection and its child sequence without selecting work beyond the supplied endpoint.
+- A conflict leaves the rejected responsibility open and preserves the earlier accepted range prefix.
+- A task change or publication failure stops the range without overwriting concurrent task edits or discarding completed source.
+- Preserve task prose, Additional Instructions, source decisions, topology and all fields outside that mechanical publication.
+- Return actual Git rows and accepted members on an interrupted or failed retained range when those facts remain readable.
+- The product owner consumes TaskWorkspace reconciliation once at the range return; the helper neither interprets pending prose nor performs semantic closure, convergence or export.
+- Exported-prefix Apply and target-only normalization retain their existing one-selection and unchanged-task contracts.
 - Native Input refusals return bounded Blocked/Input with the rejected field, preserving task and dirty source without diagnostic-text classification.
 - Prefix Apply binds source directory and complete selected structure, freezes its bytes, and rechecks them at terminal without requiring final release evidence.
 - Whole Apply requires an absent target Lane child and complete source structure; a retained source need not contain earlier reconstructed children. Unknown, reordered, duplicate, overlapping, empty, or nonunique suffix rejects before mutation.

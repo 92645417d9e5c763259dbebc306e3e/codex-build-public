@@ -1,0 +1,1011 @@
+emit-note-outcomes-through-app-server
+
+Lane: mixed
+
+Unit: present-note-operations-in-context-management
+
+ChildPatch: emit-note-outcomes-through-app-server
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+Purpose: Show every completed context-management note operation as routine or failure feedback in the TUI conversation.
+
+Requires: none
+
+Provides: Emit typed thread-scoped notices for successful note listing, reads, searches, appends, writes and automatic note-reference loading. Render each success as a normal bullet without warning entries. Preserve visible attention-colored failure bullets and warning details. Reuse native extension delivery, listener ordering and subscriber readiness for both outcomes.
+
+Boundary: Disabled operations and history tools remain silent. Note contents, paths, queries and raw backend errors are not disclosed. Model-facing results, analytics, cancellation and ordinary warning semantics remain unchanged. Routine notices are transient TUI feedback rather than durable history or exec errors. The complete formal Unit remains independent of draft and private frontend responsibilities.
+
+Verification: The installed history-notes extension tests cover every successful and failed action, repeated actions, empty reference results, disabled loading and unchanged model-facing output. App-server checks cover notification encoding, FIFO delivery, subscriber routing and existing warning behavior. TUI checks cover startup and runtime, fullscreen and legacy views, repeated normal bullets, raw and compact visibility, warning separation and thread targeting.
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -2041,6 +2041,7 @@ server_notification_definitions! {
+     TurnModerationMetadata => "turn/moderationMetadata" (v2::TurnModerationMetadataNotification),
+     ModelSafetyBufferingUpdated => "model/safetyBuffering/updated" (v2::ModelSafetyBufferingUpdatedNotification),
+     Warning => "warning" (v2::WarningNotification),
++    ContextManagementNotice => "contextManagement/notice" (v2::ContextManagementNoticeNotification),
+     GuardianWarning => "guardianWarning" (v2::GuardianWarningNotification),
+     DeprecationNotice => "deprecationNotice" (v2::DeprecationNoticeNotification),
+     ConfigWarning => "configWarning" (v2::ConfigWarningNotification),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+@@ -45,6 +45,16 @@ pub struct GuardianWarningNotification {
+     pub message: String,
+ }
+ 
++/// Routine context-management feedback, independent of warnings and errors.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ContextManagementNoticeNotification {
++    pub thread_id: String,
++    /// Fixed operation summary without note contents, paths or queries.
++    pub message: String,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -19,6 +19,7 @@ use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
+ use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+ use codex_app_server_protocol::CommandExecutionSource;
+ use codex_app_server_protocol::CommandExecutionStatus;
++use codex_app_server_protocol::ContextManagementNoticeNotification;
+ use codex_app_server_protocol::DeprecationNoticeNotification;
+ use codex_app_server_protocol::DynamicToolCallParams;
+ use codex_app_server_protocol::EnvironmentConnectionNotification;
+@@ -276,6 +277,16 @@ pub(crate) async fn apply_bespoke_event_handling(
+                 ))
+                 .await;
+         }
++        EventMsg::ContextManagementNotice(notice) => {
++            outgoing
++                .send_server_notification(ServerNotification::ContextManagementNotice(
++                    ContextManagementNoticeNotification {
++                        thread_id: conversation_id.to_string(),
++                        message: notice.message,
++                    },
++                ))
++                .await;
++        }
+         EventMsg::Warning(warning_event) => {
+             let notification = WarningNotification {
+                 thread_id: Some(conversation_id.to_string()),
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -3,6 +3,7 @@ use std::sync::Weak;
+ use std::time::Duration;
+ 
+ use codex_analytics::AnalyticsEventsClient;
++use codex_app_server_protocol::ContextManagementNoticeNotification;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ThreadGoal;
+ use codex_app_server_protocol::ThreadGoalUpdatedNotification;
+@@ -143,6 +144,24 @@ pub(crate) async fn send_thread_warning(
+     thread_state_manager: &ThreadStateManager,
+     thread_id: ThreadId,
+     message: String,
++) {
++    send_thread_notification(
++        outgoing,
++        thread_state_manager,
++        thread_id,
++        ServerNotification::Warning(WarningNotification {
++            thread_id: Some(thread_id.to_string()),
++            message,
++        }),
++    )
++    .await;
++}
++
++pub(crate) async fn send_thread_notification(
++    outgoing: &Arc<OutgoingMessageSender>,
++    thread_state_manager: &ThreadStateManager,
++    thread_id: ThreadId,
++    notification: ServerNotification,
+ ) {
+     let subscribed_connection_ids = thread_state_manager
+         .subscribed_connection_ids(thread_id)
+@@ -152,12 +171,7 @@ pub(crate) async fn send_thread_warning(
+         subscribed_connection_ids,
+         thread_id,
+     );
+-    thread_outgoing
+-        .send_server_notification(ServerNotification::Warning(WarningNotification {
+-            thread_id: Some(thread_id.to_string()),
+-            message,
+-        }))
+-        .await;
++    thread_outgoing.send_server_notification(notification).await;
+ }
+ 
+ struct AppServerExtensionEventSink {
+@@ -166,11 +180,27 @@ struct AppServerExtensionEventSink {
+ }
+ 
+ const MAX_EXTENSION_WARNING_BYTES: usize = 256;
+-const EXTENSION_WARNING_SUBSCRIBER_TIMEOUT: Duration = Duration::from_secs(10);
++const EXTENSION_NOTIFICATION_SUBSCRIBER_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ impl ExtensionEventSink for AppServerExtensionEventSink {
+     fn emit(&self, event: Event) {
+         match event.msg {
++            EventMsg::ContextManagementNotice(notice) => {
++                let Ok(thread_id) = ThreadId::from_string(&notice.thread_id) else {
++                    tracing::warn!(
++                        thread_id = %notice.thread_id,
++                        "dropping context-management notice with invalid thread id"
++                    );
++                    return;
++                };
++                let notification = ServerNotification::ContextManagementNotice(
++                    ContextManagementNoticeNotification {
++                        thread_id: thread_id.to_string(),
++                        message: notice.message,
++                    },
++                );
++                self.emit_thread_notification(thread_id, notification);
++            }
+             EventMsg::ThreadQueueChanged(queue_event) => {
+                 let thread_id = queue_event.thread_id;
+                 if let Some(listener_command_tx) = self
+@@ -264,25 +294,37 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
+             }
+             message.truncate(truncate_at);
+         }
++        self.emit_thread_notification(
++            thread_id,
++            ServerNotification::Warning(WarningNotification {
++                thread_id: Some(thread_id.to_string()),
++                message,
++            }),
++        );
++    }
++}
++
++impl AppServerExtensionEventSink {
++    fn emit_thread_notification(&self, thread_id: ThreadId, notification: ServerNotification) {
+         if let Some(listener_command_tx) = self
+             .thread_state_manager
+             .current_listener_command_tx(thread_id)
+         {
+-            let command = ThreadListenerCommand::EmitWarning {
+-                message: message.clone(),
++            let command = ThreadListenerCommand::EmitNotification {
++                notification: Box::new(notification.clone()),
+             };
+             if listener_command_tx.send(command).is_ok() {
+                 return;
+             }
+             tracing::warn!(
+-                "failed to enqueue extension warning for {thread_id}: listener command channel is closed"
++                "failed to enqueue extension notification for {thread_id}: listener command channel is closed"
+             );
+         }
+         let outgoing = Arc::clone(&self.outgoing);
+         let thread_state_manager = self.thread_state_manager.clone();
+         tokio::spawn(async move {
+             if tokio::time::timeout(
+-                EXTENSION_WARNING_SUBSCRIBER_TIMEOUT,
++                EXTENSION_NOTIFICATION_SUBSCRIBER_TIMEOUT,
+                 thread_state_manager.wait_for_thread_subscriber(thread_id),
+             )
+             .await
+@@ -290,18 +332,20 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
+             {
+                 tracing::warn!(
+                     %thread_id,
+-                    timeout_secs = EXTENSION_WARNING_SUBSCRIBER_TIMEOUT.as_secs(),
+-                    "dropping extension warning after waiting for a thread subscriber"
++                    timeout_secs = EXTENSION_NOTIFICATION_SUBSCRIBER_TIMEOUT.as_secs(),
++                    "dropping extension notification after waiting for a thread subscriber"
+                 );
+                 return;
+             }
+-            send_thread_warning(&outgoing, &thread_state_manager, thread_id, message).await;
++            send_thread_notification(&outgoing, &thread_state_manager, thread_id, notification)
++                .await;
+         });
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use codex_protocol::protocol::ContextManagementNoticeEvent;
+     use codex_protocol::protocol::ThreadGoal as CoreThreadGoal;
+     use codex_protocol::protocol::ThreadGoalStatus;
+     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+@@ -317,7 +361,7 @@ mod tests {
+     use super::*;
+ 
+     #[tokio::test]
+-    async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
++    async fn app_server_event_sink_orders_goal_updates_warnings_notices_and_clears() {
+         let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
+         let outgoing = Arc::new(OutgoingMessageSender::new(
+             outgoing_tx,
+@@ -335,13 +379,20 @@ mod tests {
+             turn_id: Some("turn-warning".to_string()),
+             message: "catalog was shortened".to_string(),
+         });
++        sink.emit(Event {
++            id: "turn-notice".to_string(),
++            msg: EventMsg::ContextManagementNotice(ContextManagementNoticeEvent {
++                thread_id: thread_id.to_string(),
++                message: "Context management: read a note.".to_string(),
++            }),
++        });
+         sink.emit(thread_goal_updated_event(thread_id, "turn-2"));
+         listener_command_tx
+             .send(ThreadListenerCommand::EmitThreadGoalCleared)
+             .expect("listener command channel should be open");
+ 
+         let mut observed = Vec::new();
+-        for _ in 0..4 {
++        for _ in 0..5 {
+             let command = timeout(Duration::from_secs(1), listener_command_rx.recv())
+                 .await
+                 .expect("timed out waiting for listener command")
+@@ -350,7 +401,17 @@ mod tests {
+                 ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, .. } => {
+                     observed.push(turn_id.expect("extension goal updates should include turn ids"));
+                 }
+-                ThreadListenerCommand::EmitWarning { message } => observed.push(message),
++                ThreadListenerCommand::EmitNotification { notification } => match *notification {
++                    ServerNotification::Warning(notification) => {
++                        assert_eq!(notification.thread_id, Some(thread_id.to_string()));
++                        observed.push(notification.message);
++                    }
++                    ServerNotification::ContextManagementNotice(notification) => {
++                        assert_eq!(notification.thread_id, thread_id.to_string());
++                        observed.push(notification.message);
++                    }
++                    _ => panic!("unexpected extension notification"),
++                },
+                 ThreadListenerCommand::EmitThreadGoalCleared => {
+                     observed.push("cleared".to_string())
+                 }
+@@ -362,6 +423,7 @@ mod tests {
+             vec![
+                 "turn-1".to_string(),
+                 "catalog was shortened".to_string(),
++                "Context management: read a note.".to_string(),
+                 "turn-2".to_string(),
+                 "cleared".to_string()
+             ],
+@@ -392,10 +454,13 @@ mod tests {
+             .await
+             .expect("timed out waiting for listener command")
+             .expect("listener command channel closed unexpectedly");
+-        let ThreadListenerCommand::EmitWarning { message } = command else {
++        let ThreadListenerCommand::EmitNotification { notification } = command else {
+             panic!("expected warning listener command");
+         };
+-        assert_eq!(message, "🙂".repeat(64));
++        let ServerNotification::Warning(notification) = *notification else {
++            panic!("expected warning notification");
++        };
++        assert_eq!(notification.message, "🙂".repeat(64));
+     }
+ 
+     #[tokio::test]
+@@ -579,7 +644,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn app_server_event_sink_drops_warning_with_invalid_thread_id() {
++    async fn app_server_event_sink_drops_notifications_with_invalid_thread_id() {
+         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+         let outgoing = Arc::new(OutgoingMessageSender::new(
+             outgoing_tx,
+@@ -592,7 +657,87 @@ mod tests {
+             turn_id: Some("turn-1".to_string()),
+             message: "catalog was shortened".to_string(),
+         });
++        sink.emit(Event {
++            id: "turn-1".to_string(),
++            msg: EventMsg::ContextManagementNotice(ContextManagementNoticeEvent {
++                thread_id: "not-a-thread-id".to_string(),
++                message: "Context management: read a note.".to_string(),
++            }),
++        });
++
++        assert!(outgoing_rx.try_recv().is_err());
++    }
+ 
++    #[tokio::test]
++    async fn note_notice_waits_for_its_thread_subscriber_without_becoming_a_warning() {
++        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
++        let outgoing = Arc::new(OutgoingMessageSender::new(
++            outgoing_tx,
++            AnalyticsEventsClient::disabled(),
++        ));
++        let thread_id = ThreadId::new();
++        let subscribed_connection = ConnectionId(1);
++        let unrelated_connection = ConnectionId(2);
++        let thread_state_manager = ThreadStateManager::new();
++        for connection_id in [subscribed_connection, unrelated_connection] {
++            thread_state_manager
++                .connection_initialized(connection_id, ConnectionCapabilities::default())
++                .await;
++        }
++        let sink = app_server_extension_event_sink(outgoing, thread_state_manager.clone());
++        let message = "Context management: loaded note references.";
++        sink.emit(Event {
++            id: String::new(),
++            msg: EventMsg::ContextManagementNotice(ContextManagementNoticeEvent {
++                thread_id: thread_id.to_string(),
++                message: message.to_string(),
++            }),
++        });
++        tokio::task::yield_now().await;
++        assert!(outgoing_rx.try_recv().is_err());
++        thread_state_manager
++            .try_ensure_connection_subscribed(
++                thread_id,
++                subscribed_connection,
++                /*experimental_raw_events*/ false,
++            )
++            .await
++            .expect("connection should be subscribed");
++
++        let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
++            .await
++            .expect("timed out waiting for note notice")
++            .expect("outgoing channel closed unexpectedly");
++        let OutgoingEnvelope::ToConnection {
++            connection_id,
++            message: outgoing_message,
++            write_complete_tx: _,
++        } = envelope
++        else {
++            panic!("expected connection-targeted note notice");
++        };
++        assert_eq!(connection_id, subscribed_connection);
++        let OutgoingMessage::AppServerNotification(envelope) = outgoing_message else {
++            panic!("expected app-server notification");
++        };
++        assert_eq!(
++            serde_json::to_value(&envelope.notification).expect("serialize note notice"),
++            serde_json::json!({
++                "method": "contextManagement/notice",
++                "params": {"threadId": thread_id.to_string(), "message": message},
++            }),
++        );
++        let ServerNotification::ContextManagementNotice(notification) = envelope.notification
++        else {
++            panic!("expected routine note notice rather than a warning");
++        };
++        assert_eq!(
++            notification,
++            ContextManagementNoticeNotification {
++                thread_id: thread_id.to_string(),
++                message: message.to_string(),
++            },
++        );
+         assert!(outgoing_rx.try_recv().is_err());
+     }
+ 
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -119,6 +119,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::TurnModerationMetadata(_)
+         | ServerNotification::ModelSafetyBufferingUpdated(_)
+         | ServerNotification::Warning(_)
++        | ServerNotification::ContextManagementNotice(_)
+         | ServerNotification::GuardianWarning(_)
+         | ServerNotification::DeprecationNotice(_)
+         | ServerNotification::ConfigWarning(_)
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::extensions::send_thread_warning;
++use crate::extensions::send_thread_notification;
+ use codex_app_server_protocol::ThreadQueueChangedNotification;
+ use codex_core::ThreadEvictionOutcome;
+ use codex_extension_api::ThreadIdleCause;
+@@ -682,8 +682,14 @@ pub(super) async fn handle_thread_listener_command(
+                 ))
+                 .await;
+         }
+-        ThreadListenerCommand::EmitWarning { message } => {
+-            send_thread_warning(outgoing, thread_state_manager, conversation_id, message).await;
++        ThreadListenerCommand::EmitNotification { notification } => {
++            send_thread_notification(
++                outgoing,
++                thread_state_manager,
++                conversation_id,
++                *notification,
++            )
++            .await;
+         }
+         ThreadListenerCommand::EmitThreadGoalCleared => {
+             outgoing
+diff --git a/codex-rs/app-server/src/thread_state.rs b/codex-rs/app-server/src/thread_state.rs
+--- a/codex-rs/app-server/src/thread_state.rs
++++ b/codex-rs/app-server/src/thread_state.rs
+@@ -1,6 +1,7 @@
+ use crate::outgoing_message::ConnectionId;
+ use crate::outgoing_message::ConnectionRequestId;
+ use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ThreadGoal;
+ use codex_app_server_protocol::ThreadHistoryBuilder;
+ use codex_app_server_protocol::ThreadHistoryTurnMetadata;
+@@ -73,9 +74,9 @@ pub(crate) enum ThreadListenerCommand {
+     },
+     // EmitThreadQueueChanged orders durable queue updates with thread notifications.
+     EmitThreadQueueChanged,
+-    // EmitWarning is used to order extension warnings with other thread notifications.
+-    EmitWarning {
+-        message: String,
++    // Orders extension warnings and routine notices with other thread notifications.
++    EmitNotification {
++        notification: Box<ServerNotification>,
+     },
+     // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
+     EmitThreadGoalCleared,
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2203,6 +2203,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<RealtimeEventTex
+         }
+         EventMsg::Error(_)
+         | EventMsg::Warning(_)
++        | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+         | EventMsg::GuardianWarning(_)
+diff --git a/codex-rs/ext/history-notes/src/extension.rs b/codex-rs/ext/history-notes/src/extension.rs
+--- a/codex-rs/ext/history-notes/src/extension.rs
++++ b/codex-rs/ext/history-notes/src/extension.rs
+@@ -8,8 +8,10 @@ use codex_extension_api::ConfigContributor;
+ use codex_extension_api::ContentItemKind;
+ use codex_extension_api::ContextContributor;
+ use codex_extension_api::ExtensionData;
++use codex_extension_api::ExtensionEventSink;
+ use codex_extension_api::ExtensionFuture;
+ use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::ExtensionWarning;
+ use codex_extension_api::PromptFragment;
+ use codex_extension_api::PromptSlot;
+ use codex_extension_api::ThreadLifecycleContributor;
+@@ -20,6 +22,10 @@ use codex_extension_api::ToolExecutor;
+ use codex_login::AuthManager;
+ use codex_model_provider::create_model_provider;
+ use codex_protocol::AgentPath;
++use codex_protocol::protocol::CONTEXT_MANAGEMENT_MESSAGE_PREFIX;
++use codex_protocol::protocol::ContextManagementNoticeEvent;
++use codex_protocol::protocol::Event;
++use codex_protocol::protocol::EventMsg;
+ use codex_utils_output_truncation::TruncationPolicy;
+ use serde_json::json;
+ 
+@@ -32,6 +38,7 @@ const MAX_THREAD_HINT_BYTES: usize = 4_000;
+ 
+ struct HistoryNotesExtension {
+     auth_manager: Arc<AuthManager>,
++    event_sink: Arc<dyn ExtensionEventSink>,
+ }
+ 
+ struct HistoryNotesExtensionConfig {
+@@ -110,7 +117,25 @@ impl ContextContributor for HistoryNotesExtension {
+             let Some(identity) = thread_store.get::<HistoryNotesAgentIdentity>() else {
+                 return Vec::new();
+             };
+-            let track_status = |status| {
++            let report_status = |status| {
++                match status {
++                    ThreadHintStatus::Succeeded => self.event_sink.emit(Event {
++                        id: String::new(),
++                        msg: EventMsg::ContextManagementNotice(ContextManagementNoticeEvent {
++                            thread_id: thread_store.level_id().to_string(),
++                            message: format!(
++                                "{CONTEXT_MANAGEMENT_MESSAGE_PREFIX}loaded note references."
++                            ),
++                        }),
++                    }),
++                    ThreadHintStatus::Failed => self.event_sink.emit_warning(ExtensionWarning {
++                        thread_id: thread_store.level_id().to_string(),
++                        turn_id: None,
++                        message: format!(
++                            "{CONTEXT_MANAGEMENT_MESSAGE_PREFIX}unable to load note references."
++                        ),
++                    }),
++                }
+                 if let Some(analytics) = session_store.get::<AnalyticsEventsClient>() {
+                     analytics.track_thread_hint_status(ThreadHintStatusEvent {
+                         thread_id: thread_store.level_id().to_string(),
+@@ -130,18 +155,18 @@ impl ContextContributor for HistoryNotesExtension {
+                 )
+                 .await
+             else {
+-                track_status(ThreadHintStatus::Failed);
++                report_status(ThreadHintStatus::Failed);
+                 return Vec::new();
+             };
+             let Some(text) = result.get("text").and_then(serde_json::Value::as_str) else {
+-                track_status(ThreadHintStatus::Failed);
++                report_status(ThreadHintStatus::Failed);
+                 return Vec::new();
+             };
+             if text.len() > MAX_THREAD_HINT_BYTES {
+-                track_status(ThreadHintStatus::Failed);
++                report_status(ThreadHintStatus::Failed);
+                 return Vec::new();
+             }
+-            track_status(ThreadHintStatus::Succeeded);
++            report_status(ThreadHintStatus::Succeeded);
+             if text.is_empty() {
+                 return Vec::new();
+             }
+@@ -176,6 +201,8 @@ impl ToolContributor for HistoryNotesExtension {
+                     config.backend.clone(),
+                     session_store.level_id().to_string(),
+                     identity.agent_name.clone(),
++                    thread_store.level_id().to_string(),
++                    Arc::clone(&self.event_sink),
+                 )) as Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>
+             })
+             .collect()
+@@ -184,7 +211,10 @@ impl ToolContributor for HistoryNotesExtension {
+ 
+ /// Installs the standalone history and notes tools backed by the Codex backend.
+ pub fn install(registry: &mut ExtensionRegistryBuilder<Config>, auth_manager: Arc<AuthManager>) {
+-    let extension = Arc::new(HistoryNotesExtension { auth_manager });
++    let extension = Arc::new(HistoryNotesExtension {
++        auth_manager,
++        event_sink: registry.event_sink(),
++    });
+     registry.thread_lifecycle_contributor(extension.clone());
+     registry.config_contributor(extension.clone());
+     registry.prompt_contributor(extension.clone());
+diff --git a/codex-rs/ext/history-notes/src/tools.rs b/codex-rs/ext/history-notes/src/tools.rs
+--- a/codex-rs/ext/history-notes/src/tools.rs
++++ b/codex-rs/ext/history-notes/src/tools.rs
+@@ -1,3 +1,7 @@
++use std::sync::Arc;
++
++use codex_extension_api::ExtensionEventSink;
++use codex_extension_api::ExtensionWarning;
+ use codex_extension_api::FunctionCallError;
+ use codex_extension_api::ResponsesApiTool;
+ use codex_extension_api::ToolCall;
+@@ -13,6 +17,10 @@ use codex_protocol::models::FunctionCallOutputContentItem;
+ use codex_protocol::models::FunctionCallOutputPayload;
+ use codex_protocol::models::ImageReference;
+ use codex_protocol::models::ResponseInputItem;
++use codex_protocol::protocol::CONTEXT_MANAGEMENT_MESSAGE_PREFIX;
++use codex_protocol::protocol::ContextManagementNoticeEvent;
++use codex_protocol::protocol::Event;
++use codex_protocol::protocol::EventMsg;
+ use codex_tools::JsonToolOutput;
+ use codex_tools::ResponsesApiNamespace;
+ use codex_tools::ResponsesApiNamespaceTool;
+@@ -100,6 +108,20 @@ impl HistoryNotesAction {
+         !matches!(self, Self::NotesAppendToFile | Self::NotesWriteFile)
+     }
+ 
++    fn note_messages(self) -> Option<(&'static str, &'static str)> {
++        match self {
++            Self::NotesListFilesByPrefix => Some(("listed notes.", "unable to list notes.")),
++            Self::NotesReadFile => Some(("read a note.", "unable to read a note.")),
++            Self::NotesSearchContents => Some(("searched notes.", "unable to search notes.")),
++            Self::NotesAppendToFile => Some(("appended to a note.", "unable to append to a note.")),
++            Self::NotesWriteFile => Some(("wrote a note.", "unable to write a note.")),
++            Self::HistoryListWindows
++            | Self::HistoryListItems
++            | Self::HistoryReadItem
++            | Self::HistorySearchContents => None,
++        }
++    }
++
+     fn namespace_description(self) -> &'static str {
+         match self.namespace() {
+             HISTORY_NAMESPACE => HISTORY_DESCRIPTION,
+@@ -242,6 +264,8 @@ pub(crate) struct HistoryNotesTool {
+     backend: HistoryNotesBackend,
+     session_id: String,
+     current_agent_name: String,
++    thread_id: String,
++    event_sink: Arc<dyn ExtensionEventSink>,
+ }
+ 
+ impl HistoryNotesTool {
+@@ -250,18 +274,22 @@ impl HistoryNotesTool {
+         backend: HistoryNotesBackend,
+         session_id: String,
+         current_agent_name: String,
++        thread_id: String,
++        event_sink: Arc<dyn ExtensionEventSink>,
+     ) -> Self {
+         Self {
+             action,
+             backend,
+             session_id,
+             current_agent_name,
++            thread_id,
++            event_sink,
+         }
+     }
+ 
+     async fn handle_call(
+         &self,
+-        call: ToolCall<'_>,
++        call: &ToolCall<'_>,
+     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+         let arguments = call.function_arguments()?;
+         let arguments = if arguments.trim().is_empty() {
+@@ -320,7 +348,28 @@ impl<'call> ToolExecutor<ToolCall<'call>> for HistoryNotesTool {
+     where
+         'call: 'a,
+     {
+-        Box::pin(self.handle_call(call))
++        Box::pin(async move {
++            let result = self.handle_call(&call).await;
++            if let Some((success, failure)) = self.action.note_messages() {
++                // Summaries never include private input or change the model-facing result.
++                if result.is_ok() {
++                    self.event_sink.emit(Event {
++                        id: call.turn_id,
++                        msg: EventMsg::ContextManagementNotice(ContextManagementNoticeEvent {
++                            thread_id: self.thread_id.clone(),
++                            message: format!("{CONTEXT_MANAGEMENT_MESSAGE_PREFIX}{success}"),
++                        }),
++                    });
++                } else {
++                    self.event_sink.emit_warning(ExtensionWarning {
++                        thread_id: self.thread_id.clone(),
++                        turn_id: Some(call.turn_id),
++                        message: format!("{CONTEXT_MANAGEMENT_MESSAGE_PREFIX}{failure}"),
++                    });
++                }
++            }
++            result
++        })
+     }
+ }
+ 
+diff --git a/codex-rs/ext/history-notes/tests/history_notes_extension.rs b/codex-rs/ext/history-notes/tests/history_notes_extension.rs
+--- a/codex-rs/ext/history-notes/tests/history_notes_extension.rs
++++ b/codex-rs/ext/history-notes/tests/history_notes_extension.rs
+@@ -1,4 +1,5 @@
+ use std::sync::Arc;
++use std::sync::Mutex;
+ 
+ use codex_config::LoaderOverrides;
+ use codex_core::config::Config;
+@@ -7,8 +8,11 @@ use codex_core::config::TokenBudgetConfig;
+ use codex_extension_api::ContentItemKind;
+ use codex_extension_api::ConversationHistory;
+ use codex_extension_api::ExtensionData;
++use codex_extension_api::ExtensionEventSink;
+ use codex_extension_api::ExtensionRegistry;
+ use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::ExtensionWarning;
++use codex_extension_api::FunctionCallError;
+ use codex_extension_api::NoopTurnItemEmitter;
+ use codex_extension_api::PromptFragment;
+ use codex_extension_api::PromptSlot;
+@@ -29,6 +33,9 @@ use codex_protocol::AgentPath;
+ use codex_protocol::ThreadId;
+ use codex_protocol::models::FunctionCallOutputContentItem;
+ use codex_protocol::models::ResponseInputItem;
++use codex_protocol::protocol::ContextManagementNoticeEvent;
++use codex_protocol::protocol::Event;
++use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::TruncationPolicy;
+@@ -47,6 +54,25 @@ use wiremock::matchers::path;
+ type TestResult = Result<(), Box<dyn std::error::Error>>;
+ const THREAD_HINT: &str = "Recent notes (up to 5, most-recent first):\n- /root/worker/notes/latest.md (2 lines, 14 UTF-8 bytes)";
+ 
++#[derive(Default)]
++struct RecordingEventSink {
++    warnings: Mutex<Vec<ExtensionWarning>>,
++    notices: Mutex<Vec<(String, ContextManagementNoticeEvent)>>,
++}
++
++impl ExtensionEventSink for RecordingEventSink {
++    fn emit(&self, event: Event) {
++        let EventMsg::ContextManagementNotice(notice) = event.msg else {
++            panic!("unexpected history-notes extension event");
++        };
++        self.notices.lock().unwrap().push((event.id, notice));
++    }
++
++    fn emit_warning(&self, warning: ExtensionWarning) {
++        self.warnings.lock().unwrap().push(warning);
++    }
++}
++
+ #[tokio::test]
+ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestResult {
+     let server = MockServer::start().await;
+@@ -89,7 +115,8 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+     );
+     let auth_manager =
+         AuthManager::from_auth_for_testing(CodexAuth::Headers(AuthHeaders::new(headers)));
+-    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    let event_sink = Arc::new(RecordingEventSink::default());
++    let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(event_sink.clone());
+     install(&mut builder, auth_manager);
+     let registry = builder.build();
+     let session_store = ExtensionData::new("session-123");
+@@ -195,6 +222,25 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+             }
+         })
+     );
++    assert_eq!(
++        std::mem::take(&mut *event_sink.notices.lock().unwrap()),
++        vec![
++            (
++                "turn-1".to_string(),
++                ContextManagementNoticeEvent {
++                    thread_id: "thread-123".to_string(),
++                    message: "Context management: read a note.".to_string(),
++                },
++            ),
++            (
++                String::new(),
++                ContextManagementNoticeEvent {
++                    thread_id: "thread-123".to_string(),
++                    message: "Context management: loaded note references.".to_string(),
++                },
++            ),
++        ],
++    );
+ 
+     for (namespace, name, mut arguments) in [
+         ("history", "list_windows", json!({"limit": 101})),
+@@ -273,6 +319,29 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+             serde_json::to_value(output.to_response_item(&call.call_id, &call.payload))?,
+             json!({"type": "function_call_output", "call_id": call.call_id, "output": expected_output})
+         );
++        let expected_notices = if namespace == "notes" {
++            let message = match name {
++                "list_files_by_prefix" => "listed notes.",
++                "read_file" => "read a note.",
++                "search_contents" => "searched notes.",
++                "append_to_file" => "appended to a note.",
++                "write_file" => "wrote a note.",
++                _ => panic!("unexpected note action"),
++            };
++            vec![(
++                "turn-1".to_string(),
++                ContextManagementNoticeEvent {
++                    thread_id: "thread-123".to_string(),
++                    message: format!("Context management: {message}"),
++                },
++            )]
++        } else {
++            Vec::new()
++        };
++        assert_eq!(
++            std::mem::take(&mut *event_sink.notices.lock().unwrap()),
++            expected_notices,
++        );
+         arguments["context"] = json!({
+             "session_id": "session-123",
+             "current_agent_name": "/root/worker",
+@@ -332,10 +401,82 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+         })
+     );
+ 
+-    for result in [
+-        json!({"text": ""}),
+-        json!({"text": "x".repeat(4_001)}),
+-        json!({"encrypted_output": "old-backend-hint"}),
++    assert!(event_sink.warnings.lock().unwrap().is_empty());
++    assert!(event_sink.notices.lock().unwrap().is_empty());
++
++    for (name, message) in [
++        ("list_files_by_prefix", "unable to list notes."),
++        ("read_file", "unable to read a note."),
++        ("search_contents", "unable to search notes."),
++        ("append_to_file", "unable to append to a note."),
++        ("write_file", "unable to write a note."),
++    ] {
++        server.reset().await;
++        Mock::given(method("POST"))
++            .and(path(format!("/backend-api/codex/alpha/notes/v2/{name}")))
++            .respond_with(ResponseTemplate::new(400).set_body_string("PRIVATE_PATH PRIVATE_TEXT"))
++            .mount(&server)
++            .await;
++        let tool_name = ToolName::namespaced("notes", name);
++        let tool = tools
++            .iter()
++            .find(|tool| tool.tool_name() == tool_name)
++            .expect("note tool");
++        let call = tool_call(
++            tool_name,
++            json!({"path": "PRIVATE_PATH", "text": "PRIVATE_TEXT", "query": "PRIVATE_QUERY"}),
++        );
++        let Err(FunctionCallError::RespondToModel(error)) = tool.handle(call).await else {
++            panic!("expected unchanged model-facing backend error");
++        };
++        assert_eq!(
++            error,
++            "Unable to perform operation: The backend request failed."
++        );
++        assert_eq!(
++            std::mem::take(&mut *event_sink.warnings.lock().unwrap()),
++            vec![ExtensionWarning {
++                thread_id: "thread-123".to_string(),
++                turn_id: Some("turn-1".to_string()),
++                message: format!("Context management: {message}"),
++            }]
++        );
++    }
++
++    server.reset().await;
++    let mut invalid_call = tool_call(ToolName::namespaced("notes", "read_file"), json!({}));
++    invalid_call.payload = ToolPayload::Function {
++        arguments: "PRIVATE_INVALID_JSON".to_string(),
++    };
++    assert!(matches!(
++        read_file.handle(invalid_call).await,
++        Err(FunctionCallError::RespondToModel(_))
++    ));
++    assert_eq!(
++        std::mem::take(&mut *event_sink.warnings.lock().unwrap()),
++        vec![ExtensionWarning {
++            thread_id: "thread-123".to_string(),
++            turn_id: Some("turn-1".to_string()),
++            message: "Context management: unable to read a note.".to_string(),
++        }]
++    );
++    assert!(server.received_requests().await.unwrap().is_empty());
++
++    let call = tool_call(
++        ToolName::namespaced("history", "read_item"),
++        json!({"window_id": "window", "item_id": "item"}),
++    );
++    assert!(matches!(
++        read_item.handle(call).await,
++        Err(FunctionCallError::RespondToModel(_))
++    ));
++    assert!(event_sink.warnings.lock().unwrap().is_empty());
++    assert!(event_sink.notices.lock().unwrap().is_empty());
++
++    for (result, failed) in [
++        (json!({"text": ""}), false),
++        (json!({"text": "x".repeat(4_001)}), true),
++        (json!({"encrypted_output": "old-backend-hint"}), true),
+     ] {
+         server.reset().await;
+         Mock::given(method("POST"))
+@@ -349,6 +490,34 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+                 .await
+                 .is_empty()
+         );
++        let expected_warnings = if failed {
++            vec![ExtensionWarning {
++                thread_id: "thread-123".to_string(),
++                turn_id: None,
++                message: "Context management: unable to load note references.".to_string(),
++            }]
++        } else {
++            Vec::new()
++        };
++        assert_eq!(
++            std::mem::take(&mut *event_sink.warnings.lock().unwrap()),
++            expected_warnings
++        );
++        let expected_notices = if failed {
++            Vec::new()
++        } else {
++            vec![(
++                String::new(),
++                ContextManagementNoticeEvent {
++                    thread_id: "thread-123".to_string(),
++                    message: "Context management: loaded note references.".to_string(),
++                },
++            )]
++        };
++        assert_eq!(
++            std::mem::take(&mut *event_sink.notices.lock().unwrap()),
++            expected_notices,
++        );
+     }
+ 
+     server.reset().await;
+@@ -364,6 +533,14 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+             .await
+             .is_empty()
+     );
++    assert_eq!(
++        std::mem::take(&mut *event_sink.warnings.lock().unwrap()),
++        vec![ExtensionWarning {
++            thread_id: "thread-123".to_string(),
++            turn_id: None,
++            message: "Context management: unable to load note references.".to_string(),
++        }]
++    );
+     assert!(
+         server
+             .received_requests()
+@@ -384,6 +561,8 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
+             .await
+             .is_empty()
+     );
++    assert!(event_sink.warnings.lock().unwrap().is_empty());
++    assert!(event_sink.notices.lock().unwrap().is_empty());
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -1474,6 +1474,9 @@ pub enum EventMsg {
+     /// indicates the turn continued but the user should still be notified.
+     Warning(WarningEvent),
+ 
++    /// A context-management note operation completed successfully.
++    ContextManagementNotice(ContextManagementNoticeEvent),
++
+     /// Provider-owned authentication recovery has started for the current turn.
+     AuthRecoveryStarted(AuthRecoveryEvent),
+ 
+@@ -2215,6 +2218,17 @@ pub struct WarningEvent {
+     pub message: String,
+ }
+ 
++/// Prefix for note-operation outcomes that clients keep visible in the conversation.
++pub const CONTEXT_MANAGEMENT_MESSAGE_PREFIX: &str = "Context management: ";
++
++/// A routine note-operation summary with an explicit thread target.
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
++pub struct ContextManagementNoticeEvent {
++    pub thread_id: String,
++    /// Fixed operation summary without note contents, paths or queries.
++    pub message: String,
++}
++
+ /// User-facing progress for provider-owned authentication recovery.
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+ pub struct AuthRecoveryEvent {
+diff --git a/codex-rs/rollout-trace/src/protocol_event.rs b/codex-rs/rollout-trace/src/protocol_event.rs
+--- a/codex-rs/rollout-trace/src/protocol_event.rs
++++ b/codex-rs/rollout-trace/src/protocol_event.rs
+@@ -354,6 +354,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
+         EventMsg::SubAgentActivity(_) => None,
+         EventMsg::Error(_)
+         | EventMsg::Warning(_)
++        | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+         | EventMsg::GuardianWarning(_)
+@@ -438,6 +439,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
+         EventMsg::ShutdownComplete => Some("shutdown_complete"),
+         EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
++        | EventMsg::ContextManagementNotice(_)
+         | EventMsg::GuardianWarning(_)
+         | EventMsg::SafetyBuffering(_)
+         | EventMsg::RealtimeConversationStarted(_)
+diff --git a/codex-rs/rollout/src/policy.rs b/codex-rs/rollout/src/policy.rs
+--- a/codex-rs/rollout/src/policy.rs
++++ b/codex-rs/rollout/src/policy.rs
+@@ -171,6 +171,7 @@ fn persisted_event_msg(
+         | EventMsg::DynamicToolCallRequest(_)
+         | EventMsg::DynamicToolCallResponse(_)
+         | EventMsg::Warning(_)
++        | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+         | EventMsg::GuardianWarning(_)

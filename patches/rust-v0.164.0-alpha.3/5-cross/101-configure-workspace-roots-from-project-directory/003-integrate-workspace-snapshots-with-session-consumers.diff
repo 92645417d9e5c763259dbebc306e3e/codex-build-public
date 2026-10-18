@@ -1,0 +1,1164 @@
+integrate-workspace-snapshots-with-session-consumers
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: integrate-workspace-snapshots-with-session-consumers
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -853,6 +853,20 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
+ async fn cold_resume_workspace_roots_honor_owned_snapshot_and_caller_overrides() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
++    let storage = TempDir::new()?;
++    let storage_roots = [
++        "REPOS_ROOT",
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ]
++    .map(|name| (name, storage.path().join(name)));
++    let env_overrides = storage_roots
++        .iter()
++        .map(|(name, path)| (*name, Some(path.to_str().expect("UTF-8 storage root"))))
++        .collect::<Vec<_>>();
+     MockResponsesConfig::new(&server.uri())
+         .with_sandbox_mode("workspace-write")
+         .with_extra_config(
+@@ -925,6 +939,7 @@ sandbox = "unelevated"
+     ] {
+         let mut mcp = TestAppServer::builder()
+             .with_codex_home(codex_home.path())
++            .with_env_overrides(&env_overrides)
+             .without_auto_env()
+             .without_managed_config()
+             .build_initialized()
+@@ -969,10 +984,24 @@ sandbox = "unelevated"
+         for root in [&saved_cwd, &new_cwd, &extra_root] {
+             assert_eq!(
+                 file_system.can_write_local_path_with_cwd(root.as_path(), expected_cwd.as_path()),
+-                expected_roots.contains(root),
++                root == expected_cwd,
+                 "resumed write permission at {root:?}"
+             );
+         }
++        for root in std::iter::once(expected_cwd.as_path())
++            .chain(storage_roots.iter().map(|(_, path)| path.as_path()))
++        {
++            assert!(
++                file_system.can_write_local_path_with_cwd(
++                    &root.join(".git/config"),
++                    expected_cwd.as_path(),
++                )
++            );
++        }
++        assert!(!file_system.can_write_local_path_with_cwd(
++            &storage.path().join("outside-storage-roots"),
++            expected_cwd.as_path(),
++        ));
+         timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+     }
+     Ok(())
+@@ -1869,9 +1898,9 @@ async fn cold_resume_permission_overrides_win_over_persisted_profile() -> Result
+     "[permissions.filesystem]\ndeny_read = [\"./private\"]",
+     AppSandboxPolicy::WorkspaceWrite {
+         writable_roots: Vec::new(),
+-        network_access: false,
+-        exclude_tmpdir_env_var: false,
+-        exclude_slash_tmp: false,
++        network_access: PermissionProfile::workspace_write().network_sandbox_policy().is_enabled(),
++        exclude_tmpdir_env_var: true,
++        exclude_slash_tmp: true,
+     };
+     "managed deny-read"
+ ))]
+@@ -1911,6 +1940,20 @@ async fn cold_resume_without_active_permission_profile_restores_base_permissions
+ ) -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
++    let storage = TempDir::new()?;
++    let storage_roots = [
++        "REPOS_ROOT",
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ]
++    .map(|name| (name, storage.path().join(name)));
++    let env_overrides = storage_roots
++        .iter()
++        .map(|(name, path)| (*name, Some(path.to_str().expect("UTF-8 storage root"))))
++        .collect::<Vec<_>>();
+     mock_responses_config(&server.uri()).write(codex_home.path())?;
+     // Only deny-read names a path on the app-server host.
+     let local = requirements.contains("deny_read");
+@@ -1919,7 +1962,9 @@ async fn cold_resume_without_active_permission_profile_restores_base_permissions
+             .with_codex_home(codex_home.path())
+             .without_managed_config();
+         if local {
+-            builder = builder.without_auto_env();
++            builder = builder
++                .without_auto_env()
++                .with_env_overrides(&env_overrides);
+         }
+         let mut mcp = builder.build_initialized().await?;
+         let params = ThreadStartParams {
+@@ -1957,7 +2002,9 @@ async fn cold_resume_without_active_permission_profile_restores_base_permissions
+     std::fs::write(codex_home.path().join("requirements.toml"), requirements)?;
+     let mut builder = TestAppServer::builder().with_codex_home(codex_home.path());
+     if local {
+-        builder = builder.without_auto_env();
++        builder = builder
++            .without_auto_env()
++            .with_env_overrides(&env_overrides);
+     }
+     let mut mcp = builder.build_initialized().await?;
+     let resume_id = mcp
+@@ -1968,6 +2015,53 @@ async fn cold_resume_without_active_permission_profile_restores_base_permissions
+         .await?;
+     let response: ThreadResumeResponse =
+         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
++    let mut expected = expected;
++    if local {
++        let (items, _, _) = RolloutRecorder::load_rollout_items(
++            response.thread.path.as_ref().expect("rollout path"),
++        )
++        .await?;
++        let thread_id = ThreadId::from_string(&response.thread.id)?;
++        let settings = items
++            .into_iter()
++            .rev()
++            .find_map(|item| match item {
++                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
++                    if event.thread_id == Some(thread_id) =>
++                {
++                    Some(event.thread_settings)
++                }
++                _ => None,
++            })
++            .expect("resumed permission checkpoint");
++        let cwd = response.cwd.as_path();
++        let file_system = settings.permission_profile.file_system_sandbox_policy();
++        assert!(!file_system.can_read_local_path_with_cwd(&cwd.join("private/secret"), cwd));
++        for root in std::iter::once(cwd).chain(storage_roots.iter().map(|(_, path)| path.as_path()))
++        {
++            assert!(file_system.can_write_local_path_with_cwd(&root.join(".git/config"), cwd));
++        }
++        assert!(
++            !file_system
++                .can_write_local_path_with_cwd(&storage.path().join("outside-storage-roots"), cwd,)
++        );
++        let codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { writable_roots, .. } =
++            codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
++                &settings.permission_profile,
++                cwd,
++            )
++        else {
++            panic!("managed deny-read must retain a restricted Workspace policy");
++        };
++        let AppSandboxPolicy::WorkspaceWrite {
++            writable_roots: expected_roots,
++            ..
++        } = &mut expected
++        else {
++            panic!("managed deny-read case must expect Workspace permissions");
++        };
++        *expected_roots = writable_roots;
++    }
+     assert_eq!(
+         (response.sandbox, response.approval_policy),
+         (expected, AskForApproval::Never),
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs b/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs
+@@ -49,10 +49,15 @@ use tokio::time::timeout;
+ 
+ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+-#[test_case(false; "legacy")]
+-#[test_case(true; "paginated")]
++#[test_case(false, false; "legacy")]
++#[test_case(true, false; "paginated")]
++#[test_case(false, true; "legacy workspace")]
++#[test_case(true, true; "paginated workspace")]
+ #[tokio::test]
+-async fn unloaded_settings_persist_without_starting_a_session(paginated: bool) -> Result<()> {
++async fn unloaded_settings_persist_without_starting_a_session(
++    paginated: bool,
++    workspace: bool,
++) -> Result<()> {
+     fn files_under(path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+         let mut paths = Vec::new();
+         for entry in std::fs::read_dir(path)? {
+@@ -70,8 +75,28 @@ async fn unloaded_settings_persist_without_starting_a_session(paginated: bool) -
+     let mock = responses::start_mock_server().await;
+     let home = TempDir::new()?;
+     let cwd = TempDir::new()?;
++    let storage = TempDir::new()?;
++    let storage_roots = [
++        "REPOS_ROOT",
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ]
++    .map(|name| (name, storage.path().join(name)));
++    let env_overrides = storage_roots
++        .iter()
++        .map(|(name, path)| (*name, Some(path.to_str().expect("UTF-8 storage root"))))
++        .collect::<Vec<_>>();
+     MockResponsesConfig::new(&mock.uri())
+         .with_approval_policy("on-request")
++        .with_sandbox_mode(if workspace {
++            "workspace-write"
++        } else {
++            "read-only"
++        })
++        .with_root_config("sandbox_workspace_write = { network_access = false }")
+         .with_root_config("approvals_reviewer = 'auto_review'")
+         .enable_feature(codex_features::Feature::GuardianApproval)
+         .write(home.path())?;
+@@ -94,6 +119,7 @@ async fn unloaded_settings_persist_without_starting_a_session(paginated: bool) -
+     for _ in 0..2 {
+         let mut mcp = TestAppServer::builder()
+             .with_codex_home(home.path())
++            .with_env_overrides(&env_overrides)
+             .build_initialized()
+             .await?;
+         for _ in 0..2 {
+@@ -138,6 +164,25 @@ async fn unloaded_settings_persist_without_starting_a_session(paginated: bool) -
+     assert_eq!(settings.cwd.as_path(), cwd.path());
+     assert_eq!(settings.model, "mock-model-2");
+     assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::High));
++    let file_system = settings.permission_profile.file_system_sandbox_policy();
++    for root in
++        std::iter::once(cwd.path()).chain(storage_roots.iter().map(|(_, path)| path.as_path()))
++    {
++        assert_eq!(
++            file_system.can_write_local_path_with_cwd(&root.join(".git/config"), cwd.path()),
++            workspace,
++            "cold settings must retain the selected filesystem policy for {}",
++            root.display()
++        );
++    }
++    assert!(
++        !file_system
++            .can_write_local_path_with_cwd(&home.path().join("outside-the-workspace"), cwd.path(),)
++    );
++    assert_eq!(
++        settings.permission_profile.network_sandbox_policy(),
++        codex_protocol::permissions::NetworkSandboxPolicy::Restricted
++    );
+     assert_eq!(
+         settings.approval_policy,
+         codex_protocol::protocol::AskForApproval::OnRequest
+@@ -151,6 +196,7 @@ async fn unloaded_settings_persist_without_starting_a_session(paginated: bool) -
+     // A genuine resume retains the reviewer; settings-only persistence must not disable it.
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(home.path())
++        .with_env_overrides(&env_overrides)
+         .build_initialized()
+         .await?;
+     let id = mcp
+diff --git a/codex-rs/core/src/guardian/review_session_setup.rs b/codex-rs/core/src/guardian/review_session_setup.rs
+--- a/codex-rs/core/src/guardian/review_session_setup.rs
++++ b/codex-rs/core/src/guardian/review_session_setup.rs
+@@ -9,7 +9,9 @@ use super::*;
+ use crate::guardian::input_budget::CheckpointRecovery;
+ use codex_guardian_reviewer::ReviewerPool;
+ use codex_guardian_reviewer::ReviewerRequest;
+-use codex_protocol::protocol::TurnEnvironmentSelection;
++use codex_guardian_reviewer::reviewer_permission_profile;
++use codex_protocol::models::PermissionProfileSnapshot;
++use codex_protocol::protocol::EnvironmentConfigState;
+ 
+ /// Controls whether selection may reuse a session or must start from the parent checkpoint.
+ #[derive(Clone, Copy, PartialEq, Eq)]
+@@ -163,9 +165,18 @@ impl PreparedGuardianContext {
+             environments: Some(
+                 self.context
+                     .environments()
+-                    .to_selections()
+-                    .into_iter()
+-                    .map(TurnEnvironmentSelection::into_request)
++                    .turn_environments()
++                    .map(|environment| {
++                        let mut selection = environment.selection();
++                        let mut config = environment.config().clone();
++                        // Startup context must use the same captured read-only settings as review turns.
++                        config.permission_profile =
++                            PermissionProfileSnapshot::legacy(reviewer_permission_profile(
++                                config.permission_profile.permission_profile(),
++                            ));
++                        selection.config = EnvironmentConfigState::Ready(config);
++                        selection.into_request()
++                    })
+                     .collect(),
+             ),
+             inherited_environments: Some(self.context.environments().clone()),
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -929,7 +929,8 @@ impl Session {
+             model_info_overrides: config.to_models_manager_config().into(),
+             developer_instructions: config.developer_instructions.clone(),
+             base_instructions,
+-            permission_profile_state: session_permission_profile_state_from_config(&config)?,
++            permission_profile_state: config.permissions.permission_profile_state().clone(),
++            local_workspace_profile: None,
+             allow_login_shell: config.permissions.allow_login_shell,
+             shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -1227,12 +1228,6 @@ fn unsupported_service_tier_warning(
+     ))
+ }
+ 
+-fn session_permission_profile_state_from_config(
+-    config: &Config,
+-) -> CodexResult<PermissionProfileState> {
+-    Ok(config.permissions.permission_profile_state().clone())
+-}
+-
+ #[cfg(test)]
+ pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
+     futures::future::ready(()).boxed().shared()
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -37,7 +37,7 @@ use codex_protocol::mcp::ClientMcpExtensions;
+ use codex_protocol::models::ProfileWorkspaceRoot;
+ use codex_protocol::permissions::FileSystemPath;
+ use codex_protocol::permissions::FileSystemSpecialPath;
+-use codex_protocol::protocol::EnvironmentConfig;
++use codex_protocol::protocol::EnvironmentConfigState;
+ use codex_protocol::protocol::HookCompletedEvent;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::ThreadHistoryMode;
+@@ -124,6 +124,9 @@ pub(crate) struct SessionConfiguration {
+     /// active profile id, and profile-defined workspace roots in sync by using
+     /// the methods below instead of mutating the fields independently.
+     pub(super) permission_profile_state: PermissionProfileState,
++    /// Local metadata for accepted settings, including changes not activated by a turn yet.
++    /// Execution environments inherit the canonical state above and bind their own roots.
++    pub(super) local_workspace_profile: Option<PermissionProfileSnapshot>,
+     pub(super) allow_login_shell: bool,
+     pub(super) shell_environment_policy: ShellEnvironmentPolicy,
+     // TODO(anp): Reconcile these legacy thread defaults with TurnEnvironment::sandbox_context;
+@@ -176,11 +179,10 @@ impl SessionConfiguration {
+         &self.codex_home
+     }
+ 
+-    pub(super) fn inferred_environment_config(&self) -> EnvironmentConfig {
+-        EnvironmentConfig {
++    pub(super) fn environment_defaults(&self) -> ThreadEnvironmentDefaults {
++        ThreadEnvironmentDefaults {
+             allow_login_shell: self.allow_login_shell,
+-            workspace_roots: Vec::new(),
+-            permission_profile: self.permission_profile_state.snapshot(),
++            permission_profile_state: self.permission_profile_state.clone(),
+             shell_environment_policy: self.shell_environment_policy.clone(),
+             windows_sandbox_level: self.windows_sandbox_level,
+             windows_sandbox_type: self
+@@ -191,20 +193,74 @@ impl SessionConfiguration {
+             mcp_policy: None,
+             network_policy: None,
+             selected_capability_roots: Vec::new(),
++            local_windows_sandbox_type: self.windows_sandbox_type,
++            codex_home: self.codex_home.clone(),
++            codex_harness: self.original_config_do_not_use.codex_harness.clone(),
+         }
+     }
+ 
+     pub(super) fn permission_profile(&self) -> PermissionProfile {
+-        self.permission_profile_state.permission_profile().clone()
++        self.local_workspace_profile.as_ref().map_or_else(
++            || self.permission_profile_state.permission_profile().clone(),
++            |snapshot| snapshot.permission_profile().clone(),
++        )
++    }
++
++    fn refresh_local_workspace_profile(&mut self) -> ConstraintResult<()> {
++        self.local_workspace_profile = None;
++        let cwd = match self.environments.first() {
++            Some(environment)
++                if environment.environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID
++                    && environment.config == EnvironmentConfigState::FromThread =>
++            {
++                environment
++                    .cwd
++                    .to_abs_path()
++                    .map_err(|error| ConstraintError::InvalidValue {
++                        field_name: "environments",
++                        candidate: environment.cwd.to_string(),
++                        allowed: format!("native local working directory ({error})"),
++                        requirement_source: codex_config::RequirementSource::Unknown,
++                    })?
++            }
++            Some(_) => return Ok(()),
++            None => self.legacy_fallback_cwd.clone(),
++        };
++        if !self.permission_profile_state.is_builtin_workspace(&cwd) {
++            return Ok(());
++        }
++        let roots = crate::config::storage_roots::StorageRoots::for_cwd(
++            &cwd,
++            &self.codex_home,
++            &self.original_config_do_not_use.codex_harness,
++        )
++        .map_err(|error| ConstraintError::InvalidValue {
++            field_name: "environments",
++            candidate: cwd.display().to_string(),
++            allowed: format!("valid project storage roots ({error:#})"),
++            requirement_source: codex_config::RequirementSource::Unknown,
++        })?;
++        let mut permissions = self.permission_profile_state.clone();
++        permissions.bind_local_workspace(&cwd, &roots)?;
++        self.local_workspace_profile = Some(permissions.snapshot());
++        Ok(())
+     }
+ 
+     fn materialized_permission_profile(
+         &self,
+         environments: &[TurnEnvironmentSelection],
+     ) -> PermissionProfile {
+-        let workspace_roots = ThreadEnvironments::primary_workspace_roots_for(environments);
+-        self.permission_profile()
+-            .materialize_project_roots_with_workspace_roots(&workspace_roots)
++        let workspace_roots = environments.first().map_or(&[][..], |environment| {
++            environment.workspace_roots.as_slice()
++        });
++        let profile = if environments.first().is_some_and(|environment| {
++            environment.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID
++        }) {
++            self.permission_profile_state.permission_profile().clone()
++        } else {
++            self.permission_profile()
++        };
++        profile.materialize_project_roots_with_path_uris(workspace_roots)
+     }
+ 
+     fn effective_permission_profile(
+@@ -239,7 +295,9 @@ impl SessionConfiguration {
+         permission_profile: PermissionProfile,
+     ) -> ConstraintResult<()> {
+         self.permission_profile_state
+-            .set_legacy_permission_profile(permission_profile)
++            .set_legacy_permission_profile(permission_profile)?;
++        self.local_workspace_profile = None;
++        Ok(())
+     }
+ 
+     pub(super) fn sandbox_policy(
+@@ -275,7 +333,11 @@ impl SessionConfiguration {
+             ThreadEnvironments::primary_workspace_roots_for(&environment_selections);
+         let permission_profile = ThreadEnvironments::primary_config_for(&environment_selections)
+             .map(|config| config.permission_profile.clone())
+-            .unwrap_or_else(|| self.permission_profile_state.snapshot());
++            .unwrap_or_else(|| {
++                self.local_workspace_profile
++                    .clone()
++                    .unwrap_or_else(|| self.permission_profile_state.snapshot())
++            });
+         ThreadConfigSnapshot {
+             model: self.step_settings.collaboration_mode.model().to_string(),
+             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
+@@ -341,6 +403,7 @@ impl SessionConfiguration {
+         &self,
+         environment_selections: Vec<TurnEnvironmentSelection>,
+     ) -> CodexThreadSettingsOverrides {
++        let permissions = self.permission_profile_state.snapshot();
+         CodexThreadSettingsOverrides {
+             environments: Some(TurnEnvironmentRequests::new(
+                 self.legacy_fallback_cwd.clone(),
+@@ -350,15 +413,11 @@ impl SessionConfiguration {
+                     .collect(),
+             )),
+             runtime_workspace_roots: Some(self.runtime_workspace_roots.clone()),
+-            profile_workspace_roots: Some(
+-                self.permission_profile_state
+-                    .profile_workspace_roots()
+-                    .to_vec(),
+-            ),
++            profile_workspace_roots: Some(permissions.profile_workspace_roots().to_vec()),
+             approval_policy: Some(self.step_settings.approval_policy.value()),
+             approvals_reviewer: Some(self.step_settings.approvals_reviewer),
+-            permission_profile: Some(self.permission_profile()),
+-            active_permission_profile: self.active_permission_profile(),
++            permission_profile: Some(permissions.permission_profile().clone()),
++            active_permission_profile: permissions.active_permission_profile(),
+             windows_sandbox_level: Some(self.windows_sandbox_level),
+             summary: self.step_settings.reasoning_summary,
+             service_tier: Some(self.step_settings.service_tier.clone()),
+@@ -465,7 +524,10 @@ impl SessionConfiguration {
+             if let Some(active_permission_profile) = next_configuration.active_permission_profile()
+             {
+                 let mut config = (*next_configuration.original_config_do_not_use).clone();
+-                let permission_profile = next_configuration.permission_profile();
++                let permission_profile = next_configuration
++                    .permission_profile_state
++                    .permission_profile()
++                    .clone();
+                 config.permissions.network = config
+                     .network_proxy_spec_for_active_permission_profile(
+                         &active_permission_profile,
+@@ -538,6 +600,12 @@ impl SessionConfiguration {
+                     )?;
+             }
+         }
++        if updates.environments.is_some()
++            || updates.permission_profile.is_some()
++            || updates.sandbox_policy.is_some()
++        {
++            next_configuration.refresh_local_workspace_profile()?;
++        }
+         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
+             next_configuration.app_server_client_name = Some(app_server_client_name);
+         }
+@@ -592,8 +660,13 @@ impl SessionConfiguration {
+             None => PermissionProfileSnapshot::legacy(effective_permission_profile),
+         };
+ 
+-        self.permission_profile_state
+-            .set_permission_profile_snapshot(permission_snapshot)
++        // A settings round trip of the displayed local view must retain its template.
++        if self.local_workspace_profile.as_ref() != Some(&permission_snapshot) {
++            self.permission_profile_state
++                .set_permission_profile_snapshot(permission_snapshot)?;
++            self.local_workspace_profile = None;
++        }
++        Ok(())
+     }
+ }
+ 
+@@ -815,6 +888,7 @@ impl Session {
+         git_enrichment_policy: GitEnrichmentPolicy,
+         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+     ) -> anyhow::Result<Arc<Self>> {
++        session_configuration.refresh_local_workspace_profile()?;
+         debug!(
+             "Configuring session: model={}; provider={:?}",
+             session_configuration
+@@ -1471,10 +1545,7 @@ impl Session {
+             let turn_environments = Arc::new(ThreadEnvironments::new(
+                 environment_manager,
+                 default_shell.clone(),
+-                ThreadEnvironmentDefaults::new(
+-                    session_configuration.inferred_environment_config(),
+-                    session_configuration.windows_sandbox_type,
+-                ),
++                session_configuration.environment_defaults(),
+                 shell_snapshot,
+                 inherited_environments.clone(),
+                 config.features.enabled(Feature::DeferredExecutor),
+diff --git a/codex-rs/core/src/session/stored_thread_settings.rs b/codex-rs/core/src/session/stored_thread_settings.rs
+--- a/codex-rs/core/src/session/stored_thread_settings.rs
++++ b/codex-rs/core/src/session/stored_thread_settings.rs
+@@ -4,7 +4,9 @@ use super::step_settings::StepSettings;
+ use super::step_settings::StepSettingsConstraints;
+ use super::step_settings::StepSettingsUpdate;
+ use crate::config::Config;
++use crate::config::ConstraintError;
+ use crate::config::ConstraintResult;
++use crate::config::storage_roots::StorageRoots;
+ use crate::path_utils;
+ use codex_features::Feature;
+ use codex_history::InitialHistory;
+@@ -85,8 +87,18 @@ pub async fn prepare_stored_thread_settings(
+         cwd.clone(),
+     );
+     config.cwd = cwd;
+-    let permission_profile = config
+-        .permissions
++    let mut permissions = config.permissions.permission_profile_state().clone();
++    if permissions.is_builtin_workspace(&config.cwd) {
++        let roots = StorageRoots::for_cwd(&config.cwd, &config.codex_home, &config.codex_harness)
++            .map_err(|error| ConstraintError::InvalidValue {
++            field_name: "cwd",
++            candidate: config.cwd.display().to_string(),
++            allowed: format!("valid project storage roots ({error:#})"),
++            requirement_source: codex_config::RequirementSource::Unknown,
++        })?;
++        permissions.bind_local_workspace(&config.cwd, &roots)?;
++    }
++    let permission_profile = permissions
+         .permission_profile()
+         .clone()
+         .materialize_project_roots_with_path_uris(&config.effective_workspace_roots());
+@@ -112,7 +124,7 @@ pub async fn prepare_stored_thread_settings(
+         approval_policy: selected.approval_policy.value(),
+         approvals_reviewer: selected.approvals_reviewer,
+         permission_profile,
+-        active_permission_profile: config.permissions.active_permission_profile(),
++        active_permission_profile: permissions.active_permission_profile(),
+         cwd: config.cwd,
+         runtime_workspace_roots: Some(config.workspace_roots),
+         reasoning_effort: selected.collaboration_mode.reasoning_effort(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -4495,6 +4495,7 @@ async fn set_rate_limits_retains_previous_credits() {
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -4618,6 +4619,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -5242,6 +5244,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -5413,10 +5416,7 @@ async fn resolved_environments_for_configuration(
+     let turn_environments = ThreadEnvironments::new(
+         Arc::clone(&environment_manager),
+         default_user_shell(),
+-        ThreadEnvironmentDefaults::new(
+-            session_configuration.inferred_environment_config(),
+-            session_configuration.windows_sandbox_type,
+-        ),
++        session_configuration.environment_defaults(),
+         ShellSnapshot::disabled(),
+         TurnEnvironmentSnapshot::default(),
+         /*non_blocking_snapshots*/ false,
+@@ -5535,6 +5535,118 @@ async fn session_configuration_apply_preserves_profile_file_system_policy_on_cwd
+     );
+ }
+ 
++#[tokio::test]
++async fn session_workspace_permissions_follow_cwd_without_changing_network_or_approval() {
++    let mut configuration = make_session_configuration_for_tests().await;
++    let workspace = tempfile::tempdir().unwrap();
++    let first = workspace.path().join("first").abs();
++    let second = workspace.path().join("second").abs();
++    let extra = workspace.path().join("remote-extra").abs();
++    configuration.legacy_fallback_cwd = first.clone();
++    let configuration = configuration
++        .apply(
++            &SessionSettingsUpdate {
++                permission_profile: Some(PermissionProfile::workspace_write_with(
++                    std::slice::from_ref(&extra),
++                    NetworkSandboxPolicy::Restricted,
++                    false,
++                    false,
++                )),
++                ..Default::default()
++            },
++            &[],
++        )
++        .unwrap();
++    let original = configuration.permission_profile_state.snapshot();
++    let first_snapshot = configuration.thread_settings_snapshot(&[]);
++    assert!(
++        first_snapshot
++            .permission_profile
++            .file_system_sandbox_policy()
++            .can_write_local_path_with_cwd(&first.join(".git/config"), &first)
++    );
++    let configuration = configuration
++        .apply(
++            &SessionSettingsUpdate {
++                permission_profile: Some(first_snapshot.permission_profile),
++                active_permission_profile: first_snapshot.active_permission_profile,
++                ..Default::default()
++            },
++            &[],
++        )
++        .unwrap();
++    assert_eq!(configuration.permission_profile_state.snapshot(), original);
++    let approval = configuration.step_settings.approval_policy.value();
++    let updated = configuration
++        .apply(
++            &SessionSettingsUpdate {
++                environments: Some(TurnEnvironmentSelections::new(second.clone(), Vec::new())),
++                ..Default::default()
++            },
++            &[],
++        )
++        .unwrap();
++    let policy = updated.file_system_sandbox_policy(&[]);
++    assert!(policy.can_write_local_path_with_cwd(&second.join(".git/config"), &second));
++    assert!(!policy.can_write_local_path_with_cwd(&first.join("file"), &second));
++    assert!(!policy.can_write_local_path_with_cwd(&extra.join("file"), &second));
++    assert_eq!(updated.permission_profile_state.snapshot(), original);
++    assert_eq!(
++        updated
++            .restorable_thread_settings(Vec::new())
++            .permission_profile,
++        Some(original.permission_profile().clone())
++    );
++    let roots = crate::config::storage_roots::StorageRoots::for_cwd(
++        &second,
++        &updated.codex_home,
++        &updated.original_config_do_not_use.codex_harness,
++    )
++    .unwrap();
++    for root in roots.directories() {
++        assert!(policy.can_write_local_path_with_cwd(&root.join(".aws/config"), &second));
++    }
++    assert_eq!(
++        updated.network_sandbox_policy(),
++        NetworkSandboxPolicy::Restricted
++    );
++    assert_eq!(updated.step_settings.approval_policy.value(), approval);
++    assert_eq!(configuration.cwd(), &first);
++
++    let returned = updated
++        .apply(
++            &SessionSettingsUpdate {
++                environments: Some(TurnEnvironmentSelections::new(first.clone(), Vec::new())),
++                ..Default::default()
++            },
++            &[],
++        )
++        .unwrap();
++    let returned_policy = returned.file_system_sandbox_policy(&[]);
++    assert!(returned_policy.can_write_local_path_with_cwd(&first.join(".git/config"), &first));
++    assert!(!returned_policy.can_write_local_path_with_cwd(&second.join("file"), &first));
++    assert!(policy.can_write_local_path_with_cwd(&second.join(".git/config"), &second));
++    assert_eq!(
++        returned.network_sandbox_policy(),
++        NetworkSandboxPolicy::Restricted
++    );
++    assert_eq!(returned.step_settings.approval_policy.value(), approval);
++    assert_eq!(returned.active_permission_profile(), None);
++    let read_only = returned
++        .apply(
++            &SessionSettingsUpdate {
++                permission_profile: Some(PermissionProfile::read_only()),
++                ..Default::default()
++            },
++            &[],
++        )
++        .unwrap();
++    assert_eq!(
++        read_only.permission_profile(),
++        PermissionProfile::read_only()
++    );
++}
++
+ #[tokio::test]
+ async fn session_configuration_apply_permission_profile_preserves_existing_deny_read_entries() {
+     let mut session_configuration = make_session_configuration_for_tests().await;
+@@ -5584,14 +5696,23 @@ async fn session_configuration_apply_permission_profile_preserves_existing_deny_
+         )
+         .expect("permission profile update should succeed");
+ 
+-    let mut expected_file_system_policy =
+-        requested_file_system_policy.materialize_project_roots_with_workspace_roots(&[]);
+-    expected_file_system_policy.glob_scan_max_depth = Some(2);
+-    expected_file_system_policy.entries.push(deny_entry);
++    let actual = updated.file_system_sandbox_policy(&[]);
++    assert_eq!(actual.glob_scan_max_depth, Some(2));
+     assert_eq!(
+-        updated.file_system_sandbox_policy(&[]),
+-        expected_file_system_policy
++        actual
++            .entries
++            .iter()
++            .filter(|entry| entry.access == FileSystemAccessMode::Deny)
++            .cloned()
++            .collect::<Vec<_>>(),
++        vec![deny_entry],
+     );
++    let deny_matcher =
++        codex_protocol::permissions::ReadDenyMatcher::try_new_for_local_paths(&actual, cwd.path())
++            .unwrap()
++            .unwrap();
++    assert!(deny_matcher.is_local_path_read_denied(&cwd.path().join("secrets.env")));
++    assert!(actual.can_write_local_path_with_cwd(&cwd.path().join(".git/config"), cwd.path()));
+ }
+ 
+ #[tokio::test]
+@@ -6815,6 +6936,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -6856,10 +6978,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+     let turn_environments = Arc::new(ThreadEnvironments::new(
+         environment_manager,
+         default_user_shell(),
+-        ThreadEnvironmentDefaults::new(
+-            session_configuration.inferred_environment_config(),
+-            session_configuration.windows_sandbox_type,
+-        ),
++        session_configuration.environment_defaults(),
+         ShellSnapshot::disabled(),
+         resolved_environments,
+         /*non_blocking_snapshots*/ false,
+@@ -7135,6 +7254,7 @@ async fn make_session_with_config_and_rx(
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -7270,6 +7390,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -9083,6 +9204,7 @@ where
+             .clone()
+             .unwrap_or_else(|| render_model_instructions(&model_info)),
+         permission_profile_state: config.permissions.permission_profile_state().clone(),
++        local_workspace_profile: None,
+         allow_login_shell: config.permissions.allow_login_shell,
+         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
+         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+@@ -9123,10 +9245,7 @@ where
+     let turn_environments = Arc::new(ThreadEnvironments::new(
+         environment_manager,
+         default_user_shell(),
+-        ThreadEnvironmentDefaults::new(
+-            session_configuration.inferred_environment_config(),
+-            session_configuration.windows_sandbox_type,
+-        ),
++        session_configuration.environment_defaults(),
+         ShellSnapshot::disabled(),
+         resolved_turn_environments.clone(),
+         /*non_blocking_snapshots*/ false,
+diff --git a/codex-rs/core/tests/suite/model_visible_layout.rs b/codex-rs/core/tests/suite/model_visible_layout.rs
+--- a/codex-rs/core/tests/suite/model_visible_layout.rs
++++ b/codex-rs/core/tests/suite/model_visible_layout.rs
+@@ -1,4 +1,3 @@
+-use codex_protocol::protocol::TurnEnvironmentRequest;
+ use codex_protocol::protocol::TurnEnvironmentRequests;
+ use core_test_support::test_codex::local_requests;
+ use std::fs;
+@@ -9,7 +8,6 @@ use anyhow::Result;
+ use codex_config::types::Personality;
+ use codex_core::TurnInputRequest;
+ use codex_core::config::Config;
+-use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+ use codex_extension_api::ContextualUserFragment;
+ use codex_extension_api::ExtensionData;
+ use codex_extension_api::ExtensionFuture;
+@@ -44,6 +42,8 @@ use core_test_support::responses::mount_sse_sequence;
+ use core_test_support::responses::sse;
+ use core_test_support::responses::start_mock_server;
+ use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::environment_config_for_selection;
++use core_test_support::test_codex::local;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::test_codex::turn_permission_fields;
+ use core_test_support::wait_for_event;
+@@ -180,6 +180,8 @@ async fn turn_input_contributors_receive_foreign_environment_cwds() -> Result<()
+     assert!(cwd.to_abs_path().is_err());
+     selection.cwd = cwd.clone();
+     selection.workspace_roots = Vec::new();
++    selection.config =
++        EnvironmentConfigState::Ready(environment_config_for_selection(&test.config, &selection));
+ 
+     test.submit_turn_with_environments("inspect the foreign environment", Some(vec![selection]))
+         .await?;
+@@ -215,8 +217,20 @@ async fn model_visible_environment_context_preserves_foreign_workspace_roots() -
+         ]),
+     )
+     .await;
+-    let test = test_codex().build(&server).await?;
++    let test = test_codex()
++        .with_config(|config| {
++            config
++                .permissions
++                .set_permission_profile(PermissionProfile::workspace_write())
++                .expect("set the environment's workspace profile");
++        })
++        .build(&server)
++        .await?;
+     let foreign_root = PathUri::parse("file:///C:/workspace")?;
++    let mut selection = local(test.config.cwd.clone());
++    selection.workspace_roots = vec![foreign_root];
++    selection.config =
++        EnvironmentConfigState::Ready(environment_config_for_selection(&test.config, &selection));
+ 
+     test.codex
+         .start_or_steer_turn(
+@@ -225,15 +239,9 @@ async fn model_visible_environment_context_preserves_foreign_workspace_roots() -
+                 text_elements: Vec::new(),
+             }])
+             .with_thread_settings(ThreadSettingsOverrides {
+-                permission_profile: Some(PermissionProfile::workspace_write()),
+                 environments: Some(TurnEnvironmentRequests::new(
+                     test.config.cwd.clone(),
+-                    vec![TurnEnvironmentRequest {
+-                        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+-                        cwd: PathUri::from_abs_path(&test.config.cwd),
+-                        workspace_roots: vec![foreign_root],
+-                        config: EnvironmentConfigState::FromThread,
+-                    }],
++                    vec![selection.into_request()],
+                 )),
+                 ..Default::default()
+             }),
+diff --git a/codex-rs/core/tests/suite/permissions_messages.rs b/codex-rs/core/tests/suite/permissions_messages.rs
+--- a/codex-rs/core/tests/suite/permissions_messages.rs
++++ b/codex-rs/core/tests/suite/permissions_messages.rs
+@@ -9,6 +9,11 @@ use codex_protocol::openai_models::ApprovalMessages;
+ use codex_protocol::openai_models::ModelMessages;
+ use codex_protocol::openai_models::ModelsResponse;
+ use codex_protocol::openai_models::PermissionMessages;
++use codex_protocol::permissions::FileSystemAccessMode;
++use codex_protocol::permissions::FileSystemPath;
++use codex_protocol::permissions::FileSystemSandboxEntry;
++use codex_protocol::permissions::FileSystemSandboxPolicy;
++use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::EventMsg;
+@@ -597,6 +602,11 @@ async fn resume_replays_permissions_messages() -> Result<()> {
+         .await?;
+     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+ 
++    let initial_cwd = initial.config.cwd.clone();
++    builder = builder.with_config(move |config| {
++        config.cwd = initial_cwd;
++        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
++    });
+     let resumed = builder.restart(&server, &initial).await?;
+     resumed
+         .codex
+@@ -681,7 +691,9 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
+     let permissions_base = permissions_texts(&req2.single_request());
+     assert_eq!(permissions_base.len(), 2);
+ 
+-    builder = builder.with_config(|config| {
++    let initial_cwd = initial.config.cwd.clone();
++    builder = builder.with_config(move |config| {
++        config.cwd = initial_cwd;
+         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+     });
+     let resumed = builder.restart(&server, &initial).await?;
+@@ -748,15 +760,24 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
+     let writable = TempDir::new()?;
+     let writable_root = AbsolutePathBuf::try_from(writable.path().canonicalize()?)?;
+     let writable_root_for_config = writable_root.clone();
+-    let permission_profile = PermissionProfile::workspace_write_with(
+-        std::slice::from_ref(&writable_root),
+-        NetworkSandboxPolicy::Restricted,
+-        /*exclude_tmpdir_env_var*/ true,
+-        /*exclude_slash_tmp*/ true,
+-    );
+-
+     let mut builder = test_codex().with_config(move |config| {
+         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
++        let permission_profile = PermissionProfile::from_runtime_permissions(
++            &FileSystemSandboxPolicy::restricted(vec![
++                FileSystemSandboxEntry::new(
++                    FileSystemPath::Special {
++                        value: FileSystemSpecialPath::Root,
++                    },
++                    FileSystemAccessMode::Read,
++                ),
++                FileSystemSandboxEntry::new(config.cwd.clone().into(), FileSystemAccessMode::Write),
++                FileSystemSandboxEntry::new(
++                    writable_root_for_config.clone().into(),
++                    FileSystemAccessMode::Write,
++                ),
++            ]),
++            NetworkSandboxPolicy::Restricted,
++        );
+         config
+             .permissions
+             .set_permission_profile(permission_profile)
+diff --git a/codex-rs/core/tests/suite/shell_snapshot.rs b/codex-rs/core/tests/suite/shell_snapshot.rs
+--- a/codex-rs/core/tests/suite/shell_snapshot.rs
++++ b/codex-rs/core/tests/suite/shell_snapshot.rs
+@@ -28,6 +28,16 @@ use codex_protocol::models::PermissionProfile;
+ #[cfg(unix)]
+ use codex_protocol::models::PermissionProfileSnapshot;
+ #[cfg(unix)]
++use codex_protocol::permissions::FileSystemAccessMode;
++#[cfg(unix)]
++use codex_protocol::permissions::FileSystemPath;
++#[cfg(unix)]
++use codex_protocol::permissions::FileSystemSandboxEntry;
++#[cfg(unix)]
++use codex_protocol::permissions::FileSystemSandboxPolicy;
++#[cfg(unix)]
++use codex_protocol::permissions::FileSystemSpecialPath;
++#[cfg(unix)]
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use codex_protocol::protocol::AskForApproval;
+ #[cfg(unix)]
+@@ -553,7 +563,7 @@ async fn shell_snapshot_v2_prewarm_preserves_the_sandbox() -> Result<()> {
+     let profile_home = tempfile::tempdir()?;
+     let outside = tempfile::tempdir()?;
+     let forbidden = outside.path().join("profile-write");
+-    let writable_home = profile_home.path().to_path_buf().try_into()?;
++    let writable_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(profile_home.path())?;
+     let forbidden_path = forbidden.to_string_lossy().into_owned();
+     fs::write(
+         profile_home.path().join(".bashrc"),
+@@ -564,11 +574,20 @@ async fn shell_snapshot_v2_prewarm_preserves_the_sandbox() -> Result<()> {
+         shell_snapshot_v2_prewarm_builder(profile_home.path()).with_config(move |config| {
+             config
+                 .permissions
+-                .set_permission_profile(PermissionProfile::workspace_write_with(
+-                    std::slice::from_ref(&writable_home),
++                .set_permission_profile(PermissionProfile::from_runtime_permissions(
++                    &FileSystemSandboxPolicy::restricted(vec![
++                        FileSystemSandboxEntry::new(
++                            FileSystemPath::Special {
++                                value: FileSystemSpecialPath::Root,
++                            },
++                            FileSystemAccessMode::Read,
++                        ),
++                        FileSystemSandboxEntry::new(
++                            writable_home.into(),
++                            FileSystemAccessMode::Write,
++                        ),
++                    ]),
+                     NetworkSandboxPolicy::Restricted,
+-                    /*exclude_tmpdir_env_var*/ true,
+-                    /*exclude_slash_tmp*/ true,
+                 ))
+                 .expect("set sandboxed permissions");
+             config
+diff --git a/codex-rs/core/tests/suite/workspace_roots.rs b/codex-rs/core/tests/suite/workspace_roots.rs
+--- a/codex-rs/core/tests/suite/workspace_roots.rs
++++ b/codex-rs/core/tests/suite/workspace_roots.rs
+@@ -27,6 +27,7 @@ use core_test_support::test_codex::TestCodex;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::test_target_os;
+ use serde_json::json;
++use std::path::Path;
+ use test_case::test_case;
+ use wiremock::MockServer;
+ 
+@@ -42,17 +43,34 @@ fn workspace_roots_profile() -> PermissionProfile {
+     )
+ }
+ 
++fn configure_workspace_roots_profile(home: &Path) {
++    std::fs::write(
++        home.join("config.toml"),
++        r#"approval_policy = "never"
++default_permissions = "folder-roots"
++[permissions.folder-roots.filesystem]
++":root" = "read"
++":workspace_roots" = "write"
++[permissions.folder-roots.network]
++enabled = false
++"#,
++    )
++    .expect("configure a custom profile that follows workspace folders");
++}
++
+ async fn workspace_roots_test(server: &MockServer) -> Result<TestCodex> {
+-    let mut builder = test_codex().with_config(|config| {
+-        #[cfg(windows)]
+-        {
+-            config.cwd = dunce::canonicalize(config.cwd.as_path())
+-                .expect("test workspace should be canonicalizable")
+-                .abs();
+-        }
+-        config.workspace_roots = vec![config.cwd.clone()];
+-        config.set_windows_sandbox_enabled(/*value*/ true);
+-    });
++    let mut builder = test_codex()
++        .with_pre_build_hook(configure_workspace_roots_profile)
++        .with_config(|config| {
++            #[cfg(windows)]
++            {
++                config.cwd = dunce::canonicalize(config.cwd.as_path())
++                    .expect("test workspace should be canonicalizable")
++                    .abs();
++            }
++            config.workspace_roots = vec![config.cwd.clone()];
++            config.set_windows_sandbox_enabled(/*value*/ true);
++        });
+     builder.build_with_auto_env(server).await
+ }
+ 
+@@ -117,11 +135,6 @@ async fn mount_patch_and_command_calls(
+     .await)
+ }
+ 
+-async fn submit_workspace_turn(test: &TestCodex, prompt: &str) -> Result<()> {
+-    test.submit_turn_with_permission_profile(prompt, workspace_roots_profile())
+-        .await
+-}
+-
+ async fn read_file(test: &TestCodex, path: &PathUri) -> Result<String> {
+     Ok(String::from_utf8(
+         test.fs()
+@@ -173,7 +186,8 @@ async fn workspace_roots_allow_file_and_command_writes() -> Result<()> {
+         COMMAND_CONTENTS,
+     )
+     .await?;
+-    submit_workspace_turn(&test, "write files inside the workspace roots").await?;
++    test.submit_text_turn("write files inside the workspace roots")
++        .await?;
+ 
+     let request = response_mock
+         .last_request()
+@@ -215,6 +229,7 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
+ 
+     let server = start_mock_server().await;
+     let mut builder = test_codex()
++        .with_pre_build_hook(configure_workspace_roots_profile)
+         .with_config(move |config| {
+             #[cfg(windows)]
+             {
+@@ -299,7 +314,8 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
+     )
+     .await?;
+ 
+-    submit_workspace_turn(&test, "write in the secondary workspace root").await?;
++    test.submit_text_turn("write in the secondary workspace root")
++        .await?;
+ 
+     let request = response_mock
+         .last_request()
+@@ -395,7 +411,8 @@ async fn workspace_roots_allow_patches_but_protect_metadata_directories() -> Res
+     )
+     .await;
+ 
+-    submit_workspace_turn(&test, "patch the workspace and protected metadata").await?;
++    test.submit_text_turn("patch the workspace and protected metadata")
++        .await?;
+ 
+     let request = response_mock
+         .last_request()
+@@ -461,7 +478,8 @@ async fn workspace_roots_deny_file_and_command_writes_outside_roots() -> Result<
+     let response_mock =
+         mount_patch_and_command_calls(&server, &patch, &command_path_display, COMMAND_CONTENTS)
+             .await?;
+-    submit_workspace_turn(&test, "try to write files outside the workspace roots").await?;
++    test.submit_text_turn("try to write files outside the workspace roots")
++        .await?;
+ 
+     let request = response_mock
+         .last_request()

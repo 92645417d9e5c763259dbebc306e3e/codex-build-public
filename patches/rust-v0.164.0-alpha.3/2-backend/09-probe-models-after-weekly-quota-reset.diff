@@ -1,0 +1,902 @@
+probe-models-after-weekly-quota-reset
+
+Lane: backend
+
+FlatPatch: probe-models-after-weekly-quota-reset
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Activate model quota windows after an observed main primary weekly quota reset for the approved personal ChatGPT plans.
+
+Requires: none
+
+Provides: Observe real account rate-limit snapshots without replacing their request-response behavior, bind reset transitions and scheduled verification to the current account revision, and run bounded health-check turns through the native ThreadManager ephemeral lifecycle across eligible available models once per verified reset.
+
+Boundary: Only the codex primary weekly window and Plus, Pro and ProLite accounts qualify; account changes cancel probes, catalog and OpenAI provider selection remain native, and isolated probes have no tools, execution environments, persisted conversations or rollouts. Existing model and batch deadlines, concurrency and output limits remain bounded. Native managed startup owns cancellation, shutdown and deregistration. Response observation and persistence remain with track-model-responses-by-attempt, without a TUI dependency.
+
+Verification: Focused app-server tests cover account eligibility, primary weekly windows, identity-bound reset deduplication, native ephemeral turn completion and failure, tool and instruction isolation, cancellation cleanup, absent persisted history and the output limit.
+
+
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -21,6 +21,7 @@ mod bedrock_gov_cloud;
+ mod bedrock_setup;
+ mod enterprise_login;
+ mod gateway_oauth;
++mod rate_limit_probe;
+ mod rate_limit_resets;
+ mod workspace_routing;
+ 
+@@ -109,6 +110,7 @@ pub(crate) struct AccountRequestProcessor {
+     workspace_routing_shutdown: CancellationToken,
+     gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
+     gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
++    weekly_reset_probe: rate_limit_probe::WeeklyResetProbe,
+     _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
+     pub(super) enterprise_login: Arc<enterprise_login::EnterpriseLoginState>,
+ }
+@@ -143,6 +145,7 @@ impl AccountRequestProcessor {
+             active_login: Arc::new(Mutex::new(None)),
+             gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+             gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
++            weekly_reset_probe: rate_limit_probe::WeeklyResetProbe::default(),
+             workspace_routing: Arc::new(Mutex::new(None)),
+             workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
+             workspace_routing_shutdown: CancellationToken::new(),
+@@ -195,12 +198,17 @@ impl AccountRequestProcessor {
+     }
+ 
+     pub(crate) async fn get_account_rate_limits(
+-        &self,
++        self: &Arc<Self>,
+         params: Option<GetAccountRateLimitsParams>,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_account_rate_limits_response(params.unwrap_or_default())
+-            .await
+-            .map(|response| Some(response.into()))
++        let auth_revision = *self.auth_manager.auth_change_receiver().borrow();
++        let response = self
++            .get_account_rate_limits_response(params.unwrap_or_default())
++            .await?;
++        self.weekly_reset_probe
++            .observe(self, auth_revision, &response)
++            .await;
++        Ok(Some(response.into()))
+     }
+ 
+     pub(crate) async fn get_account_token_usage(
+diff --git a/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs b/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/account_processor/rate_limit_probe.rs
+@@ -0,0 +1,827 @@
++//! Activates model quota windows after the main weekly quota rolls over.
++//!
++//! This is not a usage cache: account/rateLimits/read retains its upstream
++//! request/response behavior. The monitor begins only after a real account
++//! snapshot identifies a primary weekly window.
++
++use super::AccountRequestProcessor;
++use crate::config_manager::ConfigManager;
++use crate::model_catalog::ModelCatalog;
++use codex_app_server_protocol::GetAccountRateLimitsParams;
++use codex_app_server_protocol::GetAccountRateLimitsResponse;
++use codex_app_server_protocol::RateLimitSnapshot;
++use codex_core::StartIfIdleSubmission;
++use codex_core::StartThreadOptions;
++use codex_core::ThreadManager;
++use codex_core::TurnInputRequest;
++use codex_core::config::Config;
++use codex_extension_api::SessionIsolation;
++use codex_extension_api::ToolPolicy;
++use codex_features::Feature;
++use codex_login::AuthManager;
++use codex_login::CodexAuth;
++use codex_model_provider_info::OPENAI_PROVIDER_ID;
++use codex_models_manager::manager::RefreshStrategy;
++use codex_models_manager::manager::SharedModelsManager;
++use codex_protocol::account::PlanType;
++use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ThreadSource;
++use codex_protocol::user_input::UserInput;
++use futures::StreamExt;
++use std::sync::Arc;
++use std::sync::Weak;
++use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++use tokio::sync::Mutex;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++use tokio_util::task::TaskTracker;
++
++const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
++const RESET_CHANGE_TOLERANCE_SECONDS: i64 = 30;
++const RESET_OBSERVATION_DELAY: Duration = Duration::from_secs(30);
++const RESET_VERIFICATION_RETRY: Duration = Duration::from_secs(30);
++const USAGE_READ_TIMEOUT: Duration = Duration::from_secs(15);
++const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
++const PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
++const PROBE_PROMPT: &str = "reply OK if everything is fine";
++const PROBE_INSTRUCTIONS: &str = "You are Codex. Respond directly to this health-check prompt.";
++const MAX_PROBE_STREAM_BYTES: usize = 1024 * 1024;
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct AccountIdentity {
++    auth_revision: u64,
++    account_id: Option<String>,
++}
++
++#[derive(Default)]
++struct MonitorState {
++    identity: Option<AccountIdentity>,
++    primary_reset_at: Option<i64>,
++    last_probed_reset_at: Option<i64>,
++    scheduled_reset_at: Option<i64>,
++}
++
++struct Observation {
++    schedule_at: Option<i64>,
++    probe_identity: Option<AccountIdentity>,
++}
++
++impl MonitorState {
++    fn observe(&mut self, identity: AccountIdentity, reset_at: i64, now: i64) -> Observation {
++        if self.identity.as_ref() != Some(&identity) {
++            self.identity = Some(identity.clone());
++            self.primary_reset_at = None;
++            self.last_probed_reset_at = None;
++            self.scheduled_reset_at = None;
++        }
++        let previous = self.primary_reset_at.replace(reset_at);
++        let changed_after_reset = previous.is_some_and(|previous| {
++            previous <= now.saturating_add(RESET_CHANGE_TOLERANCE_SECONDS)
++                && reset_at > previous.saturating_add(RESET_CHANGE_TOLERANCE_SECONDS)
++                && self.last_probed_reset_at != Some(reset_at)
++        });
++        if changed_after_reset {
++            self.last_probed_reset_at = Some(reset_at);
++        }
++        let schedule_at = if previous != Some(reset_at) && reset_at > now {
++            self.scheduled_reset_at = Some(reset_at);
++            Some(reset_at)
++        } else {
++            None
++        };
++        Observation {
++            schedule_at,
++            probe_identity: changed_after_reset.then_some(identity),
++        }
++    }
++}
++
++#[derive(Clone, Default)]
++pub(super) struct WeeklyResetProbe {
++    state: Arc<Mutex<MonitorState>>,
++}
++
++impl WeeklyResetProbe {
++    pub(super) async fn observe(
++        &self,
++        owner: &Arc<AccountRequestProcessor>,
++        auth_revision: u64,
++        response: &GetAccountRateLimitsResponse,
++    ) {
++        if *owner.auth_manager.auth_change_receiver().borrow() != auth_revision {
++            return;
++        }
++        let Some(auth) = owner.auth_manager.auth_cached() else {
++            return;
++        };
++        if !eligible_account(&auth) {
++            return;
++        }
++        let account_id = auth.get_account_id();
++        if response
++            .account_id
++            .as_ref()
++            .is_some_and(|response_id| Some(response_id) != account_id.as_ref())
++        {
++            return;
++        }
++        let Some(reset_at) = main_weekly_reset_at(response) else {
++            return;
++        };
++        let Some(now) = unix_seconds(SystemTime::now()) else {
++            return;
++        };
++        let identity = AccountIdentity {
++            auth_revision,
++            account_id,
++        };
++        let observation = {
++            let mut state = self.state.lock().await;
++            state.observe(identity.clone(), reset_at, now)
++        };
++
++        if let Some(schedule_at) = observation.schedule_at {
++            self.schedule_verification(Arc::downgrade(owner), identity, schedule_at);
++        }
++        if let Some(identity) = observation.probe_identity {
++            self.start_probe(Arc::downgrade(owner), identity);
++        }
++    }
++
++    fn schedule_verification(
++        &self,
++        owner: Weak<AccountRequestProcessor>,
++        identity: AccountIdentity,
++        reset_at: i64,
++    ) {
++        let probe = self.clone();
++        tokio::spawn(async move {
++            let now = unix_seconds(SystemTime::now()).unwrap_or(reset_at);
++            let delay = Duration::from_secs(reset_at.saturating_sub(now).max(0) as u64)
++                .saturating_add(RESET_OBSERVATION_DELAY);
++            tokio::time::sleep_until(Instant::now() + delay).await;
++            for attempt in 0..3 {
++                if attempt != 0 {
++                    tokio::time::sleep(RESET_VERIFICATION_RETRY).await;
++                }
++                let Some(owner) = owner.upgrade() else {
++                    return;
++                };
++                {
++                    let state = probe.state.lock().await;
++                    if state.identity.as_ref() != Some(&identity)
++                        || state.scheduled_reset_at != Some(reset_at)
++                    {
++                        return;
++                    }
++                }
++                let auth_revision = *owner.auth_manager.auth_change_receiver().borrow();
++                if auth_revision != identity.auth_revision {
++                    return;
++                }
++                let result = tokio::time::timeout(
++                    USAGE_READ_TIMEOUT,
++                    owner.get_account_rate_limits_response(GetAccountRateLimitsParams {
++                        exclude_reset_credit_details: true,
++                        ..Default::default()
++                    }),
++                )
++                .await;
++                if let Ok(Ok(response)) = result {
++                    probe.observe(&owner, auth_revision, &response).await;
++                    if main_weekly_reset_at(&response) != Some(reset_at) {
++                        return;
++                    }
++                }
++            }
++            tracing::warn!("main weekly rate-limit reset could not be verified");
++        });
++    }
++
++    fn start_probe(&self, owner: Weak<AccountRequestProcessor>, identity: AccountIdentity) {
++        tokio::spawn(async move {
++            let Some(owner) = owner.upgrade() else {
++                return;
++            };
++            let tasks = TaskTracker::new();
++            let result = tokio::time::timeout(
++                PROBE_BATCH_TIMEOUT,
++                probe_enabled_models(&owner, &identity, &tasks),
++            )
++            .await;
++            tasks.close();
++            tasks.wait().await;
++            match result {
++                Ok(Ok(())) => tracing::info!("main weekly rate-limit probe completed"),
++                Ok(Err(error)) => tracing::warn!(%error, "main weekly rate-limit probe failed"),
++                Err(_) => tracing::warn!("main weekly rate-limit probe timed out"),
++            }
++        });
++    }
++}
++
++fn main_weekly_reset_at(response: &GetAccountRateLimitsResponse) -> Option<i64> {
++    let snapshot: &RateLimitSnapshot = response
++        .rate_limits_by_limit_id
++        .as_ref()
++        .and_then(|snapshots| snapshots.get("codex"))
++        .or_else(|| {
++            (response.rate_limits.limit_id.as_deref() == Some("codex"))
++                .then_some(&response.rate_limits)
++        })?;
++    let primary = snapshot.primary.as_ref()?;
++    (primary.window_duration_mins == Some(WEEKLY_WINDOW_MINUTES))
++        .then_some(primary.resets_at)
++        .flatten()
++}
++
++fn unix_seconds(time: SystemTime) -> Option<i64> {
++    time.duration_since(UNIX_EPOCH)
++        .ok()
++        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
++}
++
++async fn probe_enabled_models(
++    owner: &AccountRequestProcessor,
++    identity: &AccountIdentity,
++    tasks: &TaskTracker,
++) -> Result<(), String> {
++    let mut auth_changes = owner.auth_manager.auth_change_receiver();
++    if *auth_changes.borrow() != identity.auth_revision {
++        return Err("account changed before weekly probe".to_string());
++    }
++    let auth = owner
++        .auth_manager
++        .auth()
++        .await
++        .ok_or_else(|| "weekly probe requires ChatGPT authentication".to_string())?;
++    if !eligible_account(&auth) || auth.get_account_id() != identity.account_id {
++        return Err("account changed before weekly probe".to_string());
++    }
++
++    let (config, models_manager) = probe_model_catalog(
++        &owner.config_manager,
++        &owner.model_catalog,
++        &owner.auth_manager,
++    )
++    .await?;
++    let mut catalog = models_manager
++        .raw_model_catalog(RefreshStrategy::Offline, config.http_client_factory())
++        .await;
++    catalog.models.retain(|model| {
++        matches!(
++            model.visibility,
++            ModelVisibility::List | ModelVisibility::Hide
++        )
++    });
++    let mut models = models_manager.build_available_models(catalog.models);
++    models.sort_by(|left, right| left.model.cmp(&right.model));
++    models.dedup_by(|left, right| left.model == right.model);
++    if models.is_empty() {
++        return Err("weekly probe found no eligible models".to_string());
++    }
++    if *auth_changes.borrow() != identity.auth_revision {
++        return Err("account changed while selecting weekly probe models".to_string());
++    }
++
++    let probe_config = config.as_ref();
++    let probes = futures::stream::iter(models.into_iter().map(|model| async move {
++        let result = tokio::time::timeout(
++            PROBE_TIMEOUT,
++            run_ephemeral_probe(&owner.thread_manager, probe_config, &model.model, tasks),
++        )
++        .await;
++        let result = match result {
++            Ok(result) => result,
++            Err(_) => Err("model probe timed out".to_string()),
++        };
++        (model.model, result)
++    }))
++    .buffer_unordered(4);
++    tokio::pin!(probes);
++    loop {
++        tokio::select! {
++            biased;
++            changed = auth_changes.changed() => {
++                let _ = changed;
++                return Err("account changed during weekly probe".to_string());
++            }
++            outcome = probes.next() => {
++                let Some((model, result)) = outcome else { break; };
++                match result {
++                    Ok(()) => tracing::info!(%model, "weekly model probe completed"),
++                    Err(error) => tracing::warn!(%model, %error, "weekly model probe failed"),
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++async fn probe_model_catalog(
++    config_manager: &ConfigManager,
++    model_catalog: &ModelCatalog,
++    auth_manager: &Arc<AuthManager>,
++) -> Result<(Arc<Config>, SharedModelsManager), String> {
++    let (mut config, mut models_manager) = model_catalog
++        .current()
++        .await
++        // Config parser diagnostics can contain provider credentials.
++        .map_err(|error| format!("weekly probe model catalog unavailable: {:?}", error.kind()))?;
++    let provider = config
++        .model_providers
++        .get(OPENAI_PROVIDER_ID)
++        .ok_or_else(|| "weekly probe requires the OpenAI provider".to_owned())?;
++    let changed_route =
++        config.model_provider_id != OPENAI_PROVIDER_ID || config.model_provider != *provider;
++    if changed_route {
++        let mut selected = config.as_ref().clone();
++        selected.model_provider_id = OPENAI_PROVIDER_ID.to_owned();
++        selected.model_provider = provider.clone();
++        config = Arc::new(selected);
++    }
++    config_manager
++        .check_thread_model_provider(&config)
++        .await
++        .map_err(|error| {
++            format!(
++                "weekly probe provider requirements rejected: {:?}",
++                error.kind()
++            )
++        })?;
++    if changed_route {
++        models_manager = codex_core::build_models_manager(&config, Arc::clone(auth_manager));
++    }
++    Ok((config, models_manager))
++}
++
++async fn run_ephemeral_probe(
++    thread_manager: &Arc<ThreadManager>,
++    config: &Config,
++    model: &str,
++    tasks: &TaskTracker,
++) -> Result<(), String> {
++    let mut config = config.clone();
++    config.model = Some(model.to_owned());
++    config.ephemeral = true;
++    config.base_instructions = Some(PROBE_INSTRUCTIONS.to_owned());
++    config.developer_instructions = None;
++    config.include_permissions_instructions = false;
++    config.include_apps_instructions = false;
++    config.include_collaboration_mode_instructions = false;
++    config.include_skill_instructions = false;
++    config.model_reasoning_effort = None;
++    config.service_tier = None;
++    config.notify = None;
++    config.model_post_turn_compact_threshold_percent = 0;
++    config
++        .mcp_servers
++        .set(Default::default())
++        .map_err(|error| error.to_string())?;
++    for feature in [
++        Feature::CodexHooks,
++        Feature::Plugins,
++        Feature::ShellSnapshot,
++    ] {
++        config
++            .features
++            .disable(feature)
++            .map_err(|error| error.to_string())?;
++        if config.features.enabled(feature) {
++            return Err(format!(
++                "weekly probe cannot disable features.{}",
++                feature.key()
++            ));
++        }
++    }
++    let mut options = StartThreadOptions::new(config);
++    options.thread_source = Some(ThreadSource::Feature("weekly_reset_probe".to_owned()));
++    options.environments = Some(Vec::new());
++    options
++        .thread_extension_init
++        .insert(SessionIsolation::Isolated);
++    options.thread_extension_init.insert(ToolPolicy {
++        allowed_tools: Some(Vec::new()),
++        ..ToolPolicy::default()
++    });
++
++    // Native managed startup owns shutdown and deregistration even when the model
++    // deadline, batch deadline, or account change drops this future during startup.
++    let cancellation = CancellationToken::new();
++    let _cancel_on_exit = cancellation.clone().drop_guard();
++    let thread = thread_manager
++        .start_thread_until(options, cancellation.cancelled_owned(), tasks)
++        .await
++        .map_err(|error| error.to_string())?
++        .thread;
++    match thread
++        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: PROBE_PROMPT.to_owned(),
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .map_err(|error| error.to_string())?
++    {
++        StartIfIdleSubmission::Started { .. } => {}
++        StartIfIdleSubmission::NotSubmitted { reason } => {
++            return Err(format!("weekly probe turn was not started: {reason:?}"));
++        }
++    }
++
++    let mut stream_bytes = 0usize;
++    let mut response_completed = false;
++    loop {
++        let event = thread
++            .next_event()
++            .await
++            .map_err(|error| error.to_string())?
++            .msg;
++        let bytes = match event {
++            EventMsg::RawResponseCompleted(_) => {
++                response_completed = true;
++                0
++            }
++            EventMsg::TurnComplete(completed) => {
++                if let Some(error) = completed.error {
++                    return Err(error.message);
++                }
++                return if response_completed {
++                    Ok(())
++                } else {
++                    Err("weekly probe ended without response completion".to_owned())
++                };
++            }
++            EventMsg::Error(error) => return Err(error.message),
++            EventMsg::TurnAborted(_) | EventMsg::ShutdownComplete => {
++                return Err("weekly probe stopped before turn completion".to_owned());
++            }
++            EventMsg::AgentMessageContentDelta(delta) => delta.delta.len(),
++            EventMsg::ReasoningContentDelta(delta) => delta.delta.len(),
++            EventMsg::ReasoningRawContentDelta(delta) => delta.delta.len(),
++            EventMsg::RawResponseItem(item) => serde_json::to_vec(&item.item)
++                .map_err(|error| error.to_string())?
++                .len(),
++            _ => 0,
++        };
++        stream_bytes = stream_bytes.saturating_add(bytes);
++        if stream_bytes > MAX_PROBE_STREAM_BYTES {
++            return Err("Responses probe exceeded stream limit".to_string());
++        }
++    }
++}
++
++fn eligible_account(auth: &CodexAuth) -> bool {
++    auth.is_chatgpt_auth()
++        && matches!(
++            auth.account_plan_type(),
++            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++        )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use app_test_support::ChatGptIdTokenClaims;
++    use app_test_support::encode_id_token;
++    use codex_exec_server::EnvironmentManager;
++    use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
++    use codex_model_provider_info::ModelProviderInfo;
++    use core_test_support::responses::WebSocketConnectionConfig;
++    use core_test_support::responses::ev_assistant_message;
++    use core_test_support::responses::ev_completed;
++    use core_test_support::responses::ev_response_created;
++    use core_test_support::responses::start_websocket_server;
++    use core_test_support::responses::start_websocket_server_with_headers;
++    use pretty_assertions::assert_eq;
++
++    async fn probe_runtime(
++        base_url: &str,
++    ) -> anyhow::Result<(tempfile::TempDir, Arc<ThreadManager>, Config)> {
++        let home = tempfile::tempdir()?;
++        let mut config = core_test_support::load_default_config_for_test(&home).await;
++        let mut provider = ModelProviderInfo::create_openai_provider(Some(base_url.to_owned()));
++        provider.request_max_retries = Some(0);
++        provider.stream_max_retries = Some(0);
++        config.model_provider = provider.clone();
++        config
++            .model_providers
++            .insert(OPENAI_PROVIDER_ID.to_owned(), provider.clone());
++        config.developer_instructions = Some("parent-only-instructions".to_owned());
++        let threads = Arc::new(
++            codex_core::test_support::thread_manager_with_models_provider_and_home(
++                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
++                provider,
++                home.path().to_path_buf(),
++                Arc::new(EnvironmentManager::default_for_tests()),
++            ),
++        );
++        Ok((home, threads, config))
++    }
++
++    #[tokio::test]
++    async fn weekly_probe_catalog_checks_the_final_openai_route() -> anyhow::Result<()> {
++        for provider_id in [OPENAI_PROVIDER_ID, AMAZON_BEDROCK_PROVIDER_ID] {
++            let (home, threads, mut config) = probe_runtime("http://127.0.0.1:1").await?;
++            let openai_provider = config.model_providers[OPENAI_PROVIDER_ID].clone();
++            config.model_provider_id = provider_id.to_owned();
++            config.model_provider = config.model_providers[provider_id].clone();
++            let requirements_path = home.path().join("requirements.toml");
++            let mut overrides = codex_config::LoaderOverrides::without_managed_config_for_tests();
++            overrides.system_requirements_path = Some(requirements_path.clone());
++            let config_manager = ConfigManager::new_for_tests(
++                home.path().to_path_buf(),
++                Vec::new(),
++                overrides,
++                codex_config::CloudConfigBundleLoader::default(),
++            );
++            let auth_manager = threads.auth_manager();
++            let models_manager =
++                codex_core::build_models_manager(&config, Arc::clone(&auth_manager));
++            let model_catalog = ModelCatalog::new(
++                config_manager.clone(),
++                Some(config.cwd.to_path_buf()),
++                Arc::new(config),
++                models_manager,
++                Arc::clone(&auth_manager),
++            );
++
++            let (selected, models) =
++                probe_model_catalog(&config_manager, &model_catalog, &auth_manager)
++                    .await
++                    .map_err(anyhow::Error::msg)?;
++            assert_eq!(selected.model_provider_id, OPENAI_PROVIDER_ID);
++            assert_eq!(selected.model_provider, openai_provider);
++            let catalog = models
++                .raw_model_catalog(RefreshStrategy::Offline, selected.http_client_factory())
++                .await;
++            assert_eq!(catalog, codex_models_manager::bundled_models_response()?);
++
++            // A warm catalog must still check the actual probe route, even when the
++            // currently configured Bedrock route satisfies this new requirement.
++            std::fs::write(&requirements_path, "model_provider = 'amazon-bedrock'\n")?;
++            let result = probe_model_catalog(&config_manager, &model_catalog, &auth_manager).await;
++            assert!(matches!(result, Err(error) if error ==
++                "weekly probe provider requirements rejected: PermissionDenied"));
++            assert!(threads.list_thread_ids().await.is_empty());
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn weekly_probe_route_preserves_the_configured_catalog() -> anyhow::Result<()> {
++        let (home, threads, mut config) = probe_runtime("http://127.0.0.1:1").await?;
++        let mut catalog = codex_models_manager::bundled_models_response()?;
++        catalog.models.truncate(1);
++        catalog.models[0].slug = "configured-probe-model".to_owned();
++        config.model_catalog = Some(catalog);
++        config.model_provider_id = AMAZON_BEDROCK_PROVIDER_ID.to_owned();
++        config.model_provider = config.model_providers[AMAZON_BEDROCK_PROVIDER_ID].clone();
++        let config_manager =
++            ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
++        let auth_manager = threads.auth_manager();
++        let models_manager = codex_core::build_models_manager(&config, Arc::clone(&auth_manager));
++        let model_catalog = ModelCatalog::new(
++            config_manager.clone(),
++            Some(config.cwd.to_path_buf()),
++            Arc::new(config),
++            models_manager,
++            Arc::clone(&auth_manager),
++        );
++
++        let (selected, models) =
++            probe_model_catalog(&config_manager, &model_catalog, &auth_manager)
++                .await
++                .map_err(anyhow::Error::msg)?;
++        let catalog = models
++            .raw_model_catalog(RefreshStrategy::Offline, selected.http_client_factory())
++            .await;
++        assert_eq!(catalog.models.len(), 1);
++        assert_eq!(catalog.models[0].slug, "configured-probe-model");
++        Ok(())
++    }
++
++    #[test]
++    fn probe_scope_is_the_approved_personal_plans() -> anyhow::Result<()> {
++        for (plan, eligible) in [
++            ("plus", true),
++            ("pro", true),
++            ("prolite", true),
++            ("promax", false),
++            ("free", false),
++            ("business", false),
++            ("team", false),
++            ("enterprise", false),
++            ("unknown", false),
++        ] {
++            let token = encode_id_token(
++                &ChatGptIdTokenClaims::new()
++                    .chatgpt_account_id("account")
++                    .plan_type(plan),
++            )?;
++            let auth = CodexAuth::from_external_chatgpt_tokens(&token, "account", Some(plan))?;
++            assert_eq!(eligible_account(&auth), eligible, "plan {plan}");
++        }
++        assert!(!eligible_account(&CodexAuth::from_api_key("api-key")));
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn model_probe_uses_ephemeral_turn_and_requires_completion() -> anyhow::Result<()> {
++        for terminal in ["response.completed", "response.failed"] {
++            let events = if terminal == "response.completed" {
++                vec![
++                    ev_response_created("probe"),
++                    ev_assistant_message("answer", "OK"),
++                    ev_completed("probe"),
++                ]
++            } else {
++                vec![serde_json::json!({
++                    "type": terminal,
++                    "response": {
++                        "id": "probe",
++                        "error": {"code": "invalid_prompt", "message": "test failure"}
++                    }
++                })]
++            };
++            let server = start_websocket_server(vec![vec![
++                vec![ev_response_created("prewarm"), ev_completed("prewarm")],
++                events,
++            ]])
++            .await;
++            let (home, threads, config) = probe_runtime(server.uri()).await?;
++            let tasks = TaskTracker::new();
++            let result = tokio::time::timeout(
++                Duration::from_secs(10),
++                run_ephemeral_probe(&threads, &config, "gpt-5.4", &tasks),
++            )
++            .await?;
++            tasks.close();
++            tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await?;
++            let handshake = server.single_handshake();
++            let requests = server.single_connection();
++            server.shutdown().await;
++
++            assert_eq!(
++                result.is_ok(),
++                terminal == "response.completed",
++                "{result:?}"
++            );
++            assert_eq!(requests.len(), 2);
++            let prewarm = requests[0].body_json();
++            assert_eq!(prewarm["generate"], false);
++            let prewarm_input = prewarm["input"].to_string();
++            assert!(prewarm_input.contains(PROBE_INSTRUCTIONS));
++            assert!(!prewarm_input.contains("parent-only-instructions"));
++            assert!(prewarm["tools"].as_array().is_none_or(Vec::is_empty));
++            let request = requests[1].body_json();
++            assert_eq!(request["previous_response_id"], "prewarm");
++            assert_eq!(request["type"], "response.create");
++            assert_eq!(request["model"], "gpt-5.4");
++            assert_eq!(request["store"], false);
++            assert_ne!(request["generate"], false);
++            assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
++            let input = request["input"].to_string();
++            assert!(input.contains(PROBE_PROMPT));
++            assert!(!input.contains("parent-only-instructions"));
++            assert_eq!(
++                handshake.header("chatgpt-account-id").as_deref(),
++                Some("account_id")
++            );
++            assert_eq!(
++                handshake.header("authorization").as_deref(),
++                Some("Bearer Access Token")
++            );
++            assert!(threads.list_thread_ids().await.is_empty());
++            assert!(!home.path().join("sessions").exists());
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn dropping_ephemeral_probe_stops_and_removes_the_native_thread() -> anyhow::Result<()> {
++        let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
++            requests: vec![
++                vec![ev_response_created("prewarm"), ev_completed("prewarm")],
++                vec![ev_response_created("probe")],
++            ],
++            response_headers: Vec::new(),
++            accept_delay: None,
++            close_after_requests: false,
++        }])
++        .await;
++        let (home, threads, config) = probe_runtime(server.uri()).await?;
++        let tasks = TaskTracker::new();
++        let probe = tokio::spawn({
++            let threads = Arc::clone(&threads);
++            let tasks = tasks.clone();
++            async move { run_ephemeral_probe(&threads, &config, "gpt-5.4", &tasks).await }
++        });
++        tokio::time::timeout(Duration::from_secs(10), server.wait_for_request(0, 1)).await?;
++        let ids = threads.list_thread_ids().await;
++        assert_eq!(ids.len(), 1);
++        let thread = threads.get_thread(ids[0]).await?;
++        assert!(thread.config_snapshot().await.ephemeral);
++        assert!(thread.rollout_path().is_none());
++        probe.abort();
++        assert!(
++            probe
++                .await
++                .expect_err("probe task cancelled")
++                .is_cancelled()
++        );
++        tasks.close();
++        tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await?;
++        server.shutdown().await;
++        assert!(threads.list_thread_ids().await.is_empty());
++        assert!(!home.path().join("sessions").exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn ephemeral_probe_preserves_the_output_limit() -> anyhow::Result<()> {
++        let server = start_websocket_server(vec![vec![
++            vec![ev_response_created("prewarm"), ev_completed("prewarm")],
++            vec![
++                ev_response_created("probe"),
++                ev_assistant_message("answer", &"x".repeat(MAX_PROBE_STREAM_BYTES + 1)),
++                ev_completed("probe"),
++            ],
++        ]])
++        .await;
++        let (_home, threads, config) = probe_runtime(server.uri()).await?;
++        let tasks = TaskTracker::new();
++        let result = tokio::time::timeout(
++            Duration::from_secs(10),
++            run_ephemeral_probe(&threads, &config, "gpt-5.4", &tasks),
++        )
++        .await?;
++        tasks.close();
++        tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await?;
++        server.shutdown().await;
++        assert_eq!(
++            result,
++            Err("Responses probe exceeded stream limit".to_owned())
++        );
++        assert!(threads.list_thread_ids().await.is_empty());
++        Ok(())
++    }
++
++    #[test]
++    fn only_main_primary_weekly_window_is_observed() {
++        let response: GetAccountRateLimitsResponse = serde_json::from_value(serde_json::json!({
++            "ordinaryUsageAllowed": true,
++            "rateLimits": {
++                "limitId": "codex",
++                "primary": {"usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 120},
++                "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 130},
++                "credits": null,
++                "individualLimit": null,
++                "spendControlReached": null,
++                "planType": null,
++                "rateLimitReachedType": null,
++                "limitName": null,
++                "normalModelSlug": null
++            },
++            "rateLimitsByLimitId": null,
++            "rateLimitResetCredits": null,
++            "accountId": null,
++            "rateLimitUpsell": null
++        }))
++        .expect("rate limits response");
++        assert_eq!(main_weekly_reset_at(&response), Some(120));
++    }
++
++    #[test]
++    fn reset_transition_is_identity_bound_and_not_sliding_future_time() {
++        let mut state = MonitorState::default();
++        let alice = AccountIdentity {
++            auth_revision: 1,
++            account_id: Some("alice".to_string()),
++        };
++        assert_eq!(state.observe(alice.clone(), 100, 90).schedule_at, Some(100));
++        assert_eq!(
++            state.observe(alice.clone(), 200, 101).probe_identity,
++            Some(alice.clone())
++        );
++        assert!(
++            state
++                .observe(alice.clone(), 200, 101)
++                .probe_identity
++                .is_none()
++        );
++        assert!(
++            state
++                .observe(alice.clone(), 300, 101)
++                .probe_identity
++                .is_none()
++        );
++        let bob = AccountIdentity {
++            auth_revision: 2,
++            account_id: Some("bob".to_string()),
++        };
++        assert!(state.observe(bob, 300, 301).probe_identity.is_none());
++    }
++}

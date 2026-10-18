@@ -1,0 +1,1260 @@
+render-usage-reports-with-shared-tables
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: render-usage-reports-with-shared-tables
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/control_center_table.rs b/codex-rs/tui/src/control_center_table.rs
+--- a/codex-rs/tui/src/control_center_table.rs
++++ b/codex-rs/tui/src/control_center_table.rs
+@@ -844,6 +844,24 @@ pub(crate) mod tests {
+             .collect()
+     }
+ 
++    pub(crate) fn assert_symmetric_headers(lines: &[Line<'_>]) {
++        for line in lines {
++            for cell in line
++                .to_string()
++                .split(['│', '├', '┤', '┬', '┴', '┼', '┌', '┐', '└', '┘'])
++            {
++                if cell.trim().is_empty() || cell.trim().chars().all(|ch| ch == '─') {
++                    continue;
++                }
++                assert_eq!(
++                    cell.len() - cell.trim_start().len(),
++                    cell.len() - cell.trim_end().len(),
++                    "asymmetric header: {cell:?}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn compact_tokens_copy_exact_integers_and_keep_unknown_distinct_from_zero() {
+         let palette = Palette::current();
+diff --git a/codex-rs/tui/src/usage/mod.rs b/codex-rs/tui/src/usage/mod.rs
+--- a/codex-rs/tui/src/usage/mod.rs
++++ b/codex-rs/tui/src/usage/mod.rs
+@@ -1,4 +1,10 @@
+ //! Presentation of the app-server's shared local accounting snapshot.
++mod render;
++
++pub(crate) use render::render;
++pub(crate) use render::render_selected;
++#[cfg(test)]
++pub(crate) use render::tests::report as test_report;
+ 
+ pub(crate) use codex_app_server_protocol::UsageReport;
+ use codex_app_server_protocol::UsageTotals as Usage;
+@@ -6,39 +12,29 @@ use std::collections::BTreeMap;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(crate) enum UsageRange {
++    All,
+     Daily,
+     Weekly,
+     Monthly,
+     Yearly,
+-    Summary,
+-    Quota,
+ }
+ 
+ impl UsageRange {
+-    pub(crate) const VIEWS: [Self; 6] = [
+-        Self::Summary,
++    pub(crate) const VIEWS: [Self; 5] = [
++        Self::All,
+         Self::Daily,
+         Self::Weekly,
+         Self::Monthly,
+         Self::Yearly,
+-        Self::Quota,
+     ];
+ 
+-    pub(crate) fn index(self) -> usize {
+-        Self::VIEWS
+-            .iter()
+-            .position(|range| *range == self)
+-            .expect("every usage view is listed")
+-    }
+-
+     pub(crate) fn label(self) -> &'static str {
+         match self {
+             Self::Daily => "Daily",
+             Self::Weekly => "Weekly",
+             Self::Monthly => "Monthly",
+             Self::Yearly => "Yearly",
+-            Self::Summary => "Summary",
+-            Self::Quota => "Weekly quota",
++            Self::All => "All",
+         }
+     }
+ }
+@@ -51,21 +47,7 @@ fn periods(
+         UsageRange::Weekly => &report.weekly_rows,
+         UsageRange::Monthly => &report.monthly_rows,
+         UsageRange::Yearly => &report.yearly_rows,
+-        UsageRange::Daily | UsageRange::Summary | UsageRange::Quota => &report.rows,
++        UsageRange::All | UsageRange::Daily => &report.rows,
+     };
+-    let today = report.refreshed_at.date_naive();
+-    let bounds = match range {
+-        UsageRange::Summary => Some((today - chrono::Duration::days(364), today)),
+-        UsageRange::Daily
+-        | UsageRange::Weekly
+-        | UsageRange::Monthly
+-        | UsageRange::Yearly
+-        | UsageRange::Quota => None,
+-    }
+-    .map(|(start, end)| (start.to_string(), end.to_string()));
+-    rows.iter().filter(move |(date, _)| {
+-        bounds
+-            .as_ref()
+-            .is_none_or(|(start, end)| *date >= start && *date <= end)
+-    })
++    rows.iter()
+ }
+diff --git a/codex-rs/tui/src/usage/render.rs b/codex-rs/tui/src/usage/render.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/render.rs
+@@ -0,0 +1,479 @@
++use std::collections::BTreeMap;
++
++use crate::render::renderable::Renderable;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use unicode_width::UnicodeWidthStr;
++
++use super::UsageRange;
++use super::UsageReport;
++use crate::control_center_table as table;
++use crate::control_center_table::Cell;
++use crate::control_center_table::Column;
++use crate::control_center_table::Palette;
++use codex_app_server_protocol::UsageTotals as Usage;
++
++pub(crate) fn render(
++    report: &UsageReport,
++    range: UsageRange,
++    width: u16,
++) -> Vec<Box<dyn Renderable>> {
++    let palette = Palette::current();
++    let mut lines = diagnostics(report);
++    let combined;
++    let dates;
++    let periods = if range == UsageRange::All {
++        combined = combined_models(report.rows.values());
++        dates = match (report.rows.first_key_value(), report.rows.last_key_value()) {
++            (Some((first, _)), Some((last, _))) if first != last => format!("{first} - {last}"),
++            (Some((day, _)), _) => day.clone(),
++            _ => String::new(),
++        };
++        vec![(dates.as_str(), &combined)]
++    } else {
++        super::periods(report, range)
++            .map(|(period, models)| (period.as_str(), models))
++            .collect()
++    };
++    lines.extend(usage_tables(report, &periods, width, &palette));
++    lines
++}
++
++pub(crate) fn render_summary(
++    report: &UsageReport,
++    width: u16,
++    selected: Option<chrono::NaiveDate>,
++) -> Vec<Box<dyn Renderable>> {
++    let mut lines = diagnostics(report);
++    lines.extend(super::heatmap::render(
++        report,
++        width,
++        selected,
++        &Palette::current(),
++    ));
++    lines
++}
++
++pub(crate) fn render_quotas(report: &UsageReport, width: u16) -> Vec<Box<dyn Renderable>> {
++    quota::render(
++        &report.quota,
++        *report.refreshed_at.offset(),
++        width,
++        &Palette::current(),
++    )
++}
++
++fn diagnostics(report: &UsageReport) -> Vec<Box<dyn Renderable>> {
++    let mut lines = Vec::new();
++    if report.diagnostics.malformed_records != 0 || report.diagnostics.incomplete_tails != 0 {
++        lines.push(
++            format!(
++                " Skipped {} malformed records and {} unfinished tails",
++                count(report.diagnostics.malformed_records as u64),
++                count(report.diagnostics.incomplete_tails as u64)
++            )
++            .dim()
++            .into(),
++        );
++    }
++    lines
++}
++
++pub(super) fn combined_models<'a>(
++    rows: impl Iterator<Item = &'a BTreeMap<String, Usage>>,
++) -> BTreeMap<String, Usage> {
++    let mut combined = BTreeMap::<String, Usage>::new();
++    for (model, usage) in rows.flat_map(BTreeMap::iter) {
++        combined.entry(model.clone()).or_default().add_usage(usage);
++    }
++    combined
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum ContextColumns {
++    All,
++    ShortAndLong,
++}
++
++pub(super) fn usage_tables(
++    report: &UsageReport,
++    periods: &[(&str, &BTreeMap<String, Usage>)],
++    width: u16,
++    palette: &Palette,
++) -> Vec<Box<dyn Renderable>> {
++    if periods.iter().all(|(_, models)| models.is_empty()) {
++        return vec![" No usage in this range".dim().into()];
++    }
++    let mut lines = Vec::new();
++    for (period, models) in table::descending_rows(
++        periods
++            .iter()
++            .copied()
++            .filter(|(_, models)| !models.is_empty()),
++        |(period, _)| *period,
++    ) {
++        lines.push(usage_table(report, Some(period), models, width, palette).into());
++        lines.push(Line::default().into());
++    }
++    let models = combined_models(periods.iter().map(|(_, models)| *models));
++    lines.push(price_table(report, &models, width, palette).into());
++    lines
++}
++
++fn usage_table(
++    report: &UsageReport,
++    period: Option<&str>,
++    models: &BTreeMap<String, Usage>,
++    width: u16,
++    palette: &Palette,
++) -> table::Table {
++    let contexts = if models.keys().any(|model| {
++        report
++            .prices
++            .get(model)
++            .is_some_and(|price| price.len() > 1)
++    }) {
++        ContextColumns::ShortAndLong
++    } else {
++        ContextColumns::All
++    };
++    let writes = if contexts == ContextColumns::ShortAndLong {
++        [
++            models
++                .values()
++                .any(|usage| usage.tokens.cache_write > usage.long_tokens.cache_write),
++            models
++                .values()
++                .any(|usage| usage.long_tokens.cache_write > 0),
++        ]
++    } else {
++        [
++            models.values().any(|usage| usage.tokens.cache_write > 0),
++            false,
++        ]
++    };
++    let mut rows = Vec::new();
++    let mut total = Usage::default();
++    for (model, usage) in table::descending_rows(models, |(model, _)| *model) {
++        total.add_usage(usage);
++        rows.push(usage_row(
++            model,
++            usage,
++            !report.missing_prices.contains(model),
++            contexts,
++            writes,
++        ));
++    }
++    if models.len() > 1 {
++        rows.push(usage_row(
++            "",
++            &total,
++            models
++                .keys()
++                .any(|model| !report.missing_prices.contains(model)),
++            contexts,
++            writes,
++        ));
++    }
++    let labels = [
++        "Input",
++        "Read",
++        "Write",
++        "Output",
++        "Reasoning",
++        "Hits",
++        "Cost",
++    ];
++    let context_columns = labels.map(|label| match label {
++        "Hits" => Column::new(label, "100.00%".len(), 9),
++        "Cost" => Column::new(
++            if contexts == ContextColumns::All {
++                "Total cost"
++            } else {
++                label
++            },
++            "$0.00".len(),
++            12,
++        ),
++        _ => Column::new(label, "0.00K".len(), 10),
++    });
++    // The date and model name share one physical column and therefore one parity.
++    let model_label = if period.is_some_and(|period| period.width() % 2 == 0) {
++        "Models"
++    } else {
++        "Model"
++    };
++    let mut columns = vec![Column::new(
++        model_label,
++        12.max(period.map_or(0, UnicodeWidthStr::width)),
++        30,
++    )];
++    let mut leading_headers = vec![palette.header(model_label)];
++    let context_headers = |write: bool| {
++        labels
++            .iter()
++            .enumerate()
++            .filter(move |(index, _)| *index != 2 || write)
++            .map(|(_, label)| {
++                palette.header(if *label == "Cost" && contexts == ContextColumns::All {
++                    "Total cost"
++                } else {
++                    label
++                })
++            })
++    };
++    columns.extend(
++        context_columns
++            .iter()
++            .enumerate()
++            .filter(|(index, _)| *index != 2 || writes[0])
++            .map(|(_, column)| *column),
++    );
++    let mut headers = if contexts == ContextColumns::ShortAndLong {
++        columns.extend(
++            context_columns
++                .iter()
++                .enumerate()
++                .filter(|(index, _)| *index != 2 || writes[1])
++                .map(|(_, column)| *column),
++        );
++        columns.push(Column::new("Total cost", "$0.00".len(), 12));
++        let mut groups = leading_headers
++            .into_iter()
++            .map(|cell| cell.spanning(2, 1))
++            .collect::<Vec<_>>();
++        groups.extend([
++            palette
++                .header("Short context")
++                .spanning(1, 6 + usize::from(writes[0])),
++            palette
++                .header("Long contexts")
++                .spanning(1, 6 + usize::from(writes[1])),
++            palette.header("Total cost").spanning(2, 1),
++        ]);
++        vec![
++            groups,
++            context_headers(writes[0])
++                .chain(context_headers(writes[1]))
++                .collect(),
++        ]
++    } else {
++        leading_headers.extend(context_headers(writes[0]));
++        vec![leading_headers]
++    };
++    if let Some(period) = period {
++        headers.insert(
++            0,
++            vec![
++                palette.header(period),
++                palette.header("").spanning(1, columns.len() - 1),
++            ],
++        );
++    }
++    numeric_table(headers, &columns, rows, Some(0), width, palette)
++}
++
++fn usage_row(
++    model: &str,
++    usage: &Usage,
++    priced: bool,
++    contexts: ContextColumns,
++    writes: [bool; 2],
++) -> Vec<Cell> {
++    let mut cells = vec![Cell::text(model)];
++    let split = contexts == ContextColumns::ShortAndLong;
++    let first = if split {
++        (usage.tokens.subtract(usage.long_tokens), usage.short_cost)
++    } else {
++        (usage.tokens, usage.cost)
++    };
++    for (context, (tokens, cost)) in std::iter::once(first)
++        .chain(split.then_some((usage.long_tokens, usage.long_cost)))
++        .enumerate()
++    {
++        for (_, value) in [
++            tokens
++                .input
++                .saturating_sub(tokens.cached)
++                .saturating_sub(tokens.cache_write),
++            tokens.cached,
++            tokens.cache_write,
++            tokens.output,
++            tokens.reasoning,
++        ]
++        .into_iter()
++        .enumerate()
++        .filter(|(column, _)| *column != 2 || writes[context])
++        {
++            cells.push(Cell::tokens(Some(value)));
++        }
++        let hit = (tokens.input > 0).then_some(tokens.cached as f64 * 100.0 / tokens.input as f64);
++        cells.push(Cell::value(
++            hit,
++            hit.map_or_else(|| "--".into(), |value| number(value, 2, "", "%")),
++        ));
++        cells.push(cost_cell(cost, priced));
++    }
++    if split {
++        cells.push(cost_cell(usage.cost, priced));
++    }
++    cells
++}
++
++fn cost_cell(cost: f64, priced: bool) -> Cell {
++    Cell::value(
++        priced.then_some(cost),
++        if priced {
++            number(cost, 2, "$", "")
++        } else {
++            "--".into()
++        },
++    )
++}
++
++fn price_table(
++    report: &UsageReport,
++    models: &BTreeMap<String, Usage>,
++    width: u16,
++    palette: &Palette,
++) -> table::Table {
++    let effective = |usage: &Usage| {
++        (usage.tokens.total > 0 && usage.cost > 0.0)
++            .then_some(usage.cost / usage.tokens.total as f64)
++    };
++    let highest = models.values().filter_map(effective).fold(0.0, f64::max);
++    let contexts = models
++        .keys()
++        .filter_map(|model| report.prices.get(model))
++        .map(BTreeMap::len)
++        .max()
++        .unwrap_or(1);
++    let writes: Vec<_> = (0..contexts)
++        .map(|index| {
++            models
++                .keys()
++                .filter_map(|model| report.prices.get(model))
++                .filter_map(|price| price.iter().nth(index))
++                .any(|(_, rates)| rates.cache_write > 0.0)
++        })
++        .collect();
++    let mut rows = Vec::new();
++    for (model, usage) in table::descending_rows(models, |(model, _)| *model) {
++        let intervals = report
++            .prices
++            .get(model)
++            .map(|price| price.iter().collect::<Vec<_>>())
++            .unwrap_or_default();
++        let efficiency = effective(usage).map(|cost| highest / cost);
++        let mut row = vec![Cell::text(model)];
++        for (index, write) in writes.iter().copied().enumerate() {
++            let Some((_, rates)) = intervals.get(index) else {
++                row.extend((0..3 + usize::from(write)).map(|_| Cell::number("--")));
++                continue;
++            };
++            row.extend(
++                [
++                    rates.input,
++                    rates.cache_read,
++                    rates.cache_write,
++                    rates.output,
++                ]
++                .into_iter()
++                .enumerate()
++                .filter(|(column, _)| *column != 2 || write)
++                .map(|(_, rate)| Cell::value(Some(rate), number(rate, 4, "$", ""))),
++            );
++        }
++        row.push(Cell::value(
++            efficiency,
++            efficiency.map_or_else(|| "--".into(), |value| number(value, 2, "", "")),
++        ));
++        rows.push(row);
++    }
++    let labels = ["Input", "Read", "Write", "Output"];
++    let context_labels = |write: bool| {
++        labels
++            .into_iter()
++            .enumerate()
++            .filter(move |(index, _)| *index != 2 || write)
++            .map(|(_, label)| label)
++    };
++    let mut columns = vec![Column::new("Model", 12, 30)];
++    for write in &writes {
++        columns.extend(context_labels(*write).map(|label| Column::new(label, "$0.0000".len(), 11)));
++    }
++    columns.push(Column::new("Efficiency", "0.00".len(), 10));
++    let headers = if contexts == 1 {
++        vec![
++            std::iter::once("Model")
++                .chain(context_labels(writes[0]))
++                .chain(["Efficiency"])
++                .map(|label| palette.header(label))
++                .collect(),
++        ]
++    } else {
++        let mut groups = vec![palette.header("Model").spanning(2, 1)];
++        for (index, write) in writes.iter().enumerate() {
++            let label = match (contexts, index) {
++                (2, 0) => "Short context".to_owned(),
++                (2, 1) => "Long contexts".to_owned(),
++                _ => {
++                    let label = format!("Context {}", index + 1);
++                    if label.width() % 2 == 0 {
++                        format!("Context #{}", index + 1)
++                    } else {
++                        label
++                    }
++                }
++            };
++            groups.push(palette.header(&label).spanning(1, 3 + usize::from(*write)));
++        }
++        groups.push(palette.header("Efficiency").spanning(2, 1));
++        vec![
++            groups,
++            writes
++                .into_iter()
++                .flat_map(|write| context_labels(write).map(|label| palette.header(label)))
++                .collect(),
++        ]
++    };
++    numeric_table(headers, &columns, rows, Some(0), width, palette)
++}
++
++fn numeric_table(
++    mut headers: Vec<Vec<Cell>>,
++    columns: &[Column],
++    mut rows: Vec<Vec<Cell>>,
++    model_column: Option<usize>,
++    width: u16,
++    palette: &Palette,
++) -> table::Table {
++    table::shade_columns(&mut rows, palette);
++    let header_rows = headers.len();
++    headers.extend(rows);
++    let widths = table::widths(width, columns, &headers);
++    if let Some(column) = model_column {
++        table::center_left_column(&mut headers[header_rows..], column, widths[column]);
++    }
++    table::render(&widths, &headers, palette)
++}
++
++pub(super) fn count(value: u64) -> String {
++    if value == 0 {
++        "--".into()
++    } else {
++        table::compact_count(value)
++    }
++}
++
++pub(super) fn number(value: f64, precision: usize, prefix: &str, suffix: &str) -> String {
++    if (value * 10_f64.powi(precision as i32)).round() == 0.0 {
++        "--".into()
++    } else {
++        format!("{prefix}{value:.precision$}{suffix}")
++    }
++}
++
++#[cfg(test)]
++#[path = "render_tests.rs"]
++pub(super) mod tests;
+diff --git a/codex-rs/tui/src/usage/render_tests.rs b/codex-rs/tui/src/usage/render_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/render_tests.rs
+@@ -0,0 +1,648 @@
++use super::*;
++use crate::control_center_table::tests::render_lines;
++use chrono::DateTime;
++use codex_app_server_protocol::UsageDiagnostics as Diagnostics;
++use codex_app_server_protocol::UsageQuotaEstimate as Estimate;
++use codex_app_server_protocol::UsageQuotaStatus as Status;
++use codex_app_server_protocol::UsageTokens as Tokens;
++use itertools::Itertools;
++use pretty_assertions::assert_eq;
++use std::collections::BTreeSet;
++
++fn render(report: &UsageReport, range: UsageRange, width: u16) -> Vec<Line<'static>> {
++    render_lines(super::render(report, range, width), width)
++}
++
++pub(crate) fn report() -> UsageReport {
++    let usage = Usage {
++        tokens: Tokens {
++            input: 10_000,
++            cached: 8_000,
++            cache_write: 500,
++            output: 1_200,
++            reasoning: 800,
++            total: 11_200,
++        },
++        long_tokens: Tokens {
++            input: 4_000,
++            cached: 3_000,
++            cache_write: 100,
++            output: 200,
++            reasoning: 100,
++            total: 4_200,
++        },
++        cost: 4.2,
++        short_cost: 3.0,
++        long_cost: 1.2,
++    };
++    UsageReport {
++        refreshed_at: DateTime::parse_from_rfc3339("2026-09-30T12:00:00+08:00").unwrap(),
++        build_duration_ms: Some(1234),
++        latest_usage_at: Some(DateTime::parse_from_rfc3339("2026-09-28T18:00:00+08:00").unwrap()),
++        rows: BTreeMap::from([(
++            "2026-09-28".to_owned(),
++            BTreeMap::from([("gpt-5.4".to_owned(), usage)]),
++        )]),
++        weekly_rows: BTreeMap::new(),
++        monthly_rows: BTreeMap::new(),
++        yearly_rows: BTreeMap::new(),
++        quota: vec![
++            Estimate {
++                started_at: "2026-09-10T00:00:00Z".into(),
++                ended_at: "2026-09-11T00:00:00Z".into(),
++                used_percent_start: 0.0,
++                used_percent_end: 20.0,
++                observed_cost_usd: 100.0,
++                estimated_weekly_cost_usd: 500.0,
++                sample_count: 3,
++                status: Status::Completed,
++            },
++            Estimate {
++                started_at: "2026-09-29T00:00:00Z".into(),
++                ended_at: "2026-09-29T16:30:00Z".into(),
++                used_percent_start: 0.0,
++                used_percent_end: 60.0,
++                observed_cost_usd: 360.0,
++                estimated_weekly_cost_usd: 600.0,
++                sample_count: 5,
++                status: Status::Provisional,
++            },
++            Estimate {
++                started_at: "2026-09-22T00:00:00Z".into(),
++                ended_at: "2026-09-28T00:00:00Z".into(),
++                used_percent_start: 10.0,
++                used_percent_end: 100.0,
++                observed_cost_usd: 450.0,
++                estimated_weekly_cost_usd: 500.0,
++                sample_count: 9,
++                status: Status::Completed,
++            },
++        ],
++        credits: Vec::new(),
++        prices: serde_json::from_value(serde_json::json!({"gpt-5.4": {
++            "0": {"input":2.0,"cacheRead":0.2,"cacheWrite":2.5,"output":10.0},
++            "272000": {"input":4.0,"cacheRead":0.4,"cacheWrite":5.0,"output":20.0}
++        }}))
++        .unwrap(),
++        missing_prices: BTreeSet::new(),
++        diagnostics: Diagnostics::default(),
++    }
++}
++
++#[test]
++fn context_costs_share_their_token_groups_and_headers_are_merged() {
++    let content = super::render(&report(), UsageRange::Daily, 160);
++    // Symmetric headers need 161 columns; narrower frames retain horizontal access.
++    assert_eq!(content[0].desired_width(), 161);
++    assert!(content.iter().all(|table| table.desired_width() <= 161));
++    let lines = render_lines(content, 161);
++    let text = lines.iter().join("\n");
++    let record = text.lines().find(|line| line.contains("gpt-5.4")).unwrap();
++    let cells = record
++        .split('│')
++        .skip(1)
++        .take(16)
++        .map(str::trim)
++        .collect::<Vec<_>>();
++    assert_eq!(cells[7], "$3.00");
++    assert_eq!(cells[14], "$1.20");
++    assert_eq!(cells[15], "$4.20");
++    assert!(!text.contains("Period"));
++    assert_eq!(text.matches("2026-09-28").count(), 1);
++    assert!(text.contains("┌") && text.contains("┼") && text.contains("┘"));
++    assert!(text.contains("Cost"));
++    assert!(text.contains("Short context") && text.contains("Long context"));
++    assert!(!text.contains("Usage -"));
++    assert!(text.contains("Read") && text.contains("Write") && text.contains("Hit"));
++    assert!(!text.contains("Cache") && !text.contains("USD per 1M tokens"));
++    assert_eq!(text.matches("Total cost").count(), 1);
++    assert!(!text.contains("Subtotal"));
++    let total = lines
++        .iter()
++        .flat_map(|line| &line.spans)
++        .find(|span| span.content.contains("$4.20"))
++        .unwrap();
++    assert_eq!(
++        total.style.fg.unwrap_or_default(),
++        Palette::current().intensity(16).fg.unwrap_or_default()
++    );
++    let (_, prices) = text.rsplit_once("\n\n").unwrap();
++    let model = prices
++        .lines()
++        .find(|line| line.contains("gpt-5.4"))
++        .unwrap();
++    assert!(model.contains("$0.2000") && model.contains("$0.4000"));
++    assert!(!text.contains("0-271999") && !text.contains(">= 272000"));
++    assert!(!text.contains("Input range"));
++    assert!(text.contains("83.33%") && text.contains("75.00%"));
++    assert!(!text.contains("Weekly quota estimates"));
++    insta::assert_snapshot!("usage_daily", text);
++}
++
++#[test]
++fn all_usage_and_price_headers_have_symmetric_padding_with_optional_context_columns() {
++    let mut report = report();
++    let rates = report.prices["gpt-5.4"][&0].clone();
++    for contexts in [1, 2, 12] {
++        report.prices.insert(
++            "gpt-5.4".into(),
++            (0..contexts)
++                .map(|index| (index * 272_000, rates.clone()))
++                .collect(),
++        );
++        for writes in [true, false] {
++            let models = report.rows.get_mut("2026-09-28").unwrap();
++            let usage = models.get_mut("gpt-5.4").unwrap();
++            usage.tokens.cache_write = if writes { 500 } else { 0 };
++            usage.long_tokens.cache_write = if writes { 100 } else { 0 };
++            for width in [1, 100, 160, 220, u16::MAX] {
++                let models = &report.rows["2026-09-28"];
++                for period in [Some("2026-09-28"), Some("2026-09"), Some("2026"), None] {
++                    let palette = Palette::current();
++                    for table in [
++                        usage_table(&report, period, models, width, &palette),
++                        price_table(&report, models, width, &palette),
++                    ] {
++                        let natural = table.desired_width();
++                        let lines = render_lines(vec![table.into()], natural);
++                        let body = lines
++                            .iter()
++                            .position(|line| line.to_string().contains("gpt-5.4"))
++                            .unwrap();
++                        crate::control_center_table::tests::assert_symmetric_headers(
++                            &lines[..body],
++                        );
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn daily_report_renders_every_model_once_per_date() {
++    let mut report = report();
++    let usage = report.rows.values().next().unwrap()["gpt-5.4"].clone();
++    let models = ["gpt-5.4", "gpt-5.6-luna"];
++    let prices = report.prices["gpt-5.4"].clone();
++    for model in models {
++        report.prices.insert(model.to_owned(), prices.clone());
++    }
++    let dates = ["2024-01-01", "2026-09-28"];
++    report.rows = dates
++        .into_iter()
++        .map(|day| {
++            let rows = models
++                .iter()
++                .map(|model| ((*model).to_owned(), usage.clone()))
++                .collect();
++            (day.to_owned(), rows)
++        })
++        .collect();
++    let text = render(&report, UsageRange::Daily, 220).iter().join("\n");
++    for day in dates {
++        assert_eq!(
++            text.matches(day).count(),
++            1,
++            "missing or repeated day {day}"
++        );
++    }
++    let (usage_text, _) = text.rsplit_once("\n\n").unwrap();
++    for model in models {
++        assert_eq!(usage_text.matches(model).count(), dates.len());
++    }
++}
++
++#[test]
++fn tables_follow_the_active_theme_without_changing_values_or_geometry() {
++    let original = crate::render::highlight::current_syntax_theme();
++    let mut rendered = Vec::new();
++    for (theme, bg, fg) in [
++        ("nord", (20, 35, 50), (220, 230, 240)),
++        ("github", (250, 241, 235), (30, 40, 50)),
++    ] {
++        crate::render::highlight::set_syntax_theme(
++            crate::render::highlight::resolve_theme_by_name(theme, None).unwrap(),
++        );
++        rendered.push(crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors { fg, bg },
++            || {
++                let lines = render(&report(), UsageRange::Daily, 220);
++                let find = |value| {
++                    lines
++                        .iter()
++                        .flat_map(|line| &line.spans)
++                        .find(|span| span.content.trim() == value)
++                        .unwrap()
++                        .style
++                };
++                let total = find("$4.20");
++                assert_eq!(total.fg, Palette::current().intensity(16).fg);
++                assert_eq!(find("$3.00").fg, total.fg);
++                assert_eq!(find("$1.20").fg, total.fg);
++                let header = find("Total cost");
++                assert_eq!(
++                    header.fg,
++                    crate::style::accent_style()
++                        .fg
++                        .map(|color| { crate::style::readable_color_on(color, None) }),
++                );
++                assert!(header.add_modifier.contains(ratatui::style::Modifier::BOLD));
++                assert_eq!(
++                    lines[0].spans[0].style.fg,
++                    crate::style::table_separator_style().fg
++                );
++                (lines.iter().join("\n"), total.fg)
++            },
++        ));
++    }
++    crate::render::highlight::set_syntax_theme(original);
++    assert_eq!(rendered[0].0, rendered[1].0);
++    assert_ne!(rendered[0].1, rendered[1].1);
++}
++
++#[test]
++fn daily_tables_preserve_the_complete_shared_snapshot_dates() {
++    let mut report = report();
++    report.refreshed_at = DateTime::parse_from_rfc3339("2026-09-30T00:30:00+08:00").unwrap();
++    report.rows.insert("2026-09-29".into(), BTreeMap::new());
++    report.rows.insert("2026-09-30".into(), BTreeMap::new());
++    report.rows.insert("2025-09-29".into(), BTreeMap::new());
++    assert_eq!(
++        crate::usage::periods(&report, UsageRange::Daily)
++            .map(|(day, _)| day.as_str())
++            .collect::<Vec<_>>(),
++        vec!["2025-09-29", "2026-09-28", "2026-09-29", "2026-09-30"]
++    );
++}
++
++#[test]
++fn every_period_uses_two_date_cells_aligned_with_model() {
++    let mut report = report();
++    let models = report.rows["2026-09-28"].clone();
++    report
++        .weekly_rows
++        .insert("2026-09-28".into(), models.clone());
++    report.monthly_rows.insert("2026-09".into(), models.clone());
++    report.yearly_rows.insert("2026".into(), models);
++    for range in UsageRange::VIEWS {
++        let lines = render(&report, range, 220);
++        let date = lines[1].to_string();
++        let model = lines
++            .iter()
++            .find(|line| line.to_string().contains("Model"))
++            .unwrap()
++            .to_string();
++        assert_eq!(date.matches('│').count(), 3);
++        assert_eq!(
++            date.chars().position(|ch| ch == '│'),
++            model.chars().position(|ch| ch == '│')
++        );
++        assert_eq!(
++            date.chars().skip(1).position(|ch| ch == '│'),
++            model
++                .chars()
++                .skip(1)
++                .position(|ch| matches!(ch, '│' | '├' | '┤' | '┼')),
++            "{range:?}: {date}\n{model}"
++        );
++        assert!(date.split('│').nth(2).unwrap().trim().is_empty());
++    }
++}
++
++#[test]
++fn all_dates_combine_usage_without_losing_older_models() {
++    let mut report = report();
++    let models = report.rows["2026-09-28"].clone();
++    report.rows.insert("2025-01-01".into(), models);
++    let text = render(&report, UsageRange::All, 300).iter().join("\n");
++    assert!(text.contains("2025-01-01 - 2026-09-28"));
++    assert!(text.contains("$8.40"));
++    assert_eq!(text.matches("gpt-5.4").count(), 2);
++}
++
++#[test]
++fn zero_pricing_is_visible_without_inventing_a_price() {
++    let mut report = report();
++    report.missing_prices.insert("unpriced-model".to_owned());
++    let models = report.rows.get_mut("2026-09-28").unwrap();
++    let usage = models.remove("gpt-5.4").unwrap();
++    models.insert("unpriced-model".into(), usage);
++    let text = render(&report, UsageRange::Daily, 140).iter().join("\n");
++    let model = text
++        .lines()
++        .find(|line| line.contains("unpriced-model"))
++        .unwrap();
++    assert!(model.contains("--") && !model.contains('$'));
++    assert!(!text.rsplit_once("\n\n").unwrap().1.contains("Write"));
++}
++
++#[test]
++fn zero_token_counts_remain_explicit_while_rounded_zero_costs_keep_their_values() {
++    let usage = Usage {
++        cost: 0.001,
++        short_cost: 0.001,
++        ..Default::default()
++    };
++    let row = usage_row(
++        "model",
++        &usage,
++        true,
++        ContextColumns::ShortAndLong,
++        [true, true],
++    );
++    for column in [1, 2, 3, 4, 5, 8, 9, 10, 11, 12] {
++        assert_eq!(row[column].lines[0].to_string(), "0");
++        assert_eq!(row[column].copy_text.as_ref(), "0");
++        assert_eq!(row[column].value, Some(0.0));
++    }
++    for column in [6, 7, 13, 14, 15] {
++        assert_eq!(row[column].lines[0].to_string(), "--");
++    }
++    assert_eq!(row.last().unwrap().value, Some(0.001));
++    assert_eq!(number(0.0, 1, "", "%"), "--");
++}
++
++#[test]
++fn every_view_omits_the_redundant_token_and_cost_summary() {
++    for range in UsageRange::VIEWS {
++        let text = render(&report(), range, 200).iter().join("\n");
++        assert!(!text.contains("Estimated cost"), "{range:?}: {text}");
++        assert!(
++            !text.contains("Prices - USD per 1M tokens"),
++            "{range:?}: {text}"
++        );
++    }
++}
++
++#[test]
++fn tables_bound_long_model_cells_and_keep_pricing_unknown() {
++    let mut report = report();
++    let model = "gpt-6-internal-rollout-very-long-unpublished-model-name";
++    let models = report.rows.get_mut("2026-09-28").unwrap();
++    let mut usage = models.remove("gpt-5.4").unwrap();
++    usage.tokens.output = 1_234_567;
++    models.insert(model.to_owned(), usage);
++    report.missing_prices.insert(model.to_owned());
++    for width in [160, 180, 200, 240] {
++        let lines = render(&report, UsageRange::Daily, width);
++        let table: Vec<_> = lines
++            .iter()
++            .filter(|line| matches!(line.to_string().chars().next(), Some('│' | '├' | '┌' | '└')))
++            .collect();
++        assert!(!table.is_empty());
++        assert!(table.iter().all(|line| line.width() <= usize::from(width)));
++        assert!(table.iter().any(|line| line.to_string().contains("…")));
++        assert!(table.iter().any(|line| line.to_string().contains("--")));
++        assert!(table.iter().any(|line| line.to_string().contains("1.23M")));
++        let tables = super::render(&report, UsageRange::Daily, width);
++        let cells = tables[0].copyable_cells(ratatui::layout::Rect::new(0, 0, width, 100), 0, 0);
++        assert!(cells.iter().any(|(_, text)| text.as_ref() == model));
++        assert!(cells.iter().any(|(_, text)| text.as_ref() == "1234567"));
++    }
++}
++
++#[test]
++fn numeric_intensity_uses_actual_values() {
++    let palette = Palette::current();
++    let rows = [("900", 900.0), ("1.00K", 1_000.0)]
++        .map(|(text, value)| vec![Cell::value(Some(value), text)]);
++    let lines = render_lines(
++        vec![
++            numeric_table(
++                vec![vec![palette.header("Input")]],
++                &[Column::new("Input", "0.00K".len(), 8)],
++                rows.into(),
++                None,
++                20,
++                &palette,
++            )
++            .into(),
++        ],
++        20,
++    );
++    for (text, level) in [("900", 1), ("1.00K", 16)] {
++        let span = lines
++            .iter()
++            .flat_map(|line| &line.spans)
++            .find(|span| span.content.contains(text))
++            .unwrap();
++        let expected = palette.intensity(level);
++        assert_eq!(
++            span.style.fg.unwrap_or_default(),
++            expected.fg.unwrap_or_default()
++        );
++        assert_eq!(span.style.add_modifier, expected.add_modifier);
++    }
++}
++
++#[test]
++fn dates_descend_and_models_descend_by_name_without_contexts_for_single_prices() {
++    let mut report = report();
++    report.prices = serde_json::from_value(serde_json::json!({
++        "alpha": {"0": {"input": 2.0,"cacheRead": 0.2,"cacheWrite": 2.5,"output": 10.0}},
++        "zeta": {"0": {"input": 2.0,"cacheRead": 0.2,"cacheWrite": 2.5,"output": 10.0}}
++    }))
++    .unwrap();
++    let mut usage = report.rows["2026-09-28"]["gpt-5.4"].clone();
++    report.rows.clear();
++    let mut models = BTreeMap::from([("alpha".into(), usage.clone())]);
++    usage.cost = 1.0;
++    models.insert("zeta".into(), usage);
++    report.rows.insert("2026-09-28".into(), models.clone());
++    report.rows.insert("2026-09-29".into(), models);
++    let text = render(&report, UsageRange::Daily, 140).iter().join("\n");
++    assert!(text.find("2026-09-29").unwrap() < text.find("2026-09-28").unwrap());
++    assert!(text.find("zeta").unwrap() < text.find("alpha").unwrap());
++    let older = text.split("2026-09-28").nth(1).unwrap();
++    assert!(older.find("zeta").unwrap() < older.find("alpha").unwrap());
++    let (_, prices) = text.rsplit_once("\n\n").unwrap();
++    assert!(prices.find("zeta").unwrap() < prices.find("alpha").unwrap());
++    assert!(!text.contains("Short context") && !text.contains("Long context"));
++    assert!(!text.contains("All input"));
++}
++
++#[test]
++fn period_headers_are_centered_and_model_columns_share_a_centered_left_edge() {
++    let mut report = report();
++    let usage = report.rows["2026-09-28"]["gpt-5.4"].clone();
++    let models = BTreeMap::from([
++        ("alpha".to_owned(), usage.clone()),
++        ("zeta-extended".to_owned(), usage),
++    ]);
++    report.rows = BTreeMap::from([
++        ("2026-09-29".to_owned(), models.clone()),
++        ("2026-09-30".to_owned(), models.clone()),
++    ]);
++    report.weekly_rows = BTreeMap::from([
++        ("2026-W39".to_owned(), models.clone()),
++        ("2026-W40".to_owned(), models.clone()),
++    ]);
++    report.monthly_rows = BTreeMap::from([
++        ("2026-08".to_owned(), models.clone()),
++        ("2026-09".to_owned(), models.clone()),
++    ]);
++    report.yearly_rows = BTreeMap::from([
++        ("2025".to_owned(), models.clone()),
++        ("2026".to_owned(), models.clone()),
++    ]);
++    for (range, period) in [
++        (UsageRange::Daily, "2026-09-30"),
++        (UsageRange::Weekly, "2026-W40"),
++        (UsageRange::Monthly, "2026-09"),
++        (UsageRange::Yearly, "2026"),
++    ] {
++        let lines = render(&report, range, 200);
++        let text = lines.iter().join("\n");
++        let (consumption, prices) = text.rsplit_once("\n\n").unwrap();
++        assert_eq!(consumption.matches('┌').count(), 2, "{range:?}");
++        assert_eq!(consumption.matches('└').count(), 2, "{range:?}");
++        assert_eq!(consumption.matches("Model").count(), 2, "{range:?}");
++        assert_eq!(consumption.matches("Total cost").count(), 2, "{range:?}");
++        assert!(!consumption.contains("Period"));
++        let period_row = consumption
++            .lines()
++            .find(|line| line.contains(period))
++            .unwrap();
++        let period_cell = period_row.split('│').nth(1).unwrap();
++        assert_eq!(
++            period_cell.len() - period_cell.trim_start().len(),
++            (period_cell.len() - period.len()) / 2,
++            "{range:?}: {period_row}"
++        );
++        for table in [consumption, prices] {
++            let labels = table
++                .lines()
++                .filter_map(|line| line.split('│').nth(1))
++                .filter(|cell| matches!(cell.trim(), "alpha" | "zeta-extended"))
++                .collect::<Vec<_>>();
++            assert!(labels.len() >= 2, "{range:?}: {table}");
++            for label in labels {
++                assert_eq!(
++                    label.len() - label.trim_start().len(),
++                    (label.len() - "zeta-extended".len()) / 2,
++                    "{range:?}: {label}"
++                );
++            }
++        }
++    }
++    let lines = render_lines(
++        usage_tables(
++            &report,
++            &[("2026-09-30", &models)],
++            200,
++            &Palette::current(),
++        ),
++        200,
++    );
++    let labels = lines
++        .iter()
++        .map(ToString::to_string)
++        .filter(|line| line.contains("alpha") || line.contains("zeta-extended"))
++        .collect::<Vec<_>>();
++    assert_eq!(labels.len(), 4);
++    for line in labels {
++        let label = line.split('│').nth(1).unwrap();
++        assert_eq!(
++            label.len() - label.trim_start().len(),
++            (label.len() - "zeta-extended".len()) / 2
++        );
++    }
++}
++
++#[test]
++fn empty_write_columns_disappear_independently_without_shifting_other_values() {
++    for (short_write, long_write, short_price, long_price) in [
++        (0, 0, 0.0, 0.0),
++        (400, 0, 2.5, 0.0),
++        (0, 100, 0.0, 5.0),
++        (400, 100, 2.5, 5.0),
++        (0, 0, 2.5, 5.0),
++        (400, 100, 0.0, 0.0),
++    ] {
++        let mut report = report();
++        let usage = report
++            .rows
++            .get_mut("2026-09-28")
++            .unwrap()
++            .get_mut("gpt-5.4")
++            .unwrap();
++        usage.tokens.cache_write = short_write + long_write;
++        usage.long_tokens.cache_write = long_write;
++        report.prices = serde_json::from_value(serde_json::json!({"gpt-5.4": {
++            "0": {"input":2.0,"cacheRead":0.2,"cacheWrite":short_price,"output":10.0},
++            "272000": {"input":4.0,"cacheRead":0.4,"cacheWrite":long_price,"output":20.0}
++        }}))
++        .unwrap();
++        let lines = render(&report, UsageRange::Daily, 220);
++        let text = lines.iter().join("\n");
++        let (usage, prices) = text.rsplit_once("\n\n").unwrap();
++        assert_eq!(
++            usage.matches("Write").count(),
++            usize::from(short_write > 0) + usize::from(long_write > 0)
++        );
++        assert_eq!(
++            prices.matches("Write").count(),
++            usize::from(short_price > 0.0) + usize::from(long_price > 0.0)
++        );
++        let row = usage.lines().find(|line| line.contains("gpt-5.4")).unwrap();
++        assert!(row.contains("$3.00") && row.contains("$1.20") && row.contains("$4.20"));
++        assert!(row.contains("83.33%") && row.contains("75.00%"));
++        assert!(prices.contains("$0.2000") && prices.contains("$0.4000"));
++        for section in [usage, prices] {
++            let table = section
++                .lines()
++                .filter(|line| line.starts_with(['┌', '│', '├', '└']))
++                .collect::<Vec<_>>();
++            let width = table[0].chars().count();
++            assert!(width <= 220);
++            assert!(table.iter().all(|line| line.chars().count() == width));
++        }
++    }
++}
++
++#[test]
++fn single_model_periods_omit_only_duplicate_totals() {
++    for (model_counts, expected_rows, expected_summaries) in [
++        (vec![1], 1, 0),
++        (vec![2], 3, 1),
++        (vec![1, 1], 2, 0),
++        (vec![2, 1], 4, 1),
++    ] {
++        let mut report = report();
++        let usage = report.rows["2026-09-28"]["gpt-5.4"].clone();
++        report.rows.clear();
++        for (day, count) in model_counts.into_iter().enumerate() {
++            report.rows.insert(
++                format!("2026-09-{}", 28 + day),
++                (0..count)
++                    .map(|model| (format!("model-{model}"), usage.clone()))
++                    .collect(),
++            );
++        }
++        let lines = render(&report, UsageRange::Daily, 200);
++        let text = lines.iter().join("\n");
++        let (consumption, _) = text.rsplit_once("\n\n").unwrap();
++        let rows = consumption
++            .lines()
++            .filter(|line| line.starts_with('│') && line.contains('$'))
++            .collect::<Vec<_>>();
++        assert_eq!(rows.len(), expected_rows);
++        let summaries = rows
++            .iter()
++            .filter(|line| line.split('│').nth(1).unwrap().trim().is_empty())
++            .count();
++        assert_eq!(summaries, expected_summaries);
++        for (period, models) in &report.rows {
++            let section = consumption.split(period).nth(1).unwrap();
++            let last = section
++                .lines()
++                .take_while(|line| !line.starts_with('└'))
++                .filter(|line| line.starts_with('│') && line.contains('$'))
++                .last()
++                .unwrap();
++            let total = models.values().map(|usage| usage.cost).sum::<f64>();
++            assert!(last.contains(&format!("${total:.2}")), "{last}");
++        }
++    }
++}

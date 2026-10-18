@@ -1,0 +1,843 @@
+persist-manual-pairing-code-in-daemon-settings
+
+Lane: backend
+
+Unit: enroll-local-daemons-for-remote-control
+
+ChildPatch: persist-manual-pairing-code-in-daemon-settings
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2098,6 +2098,7 @@ dependencies = [
+  "clap",
+  "codex-agent-extension",
+  "codex-analytics",
++ "codex-app-server-daemon",
+  "codex-app-server-protocol",
+  "codex-app-server-transport",
+  "codex-arg0",
+diff --git a/codex-rs/app-server-daemon/src/launch.rs b/codex-rs/app-server-daemon/src/launch.rs
+--- a/codex-rs/app-server-daemon/src/launch.rs
++++ b/codex-rs/app-server-daemon/src/launch.rs
+@@ -17,7 +17,10 @@ pub async fn start_with_features(features: &BTreeMap<String, bool>) -> Result<Li
+     daemon.log_diagnostics = true;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+     let selected = daemon.current_installation();
+-    let mut overrides = selected.load_settings().await?.feature_overrides;
++    let mut overrides = selected
++        .load_settings_for_operation()
++        .await?
++        .feature_overrides;
+     overrides.extend(features.clone());
+     // A fresh managed daemon owns remote startup. Attaching to an existing
+     // daemon must leave its remote-control policy unchanged.
+@@ -39,7 +42,7 @@ impl Daemon {
+         &self,
+         features: &BTreeMap<String, bool>,
+     ) -> Result<LifecycleOutput> {
+-        let mut settings = self.load_settings().await?;
++        let mut settings = self.load_settings_for_operation().await?;
+         // Explicit requests replace saved aliases as well as canonical keys.
+         settings.feature_overrides.retain(|name, _| {
+             let canonical = codex_features::feature_for_key(name)
+@@ -55,7 +58,7 @@ impl Daemon {
+         &self,
+         features: &BTreeMap<String, bool>,
+     ) -> Result<LifecycleOutput> {
+-        let mut settings = self.load_settings().await?;
++        let mut settings = self.load_settings_for_operation().await?;
+         ensure!(
+             self.running_backend_instance(&settings).await?.is_some(),
+             "no running managed daemon; rerun the command to check the current server"
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -276,15 +276,24 @@ pub async fn enable_remote_control_on_socket(
+ 
+ /// Starts a manual pairing session through an already-running daemon app-server.
+ pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
+-    ensure_supported_platform()?;
+     let daemon = Daemon::from_environment()?;
+-    remote_control_client::start_pairing(&daemon.socket_path).await
++    let _operation_lock = daemon.acquire_operation_lock().await?;
++    daemon.start_and_store_pairing().await
++}
++
++/// Persist a pairing result produced by the managed app-server itself, without
++/// opening another app-server client connection.
++pub async fn store_managed_manual_pairing(
++    pairing: &RemoteControlPairingStartResponse,
++) -> Result<()> {
++    let daemon = Daemon::from_environment()?;
++    let _operation_lock = daemon.acquire_operation_lock().await?;
++    daemon
++        .record_manual_pairing(pairing, /*background*/ true)
++        .await
+ }
+ 
+ pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControlOutput> {
+-    ensure_supported_platform()?;
+-    #[cfg(windows)]
+-    backend::windows::ensure_not_elevated()?;
+     Box::pin(Daemon::from_environment()?.set_remote_control(mode)).await
+ }
+ 
+@@ -432,7 +441,7 @@ impl Daemon {
+         intent: StartIntent,
+     ) -> Result<LifecycleOutput> {
+         let mut managed = self.clone();
+-        let mut settings = self.load_settings().await?;
++        let mut settings = self.load_settings_for_operation().await?;
+         let foreground_enrollment = matches!(intent, StartIntent::LocalEnrollment);
+         let remote_control_setting_changed =
+             foreground_enrollment && !settings.remote_control_enabled;
+@@ -496,6 +505,13 @@ impl Daemon {
+         }
+         if foreground_enrollment && backend.is_some() {
+             remote_control_client::enable_remote_control(&self.socket_path).await?;
++            // A fresh app-server pairs in its own background startup task. An
++            // explicit start of an already-running server has no such task.
++            if status == LifecycleStatus::AlreadyRunning
++                && let Err(err) = self.start_and_store_pairing().await
++            {
++                tracing::warn!("manual pairing is not available after daemon start: {err:#}");
++            }
+         }
+         if foreground_enrollment
+             && status == LifecycleStatus::AlreadyRunning
+@@ -537,7 +553,7 @@ impl Daemon {
+ 
+         // Persist changed launch settings only after the old process has stopped.
+         // A failed or interrupted drain must not make an unapplied change look current.
+-        if self.load_settings().await? != settings {
++        if self.load_settings_for_operation().await? != settings {
+             settings.save(&self.settings_file).await?;
+         }
+         let pid = managed.start_managed_backend(&settings).await?;
+@@ -568,7 +584,7 @@ impl Daemon {
+         if !try_lock_file(&operation_lock)? {
+             return Ok(RestartIfRunningOutcome::Busy);
+         }
+-        let settings = self.load_settings().await?;
++        let settings = self.load_settings_for_operation().await?;
+         let outcome = if let Some(backend) = self.running_backend_instance(&settings).await? {
+             let info = client::probe(&self.socket_path).await.ok();
+             let managed_version = if info.is_some() {
+@@ -680,6 +696,9 @@ impl Daemon {
+             backend
+                 .stop_with_grace(settings.shutdown_grace_seconds)
+                 .await?;
++            if let Err(err) = settings::clear_manual_pairing(&self.settings_file).await {
++                tracing::warn!("failed to clear manual pairing after daemon stop: {err:#}");
++            }
+             return Ok(self
+                 .output(
+                     LifecycleStatus::Stopped,
+@@ -696,6 +715,10 @@ impl Daemon {
+             ));
+         }
+ 
++        if let Err(err) = settings::clear_manual_pairing(&self.settings_file).await {
++            tracing::warn!("failed to clear manual pairing after daemon stop: {err:#}");
++        }
++
+         Ok(self
+             .output(
+                 LifecycleStatus::NotRunning,
+@@ -707,7 +730,8 @@ impl Daemon {
+     }
+ 
+     async fn version(&self) -> Result<LifecycleOutput> {
+-        let settings = self.load_settings().await?;
++        let _operation_lock = self.acquire_operation_lock().await?;
++        let settings = self.load_settings_for_operation().await?;
+         let info = client::probe(&self.socket_path).await?;
+         Ok(self
+             .output(
+@@ -765,7 +789,7 @@ impl Daemon {
+     async fn ensure_remote_control_started(&self) -> Result<RemoteControlStartOutput> {
+         let _operation_lock = self.acquire_operation_lock().await?;
+         let selected = self.current_installation();
+-        let settings = selected.load_settings().await?;
++        let settings = selected.load_settings_for_operation().await?;
+         if selected.is_bootstrapped(&settings).await? {
+             let _ = selected
+                 .set_remote_control_locked(RemoteControlMode::Enabled)
+@@ -805,7 +829,7 @@ impl Daemon {
+         &self,
+         mode: RemoteControlMode,
+     ) -> Result<RemoteControlOutput> {
+-        let previous_settings = self.load_settings().await?;
++        let previous_settings = self.load_settings_for_operation().await?;
+         let mut settings = previous_settings.clone();
+         let remote_control_enabled = mode.is_enabled();
+         let backend = self.running_backend_instance(&previous_settings).await?;
+@@ -832,6 +856,9 @@ impl Daemon {
+                     }
+                 }
+             }
++            if mode == RemoteControlMode::Disabled {
++                settings::clear_manual_pairing(&self.settings_file).await?;
++            }
+             return Ok(self.remote_control_output(
+                 already_remote_control_status(mode),
+                 backend.map(|_| BackendKind::Pid),
+@@ -876,7 +903,7 @@ impl Daemon {
+     }
+ 
+     async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
+-        let mut settings = self.load_settings().await?;
++        let mut settings = self.load_settings_for_operation().await?;
+         settings.remote_control_enabled = options.remote_control_enabled;
+         if client::probe(&self.socket_path).await.is_ok()
+             && self.running_backend(&settings).await?.is_none()
+@@ -1122,6 +1149,33 @@ impl Daemon {
+         DaemonSettings::load(&self.settings_file).await
+     }
+ 
++    // The caller holds the operation lock: expiry cleanup replaces the settings file.
++    async fn load_settings_for_operation(&self) -> Result<DaemonSettings> {
++        settings::clear_expired_manual_pairing(&self.settings_file).await?;
++        self.load_settings().await
++    }
++
++    async fn start_and_store_pairing(&self) -> Result<RemoteControlPairingStartResponse> {
++        let pairing = remote_control_client::start_pairing(&self.socket_path).await?;
++        self.record_manual_pairing(&pairing, /*background*/ false)
++            .await?;
++        Ok(pairing)
++    }
++
++    async fn record_manual_pairing(
++        &self,
++        pairing: &RemoteControlPairingStartResponse,
++        background: bool,
++    ) -> Result<()> {
++        let Some(code) = pairing.manual_pairing_code.as_deref() else {
++            settings::clear_manual_pairing(&self.settings_file).await?;
++            return Err(anyhow!("manual pairing code was not returned"));
++        };
++        settings::store_manual_pairing(&self.settings_file, code, pairing.expires_at, background)
++            .await?;
++        Ok(())
++    }
++
+     async fn acquire_operation_lock(&self) -> Result<tokio::fs::File> {
+         let operation_lock = self.open_operation_lock_file().await?;
+         let deadline = tokio::time::Instant::now() + OPERATION_LOCK_TIMEOUT;
+@@ -1278,6 +1332,37 @@ mod tests {
+     #[cfg(unix)]
+     use crate::settings::DaemonSettings;
+ 
++    #[tokio::test]
++    async fn settings_reads_leave_expiry_cleanup_to_locked_operations() -> anyhow::Result<()> {
++        let home = TempDir::new()?;
++        let harness = TempDir::new()?;
++        let daemon = Daemon::from_roots(home.path(), harness.path())?;
++        codex_uds::prepare_private_socket_directory(
++            daemon.settings_file.parent().expect("settings parent"),
++        )
++        .await?;
++        let contents = br#"{"remoteControlEnabled":true,"futureSetting":42,"manualPairing":{"code":"EXPIRED","expiresAt":0}}"#;
++        tokio::fs::write(&daemon.settings_file, contents).await?;
++
++        assert!(daemon.load_settings().await?.remote_control_enabled);
++        assert_eq!(tokio::fs::read(&daemon.settings_file).await?, contents);
++
++        let _operation_lock = daemon.acquire_operation_lock().await?;
++        assert!(
++            daemon
++                .load_settings_for_operation()
++                .await?
++                .remote_control_enabled
++        );
++        let stored: serde_json::Value =
++            serde_json::from_slice(&tokio::fs::read(&daemon.settings_file).await?)?;
++        assert_eq!(
++            stored,
++            serde_json::json!({"remoteControlEnabled": true, "futureSetting": 42})
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn remote_control_status_uses_camel_case_json() {
+         assert_eq!(
+diff --git a/codex-rs/app-server-daemon/src/manual_update.rs b/codex-rs/app-server-daemon/src/manual_update.rs
+--- a/codex-rs/app-server-daemon/src/manual_update.rs
++++ b/codex-rs/app-server-daemon/src/manual_update.rs
+@@ -61,7 +61,7 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
+                     if let Ok(connection) = UnixStream::connect(&socket_path).await {
+                         connection
+                     } else {
+-                        let settings = daemon.load_settings().await?;
++                        let settings = daemon.load_settings_for_operation().await?;
+                         if !supported(daemon)?
+                             || (daemon.running_backend_instance(&settings).await?.is_none()
+                                 && client::probe(&daemon.socket_path).await.is_ok())
+@@ -135,7 +135,7 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
+             // A scheduled or older updater cannot authorize restoring a pin.
+             // Replace it under the writable operation lock, even with identical bytes.
+             let _operation_lock = daemon.acquire_operation_lock().await?;
+-            let settings = daemon.load_settings().await?;
++            let settings = daemon.load_settings_for_operation().await?;
+             let worker = crate::backend::pid_update_loop_backend(daemon.backend_paths(&settings));
+             if !daemon.is_stable_standalone_release() {
+                 worker.stop().await?;
+diff --git a/codex-rs/app-server-daemon/src/migration.rs b/codex-rs/app-server-daemon/src/migration.rs
+--- a/codex-rs/app-server-daemon/src/migration.rs
++++ b/codex-rs/app-server-daemon/src/migration.rs
+@@ -33,7 +33,7 @@ pub(super) async fn run(http: &impl InstallerHttp, legacy: &Daemon) -> Result<Up
+         .and_then(Path::parent)
+         .context("package root has no Codex home")?;
+     let root = home.join("packages/app-server-daemon");
+-    let settings = legacy.load_settings().await?;
++    let settings = legacy.load_settings_for_operation().await?;
+     let running = legacy.running_backend_instance(&settings).await?;
+     if running.is_none() && client::probe(&legacy.socket_path).await.is_ok() {
+         return super::manual_update::unsupported(legacy).await;
+diff --git a/codex-rs/app-server-daemon/src/prepare_install.rs b/codex-rs/app-server-daemon/src/prepare_install.rs
+--- a/codex-rs/app-server-daemon/src/prepare_install.rs
++++ b/codex-rs/app-server-daemon/src/prepare_install.rs
+@@ -219,7 +219,7 @@ async fn prepare_from_package(
+         None // Initial startup already holds the operation lock.
+     };
+     let current_settings = if mode == InstallMode::Replace {
+-        Some(daemon.load_settings().await?)
++        Some(daemon.load_settings_for_operation().await?)
+     } else {
+         None
+     };
+diff --git a/codex-rs/app-server-daemon/src/settings.rs b/codex-rs/app-server-daemon/src/settings.rs
+--- a/codex-rs/app-server-daemon/src/settings.rs
++++ b/codex-rs/app-server-daemon/src/settings.rs
+@@ -1,6 +1,9 @@
+ use std::collections::BTreeMap;
++use std::os::unix::fs::PermissionsExt;
+ use std::path::Path;
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use anyhow::Context;
+ use anyhow::Result;
+@@ -9,11 +12,13 @@ use serde::Deserialize;
+ use serde::de::DeserializeOwned;
+ use serde_json::Map;
+ use serde_json::Value;
++use serde_json::json;
+ use tokio::fs;
+ 
+ pub(crate) const DEFAULT_UPDATE_INTERVAL_MINUTES: u32 = 60;
+ pub(crate) const DEFAULT_SHUTDOWN_GRACE_SECONDS: u32 = 60;
+ pub(crate) const MAX_SHUTDOWN_GRACE_SECONDS: u32 = 5 * 60;
++const MANUAL_PAIRING_SETTING: &str = "manualPairing";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct DaemonSettings {
+@@ -155,19 +160,14 @@ impl DaemonSettings {
+     }
+ 
+     pub(crate) async fn save(&self, path: &Path) -> Result<()> {
+-        if let Some(parent) = path.parent() {
+-            fs::create_dir_all(parent).await.with_context(|| {
+-                format!(
+-                    "failed to create daemon settings directory {}",
+-                    parent.display()
+-                )
+-            })?;
+-        }
+         let mut settings: Map<String, Value> = read_settings(path).await?;
+         settings.insert(
+             "remoteControlEnabled".to_string(),
+             Value::Bool(self.remote_control_enabled),
+         );
++        if !self.remote_control_enabled {
++            settings.remove(MANUAL_PAIRING_SETTING);
++        }
+         if self.feature_overrides.is_empty() {
+             settings.remove("featureOverrides");
+         } else {
+@@ -176,21 +176,103 @@ impl DaemonSettings {
+                 serde_json::to_value(&self.feature_overrides)?,
+             );
+         }
+-        let contents =
+-            serde_json::to_vec_pretty(&settings).context("failed to serialize settings")?;
+-        let temporary_path = path.with_extension("tmp");
+-        fs::write(&temporary_path, contents)
+-            .await
+-            .with_context(|| {
+-                format!(
+-                    "failed to write daemon settings {}",
+-                    temporary_path.display()
+-                )
+-            })?;
+-        fs::rename(&temporary_path, path)
+-            .await
+-            .with_context(|| format!("failed to replace daemon settings {}", path.display()))
++        write_settings(path, &settings).await
++    }
++}
++
++pub(crate) async fn store_manual_pairing(
++    path: &Path,
++    code: &str,
++    expires_at: i64,
++    background: bool,
++) -> Result<()> {
++    if code.is_empty() {
++        clear_manual_pairing(path).await?;
++        anyhow::bail!("manual pairing code was empty");
++    }
++    if expires_at <= unix_now()? {
++        clear_manual_pairing(path).await?;
++        anyhow::bail!("manual pairing code already expired");
++    }
++    let mut settings: Map<String, Value> = read_settings(path).await?;
++    // Background requests precede the operation lock and may finish after disable.
++    // Explicit requests hold that lock before requesting a code, including re-enrollment.
++    if background
++        && matches!(
++            settings.get("remoteControlEnabled"),
++            Some(Value::Bool(false))
++        )
++    {
++        return Ok(());
++    }
++    settings.insert(
++        MANUAL_PAIRING_SETTING.to_string(),
++        json!({"code": code, "expiresAt": expires_at}),
++    );
++    write_settings(path, &settings).await
++}
++
++pub(crate) async fn clear_manual_pairing(path: &Path) -> Result<()> {
++    let mut settings: Map<String, Value> = read_settings(path).await?;
++    if settings.remove(MANUAL_PAIRING_SETTING).is_some() {
++        write_settings(path, &settings).await?;
++    }
++    Ok(())
++}
++
++pub(crate) async fn clear_expired_manual_pairing(path: &Path) -> Result<()> {
++    let mut settings: Map<String, Value> = read_settings(path).await?;
++    let Some(pairing) = settings.get(MANUAL_PAIRING_SETTING) else {
++        return Ok(());
++    };
++    let expires_at = pairing.get("expiresAt").and_then(Value::as_i64);
++    let code = pairing.get("code").and_then(Value::as_str);
++    let now = unix_now()?;
++    if code.is_none_or(str::is_empty) || expires_at.is_none_or(|expiry| expiry <= now) {
++        settings.remove(MANUAL_PAIRING_SETTING);
++        write_settings(path, &settings).await?;
+     }
++    Ok(())
++}
++
++async fn write_settings(path: &Path, settings: &Map<String, Value>) -> Result<()> {
++    let parent = path
++        .parent()
++        .context("daemon settings path has no parent")?;
++    fs::create_dir_all(parent).await.with_context(|| {
++        format!(
++            "failed to create daemon settings directory {}",
++            parent.display()
++        )
++    })?;
++    let temporary = tempfile::Builder::new()
++        .prefix(".settings-")
++        .tempfile_in(parent)
++        .with_context(|| format!("failed to stage daemon settings in {}", parent.display()))?;
++    temporary
++        .as_file()
++        .set_permissions(std::fs::Permissions::from_mode(0o600))
++        .context("failed to protect staged daemon settings")?;
++    let contents = serde_json::to_vec_pretty(settings).context("failed to serialize settings")?;
++    fs::write(temporary.path(), contents)
++        .await
++        .with_context(|| {
++            format!(
++                "failed to write staged daemon settings {}",
++                temporary.path().display()
++            )
++        })?;
++    temporary
++        .persist(path)
++        .with_context(|| format!("failed to replace daemon settings {}", path.display()))?;
++    Ok(())
++}
++
++fn unix_now() -> Result<i64> {
++    let duration = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .context("system clock precedes Unix epoch")?;
++    i64::try_from(duration.as_secs()).context("system clock exceeds pairing expiry range")
+ }
+ 
+ pub(crate) async fn telemetry_tags(path: &Path) -> Result<[(&'static str, &'static str); 4]> {
+diff --git a/codex-rs/app-server-daemon/src/settings_tests.rs b/codex-rs/app-server-daemon/src/settings_tests.rs
+--- a/codex-rs/app-server-daemon/src/settings_tests.rs
++++ b/codex-rs/app-server-daemon/src/settings_tests.rs
+@@ -3,6 +3,10 @@ use tempfile::TempDir;
+ 
+ use super::DaemonSettings;
+ use super::MAX_SHUTDOWN_GRACE_SECONDS;
++use super::clear_expired_manual_pairing;
++use super::clear_manual_pairing;
++use super::store_manual_pairing;
++use super::unix_now;
+ 
+ #[tokio::test]
+ async fn remote_control_save_preserves_updater_settings() {
+@@ -49,6 +53,109 @@ async fn remote_control_save_preserves_updater_settings() {
+     );
+ }
+ 
++#[tokio::test]
++async fn manual_pairing_replaces_only_its_settings_and_protects_the_file() -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++
++    let temp = TempDir::new()?;
++    let path = temp.path().join("app-server-daemon/settings.json");
++    tokio::fs::create_dir_all(path.parent().expect("settings parent")).await?;
++    tokio::fs::write(&path, r#"{"remoteControlEnabled":true,"futureSetting":42}"#).await?;
++
++    let expiry = unix_now()? + 60;
++    store_manual_pairing(&path, "AAAA-BBBB", expiry, /*background*/ true).await?;
++    store_manual_pairing(&path, "CCCC-DDDD", expiry + 60, /*background*/ false).await?;
++
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(
++        contents,
++        serde_json::json!({
++            "remoteControlEnabled": true,
++            "futureSetting": 42,
++            "manualPairing": {"code": "CCCC-DDDD", "expiresAt": expiry + 60},
++        })
++    );
++    assert_eq!(
++        tokio::fs::metadata(&path).await?.permissions().mode() & 0o777,
++        0o600
++    );
++
++    let disabled = DaemonSettings {
++        remote_control_enabled: false,
++        ..DaemonSettings::load(&path).await?
++    };
++    disabled.save(&path).await?;
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(contents.get("manualPairing"), None);
++    assert_eq!(contents.get("futureSetting"), Some(&serde_json::json!(42)));
++    // A request admitted before disable can finish after its settings write.
++    store_manual_pairing(&path, "LATE-RESULT", expiry + 120, /*background*/ true).await?;
++    assert_eq!(
++        serde_json::from_slice::<serde_json::Value>(&tokio::fs::read(&path).await?)?,
++        contents
++    );
++    // An explicit request can pair an ephemerally enabled server without changing its preference.
++    store_manual_pairing(&path, "EXPLICIT", expiry + 120, /*background*/ false).await?;
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(contents["remoteControlEnabled"], false);
++    assert_eq!(contents["manualPairing"]["code"], "EXPLICIT");
++    assert_eq!(contents["futureSetting"], 42);
++    Ok(())
++}
++
++#[tokio::test]
++async fn expired_or_cleared_manual_pairing_does_not_touch_other_settings() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let path = temp.path().join("settings.json");
++    tokio::fs::write(
++        &path,
++        serde_json::to_vec(&serde_json::json!({
++            "remoteControlEnabled": true,
++            "futureSetting": 42,
++            "manualPairing": {"code": "EXPIRED", "expiresAt": unix_now()? - 1},
++        }))?,
++    )
++    .await?;
++
++    clear_expired_manual_pairing(&path).await?;
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(
++        contents,
++        serde_json::json!({"remoteControlEnabled": true, "futureSetting": 42})
++    );
++
++    tokio::fs::write(
++        &path,
++        serde_json::to_vec(&serde_json::json!({
++            "remoteControlEnabled": true,
++            "futureSetting": 42,
++            "manualPairing": {"code": "BROKEN", "expiresAt": "invalid"},
++        }))?,
++    )
++    .await?;
++    clear_expired_manual_pairing(&path).await?;
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(
++        contents,
++        serde_json::json!({"remoteControlEnabled": true, "futureSetting": 42})
++    );
++
++    store_manual_pairing(
++        &path,
++        "CURRENT",
++        unix_now()? + 60,
++        /*background*/ false,
++    )
++    .await?;
++    clear_manual_pairing(&path).await?;
++    let contents: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
++    assert_eq!(
++        contents,
++        serde_json::json!({"remoteControlEnabled": true, "futureSetting": 42})
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn shutdown_grace_accepts_zero_through_five_minutes() {
+     let temp = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+--- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
++++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+@@ -707,6 +707,37 @@ async fn test_control_server(
+                 .await
+                 .expect("initialized notification")
+                 .expect("frame");
++            while let Some(Ok(message)) = websocket.next().await {
++                if !message.is_text() {
++                    break;
++                }
++                let text = message.to_text().expect("text request");
++                let request: serde_json::Value =
++                    serde_json::from_str(text).expect("remote control request");
++                let result = match request["method"].as_str().expect("request method") {
++                    "remoteControl/enable" => serde_json::json!({
++                        "status": "connected",
++                        "serverName": "test-server",
++                        "installationId": "test-installation",
++                        "environmentId": "test-environment",
++                    }),
++                    "remoteControl/pairing/start" => serde_json::json!({
++                        "pairingCode": "test-pairing-code",
++                        "manualPairingCode": "ABCD-EFGH",
++                        "environmentId": "test-environment",
++                        "expiresAt": 4_000_000_000_i64,
++                    }),
++                    method => panic!("unexpected remote control request: {method}"),
++                };
++                websocket
++                    .send(tokio_tungstenite::tungstenite::Message::Text(
++                        serde_json::json!({"id": request["id"], "result": result})
++                            .to_string()
++                            .into(),
++                    ))
++                    .await
++                    .expect("remote control response");
++            }
+         }
+     })
+ }
+@@ -949,6 +980,14 @@ async fn managed_auto_start_leaves_existing_daemon_remote_policy_unchanged() {
+     assert_eq!(reused.status, crate::LifecycleStatus::AlreadyRunning);
+     assert!(!daemon.load_settings().await.unwrap().remote_control_enabled);
+     assert_eq!(std::fs::read_to_string(&args_path).unwrap(), original_args);
++
++    let enrolled = daemon.run(crate::LifecycleCommand::Start).await.unwrap();
++    assert_eq!(enrolled.status, crate::LifecycleStatus::AlreadyRunning);
++    let settings: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(&daemon.settings_file).unwrap()).unwrap();
++    assert_eq!(settings["remoteControlEnabled"], true);
++    assert_eq!(settings["manualPairing"]["code"], "ABCD-EFGH");
++    assert_eq!(std::fs::read_to_string(&args_path).unwrap(), original_args);
+     daemon.stop().await.unwrap();
+     server.abort();
+ }
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -35,6 +35,7 @@ axum = { workspace = true, default-features = false, features = [
+     "ws",
+ ] }
+ codex-analytics = { workspace = true }
++codex-app-server-daemon = { workspace = true }
+ codex-agent-extension = { workspace = true }
+ codex-arg0 = { workspace = true }
+ codex-aws-auth = { workspace = true }
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -50,6 +50,7 @@ use crate::transport::start_websocket_acceptor;
+ use codex_analytics::AppServerRpcTransport;
+ use codex_app_server_protocol::ConfigWarningNotification;
+ use codex_app_server_protocol::JSONRPCMessage;
++use codex_app_server_protocol::RemoteControlPairingStartParams;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::TextPosition as AppTextPosition;
+ use codex_app_server_protocol::TextRange as AppTextRange;
+@@ -880,6 +881,44 @@ pub async fn run_main_with_transport_options(
+         remote_control_startup_mode,
+     )
+     .await?;
++    if managed_daemon
++        && remote_control_enabled
++        && auth_manager.auth_cached().is_some_and(|auth| {
++            auth.uses_codex_backend()
++                && matches!(
++                    auth.account_plan_type(),
++                    Some(
++                        codex_protocol::account::PlanType::Plus
++                            | codex_protocol::account::PlanType::Pro
++                            | codex_protocol::account::PlanType::ProLite
++                    )
++                )
++        })
++    {
++        let remote_control_handle = remote_control_handle.clone();
++        let shutdown = remote_control_shutdown_token.clone();
++        tokio::spawn(async move {
++            let pair_and_store = async {
++                let pairing = remote_control_handle
++                    .start_pairing(RemoteControlPairingStartParams { manual_code: true }, None)
++                    .await;
++                match pairing {
++                    Ok(pairing) => {
++                        if let Err(err) =
++                            codex_app_server_daemon::store_managed_manual_pairing(&pairing).await
++                        {
++                            warn!("failed to persist daemon manual pairing: {err:#}");
++                        }
++                    }
++                    Err(err) => warn!("daemon manual pairing is unavailable: {err}"),
++                }
++            };
++            tokio::select! {
++                _ = shutdown.cancelled() => {},
++                _ = pair_and_store => {},
++            }
++        });
++    }
+     if no_local_transport
+         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
+     {
+diff --git a/codex-rs/app-server/src/request_processors/remote_control_processor.rs b/codex-rs/app-server/src/request_processors/remote_control_processor.rs
+--- a/codex-rs/app-server/src/request_processors/remote_control_processor.rs
++++ b/codex-rs/app-server/src/request_processors/remote_control_processor.rs
+@@ -109,6 +109,9 @@ impl RemoteControlRequestProcessor {
+                 Err(err) => return Err(err),
+             };
+             settings.insert("remoteControlEnabled".to_string(), Value::Bool(enabled));
++            if !enabled {
++                settings.remove("manualPairing");
++            }
+             write_atomically(&path, &serde_json::to_string_pretty(&settings)?)
+         })
+         .await
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_control.rs b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+--- a/codex-rs/app-server/tests/suite/v2/remote_control.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+@@ -765,6 +765,12 @@ async fn managed_rpc_persists_unless_daemon_lock_is_busy() -> Result<()> {
+         serde_json::from_slice::<serde_json::Value>(&settings)?,
+         json!({"remoteControlEnabled": true})
+     );
++    settings = serde_json::to_vec(&json!({
++        "remoteControlEnabled": true,
++        "futureSetting": 42,
++        "manualPairing": {"code": "ABCD-EFGH", "expiresAt": 4_000_000_000_i64},
++    }))?;
++    tokio::fs::write(&settings_file, &settings).await?;
+     for (id, method, ephemeral) in [
+         (3, "remoteControl/disable", true),
+         (4, "remoteControl/disable", false),
+@@ -777,7 +783,7 @@ async fn managed_rpc_persists_unless_daemon_lock_is_busy() -> Result<()> {
+         } else {
+             assert_eq!(
+                 serde_json::from_slice::<serde_json::Value>(&updated)?,
+-                json!({"remoteControlEnabled": false})
++                json!({"remoteControlEnabled": false, "futureSetting": 42})
+             );
+         }
+         settings = updated;
+@@ -931,6 +937,73 @@ async fn remote_control_pairing_start_returns_pairing_artifacts() -> Result<()>
+     Ok(())
+ }
+ 
++#[tokio::test]
++#[serial]
++async fn managed_daemon_pairs_in_background_without_a_tui_client() -> Result<()> {
++    let codex_home = TempDir::new()?;
++    let codex_harness = TempDir::new()?;
++    let _backend = PairingRemoteControlBackend::start(codex_home.path()).await?;
++    write_chatgpt_auth(
++        codex_home.path(),
++        ChatGptAuthFixture::new("chatgpt-token")
++            .account_id("account_id")
++            .chatgpt_account_id("account_id")
++            .plan_type("plus"),
++        AuthCredentialsStoreMode::File,
++    )?;
++    let socket_path = codex_harness
++        .path()
++        .join("app-server-control/app-server.sock");
++    let settings_path = codex_harness.path().join("app-server-daemon/settings.json");
++    let transport =
++        AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
++    let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
++    let _codex_harness_guard = EnvVarGuard::set("CODEX_HARNESS", codex_harness.path().as_os_str());
++    let mut server =
++        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(run_main_with_transport_options(
++            Arg0DispatchPaths {
++                codex_self_exe: Some(std::env::current_exe()?),
++                codex_linux_sandbox_exe: None,
++                main_execve_wrapper_exe: None,
++            },
++            CliConfigOverrides::default(),
++            LoaderOverrides::with_managed_config_path_for_tests(
++                codex_home.path().join("managed_config.toml"),
++            ),
++            /*strict_config*/ false,
++            /*default_analytics_enabled*/ false,
++            transport,
++            SessionSource::VSCode,
++            WebsocketAuthSettings::default(),
++            AppServerRuntimeOptions {
++                managed_daemon: true,
++                remote_control_startup_mode: RemoteControlStartupMode::EnabledEphemeral,
++                install_shutdown_signal_handler: false,
++                plugin_startup_tasks: PluginStartupTasks::Skip,
++                ..Default::default()
++            },
++        )));
++    let pairing = tokio::select! {
++        result = &mut server => {
++            result??;
++            anyhow::bail!("managed daemon exited before pairing");
++        }
++        result = timeout(STARTUP_TIMEOUT, async {
++            loop {
++                if let Ok(contents) = tokio::fs::read(&settings_path).await
++                    && let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&contents)
++                    && settings["manualPairing"]["code"] == "ABCD-EFGH"
++                {
++                    return settings;
++                }
++                tokio::time::sleep(Duration::from_millis(25)).await;
++            }
++        }) => result.context("managed daemon did not persist its manual pairing")?,
++    };
++    assert_eq!(pairing["manualPairing"]["code"], "ABCD-EFGH");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn pairing_start_works_after_ephemeral_enable() -> Result<()> {
+     let codex_home = TempDir::new()?;

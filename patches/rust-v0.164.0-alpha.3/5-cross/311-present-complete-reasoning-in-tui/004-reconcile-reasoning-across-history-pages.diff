@@ -1,0 +1,358 @@
+reconcile-reasoning-across-history-pages
+
+Lane: cross
+
+Unit: present-complete-reasoning-in-tui
+
+ChildPatch: reconcile-reasoning-across-history-pages
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app/history_pagination.rs b/codex-rs/tui/src/app/history_pagination.rs
+--- a/codex-rs/tui/src/app/history_pagination.rs
++++ b/codex-rs/tui/src/app/history_pagination.rs
+@@ -119,6 +119,8 @@ impl App {
+         if !inserted.is_empty() {
+             self.join_older_activity_group(inserted.end, &turns);
+         }
++        self.reproject_loaded_reasoning(&turns, thread_id, &cwd, visibility);
++        self.chat_widget.remember_older_reasoning(&turns);
+         merge_older_turns(&mut store.lock().await.turns, turns);
+         self.scrollback_has_older_history = app_server.has_older_history(thread_id);
+         if self.backtrack.overlay_preview_active
+@@ -249,6 +251,73 @@ impl App {
+         cells
+     }
+ 
++    /// Reconcile turn-scoped deduplication when a page reveals an earlier copy of a block.
++    fn reproject_loaded_reasoning(
++        &mut self,
++        turns: &[Turn],
++        thread_id: ThreadId,
++        cwd: &AbsolutePathBuf,
++        visibility: RawReasoningVisibility,
++    ) {
++        if !self.local_settings.tui.fullscreen_transcript {
++            return;
++        }
++        let projected = turns
++            .iter()
++            .flat_map(|turn| {
++                thread_items_to_transcript_cells(
++                    Some(thread_id),
++                    cwd,
++                    turn.items
++                        .iter()
++                        .filter(|item| matches!(item, ThreadItem::Reasoning { .. }))
++                        .cloned(),
++                    visibility,
++                    true,
++                    Some(&self.config),
++                )
++            })
++            .filter_map(|cell| {
++                let id = cell
++                    .as_any()
++                    .downcast_ref::<history_cell::ReasoningSummaryCell>()?
++                    .source_item_id()?
++                    .to_owned();
++                Some((id, cell))
++            })
++            .collect::<std::collections::BTreeMap<_, _>>();
++        for index in 0..self.transcript_cells.len() {
++            let Some(reasoning) = self.transcript_cells[index]
++                .as_any()
++                .downcast_ref::<history_cell::ReasoningSummaryCell>()
++            else {
++                continue;
++            };
++            let Some(replacement) = reasoning.source_item_id().and_then(|id| projected.get(id))
++            else {
++                continue;
++            };
++            if reasoning.markdown_source()
++                == replacement
++                    .as_any()
++                    .downcast_ref::<history_cell::ReasoningSummaryCell>()
++                    .expect("reasoning projection")
++                    .markdown_source()
++            {
++                continue;
++            }
++            let range = index..index + 1;
++            self.native_history
++                .consolidate(&self.transcript_cells[range.clone()], replacement);
++            self.transcript_view
++                .replace_group(&self.transcript_cells, range.clone(), replacement);
++            if let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut() {
++                overlay.regroup_cells(range, Arc::clone(replacement));
++            }
++            self.transcript_cells[index] = Arc::clone(replacement);
++        }
++    }
++
+     /// Insert each page once, keeping session headers and any backtrack selection in place.
+     fn prepend_older_transcript_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) -> Range<usize> {
+         if self.backtrack.overlay_preview_active {
+diff --git a/codex-rs/tui/src/app/history_pagination_tests.rs b/codex-rs/tui/src/app/history_pagination_tests.rs
+--- a/codex-rs/tui/src/app/history_pagination_tests.rs
++++ b/codex-rs/tui/src/app/history_pagination_tests.rs
+@@ -100,6 +100,105 @@ async fn fork_lineage_stays_before_repeated_older_history_pages() {
+     "###);
+ }
+ 
++#[tokio::test]
++async fn older_reasoning_reprojects_loaded_duplicates_without_crossing_turns() {
++    let mut app = make_test_app().await;
++    let cwd = app.config.cwd.clone();
++    let thread_id = ThreadId::new();
++    let reasoning = |id: &str, text: &str| ThreadItem::Reasoning {
++        id: id.into(),
++        summary: vec![text.into()],
++        content: Vec::new(),
++    };
++    let mut first = turn("first", TurnStatus::Completed, &[]);
++    first.items = vec![
++        reasoning("older", "## Inspect\n\nRetained paragraph."),
++        reasoning("newer", "**Inspect**\n\nRetained paragraph.\n\nNew detail."),
++    ];
++    let mut second = turn("second", TurnStatus::Completed, &[]);
++    second.items = vec![reasoning("next-turn", "**Inspect**\n\nRetained paragraph.")];
++    for item in first.items.iter().chain(&second.items) {
++        app.transcript_cells
++            .extend(thread_items_to_transcript_cells(
++                Some(thread_id),
++                &cwd,
++                [item.clone()],
++                RawReasoningVisibility::Hidden,
++                true,
++                Some(&app.config),
++            ));
++    }
++    let area = ratatui::layout::Rect::new(0, 0, 80, 2);
++    app.transcript_view.jump_to_entry(&app.transcript_cells, 1);
++    let mut before = ratatui::buffer::Buffer::empty(area);
++    app.transcript_view
++        .render(area, &mut before, &app.transcript_cells);
++    use crossterm::event::MouseButton;
++    use crossterm::event::MouseEventKind;
++    for (kind, column) in [
++        (MouseEventKind::Down(MouseButton::Left), 2),
++        (MouseEventKind::Drag(MouseButton::Left), 8),
++        (MouseEventKind::Up(MouseButton::Left), 8),
++    ] {
++        app.transcript_view.handle_mouse(
++            crossterm::event::MouseEvent {
++                kind,
++                column,
++                row: 0,
++                modifiers: crossterm::event::KeyModifiers::NONE,
++            },
++            &app.transcript_cells,
++        );
++    }
++    let selected = app.transcript_view.selected_text(&app.transcript_cells);
++    assert!(selected.as_ref().is_some_and(|text| !text.is_empty()));
++    app.transcript_view
++        .render(area, &mut before, &app.transcript_cells);
++    let turns = vec![first, second];
++    app.reproject_loaded_reasoning(&turns, thread_id, &cwd, RawReasoningVisibility::Hidden);
++    let mut after = ratatui::buffer::Buffer::empty(area);
++    app.transcript_view
++        .render(area, &mut after, &app.transcript_cells);
++    assert_eq!(after, before);
++    assert_eq!(
++        app.transcript_view.selected_text(&app.transcript_cells),
++        selected
++    );
++    let sources = app
++        .transcript_cells
++        .iter()
++        .map(|cell| {
++            let reasoning = cell
++                .as_any()
++                .downcast_ref::<history_cell::ReasoningSummaryCell>()
++                .unwrap();
++            (
++                reasoning.source_item_id().unwrap().to_owned(),
++                reasoning.markdown_source().to_owned(),
++            )
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(
++        sources,
++        vec![
++            ("older".into(), "## Inspect\n\nRetained paragraph.".into()),
++            ("newer".into(), "New detail.".into()),
++            (
++                "next-turn".into(),
++                "**Inspect**\n\nRetained paragraph.".into()
++            )
++        ]
++    );
++    let retained = app.transcript_cells.clone();
++    app.reproject_loaded_reasoning(&turns, thread_id, &cwd, RawReasoningVisibility::Hidden);
++    assert!(
++        retained
++            .iter()
++            .zip(&app.transcript_cells)
++            .all(|(before, after)| Arc::ptr_eq(before, after))
++    );
++}
++
+ #[test]
+ fn repeated_prompt_matching_removes_only_the_hidden_occurrence() {
+     let cells = vec![user_cell("repeat"), user_cell("other"), user_cell("repeat")];
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -7,6 +7,62 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    /// Older pages can reveal a duplicate before reasoning retained in an active tool group.
++    pub(crate) fn remember_older_reasoning(&mut self, turns: &[Turn]) {
++        if !self.local_settings.tui.fullscreen_transcript {
++            return;
++        }
++        let Some(turn) = turns
++            .iter()
++            .find(|turn| Some(&turn.id) == self.turn_lifecycle.last_turn_id.as_ref())
++        else {
++            return;
++        };
++        let mut seen = std::collections::BTreeSet::new();
++        let mut changed = false;
++        for item in &turn.items {
++            let ThreadItem::Reasoning {
++                id,
++                summary,
++                content,
++            } = item
++            else {
++                continue;
++            };
++            if self.status_state.reasoning_item_id.as_ref() == Some(id)
++                || self.is_realtime_delegated_reasoning_item(&turn.id, id)
++            {
++                continue;
++            }
++            let mut cell = history_cell::new_visible_reasoning_block(
++                summary.iter().chain(
++                    self.config
++                        .show_raw_agent_reasoning
++                        .then_some(content)
++                        .into_iter()
++                        .flatten(),
++                ),
++                self.config.cwd.as_path(),
++                &mut seen,
++            );
++            cell.set_source_item_id(id.clone());
++            if let Some(active) = self.transcript.active_cell.as_mut() {
++                if let Some(exec) = active.as_any_mut().downcast_mut::<ExecCell>() {
++                    changed |= exec.group.details.replace_reasoning(Arc::from(cell));
++                } else if let Some(computer) = active
++                    .as_any_mut()
++                    .downcast_mut::<history_cell::ComputerActivityCell>()
++                {
++                    changed |= computer.group.details.replace_reasoning(Arc::from(cell));
++                }
++            }
++        }
++        self.reasoning_seen_blocks.extend(seen);
++        if changed {
++            self.bump_active_cell_revision();
++        }
++    }
++
+     /// Restores the active typed reasoning item after a thread switch or session refresh.
+     /// Its completion carries the full summary if the bounded event buffer lost earlier deltas.
+     pub(crate) fn restore_active_reasoning_item(
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_projection.rs b/codex-rs/tui/src/chatwidget/tests/history_projection.rs
+--- a/codex-rs/tui/src/chatwidget/tests/history_projection.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_projection.rs
+@@ -283,6 +283,57 @@ async fn snapshot_formatter_reasoning_matches_compact_and_detailed_replay() {
+     insta::assert_snapshot!(snapshots.join("\n"));
+ }
+ 
++#[tokio::test]
++async fn older_reasoning_updates_pending_tool_details_and_later_completions() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
++    drain_insert_history(&mut rx);
++    chat.turn_lifecycle.last_turn_id = Some("turn".into());
++    chat.on_task_started();
++    let command = |status: &str| {
++        serde_json::from_value(serde_json::json!({
++        "type": "commandExecution", "id": "pending", "command": "cat source.rs", "cwd": chat.config.cwd,
++        "source": "agent", "status": status,
++        "commandActions": [{"type": "read", "command": "cat source.rs", "name": "source.rs", "path": "source.rs"}],
++        "aggregatedOutput": "Complete command output", "exitCode": 0, "durationMs": 10
++    })).unwrap()
++    };
++    let started = command("inProgress");
++    let completed = command("completed");
++    let reasoning = |id: &str, text: &str| AppServerThreadItem::Reasoning {
++        id: id.into(),
++        summary: vec![text.into()],
++        content: Vec::new(),
++    };
++    let newer = reasoning("newer", "Shared paragraph.\n\nNew detail.");
++    chat.handle_command_execution_started_now(started);
++    chat.replay_thread_item(newer.clone(), "turn".into(), ReplayKind::ThreadSnapshot);
++    let before = chat.active_cell_transcript_lines(80).unwrap();
++    assert!(lines_to_single_string(&before).contains("Shared paragraph."));
++    chat.remember_older_reasoning(&[AppServerTurn {
++        items: vec![reasoning("older", "Shared paragraph."), newer],
++        ..app_server_turn("turn", AppServerTurnStatus::InProgress, None, None)
++    }]);
++    let active = lines_to_single_string(&chat.active_cell_transcript_lines(80).unwrap());
++    assert!(!active.contains("Shared paragraph."));
++    assert!(active.contains("New detail."));
++    chat.handle_command_execution_completed_now(completed);
++    chat.replay_thread_item(
++        reasoning("last", "Shared paragraph."),
++        "turn".into(),
++        ReplayKind::ThreadSnapshot,
++    );
++    let cells = take_history_cells(&mut rx);
++    let rendered = cells
++        .iter()
++        .flat_map(|cell| cell.raw_lines())
++        .map(|line| line.to_string())
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Complete command output"));
++    assert_eq!(rendered.matches("New detail.").count(), 1);
++    assert!(!rendered.contains("Shared paragraph."));
++}
++
+ #[test]
+ fn raw_reasoning_keeps_its_own_heading() {
+     let projected = thread_items_to_transcript_cells(
+diff --git a/codex-rs/tui/src/history_cell/activity_details.rs b/codex-rs/tui/src/history_cell/activity_details.rs
+--- a/codex-rs/tui/src/history_cell/activity_details.rs
++++ b/codex-rs/tui/src/history_cell/activity_details.rs
+@@ -17,6 +17,19 @@ pub(crate) struct ActivityDetails {
+ }
+ 
+ impl ActivityDetails {
++    pub(crate) fn replace_reasoning(&mut self, replacement: Arc<ReasoningSummaryCell>) -> bool {
++        for (_, cell) in &mut self.entries {
++            if let Some(reasoning) = cell.as_any().downcast_ref::<ReasoningSummaryCell>()
++                && reasoning.source_item_id() == replacement.source_item_id()
++                && reasoning.markdown_source() != replacement.markdown_source()
++            {
++                *cell = replacement;
++                return true;
++            }
++        }
++        false
++    }
++
+     pub(crate) fn has_visible_reasoning(&self) -> bool {
+         self.entries.iter().any(|(_, cell)| {
+             cell.as_any()

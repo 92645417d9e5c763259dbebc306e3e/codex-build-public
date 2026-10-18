@@ -1,0 +1,1065 @@
+render-shared-tables-for-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: render-shared-tables-for-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Present one Alt+grave control center with Summary and Responses tabs, full-screen usage and quota reports, runtime observations and complete formal-interface consumption.
+
+Requires: Unit:cross/host-dialogs-with-shared-resources, Unit:cross/materialize-model-catalog-from-local-file, Unit:cross/report-usage-via-session-files, Unit:cross/track-model-responses-by-attempt, Unit:cross/present-response-progress-with-live-timing, Unit:cross/coordinate-client-lifecycle-for-local-daemons, Unit:cross/configure-application-proxy-at-runtime, Unit:cross/send-notifications-through-telegram, Unit:cross/report-storage-capacity-for-local-roots, Unit:cross/measure-websocket-round-trips-with-ping-pong
+
+Provides: Share merged-cell tables, compact token display with exact integer copying, theme-derived categorical colors and numeric shading. Allocate predictable format-derived column minimums through one shared layout, retain bounded exceptional values and exact-copy text, and size variable model labels from content. Give every visible header equal left and right padding at effective minimum, maximum and intermediate widths through parity-preserving bounds and growth, using necessary synonymous names while retaining column groups. Preserve stable status widths, model colors, red mismatches and failed Attempt IDs, served-label truncation, unhighlighted scrolling and content-bearing viewport fragments. Every painted cell interior copies its full logical value through the native clipboard worker with truthful shared bottom-right feedback; wheel scrolling preserves configured speed and fractional accumulation, Ctrl+Left/Right and Shift+Left/Right move table columns, and plain arrows retain page actions. Give every usage period, All aggregate and heatmap-selected day the same two-cell date header aligned with its model column. Retain usage and prices, default Summary to the latest usage day, label every heatmap weekday with its three-letter name, and open All through Yearly plus actual Credits before Weekly as auxiliary screens. Give quota and credit periods a blank-header cursor column and italic selected row, with cached per-model usage beside the period tables and no repeated date header. Present aligned lowercase shortcuts, refresh hints, cache freshness, full-history totals and streaks, catalog labels, per-model Last and rolling 24H TPS P50/P05 and TTFC P50/P95 with independent valid samples, per-model and total Done/total success rates with one blank row between the 24H total and model list, RTT, proxy, client count, Home and Harness capacity, and sidebar quota means and the latest quota-window estimate with themed section and model subtitles. Integrate fixed grouped response columns, paging, live updates and combined model/status filters cycled by plain Left/Right with horizontal access. Keep Attempt ID as the sole response identity. Route usage refresh, centered Proxy and Telegram dialogs hosted by shared resources over the retained control center, and confirmed idle last-client shutdown through one overlay. Refresh a visible Responses persistence error from the shared in-memory timing summary and clear it after recovery without reloading usage or prices. Stack Summary details below reports that do not fit beside them. Place loading indicators bottom-right, hide stale usage during refresh, and display the complete producer Build duration retained by each successful cached snapshot, including measured zero and reads by a newly opened client. Centralize descending semantic-key ordering before formatting for usage periods, models, quota cycles and Credits while retaining response paging order. Show a centered usage-build dialog while usage/read is pending, with real producer phases, completed candidate-file counts, a live reading-only file percentage shown as text, and separately labeled elapsed request wait time. Use the shared shaded body, terminal-background shortcut footer and padding. Respect native motion preferences without inventing a report-wide percentage or ETA. Successful completion closes the dialog and failures display their actual error. Escape hides only the dialog while the request and shared build continue; reopening Control Center reuses the pending request, its clock and latest progress.
+
+Boundary: Own TUI presentation, transient interaction and formal-interface consumption only. Collection, pricing, quota, caches, response storage, settings persistence and daemon admission remain with their existing owners. Use shared dialog resources and an independent Control Center DialogStack for settings, usage progress and shutdown dialogs, without routing their input or painting through ChatWidget. Preserve native configuration operations, the ordinary settings host and the control-center view on dialog closure. Preserve native analytics, slash quits, report contents, raw identifiers, unknown and zero values, and transcript footer copy feedback. Use catalog display names without changing record identity or pricing. Keep one entry and perform no scan or database query during drawing or period selection. The r action refreshes only usage; response history and timing remain automatic. Snapshot producers own build duration and cached quota-period model usage. Display unavailable duration and model detail explicitly when an older running server omits those fields, without restarting it, substituting client wait time for producer build duration, or deriving missing cached model detail from approximate daily aggregation. Request-scoped progress remains separate from response-attempt observations and never creates a second scan or render-time RPC.
+
+Verification: Focused shared-table, usage, heatmap and quota checks cover values, themes, exact symmetric padding at every effective width, Unicode labels, date geometry, semantic ordering, format floors across empty/live rows, merged sizing, adaptive allocation and horizontal overflow. Interaction checks cover every cell including merged headers, full text, padding, borders, clipping, exact token and truncated model copying, keyboard scrolling, responsive Summary stacking, loading placement, resize, fractional wheel and clipboard completion. Response table and paging checks cover grouped headers, stable numeric/status widths, catalog labels, colors, mismatch truncation, live clocks, stale-result rejection, combined filters and unknown metrics. Overlay and app checks cover two tabs, auxiliary report return, latest-day selection, all weekday labels, themed shortcuts, footer-only filters, painted-frame copy ownership, quota means, usage statistics, centered settings input/save/cancel and guarded shutdown. Observation checks cover per-model and total recent-24H success accounting independently of timing validity, hidden stale usage, refresh ownership across reopen and completion while closed, producer duration shared by refreshed and cached reports including zero and older-server absence, stale completion rejection and independent metric sample counts. Unordered snapshot replacement remains ordered without navigation, including timestamp offsets and model names independent of cost. Shared-dialog integration covers nested completion, masked input, current keymaps, covered-view updates and retained control-center state. Latest quota selection compares actual window instants across unordered data and timezone offsets, including provisional and zero estimates. Persistence-status refresh covers recovery, retained terminal errors, bounded request scheduling and stale completion rejection without reloading response pages, usage or prices. Quotas checks keep Credits before Weekly and verify cursor selection, italic rows, cached right-hand model detail, missing older-server detail, omitted duplicate dates and clipped copy regions. Responses checks retain one blank row after the total success line without changing model layouts. Settings integration preserves native popup backgrounds in both themes and hosts. Progress checks cover shared body and footer surfaces, text-only live percentages, request correlation, stale notifications, real file progress confined to reading, unknown totals and older-server waiting state, preserved elapsed clocks across reopening, Escape hiding without cancellation, completion and errors, native dialog input isolation and retained settings dialogs.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/tui/src/control_center_table.rs b/codex-rs/tui/src/control_center_table.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/control_center_table.rs
+@@ -0,0 +1,926 @@
++//! Shared control-center cells, numeric shading, and bounded tables with merged cells.
++
++use crate::color::blend;
++use crate::render::highlight::convert_syntect_color;
++use crate::render::highlight::current_syntax_theme;
++use crate::render::highlight::foreground_style_for_scopes;
++use crate::render::renderable::Renderable;
++use crate::style::accent_style;
++use crate::style::readable_color_on;
++use crate::style::table_separator_style;
++use crate::style::theme_color_on;
++use crate::terminal_palette::best_color;
++use crate::terminal_palette::default_bg;
++use itertools::Itertools;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Color;
++use ratatui::style::Style;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
++use unicode_width::UnicodeWidthStr;
++
++// Two interior padding cells and the next border belong to each physical column.
++const COLUMN_SPACING: usize = 3;
++
++/// Resolve theme scopes once for a complete report or response-table frame.
++pub(crate) struct Palette {
++    header: Style,
++    separator: Style,
++    intensities: [Style; 17],
++    models: Vec<Style>,
++    pub(crate) effort: Style,
++    pub(crate) success: Style,
++    pub(crate) attention: Style,
++    pub(crate) failure: Style,
++}
++
++impl Palette {
++    pub(crate) fn current() -> Self {
++        let mut header = accent_style();
++        if let Some(color) = header.fg {
++            header = header.fg(readable_color_on(color, None));
++        }
++        let numeric = foreground_style_for_scopes(&["constant.numeric"])
++            .and_then(|style| style.fg)
++            .or_else(|| {
++                current_syntax_theme()
++                    .settings
++                    .foreground
++                    .and_then(convert_syntect_color)
++            })
++            .unwrap_or(Color::Reset);
++        Self {
++            header,
++            separator: table_separator_style(),
++            intensities: std::array::from_fn(|level| intensity_style(numeric, level)),
++            models: [
++                "entity.name.type",
++                "string",
++                "constant.numeric",
++                "keyword",
++                "entity.name.function",
++                "variable.parameter",
++                "storage.modifier",
++            ]
++            .into_iter()
++            .map(|scope| theme_color_on(&[scope], None))
++            .unique()
++            .map(|color| Style::default().fg(color))
++            .collect(),
++            effort: Style::default().fg(theme_color_on(&["storage.modifier"], None)),
++            success: Style::default().fg(theme_color_on(&["string"], None)),
++            attention: Style::default().fg(theme_color_on(&["keyword"], None)),
++            failure: Style::default().fg(theme_color_on(&["invalid"], None)),
++        }
++    }
++
++    pub(crate) fn header(&self, text: &str) -> Cell {
++        Cell {
++            style: self.header,
++            ..Cell::text(text)
++        }
++    }
++
++    pub(crate) fn intensity(&self, level: usize) -> Style {
++        self.intensities[level]
++    }
++
++    pub(crate) fn model(&self, index: usize) -> Style {
++        self.models[index % self.models.len()]
++    }
++}
++
++pub(crate) struct Cell {
++    pub(crate) lines: Vec<Line<'static>>,
++    pub(crate) value: Option<f64>,
++    pub(crate) right: bool,
++    pub(crate) rows: usize,
++    pub(crate) columns: usize,
++    pub(crate) style: Style,
++}
++
++impl Cell {
++    pub(crate) fn text(text: impl Into<String>) -> Self {
++        Self::lines(
++            text.into()
++                .split('\n')
++                .map(|line| line.to_owned().into())
++                .collect(),
++        )
++    }
++
++    pub(crate) fn lines(lines: Vec<Line<'static>>) -> Self {
++        Self {
++            lines,
++            value: None,
++            right: false,
++            rows: 1,
++            columns: 1,
++            style: Style::default(),
++        }
++    }
++
++    pub(crate) fn number(text: impl Into<String>) -> Self {
++        Self {
++            right: true,
++            ..Self::text(text)
++        }
++    }
++
++    pub(crate) fn spanning(mut self, rows: usize, columns: usize) -> Self {
++        self.rows = rows;
++        self.columns = columns;
++        self
++    }
++
++    pub(crate) fn value(value: Option<f64>, text: impl Into<String>) -> Self {
++        Self {
++            value,
++            ..Self::number(text)
++        }
++    }
++}
++
++pub(crate) fn compact_count(value: u64) -> String {
++    if value >= 1_000_000_000 {
++        format!("{:.2}B", value as f64 / 1_000_000_000.0)
++    } else if value >= 1_000_000 {
++        format!("{:.2}M", value as f64 / 1_000_000.0)
++    } else if value >= 1_000 {
++        format!("{:.2}K", value as f64 / 1_000.0)
++    } else {
++        value.to_string()
++    }
++}
++
++/// Order logical rows before formatting, clipping, shading, or adding headers and totals.
++pub(crate) fn descending_rows<T, K: Ord>(
++    rows: impl IntoIterator<Item = T>,
++    mut key: impl FnMut(&T) -> K,
++) -> Vec<T> {
++    let mut rows: Vec<_> = rows.into_iter().collect();
++    rows.sort_by_cached_key(|row| std::cmp::Reverse(key(row)));
++    rows
++}
++
++/// Content widths exclude padding and borders. A presentation limit retains the full
++/// logical value for copying while bounding exceptional values with the table's ellipsis.
++#[derive(Clone, Copy)]
++pub(crate) struct Column {
++    minimum: usize,
++    maximum: usize,
++}
++
++impl Column {
++    /// Reserve format-sized bounds, including at most one cell for symmetric headers.
++    /// Matching label parity lets every later growth step preserve equal padding.
++    pub(crate) fn new(label: &str, minimum: usize, maximum: usize) -> Self {
++        let label_width = label.width();
++        let maximum = maximum.max(label_width);
++        let maximum = maximum + maximum.abs_diff(label_width) % 2;
++        let minimum = minimum.max(label_width).min(maximum);
++        Self {
++            minimum: minimum + minimum.abs_diff(label_width) % 2,
++            maximum,
++        }
++    }
++
++    pub(crate) fn maximum(self) -> usize {
++        self.maximum
++    }
++}
++
++/// Allocate from format-derived floors toward actual content, including merged cells.
++/// A narrow viewport never shrinks a floor; horizontal scrolling owns the overflow.
++pub(crate) fn widths(available: u16, columns: &[Column], rows: &[Vec<Cell>]) -> Vec<usize> {
++    let (placed, _) = place_cells(columns.len(), rows);
++    let mut desired: Vec<_> = columns.iter().map(|column| column.minimum).collect();
++    let maxima: Vec<_> = columns.iter().map(|column| column.maximum).collect();
++    for entry in &placed {
++        if entry.cell.columns == 1 {
++            let needed = desired[entry.column]
++                .max(entry.cell.lines.iter().map(Line::width).max().unwrap_or(0))
++                .min(columns[entry.column].maximum);
++            desired[entry.column] = needed + needed.abs_diff(columns[entry.column].minimum) % 2;
++        }
++    }
++    for entry in &placed {
++        if entry.cell.columns > 1 {
++            let range = entry.column..entry.column + entry.cell.columns;
++            let needed = entry.cell.lines.iter().map(Line::width).max().unwrap_or(0);
++            let present = desired[range.clone()].iter().sum::<usize>()
++                + (entry.cell.columns - 1) * COLUMN_SPACING;
++            grow_columns(
++                &mut desired[range.clone()],
++                &maxima[range],
++                needed.saturating_sub(present).next_multiple_of(2),
++            );
++        }
++    }
++    let room = usize::from(available).saturating_sub(columns.len() * COLUMN_SPACING + 1);
++    let mut widths: Vec<_> = columns.iter().map(|column| column.minimum).collect();
++    let remaining = room.saturating_sub(widths.iter().sum());
++    grow_columns(&mut widths, &desired, remaining);
++    widths
++}
++
++fn grow_columns(widths: &mut [usize], desired: &[usize], mut remaining: usize) {
++    while remaining >= 2 {
++        let mut grew = false;
++        for (width, desired) in widths.iter_mut().zip(desired) {
++            if remaining >= 2 && *width < *desired {
++                *width += 2;
++                remaining -= 2;
++                grew = true;
++            }
++        }
++        if !grew {
++            break;
++        }
++    }
++}
++
++struct Placed<'a> {
++    cell: &'a Cell,
++    row: usize,
++    column: usize,
++}
++
++fn place_cells(columns: usize, rows: &[Vec<Cell>]) -> (Vec<Placed<'_>>, Vec<Vec<usize>>) {
++    let mut placed = Vec::new();
++    let mut owners = vec![vec![usize::MAX; columns]; rows.len()];
++    for (row, cells) in rows.iter().enumerate() {
++        let mut column = 0;
++        for cell in cells {
++            while column < columns && owners[row][column] != usize::MAX {
++                column += 1;
++            }
++            assert!(cell.rows > 0 && cell.columns > 0);
++            assert!(row + cell.rows <= rows.len() && column + cell.columns <= columns);
++            for occupied in &mut owners[row..row + cell.rows] {
++                for slot in &mut occupied[column..column + cell.columns] {
++                    assert_eq!(*slot, usize::MAX, "overlapping table cells");
++                    *slot = placed.len();
++                }
++            }
++            placed.push(Placed { cell, row, column });
++            column += cell.columns;
++        }
++        assert!(owners[row].iter().all(|owner| *owner != usize::MAX));
++    }
++    (placed, owners)
++}
++
++/// Center the longest visible label, then align every label to its left edge.
++pub(crate) fn center_left_column(rows: &mut [Vec<Cell>], column: usize, width: usize) {
++    let text_width = rows
++        .iter()
++        .flat_map(|row| &row[column].lines)
++        .map(Line::width)
++        .max()
++        .unwrap_or_default()
++        .min(width);
++    for row in rows {
++        for line in &mut row[column].lines {
++            let padding = text_width.saturating_sub(line.width());
++            if padding > 0 {
++                line.spans.push(Span::from(" ".repeat(padding)));
++            }
++        }
++    }
++}
++
++pub(crate) fn shade_columns(rows: &mut [Vec<Cell>], palette: &Palette) {
++    for column in 0..rows.iter().map(Vec::len).max().unwrap_or(0) {
++        let scale = rows
++            .iter()
++            .filter_map(|row| row.get(column)?.value)
++            .filter(|value| *value > 0.0)
++            .sorted_by(f64::total_cmp)
++            .dedup()
++            .collect::<Vec<_>>();
++        for cell in rows.iter_mut().filter_map(|row| row.get_mut(column)) {
++            if let Some(value) = cell.value.filter(|value| *value > 0.0) {
++                let rank = scale.partition_point(|candidate| *candidate < value);
++                cell.style = cell.style.patch(palette.intensity(if scale.len() == 1 {
++                    16
++                } else {
++                    1 + rank * 15 / (scale.len() - 1)
++                }));
++            }
++        }
++    }
++}
++
++pub(crate) struct Table {
++    lines: Vec<Line<'static>>,
++    separator: Style,
++    // Physical row starts and their column edges preserve merged cells at viewport cuts.
++    row_edges: Vec<(usize, Vec<usize>)>,
++}
++
++impl Table {
++    fn cap(&self, after: usize, bottom: bool) -> Line<'static> {
++        let row = self.row_edges.partition_point(|(start, _)| *start <= after) - 1;
++        let columns = &self.row_edges[row].1;
++        let style = self.separator;
++        let mut spans = vec![Span::styled(if bottom { "└" } else { "┌" }, style)];
++        for (index, pair) in columns.windows(2).enumerate() {
++            spans.push(Span::styled("─".repeat(pair[1] - pair[0] - 1), style));
++            let edge = if index + 2 == columns.len() {
++                if bottom { "┘" } else { "┐" }
++            } else if bottom {
++                "┴"
++            } else {
++                "┬"
++            };
++            spans.push(Span::styled(edge, style));
++        }
++        spans.into()
++    }
++}
++
++impl Renderable for Table {
++    fn desired_width(&self) -> u16 {
++        self.lines
++            .first()
++            .map_or(0, Line::width)
++            .min(usize::from(u16::MAX)) as u16
++    }
++
++    fn desired_height(&self, _width: u16) -> u16 {
++        self.lines.len().min(usize::from(u16::MAX)) as u16
++    }
++
++    fn render(&self, area: Rect, buf: &mut Buffer) {
++        self.render_scrolled(area, buf, 0);
++    }
++
++    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
++        self.render_viewport(area, buf, scroll_offset, 0)
++    }
++}
++
++impl Table {
++    pub(crate) fn render_viewport(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> bool {
++        let offset = usize::from(scroll_offset);
++        let mut height = usize::from(area.height).min(self.lines.len().saturating_sub(offset));
++        if offset + height < self.lines.len()
++            && height > 2
++            && self
++                .row_edges
++                .binary_search_by_key(&(offset + height - 2), |(start, _)| *start)
++                .is_ok()
++        {
++            // Close above an orphan separator, at the last displayed content row.
++            // Keep source offsets unchanged so overlapping pages retain every row.
++            height -= 1;
++        }
++        // Borders without an interior row are not a useful table fragment.
++        if height < 3 {
++            return true;
++        }
++        for (row, line) in self.lines.iter().skip(offset).take(height).enumerate() {
++            let cap = if height > 1 && row == 0 && offset > 0 {
++                Some(self.cap(offset, false))
++            } else if row + 1 == height && offset + height < self.lines.len() {
++                Some(self.cap(offset + height.saturating_sub(2), true))
++            } else {
++                None
++            };
++            let line = cap.as_ref().unwrap_or(line);
++            let row_area = Rect::new(area.x, area.y + row as u16, area.width, 1);
++            if horizontal_offset == 0 {
++                Widget::render(line, row_area, buf);
++            } else {
++                Paragraph::new(line.clone())
++                    .scroll((0, horizontal_offset))
++                    .render(row_area, buf);
++            }
++        }
++        true
++    }
++}
++
++/// Every row supplies only cells that start there; spanned positions are omitted.
++pub(crate) fn render(widths: &[usize], rows: &[Vec<Cell>], palette: &Palette) -> Table {
++    if rows.is_empty() || widths.is_empty() {
++        return Table {
++            lines: Vec::new(),
++            separator: palette.separator,
++            row_edges: Vec::new(),
++        };
++    }
++    let (placed, owners) = place_cells(widths.len(), rows);
++    let mut heights = vec![1; rows.len()];
++    for entry in &placed {
++        if entry.cell.rows == 1 {
++            heights[entry.row] = heights[entry.row].max(entry.cell.lines.len());
++        }
++    }
++    for entry in &placed {
++        let end = entry.row + entry.cell.rows;
++        let available = heights[entry.row..end].iter().sum::<usize>() + entry.cell.rows - 1;
++        heights[end - 1] += entry.cell.lines.len().saturating_sub(available);
++    }
++    let mut boundaries = vec![0];
++    for height in &heights {
++        boundaries.push(boundaries.last().unwrap() + height + 1);
++    }
++    let horizontal = |row: usize, column: usize| {
++        row == 0 || row == rows.len() || owners[row - 1][column] != owners[row][column]
++    };
++    let vertical = |row: usize, column: usize| {
++        column == 0 || column == widths.len() || owners[row][column - 1] != owners[row][column]
++    };
++    let junction = |row: usize, column: usize| {
++        let north = row > 0 && vertical(row - 1, column);
++        let south = row < rows.len() && vertical(row, column);
++        let west = column > 0 && horizontal(row, column - 1);
++        let east = column < widths.len() && horizontal(row, column);
++        let mask =
++            u8::from(north) | u8::from(south) << 1 | u8::from(west) << 2 | u8::from(east) << 3;
++        match mask {
++            15 => "┼",
++            14 => "┬",
++            13 => "┴",
++            11 => "├",
++            7 => "┤",
++            10 => "┌",
++            6 => "┐",
++            9 => "└",
++            5 => "┘",
++            3 => "│",
++            12 => "─",
++            _ => " ",
++        }
++    };
++    let content = |entry: &Placed<'_>, y: usize| {
++        let width = widths[entry.column..entry.column + entry.cell.columns]
++            .iter()
++            .sum::<usize>()
++            + (entry.cell.columns - 1) * COLUMN_SPACING;
++        let height = boundaries[entry.row + entry.cell.rows] - boundaries[entry.row] - 1;
++        let offset = y - boundaries[entry.row] - 1;
++        cell_line(entry.cell, width, offset, height)
++    };
++    let mut lines = Vec::with_capacity(boundaries.last().unwrap() + 1);
++    let separator = palette.separator;
++    for row in 0..=rows.len() {
++        let mut spans = Vec::new();
++        let mut column = 0;
++        while column < widths.len() {
++            spans.push(Span::styled(junction(row, column), separator));
++            if horizontal(row, column) {
++                spans.push(Span::styled("─".repeat(widths[column] + 2), separator));
++                column += 1;
++            } else {
++                let entry = &placed[owners[row][column]];
++                spans.extend(content(entry, boundaries[row]));
++                column += entry.cell.columns;
++            }
++        }
++        spans.push(Span::styled(junction(row, column), separator));
++        lines.push(spans.into());
++        if row == rows.len() {
++            break;
++        }
++        for y in 0..heights[row] {
++            let mut spans = vec![Span::styled("│", separator)];
++            let mut column = 0;
++            while column < widths.len() {
++                let entry = &placed[owners[row][column]];
++                spans.extend(content(entry, boundaries[row] + y + 1));
++                spans.push(Span::styled("│", separator));
++                column += entry.cell.columns;
++            }
++            lines.push(spans.into());
++        }
++    }
++    let mut columns = vec![0];
++    for width in widths {
++        columns.push(columns.last().unwrap() + width + 3);
++    }
++    let row_edges = boundaries
++        .into_iter()
++        .take(rows.len())
++        .enumerate()
++        .map(|(row, start)| {
++            let edges = columns
++                .iter()
++                .enumerate()
++                .filter(|(column, _)| vertical(row, *column))
++                .map(|(_, x)| *x)
++                .collect();
++            (start, edges)
++        })
++        .collect();
++    Table {
++        lines,
++        separator,
++        row_edges,
++    }
++}
++
++fn cell_line(cell: &Cell, width: usize, row: usize, height: usize) -> Vec<Span<'static>> {
++    let padding_top = height.saturating_sub(cell.lines.len()) / 2;
++    let line = row
++        .checked_sub(padding_top)
++        .and_then(|row| cell.lines.get(row))
++        .cloned()
++        .unwrap_or_default();
++    let mut line = crate::line_truncation::truncate_line_with_ellipsis_if_overflow(line, width);
++    let padding = width.saturating_sub(line.width());
++    let left = if cell.right { padding } else { padding / 2 };
++    line.spans.insert(0, Span::from(" ".repeat(left + 1)));
++    line.spans.push(Span::from(" ".repeat(padding - left + 1)));
++    for span in &mut line.spans {
++        span.style = cell.style.patch(line.style).patch(span.style);
++    }
++    line.spans
++}
++
++fn intensity_style(color: Color, level: usize) -> Style {
++    let color = if let Color::Rgb(red, green, blue) = color
++        && let Some(background) = default_bg()
++    {
++        let alpha = if level == 0 {
++            0.15
++        } else {
++            0.5 + level as f32 / 32.0
++        };
++        best_color(blend((red, green, blue), background, alpha))
++    } else {
++        color
++    };
++    let style = Style::default().fg(if level == 0 {
++        color
++    } else {
++        readable_color_on(color, None)
++    });
++    if level <= 5 {
++        style.dim()
++    } else if level >= 12 {
++        style.bold()
++    } else {
++        style
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use itertools::Itertools;
++    use ratatui::style::Color;
++    use unicode_width::UnicodeWidthStr;
++
++    #[test]
++    fn headers_keep_equal_padding_at_every_width_including_unicode_and_merged_cells() {
++        let palette = Palette::current();
++        let columns = [
++            Column::new("模型", 7, 20),
++            Column::new("Value", 8, 20),
++            Column::new("Amount", 9, 20),
++        ];
++        let rows = vec![
++            vec![
++                palette.header("Fields").spanning(1, 2),
++                palette.header("Amount").spanning(2, 1),
++            ],
++            vec![palette.header("模型"), palette.header("Value")],
++            vec![
++                Cell::text("long-model".repeat(10)),
++                Cell::text("long-value".repeat(10)),
++                Cell::number("1234567890123456789012345"),
++            ],
++        ];
++        for available in (0..=120).chain([u16::MAX]) {
++            let widths = widths(available, &columns, &rows);
++            for (index, label) in ["模型", "Value", "Amount"].into_iter().enumerate() {
++                assert_eq!(widths[index] % 2, label.width() % 2);
++            }
++            let table = render(&widths, &rows, &palette);
++            for label in ["Fields", "模型", "Value", "Amount"] {
++                let (line, index) = table
++                    .lines
++                    .iter()
++                    .find_map(|line| {
++                        line.spans
++                            .iter()
++                            .position(|span| span.content == label)
++                            .map(|index| (line, index))
++                    })
++                    .expect("every header remains visible");
++                assert_eq!(line.spans[index - 1].width(), line.spans[index + 1].width());
++            }
++        }
++    }
++
++    #[test]
++    fn format_floors_survive_empty_rows_and_narrow_viewports() {
++        let columns = [
++            Column::new("Model", 12, 30),
++            Column::new("Tokens", "0.00K".len(), 10),
++            Column::new("Hit", "100.00%".len(), 7),
++        ];
++        let empty = widths(80, &columns, &[]);
++        assert_eq!(empty, [13, 6, 7]);
++        for count in [0, 999, 1_000, 1_000_000] {
++            let rows = vec![vec![
++                Cell::text("model"),
++                Cell::number(compact_count(count)),
++                Cell::number("0.00%"),
++            ]];
++            assert_eq!(widths(80, &columns, &rows), empty);
++            assert_eq!(widths(1, &columns, &rows), empty);
++        }
++        for (count, expected) in [(999_999, 8), (u64::MAX, 10)] {
++            let rows = vec![vec![
++                Cell::text("model"),
++                Cell::number(compact_count(count)),
++                Cell::number("0.00%"),
++            ]];
++            assert_eq!(widths(80, &columns, &rows), [13, expected, 7]);
++            assert_eq!(widths(1, &columns, &rows), empty);
++        }
++    }
++
++    #[test]
++    fn content_allocation_uses_display_cells_padding_and_available_room() {
++        let columns = [Column::new("Model", 0, 20), Column::new("Value", 0, 20)];
++        let rows = vec![vec![Cell::text("模型名称较长"), Cell::text("long value")]];
++        // Header parity reserves 13 and 11 cells for the 12- and 10-cell values.
++        assert_eq!(widths(100, &columns, &rows), [13, 11]);
++        assert_eq!(widths(19, &columns, &rows), [7, 5]);
++        assert_eq!(widths(1, &columns, &rows), [5, 5]);
++        let table = render(&widths(29, &columns, &rows), &rows, &Palette::current());
++        assert_eq!(table.desired_width(), 29);
++    }
++
++    #[test]
++    fn merged_cell_sizing_and_rendering_use_the_same_physical_columns() {
++        let palette = Palette::current();
++        let columns = [
++            Column::new("Date", 0, 10),
++            Column::new("In", 0, 8),
++            Column::new("Out", 0, 8),
++        ];
++        let rows = vec![
++            vec![
++                palette.header("Date").spanning(2, 1),
++                palette.header("Long context").spanning(1, 2),
++            ],
++            vec![palette.header("In"), palette.header("Out")],
++            vec![
++                Cell::text("2026-10-14"),
++                Cell::number("1"),
++                Cell::number("2"),
++            ],
++        ];
++        let widths = widths(80, &columns, &rows);
++        assert_eq!(widths, [10, 4, 5]);
++        let table = render(&widths, &rows, &palette);
++        assert_eq!(table.desired_width(), 29);
++        assert!(
++            table
++                .lines
++                .iter()
++                .any(|line| line.to_string().contains("Long context"))
++        );
++    }
++
++    pub(crate) fn render_lines(
++        content: Vec<Box<dyn Renderable>>,
++        width: u16,
++    ) -> Vec<Line<'static>> {
++        let height = content.iter().map(|item| item.desired_height(width)).sum();
++        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
++        let mut y = 0;
++        for item in content {
++            let height = item.desired_height(width);
++            item.render(Rect::new(0, y, width, height), &mut buffer);
++            y += height;
++        }
++        buffer
++            .content
++            .chunks_exact(usize::from(width))
++            .map(|row| {
++                let mut spans: Vec<Span<'static>> = Vec::new();
++                let mut continuation = 0;
++                for cell in row {
++                    if continuation > 0 {
++                        continuation -= 1;
++                        continue;
++                    }
++                    continuation = cell.symbol().width().saturating_sub(1);
++                    let style = Style {
++                        fg: (cell.fg != Color::Reset).then_some(cell.fg),
++                        bg: (cell.bg != Color::Reset).then_some(cell.bg),
++                        ..cell.style()
++                    };
++                    if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
++                        last.content.to_mut().push_str(cell.symbol());
++                    } else {
++                        spans.push(Span::styled(cell.symbol().to_owned(), style));
++                    }
++                }
++                while let Some(last) = spans.last_mut() {
++                    last.content = last.content.trim_end().to_owned().into();
++                    if !last.content.is_empty() {
++                        break;
++                    }
++                    spans.pop();
++                }
++                Line::from(spans)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn horizontal_viewport_preserves_merged_borders_values_and_styles() {
++        let palette = Palette::current();
++        let rows = vec![
++            vec![palette.header("Model").spanning(1, 2)],
++            vec![palette.header("Requested"), palette.header("Served")],
++            vec![
++                Cell::lines(vec!["request".red().into()]),
++                Cell::lines(vec!["served".yellow().into()]),
++            ],
++        ];
++        let table = render(&[10, 10], &rows, &palette);
++        let full_area = Rect::new(0, 0, 27, 7);
++        let mut full = Buffer::empty(full_area);
++        table.render(full_area, &mut full);
++        for offset in 0..=20 {
++            let area = Rect::new(3, 2, 7, 7);
++            let mut view = Buffer::empty(Rect::new(0, 0, 14, 12));
++            table.render_viewport(area, &mut view, 0, offset);
++            for y in 0..area.height {
++                for x in 0..area.width {
++                    assert_eq!(view[(area.x + x, area.y + y)], full[(offset + x, y)]);
++                }
++            }
++            assert_eq!(view[(2, 2)].symbol(), " ");
++            assert_eq!(view[(10, 2)].symbol(), " ");
++        }
++    }
++
++    #[test]
++    fn viewport_caps_follow_merged_cells_and_leave_interior_styles_untouched() {
++        let palette = Palette::current();
++        let rows = vec![
++            vec![palette.header("Group").spanning(1, 2)],
++            vec![palette.header("Model"), palette.header("Value")],
++            vec![
++                Cell::text("model").spanning(2, 1),
++                Cell::lines(vec!["first".yellow().into(), "second".yellow().into()]),
++            ],
++            vec![Cell::number("100")],
++            vec![Cell::text("last"), Cell::number("200")],
++        ];
++        let table = render(&[5, 7], &rows, &palette);
++        let mut full = Buffer::empty(Rect::new(0, 0, 19, table.desired_height(19)));
++        table.render(*full.area(), &mut full);
++        for (offset, expected_top, expected_bottom) in [
++            (0, "┌─────────────────┐", "└─────────────────┘"),
++            (2, "┌───────┬─────────┐", "└───────┴─────────┘"),
++            (5, "┌───────┬─────────┐", "└───────┴─────────┘"),
++        ] {
++            let area = Rect::new(4, 3, 19, 3);
++            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
++            for cell in &mut buffer.content {
++                cell.set_symbol("~");
++            }
++            assert!(table.render_scrolled(area, &mut buffer, offset));
++            let line = |row| {
++                (area.x..area.right())
++                    .map(|x| buffer[(x, row)].symbol())
++                    .collect::<String>()
++            };
++            assert_eq!(line(area.y), expected_top);
++            assert_eq!(line(area.bottom() - 1), expected_bottom);
++            for x in 0..area.width {
++                assert_eq!(buffer[(area.x + x, area.y + 1)], full[(x, offset + 1)]);
++                assert_eq!(buffer[(area.x + x, area.y)].fg, Color::Reset);
++                assert_eq!(buffer[(area.x + x, area.bottom() - 1)].fg, Color::Reset);
++            }
++            for y in 0..12 {
++                for x in 0..30 {
++                    if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
++                        assert_eq!(buffer[(x, y)].symbol(), "~");
++                    }
++                }
++            }
++        }
++        for height in 0..=2 {
++            let area = Rect::new(4, 3, 19, height);
++            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
++            table.render_scrolled(area, &mut buffer, 5);
++            assert!(buffer.content.iter().all(|cell| cell.symbol() == " "));
++        }
++    }
++
++    #[test]
++    fn every_viewport_cut_closes_after_content_without_an_orphan_separator() {
++        let palette = Palette::current();
++        let rows = vec![
++            vec![palette.header("Group").spanning(1, 2)],
++            vec![
++                palette.header("Model").spanning(2, 1),
++                palette.header("Value"),
++            ],
++            vec![palette.header("Units")],
++            vec![
++                Cell::text("first"),
++                Cell::lines(vec!["one".yellow().into(), "two".yellow().into()]),
++            ],
++            vec![Cell::text("last"), Cell::number("200")],
++        ];
++        let table = render(&[5, 7], &rows, &palette);
++        let full_height = table.desired_height(19);
++        let mut full = Buffer::empty(Rect::new(0, 0, 19, full_height));
++        table.render(*full.area(), &mut full);
++        for offset in 0..=full_height {
++            for height in 0..=full_height + 1 {
++                let area = Rect::new(4, 3, 19, height);
++                let mut buffer = Buffer::empty(Rect::new(0, 0, 30, full_height + 5));
++                table.render_scrolled(area, &mut buffer, offset);
++                let visible = (area.y..area.bottom())
++                    .filter(|y| buffer[(area.x, *y)].symbol() != " ")
++                    .collect::<Vec<_>>();
++                let Some(&bottom) = visible.last() else {
++                    assert!(height.min(full_height - offset) <= 3);
++                    continue;
++                };
++                assert!(visible.len() >= 3);
++                assert_eq!(buffer[(area.x, bottom)].symbol(), "└");
++                assert_eq!(buffer[(area.right() - 1, bottom)].symbol(), "┘");
++                if visible.len() > 1 {
++                    assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
++                }
++                if visible.len() > 2 {
++                    let previous = (area.x..area.right())
++                        .map(|x| buffer[(x, bottom - 1)].symbol())
++                        .collect::<String>();
++                    assert!(
++                        !previous.contains('─'),
++                        "offset {offset}, height {height}: {previous}"
++                    );
++                }
++                for y in area.y + 1..bottom {
++                    for x in 0..area.width {
++                        assert_eq!(buffer[(area.x + x, y)], full[(x, offset + y - area.y)]);
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn merged_headers_and_rows_share_borders_and_preserve_cell_styles() {
++        let palette = Palette::current();
++        let rows = vec![
++            vec![
++                palette.header("Period").spanning(2, 1),
++                palette.header("Context").spanning(1, 2),
++            ],
++            vec![palette.header("Input"), palette.header("Cost")],
++            vec![
++                Cell {
++                    style: Style::default().fg(Color::Yellow),
++                    ..Cell::text("2026-10-04").spanning(2, 1)
++                },
++                Cell::text("modèle-internal-build-name").spanning(1, 2),
++            ],
++            vec![Cell::text("served"), Cell::number("$1.00")],
++        ];
++        let table = render(&[10, 7, 7], &rows, &palette);
++        let lines = table.lines;
++        assert!(lines.iter().all(|line| line.width() == 34));
++        let text = lines.iter().join("\n");
++        assert_eq!(text.matches("Period").count(), 1);
++        assert!(text.contains("│   Period   ├"));
++        assert!(text.contains("│ served  │   $1.00 │"));
++        assert!(text.contains("modèle-internal-…"));
++        for line in &lines[5..8] {
++            let styled_width = line
++                .spans
++                .iter()
++                .filter(|span| span.style.fg == Some(Color::Yellow))
++                .map(Span::width)
++                .sum::<usize>();
++            assert_eq!(styled_width, 12);
++        }
++        insta::assert_snapshot!(text);
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -171,6 +171,7 @@ mod managed_worktree_tool_specs;
+ mod managed_worktree_tools;
+ mod terminal_program_status;
+ pub use insert_history::insert_history_lines;
++mod control_center_table;
+ mod footer_hint;
+ mod key_hint;
+ mod keymap;
+@@ -179,6 +180,7 @@ mod line_truncation;
+ pub(crate) mod live_wrap;
+ mod local_settings;
+ mod rendered_selection;
++mod usage;
+ pub use live_wrap::RowBuilder;
+ mod local_chatgpt_auth;
+ mod managed_new_thread_defaults;
+diff --git a/codex-rs/tui/src/render/renderable.rs b/codex-rs/tui/src/render/renderable.rs
+--- a/codex-rs/tui/src/render/renderable.rs
++++ b/codex-rs/tui/src/render/renderable.rs
+@@ -16,6 +16,10 @@ use crate::render::RectExt as _;
+ pub trait Renderable {
+     fn render(&self, area: Rect, buf: &mut Buffer);
+     fn desired_height(&self, width: u16) -> u16;
++    /// Width of fixed-column content that remains reachable by horizontal scrolling.
++    fn desired_width(&self) -> u16 {
++        0
++    }
+     /// Renders visible rows after `scroll_offset` when direct scrolling is supported.
+     ///
+     /// Implementations returning `false` must leave `buf` unchanged so callers can use their
+diff --git a/codex-rs/tui/src/usage/mod.rs b/codex-rs/tui/src/usage/mod.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/mod.rs
+@@ -0,0 +1,71 @@
++//! Presentation of the app-server's shared local accounting snapshot.
++
++pub(crate) use codex_app_server_protocol::UsageReport;
++use codex_app_server_protocol::UsageTotals as Usage;
++use std::collections::BTreeMap;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum UsageRange {
++    Daily,
++    Weekly,
++    Monthly,
++    Yearly,
++    Summary,
++    Quota,
++}
++
++impl UsageRange {
++    pub(crate) const VIEWS: [Self; 6] = [
++        Self::Summary,
++        Self::Daily,
++        Self::Weekly,
++        Self::Monthly,
++        Self::Yearly,
++        Self::Quota,
++    ];
++
++    pub(crate) fn index(self) -> usize {
++        Self::VIEWS
++            .iter()
++            .position(|range| *range == self)
++            .expect("every usage view is listed")
++    }
++
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::Daily => "Daily",
++            Self::Weekly => "Weekly",
++            Self::Monthly => "Monthly",
++            Self::Yearly => "Yearly",
++            Self::Summary => "Summary",
++            Self::Quota => "Weekly quota",
++        }
++    }
++}
++
++fn periods(
++    report: &UsageReport,
++    range: UsageRange,
++) -> impl DoubleEndedIterator<Item = (&String, &BTreeMap<String, Usage>)> {
++    let rows = match range {
++        UsageRange::Weekly => &report.weekly_rows,
++        UsageRange::Monthly => &report.monthly_rows,
++        UsageRange::Yearly => &report.yearly_rows,
++        UsageRange::Daily | UsageRange::Summary | UsageRange::Quota => &report.rows,
++    };
++    let today = report.refreshed_at.date_naive();
++    let bounds = match range {
++        UsageRange::Summary => Some((today - chrono::Duration::days(364), today)),
++        UsageRange::Daily
++        | UsageRange::Weekly
++        | UsageRange::Monthly
++        | UsageRange::Yearly
++        | UsageRange::Quota => None,
++    }
++    .map(|(start, end)| (start.to_string(), end.to_string()));
++    rows.iter().filter(move |(date, _)| {
++        bounds
++            .as_ref()
++            .is_none_or(|(start, end)| *date >= start && *date <= end)
++    })
++}

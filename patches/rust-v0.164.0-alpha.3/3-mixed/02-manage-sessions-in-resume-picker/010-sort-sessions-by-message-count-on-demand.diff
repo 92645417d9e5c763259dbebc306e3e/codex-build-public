@@ -1,0 +1,1187 @@
+sort-sessions-by-message-count-on-demand
+
+Lane: mixed
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: sort-sessions-by-message-count-on-demand
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -106,6 +106,7 @@ fn test_row(thread_id: ThreadId) -> Row {
+ 
+ mod archive;
+ mod layout;
++mod message_counts;
+ mod page_loading;
+ mod profiles;
+ mod title_generation;
+@@ -119,6 +120,7 @@ mod color_tests;
+ #[path = "resume_picker_pagination_error_tests.rs"]
+ mod pagination_error_tests;
+ 
++use message_counts::MessageCounts;
+ use page_loading::PageCwdFilter;
+ use page_loading::PageLoadMode;
+ use page_loading::PaginationState;
+@@ -230,6 +232,11 @@ struct PageLoadRequest {
+ 
+ enum PickerLoadRequest {
+     Page(PageLoadRequest),
++    MessageCounts {
++        request_token: usize,
++        requests: mpsc::UnboundedReceiver<ThreadId>,
++        cancellation: tokio_util::sync::CancellationToken,
++    },
+     Preview {
+         thread_id: ThreadId,
+     },
+@@ -329,6 +336,21 @@ enum SessionListDensity {
+     Dense,
+ }
+ 
++enum PickerSortKey {
++    UpdatedAt,
++    CreatedAt,
++    MessageCount(MessageCounts),
++}
++
++impl PickerSortKey {
++    fn native_sort_key(&self) -> ThreadSortKey {
++        match self {
++            Self::UpdatedAt => ThreadSortKey::UpdatedAt,
++            Self::CreatedAt | Self::MessageCount(_) => ThreadSortKey::CreatedAt,
++        }
++    }
++}
++
+ impl SessionListDensity {
+     fn toggle(self) -> Self {
+         match self {
+@@ -363,6 +385,11 @@ enum BackgroundEvent {
+         search_token: Option<usize>,
+         page: std::io::Result<PickerPage>,
+     },
++    MessageCount {
++        request_token: usize,
++        thread_id: ThreadId,
++        result: std::io::Result<u64>,
++    },
+     Preview {
+         thread_id: ThreadId,
+         preview: std::io::Result<Vec<TranscriptPreviewLine>>,
+@@ -836,6 +863,19 @@ fn spawn_app_server_page_loader(
+                         page,
+                     });
+                 }
++                PickerLoadRequest::MessageCounts {
++                    request_token,
++                    requests,
++                    cancellation,
++                } => {
++                    tokio::spawn(message_counts::run(
++                        app_server.request_handle(),
++                        request_token,
++                        requests,
++                        cancellation,
++                        bg_tx.clone(),
++                    ));
++                }
+                 PickerLoadRequest::Preview { thread_id } => {
+                     let preview =
+                         load_transcript_preview(&mut app_server, thread_id, config.as_ref()).await;
+@@ -983,12 +1023,11 @@ fn spawn_app_server_page_loader(
+ }
+ 
+ /// Returns the human-readable column header for the given sort key.
+-fn sort_key_label(sort_key: ThreadSortKey) -> &'static str {
++fn sort_key_label(sort_key: &PickerSortKey) -> &'static str {
+     match sort_key {
+-        ThreadSortKey::CreatedAt => "Created",
+-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+-            "Updated"
+-        }
++        PickerSortKey::CreatedAt => "Created",
++        PickerSortKey::UpdatedAt => "Updated",
++        PickerSortKey::MessageCount(_) => "Messages",
+     }
+ }
+ 
+@@ -1047,7 +1086,7 @@ struct PickerState {
+     launch_context: SessionPickerLaunchContext,
+     view_persistence: Option<SessionPickerViewPersistence>,
+     action: SessionPickerAction,
+-    sort_key: ThreadSortKey,
++    sort_key: PickerSortKey,
+     inline_error: Option<String>,
+     profile_pending: Option<(ThreadId, u8)>,
+     profile_names: BTreeMap<u8, String>,
+@@ -1261,7 +1300,7 @@ impl PickerState {
+             launch_context: SessionPickerLaunchContext::Startup,
+             view_persistence: None,
+             action,
+-            sort_key: ThreadSortKey::UpdatedAt,
++            sort_key: PickerSortKey::UpdatedAt,
+             inline_error: None,
+             profile_pending: None,
+             profile_names: BTreeMap::new(),
+@@ -1676,6 +1715,10 @@ impl PickerState {
+         self.pending_page_down_target = None;
+         self.frozen_footer_percent = None;
+ 
++        if matches!(&self.sort_key, PickerSortKey::MessageCount(_)) {
++            self.start_message_counts();
++        }
++
+         let search_token = if self.query.is_empty() {
+             self.search_state = SearchState::Idle;
+             None
+@@ -1699,7 +1742,7 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             status: self.status,
+             provider_filter: self.provider_filter.clone(),
+-            sort_key: self.sort_key,
++            sort_key: self.sort_key.native_sort_key(),
+         }));
+     }
+ 
+@@ -1739,7 +1782,7 @@ impl PickerState {
+                         cwd_filter: self.active_cwd_filter(),
+                         status: self.status,
+                         provider_filter: self.provider_filter.clone(),
+-                        sort_key: self.sort_key,
++                        sort_key: self.sort_key.native_sort_key(),
+                     }));
+                     return Ok(None);
+                 }
+@@ -1766,6 +1809,11 @@ impl PickerState {
+                     self.load_more_if_needed(LoadTrigger::Scroll);
+                 }
+             }
++            BackgroundEvent::MessageCount {
++                request_token,
++                thread_id,
++                result,
++            } => self.message_count_finished(request_token, thread_id, result),
+             BackgroundEvent::Preview { thread_id, preview } => {
+                 self.transcript_previews.insert(
+                     thread_id,
+@@ -1899,9 +1947,26 @@ impl PickerState {
+             let q = self.query.to_lowercase();
+             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
+         }
++        if let PickerSortKey::MessageCount(counts) = &mut self.sort_key {
++            counts.queue_rows(&self.filtered_rows);
++        }
++        self.sort_filtered_rows(selected_key);
++    }
++
++    fn sort_filtered_rows(&mut self, selected_key: Option<SeenRowKey>) {
+         if matches!(self.action, SessionPickerAction::Resume) {
+-            self.filtered_rows
+-                .sort_by_key(|row| !row.has_single_word_title());
++            if let PickerSortKey::MessageCount(counts) = &self.sort_key {
++                self.filtered_rows.sort_by_key(|row| {
++                    (
++                        !row.has_single_word_title(),
++                        std::cmp::Reverse(counts.sort_value(row)),
++                        std::cmp::Reverse(row.created_at),
++                    )
++                });
++            } else {
++                self.filtered_rows
++                    .sort_by_key(|row| !row.has_single_word_title());
++            }
+         }
+         if let Some(selected_key) = selected_key
+             && let Some(index) = self
+@@ -2093,7 +2158,7 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             status: self.status,
+             provider_filter: self.provider_filter.clone(),
+-            sort_key: self.sort_key,
++            sort_key: self.sort_key.native_sort_key(),
+         }));
+     }
+ 
+@@ -2114,19 +2179,23 @@ impl PickerState {
+         token
+     }
+ 
+-    /// Cycles the sort order between creation time and last-updated time.
+-    ///
+-    /// Triggers a full reload because the backend must re-sort all sessions.
+-    /// The existing `all_rows` are cleared and pagination restarts from the
+-    /// beginning with the new sort key.
++    /// Reload the native time order, then optionally rank that complete listing by message count.
+     fn toggle_sort_key(&mut self) {
+-        self.sort_key = match self.sort_key {
+-            ThreadSortKey::CreatedAt => ThreadSortKey::UpdatedAt,
+-            ThreadSortKey::UpdatedAt
+-            | ThreadSortKey::RecencyAt
+-            | ThreadSortKey::SectionPosition => ThreadSortKey::CreatedAt,
+-        };
+-        self.start_initial_load();
++        if matches!(&self.sort_key, PickerSortKey::CreatedAt)
++            && matches!(self.action, SessionPickerAction::Resume)
++        {
++            // Counts share Created's native pagination without adding a backend sort key.
++            self.start_initial_load();
++            self.start_message_counts();
++        } else {
++            self.sort_key = match &self.sort_key {
++                PickerSortKey::UpdatedAt => PickerSortKey::CreatedAt,
++                PickerSortKey::CreatedAt | PickerSortKey::MessageCount(_) => {
++                    PickerSortKey::UpdatedAt
++                }
++            };
++            self.start_initial_load();
++        }
+     }
+ 
+     fn toggle_filter_mode(&mut self) {
+@@ -2489,25 +2558,33 @@ fn sort_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>>
+         return vec![
+             "Sort:".set_style(secondary_text_style()),
+             toolbar_value(
+-                sort_key_label(state.sort_key),
++                sort_key_label(&state.sort_key),
+                 /*active*/ true,
+                 sort_focused,
+             ),
+         ];
+     }
+-    vec![
++    let mut spans = vec![
+         "Sort: ".set_style(secondary_text_style()),
+         toolbar_value(
+-            sort_key_label(ThreadSortKey::UpdatedAt),
+-            state.sort_key == ThreadSortKey::UpdatedAt,
++            "Updated",
++            matches!(&state.sort_key, PickerSortKey::UpdatedAt),
+             sort_focused,
+         ),
+         toolbar_value(
+-            sort_key_label(ThreadSortKey::CreatedAt),
+-            state.sort_key == ThreadSortKey::CreatedAt,
++            "Created",
++            matches!(&state.sort_key, PickerSortKey::CreatedAt),
+             sort_focused,
+         ),
+-    ]
++    ];
++    if matches!(state.action, SessionPickerAction::Resume) {
++        spans.push(toolbar_value(
++            "Messages",
++            matches!(&state.sort_key, PickerSortKey::MessageCount(_)),
++            sort_focused,
++        ));
++    }
++    spans
+ }
+ 
+ fn filter_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
+@@ -3240,9 +3317,12 @@ fn render_comfortable_session_lines(
+         return lines;
+     }
+ 
+-    let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
+-    let created = format_relative_time(reference, row.created_at);
+-    let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
++    let primary = row_primary_value(row, state);
++    let primary = if matches!(&state.sort_key, PickerSortKey::MessageCount(_)) {
++        format!("Messages {primary}")
++    } else {
++        primary
++    };
+     let branch = row.git_branch.as_deref();
+     let cwd = row
+         .cwd
+@@ -3254,15 +3334,7 @@ fn render_comfortable_session_lines(
+             .as_deref()
+             .zip(state.local_filter_cwd.as_deref())
+             .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd));
+-    let footer_lines = render_footer_lines(
+-        state.sort_key,
+-        &created,
+-        &updated,
+-        branch,
+-        cwd.as_deref(),
+-        show_cwd,
+-        width,
+-    );
++    let footer_lines = render_footer_lines(&primary, branch, cwd.as_deref(), show_cwd, width);
+     lines.extend(apply_session_row_background(footer_lines, row_style, width));
+     lines
+ }
+@@ -3313,18 +3385,10 @@ fn render_dense_session_lines(
+     width: u16,
+ ) -> Vec<Line<'static>> {
+     let marker = selection_marker(is_selected, is_expanded);
+-    let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
+-    let created = format_relative_time(reference, row.created_at);
+-    let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
+-    let date = match state.sort_key {
+-        ThreadSortKey::CreatedAt => created,
+-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+-            updated
+-        }
+-    };
++    let primary = row_primary_value(row, state);
+     let mut lines = vec![dense_summary_line(DenseSummaryInput {
+         marker,
+-        date: &date,
++        primary: &primary,
+         title: row.display_preview(),
+         thread_id: row.thread_id,
+         use_theme_colors: state.use_theme_colors,
+@@ -3342,7 +3406,7 @@ struct DenseSummaryInput<'a> {
+     thread_id: Option<ThreadId>,
+     use_theme_colors: bool,
+     marker: Span<'static>,
+-    date: &'a str,
++    primary: &'a str,
+     title: &'a str,
+     is_selected: bool,
+     is_zebra: bool,
+@@ -3362,7 +3426,7 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+ 
+     let spans = vec![
+         input.marker,
+-        dense_column_text(input.date, columns.date_width).set_style(secondary_text_style()),
++        dense_column_text(input.primary, columns.date_width).set_style(secondary_text_style()),
+         title,
+     ];
+     let line = Line::from(spans);
+@@ -3441,22 +3505,25 @@ fn session_title_span(
+     if is_selected { title.bold() } else { title }
+ }
+ 
++fn row_primary_value(row: &Row, state: &PickerState) -> String {
++    let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
++    match &state.sort_key {
++        PickerSortKey::CreatedAt => format_relative_time(reference, row.created_at),
++        PickerSortKey::UpdatedAt => {
++            format_relative_time(reference, row.updated_at.or(row.created_at))
++        }
++        PickerSortKey::MessageCount(counts) => counts.display_value(row),
++    }
++}
++
+ fn render_footer_lines(
+-    sort_key: ThreadSortKey,
+-    created: &str,
+-    updated: &str,
++    primary: &str,
+     branch: Option<&str>,
+     cwd: Option<&str>,
+     show_cwd: bool,
+     width: u16,
+ ) -> Vec<Line<'static>> {
+-    let date = match sort_key {
+-        ThreadSortKey::CreatedAt => created,
+-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+-            updated
+-        }
+-    };
+-    let mut parts = vec![FooterPart::Date(date.to_string())];
++    let mut parts = vec![FooterPart::Primary(primary.to_string())];
+     if show_cwd {
+         parts.push(FooterPart::Cwd(cwd.map(str::to_string)));
+     }
+@@ -3465,7 +3532,7 @@ fn render_footer_lines(
+ }
+ 
+ enum FooterPart {
+-    Date(String),
++    Primary(String),
+     Branch(Option<String>),
+     Cwd(Option<String>),
+ }
+@@ -3473,7 +3540,7 @@ enum FooterPart {
+ impl FooterPart {
+     fn text(&self) -> &str {
+         match self {
+-            FooterPart::Date(text) => text,
++            FooterPart::Primary(text) => text,
+             FooterPart::Branch(Some(text)) | FooterPart::Cwd(Some(text)) => text,
+             FooterPart::Branch(None) => "no branch",
+             FooterPart::Cwd(None) => "no cwd",
+@@ -3482,7 +3549,7 @@ impl FooterPart {
+ 
+     fn prefix(&self) -> Option<&'static str> {
+         match self {
+-            FooterPart::Date(_) => None,
++            FooterPart::Primary(_) => None,
+             FooterPart::Branch(_) => Some(SESSION_META_BRANCH_ICON),
+             FooterPart::Cwd(_) => Some(SESSION_META_CWD_ICON),
+         }
+@@ -3543,7 +3610,7 @@ fn footer_part_width(part: &FooterPart, padded: bool, cwd_width: usize) -> usize
+     let text_width = UnicodeWidthStr::width(part.text());
+     let actual_width = prefix_width + prefix_gap_width + text_width;
+     match part {
+-        FooterPart::Date(_) if padded => SESSION_META_DATE_WIDTH.max(actual_width),
++        FooterPart::Primary(_) if padded => SESSION_META_DATE_WIDTH.max(actual_width),
+         FooterPart::Cwd(_) if padded => cwd_width,
+         _ => actual_width,
+     }
+@@ -3563,9 +3630,9 @@ fn footer_line(parts: Vec<FooterPart>, width: usize, cwd_width: usize) -> Line<'
+         }
+         let padded = idx + 1 < part_count;
+         let target_width = match part {
+-            FooterPart::Date(_) if padded => Some(SESSION_META_DATE_WIDTH),
++            FooterPart::Primary(_) if padded => Some(SESSION_META_DATE_WIDTH),
+             FooterPart::Cwd(_) if padded => Some(cwd_width),
+-            FooterPart::Date(_) | FooterPart::Branch(_) | FooterPart::Cwd(_) => None,
++            FooterPart::Primary(_) | FooterPart::Branch(_) | FooterPart::Cwd(_) => None,
+         };
+         let used_width = push_footer_part(&mut spans, part, target_width, remaining_width);
+         remaining_width = remaining_width.saturating_sub(used_width);
+@@ -3686,7 +3753,7 @@ fn render_expanded_session_details(
+         row.git_branch.as_deref().unwrap_or("no branch")
+     );
+ 
+-    vec![
++    let mut lines = vec![
+         expanded_detail_line("Session:", &session, width),
+         expanded_time_detail_line(
+             "Created:",
+@@ -3710,7 +3777,14 @@ fn render_expanded_session_details(
+             "Conversation:".set_style(secondary_text_style()),
+         ]
+         .into(),
+-    ]
++    ];
++    if matches!(&state.sort_key, PickerSortKey::MessageCount(_)) {
++        lines.insert(
++            1,
++            expanded_detail_line("Messages:", &row_primary_value(row, state), width),
++        );
++    }
++    lines
+ }
+ 
+ fn render_conversation_preview_lines(
+@@ -4801,19 +4875,22 @@ mod tests {
+ 
+     #[test]
+     fn footer_prioritizes_active_sort_timestamp() {
++        let (mut state, _) = test_picker();
++        let now = parse_timestamp_str("2026-04-28T18:00:00Z").unwrap();
++        state.relative_time_reference = Some(now);
++        let mut row = test_row(ThreadId::new());
++        row.created_at = Some(now - Duration::hours(5));
++        row.updated_at = Some(now - Duration::hours(3));
+         let updated = render_footer_lines(
+-            ThreadSortKey::UpdatedAt,
+-            "5h ago",
+-            "3h ago",
++            &row_primary_value(&row, &state),
+             Some("main"),
+             Some("tmp/codex"),
+             /*show_cwd*/ true,
+             /*width*/ 80,
+         );
++        state.sort_key = PickerSortKey::CreatedAt;
+         let created = render_footer_lines(
+-            ThreadSortKey::CreatedAt,
+-            "5h ago",
+-            "3h ago",
++            &row_primary_value(&row, &state),
+             Some("main"),
+             Some("tmp/codex"),
+             /*show_cwd*/ true,
+@@ -4833,8 +4910,6 @@ mod tests {
+     #[test]
+     fn footer_marks_missing_branch() {
+         let footer = render_footer_lines(
+-            ThreadSortKey::UpdatedAt,
+-            "5h ago",
+             "3h ago",
+             /*branch*/ None,
+             Some("/tmp/codex"),
+@@ -4853,8 +4928,6 @@ mod tests {
+     fn footer_branch_expands_when_line_has_room() {
+         let branch = "etraut/animations-false-improvements";
+         let footer = render_footer_lines(
+-            ThreadSortKey::UpdatedAt,
+-            "5h ago",
+             "4h ago",
+             Some(branch),
+             Some("~/code/codex.etraut-animations-false-improvements/codex-rs"),
+@@ -4871,8 +4944,6 @@ mod tests {
+         let cwd = "~/code/codex.owner-extremely-long-worktree-name-that-needs-truncating/codex-rs";
+         let branch = "owner/branch";
+         let footer = render_footer_lines(
+-            ThreadSortKey::UpdatedAt,
+-            "5h ago",
+             "4h ago",
+             Some(branch),
+             Some(cwd),
+@@ -4891,8 +4962,6 @@ mod tests {
+     #[test]
+     fn footer_omits_cwd_when_hidden() {
+         let footer = render_footer_lines(
+-            ThreadSortKey::UpdatedAt,
+-            "5h ago",
+             "4h ago",
+             Some("owner/branch"),
+             Some("~/code/codex.owner-worktree/codex-rs"),
+@@ -6351,7 +6420,7 @@ session_picker_view = "dense"
+     fn dense_selected_summary_line_uses_full_width_selection_style() {
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
+-            date: "15m ago",
++            primary: "15m ago",
+             title: "Selected dense row",
+             thread_id: None,
+             use_theme_colors: true,
+@@ -6369,7 +6438,7 @@ session_picker_view = "dense"
+     fn dense_zebra_summary_line_uses_full_width_background() {
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
+-            date: "15m ago",
++            primary: "15m ago",
+             title: "Zebra dense row",
+             thread_id: None,
+             use_theme_colors: true,
+diff --git a/codex-rs/tui/src/resume_picker/archive.rs b/codex-rs/tui/src/resume_picker/archive.rs
+--- a/codex-rs/tui/src/resume_picker/archive.rs
++++ b/codex-rs/tui/src/resume_picker/archive.rs
+@@ -128,8 +128,9 @@ impl PickerState {
+                     .insert(cwd.clone(), self.row_matches_local_cwd(&row));
+             }
+             self.all_rows[index] = row;
++            let sort_key = self.sort_key.native_sort_key();
+             self.all_rows.sort_by_key(|row| {
+-                std::cmp::Reverse(match self.sort_key {
++                std::cmp::Reverse(match sort_key {
+                     ThreadSortKey::CreatedAt => row.created_at,
+                     _ => row.updated_at,
+                 })
+diff --git a/codex-rs/tui/src/resume_picker/message_count_tests.rs b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+@@ -0,0 +1,412 @@
++use super::*;
++use codex_app_server_client::RemoteAppServerClient;
++use codex_app_server_client::RemoteAppServerConnectArgs;
++use codex_app_server_client::RemoteAppServerEndpoint;
++use codex_app_server_protocol::ModelListParams;
++use codex_app_server_protocol::ModelListResponse;
++use futures::SinkExt;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::sync::Mutex;
++use tokio_tungstenite::tungstenite::Message;
++
++type Requests = Arc<Mutex<Vec<PickerLoadRequest>>>;
++
++fn take_page(requests: &Requests) -> PageLoadRequest {
++    let mut requests = requests.lock().unwrap();
++    let index = requests
++        .iter()
++        .position(|request| matches!(request, PickerLoadRequest::Page(_)))
++        .unwrap();
++    let PickerLoadRequest::Page(page) = requests.remove(index) else {
++        unreachable!()
++    };
++    page
++}
++
++fn take_counts(
++    requests: &Requests,
++) -> (usize, mpsc::UnboundedReceiver<ThreadId>, CancellationToken) {
++    let mut requests = requests.lock().unwrap();
++    let index = requests
++        .iter()
++        .position(|request| matches!(request, PickerLoadRequest::MessageCounts { .. }))
++        .unwrap();
++    let PickerLoadRequest::MessageCounts {
++        request_token,
++        requests: receiver,
++        cancellation,
++    } = requests.remove(index)
++    else {
++        unreachable!()
++    };
++    (request_token, receiver, cancellation)
++}
++
++fn row(title: &str, timestamp: &str) -> Row {
++    let timestamp = parse_timestamp_str(timestamp).unwrap();
++    Row {
++        preview: title.into(),
++        thread_name: Some(title.into()),
++        created_at: Some(timestamp),
++        updated_at: Some(timestamp),
++        ..test_row(ThreadId::new())
++    }
++}
++
++async fn deliver(
++    state: &mut PickerState,
++    request: PageLoadRequest,
++    rows: Vec<Row>,
++    next: Option<&str>,
++) {
++    state
++        .handle_background_event(BackgroundEvent::Page {
++            request_token: request.request_token,
++            search_token: request.search_token,
++            page: Ok(PickerPage {
++                num_scanned_files: rows.len(),
++                rows,
++                history_modes: HashMap::new(),
++                next_cursor: next.map(|cursor| PageCursor::AppServer(cursor.into())),
++                reached_scan_cap: false,
++            }),
++        })
++        .await
++        .unwrap();
++}
++
++#[tokio::test]
++async fn messages_sort_is_opt_in_and_fork_keeps_its_native_time_choices() {
++    let (mut state, requests) = test_picker();
++    state.start_initial_load();
++    assert_eq!(take_page(&requests).sort_key, ThreadSortKey::UpdatedAt);
++    assert!(requests.lock().unwrap().is_empty());
++    assert_eq!(sort_key_label(&state.sort_key), "Updated");
++    state.toggle_sort_key();
++    assert_eq!(take_page(&requests).sort_key, ThreadSortKey::CreatedAt);
++    assert!(requests.lock().unwrap().is_empty());
++    assert_eq!(sort_key_label(&state.sort_key), "Created");
++    state.toggle_sort_key();
++    assert_eq!(take_page(&requests).sort_key, ThreadSortKey::CreatedAt);
++    let (_, _counts, cancellation) = take_counts(&requests);
++    assert_eq!(sort_key_label(&state.sort_key), "Messages");
++    assert!(!cancellation.is_cancelled());
++    state.toggle_sort_key();
++    assert!(cancellation.is_cancelled());
++    assert_eq!(take_page(&requests).sort_key, ThreadSortKey::UpdatedAt);
++    assert_eq!(sort_key_label(&state.sort_key), "Updated");
++    state.action = SessionPickerAction::Fork;
++    for expected in [ThreadSortKey::CreatedAt, ThreadSortKey::UpdatedAt] {
++        state.toggle_sort_key();
++        assert_eq!(take_page(&requests).sort_key, expected);
++        assert!(requests.lock().unwrap().is_empty());
++        assert!(
++            !sort_control_spans(&state, false)
++                .iter()
++                .any(|span| span.content.contains("Messages"))
++        );
++    }
++}
++
++#[tokio::test]
++async fn counts_sort_all_pages_keep_title_pinning_and_preserve_selected_session() {
++    let (mut state, requests) = test_picker();
++    state.sort_key = PickerSortKey::CreatedAt;
++    state.toggle_sort_key();
++    let (token, mut counts, _) = take_counts(&requests);
++    let recent = row("recent session", "2026-10-16T00:00:00Z");
++    let pinned = row("project", "2026-10-15T00:00:00Z");
++    let older = row("older session", "2026-10-14T00:00:00Z");
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![recent.clone(), pinned.clone()],
++        Some("older"),
++    )
++    .await;
++    state.selected = 1;
++    assert_eq!(
++        state.filtered_rows[state.selected].thread_id,
++        recent.thread_id
++    );
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![pinned.clone(), older.clone()],
++        None,
++    )
++    .await;
++    for expected in [recent.thread_id, pinned.thread_id, older.thread_id] {
++        assert_eq!(counts.try_recv().unwrap(), expected.unwrap());
++    }
++    assert!(counts.try_recv().is_err());
++    for (target, value) in [(&recent, 8), (&pinned, 1), (&older, 55)] {
++        state.message_count_finished(token, target.thread_id.unwrap(), Ok(value));
++        assert_eq!(
++            state.filtered_rows[state.selected].thread_id,
++            recent.thread_id
++        );
++    }
++    assert_eq!(state.filtered_rows, vec![pinned, older, recent]);
++    assert!(requests.lock().unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn pending_and_completed_counts_replace_time_without_changing_titles_in_either_density() {
++    let (mut state, requests) = test_picker();
++    state.sort_key = PickerSortKey::CreatedAt;
++    state.toggle_sort_key();
++    let (token, _counts, _cancellation) = take_counts(&requests);
++    let session = row("keep this title", "2026-10-16T00:00:00Z");
++    let failed = row("failed session", "2026-10-15T00:00:00Z");
++    state.relative_time_reference = Some(parse_timestamp_str("2026-10-17T00:00:00Z").unwrap());
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![session.clone(), failed.clone()],
++        None,
++    )
++    .await;
++    let render = |state: &PickerState, expanded| {
++        render_session_lines(&session, state, false, expanded, false, 120)
++            .into_iter()
++            .map(|line| line.to_string())
++            .collect::<Vec<_>>()
++            .join("\n")
++    };
++    for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
++        state.density = density;
++        let pending = render(&state, false);
++        assert!(pending.contains("keep this title"));
++        assert!(!pending.contains("ago"));
++        assert_eq!(row_primary_value(&session, &state), "0");
++        if density == SessionListDensity::Dense {
++            assert!(pending.starts_with("  0"));
++            assert_eq!(
++                pending.find("keep this title"),
++                Some(2 + SESSION_META_DATE_WIDTH)
++            );
++        } else {
++            assert!(pending.contains("Messages 0"));
++        }
++        let expanded = render(&state, true);
++        assert!(expanded.contains("Messages:"));
++        assert!(expanded.contains("Created:"));
++        assert!(expanded.contains("Updated:"));
++    }
++    state.message_count_finished(token, session.thread_id.unwrap(), Ok(133));
++    assert_eq!(row_primary_value(&session, &state), "133");
++    for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
++        state.density = density;
++        let completed = render(&state, false);
++        assert!(completed.contains("133"));
++        assert!(completed.contains("keep this title"));
++        assert!(!completed.contains("ago"));
++    }
++    state.message_count_finished(
++        token,
++        failed.thread_id.unwrap(),
++        Err(std::io::Error::other("history unavailable")),
++    );
++    assert_eq!(row_primary_value(&failed, &state), "Error");
++    assert!(
++        state
++            .inline_error
++            .as_deref()
++            .unwrap()
++            .contains("history unavailable")
++    );
++    state.sort_key = PickerSortKey::UpdatedAt;
++    for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
++        state.density = density;
++        let timed = render(&state, false);
++        assert!(timed.contains("1d ago"));
++        assert!(timed.contains("keep this title"));
++        assert!(!timed.contains("Messages"));
++    }
++}
++
++#[tokio::test]
++async fn listing_replacement_cancels_counts_and_rejects_stale_completions() {
++    let (mut state, requests) = test_picker();
++    state.sort_key = PickerSortKey::CreatedAt;
++    state.toggle_sort_key();
++    let (old_token, mut old_counts, old_cancellation) = take_counts(&requests);
++    let session = row("saved session", "2026-10-16T00:00:00Z");
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![session.clone()],
++        None,
++    )
++    .await;
++    assert_eq!(old_counts.try_recv().unwrap(), session.thread_id.unwrap());
++    state.toggle_status();
++    assert!(old_cancellation.is_cancelled());
++    let (token, _counts, cancellation) = take_counts(&requests);
++    assert_ne!(token, old_token);
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![session.clone()],
++        None,
++    )
++    .await;
++    state.message_count_finished(old_token, session.thread_id.unwrap(), Ok(999));
++    assert_eq!(row_primary_value(&session, &state), "0");
++    state.message_count_finished(token, session.thread_id.unwrap(), Ok(7));
++    assert_eq!(row_primary_value(&session, &state), "7");
++    drop(state);
++    assert!(cancellation.is_cancelled());
++}
++
++#[tokio::test]
++async fn count_updates_keep_pending_key_chords_navigation_and_title_queue_available() -> Result<()>
++{
++    let (mut state, requests) = test_picker();
++    state.sort_key = PickerSortKey::CreatedAt;
++    state.toggle_sort_key();
++    let (token, _counts, _cancellation) = take_counts(&requests);
++    let first = row("first session", "2026-10-16T00:00:00Z");
++    let second = row("second session", "2026-10-15T00:00:00Z");
++    let third = row("third session", "2026-10-14T00:00:00Z");
++    deliver(
++        &mut state,
++        take_page(&requests),
++        vec![first.clone(), second.clone(), third.clone()],
++        None,
++    )
++    .await;
++    state.request_title();
++    state.keymap = RuntimeKeymap::from_config(&serde_json::from_value(json!({
++        "list": {"move_down": ["ctrl-x j"]}
++    }))?)
++    .expect("valid count navigation keymap");
++    assert!(
++        state
++            .route_key_chord(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
++            .is_none()
++    );
++    state.message_count_finished(token, first.thread_id.unwrap(), Ok(5));
++    state.message_count_finished(token, second.thread_id.unwrap(), Ok(10));
++    assert_eq!(
++        state.filtered_rows[state.selected].thread_id,
++        first.thread_id
++    );
++    let next = state
++        .route_key_chord(KeyEvent::from(KeyCode::Char('j')))
++        .expect("count update must retain the pending chord");
++    state.handle_key(next).await?;
++    assert_eq!(
++        state.filtered_rows[state.selected].thread_id,
++        third.thread_id
++    );
++    state.request_title();
++    assert!(
++        matches!(&state.title_action, Some(TitleAction::Generating { thread_id, remaining, .. })
++        if Some(*thread_id) == first.thread_id && remaining.front().copied() == third.thread_id)
++    );
++    assert_eq!(
++        requests
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|request| matches!(request, PickerLoadRequest::GenerateTitle { .. }))
++            .count(),
++        1
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn pending_count_rpc_leaves_other_requests_available_and_cancellation_stops_the_queue()
++-> Result<()> {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++    let address = listener.local_addr()?;
++    let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
++    let server = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await.unwrap();
++        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
++        while let Some(frame) = futures::StreamExt::next(&mut socket).await {
++            let frame = frame.unwrap();
++            if frame.is_close() {
++                break;
++            }
++            if !frame.is_text() {
++                continue;
++            }
++            let request: serde_json::Value =
++                serde_json::from_str(frame.to_text().unwrap()).unwrap();
++            let method = request["method"].as_str().unwrap();
++            let result = match method {
++                "initialize" => {
++                    json!({"userAgent":"message-count-test","codexHome":"/server/.codex"})
++                }
++                "initialized" => continue,
++                "thread/messageCount/read" => {
++                    requests_tx.send(request.clone()).unwrap();
++                    continue;
++                }
++                "model/list" => {
++                    requests_tx.send(request.clone()).unwrap();
++                    json!({"data":[],"nextCursor":null})
++                }
++                _ => panic!("unexpected message-count request: {method}"),
++            };
++            socket
++                .send(Message::Text(
++                    json!({"id":request["id"],"result":result})
++                        .to_string()
++                        .into(),
++                ))
++                .await
++                .unwrap();
++        }
++    });
++    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
++        endpoint: RemoteAppServerEndpoint::WebSocket {
++            websocket_url: format!("ws://{address}"),
++            auth_token: None,
++        },
++        client_name: "message-count-test".into(),
++        client_version: "test".into(),
++        experimental_api: true,
++        mcp_server_openai_form_elicitation: false,
++        opt_out_notification_methods: Vec::new(),
++        channel_capacity: 8,
++    })
++    .await?;
++    let handle = AppServerRequestHandle::Remote(client.request_handle());
++    let (counts_tx, counts_rx) = mpsc::unbounded_channel();
++    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel();
++    let first = ThreadId::new();
++    counts_tx.send(first)?;
++    counts_tx.send(ThreadId::new())?;
++    let cancellation = CancellationToken::new();
++    let worker = tokio::spawn(run(
++        handle.clone(),
++        17,
++        counts_rx,
++        cancellation.clone(),
++        bg_tx,
++    ));
++    let pending = requests_rx.recv().await.unwrap();
++    assert_eq!(pending["method"], "thread/messageCount/read");
++    assert_eq!(pending["params"]["threadId"], first.to_string());
++    let _: ModelListResponse = handle
++        .request_typed(ClientRequest::ModelList {
++            request_id: RequestId::String("message-count-barrier".into()),
++            params: ModelListParams::default(),
++        })
++        .await?;
++    assert_eq!(requests_rx.recv().await.unwrap()["method"], "model/list");
++    assert!(!worker.is_finished());
++    cancellation.cancel();
++    worker.await?;
++    assert!(requests_rx.try_recv().is_err());
++    assert!(bg_rx.try_recv().is_err());
++    client.shutdown().await?;
++    server.await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/resume_picker/message_counts.rs b/codex-rs/tui/src/resume_picker/message_counts.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/resume_picker/message_counts.rs
+@@ -0,0 +1,148 @@
++//! Count messages only for an explicitly selected Messages listing.
++
++use super::*;
++use codex_app_server_protocol::ThreadMessageCountReadParams;
++use codex_app_server_protocol::ThreadMessageCountReadResponse;
++use tokio_util::sync::CancellationToken;
++
++pub(super) struct MessageCounts {
++    request_token: usize,
++    values: HashMap<ThreadId, MessageCount>,
++    requests: mpsc::UnboundedSender<ThreadId>,
++    _cancellation: tokio_util::sync::DropGuard,
++}
++
++#[derive(Clone, Copy)]
++enum MessageCount {
++    Pending,
++    Ready(u64),
++    Failed,
++}
++
++impl MessageCounts {
++    pub(super) fn queue_rows(&mut self, rows: &[Row]) {
++        for row in rows {
++            if let Some(thread_id) = row.thread_id
++                && let std::collections::hash_map::Entry::Vacant(entry) =
++                    self.values.entry(thread_id)
++            {
++                entry.insert(MessageCount::Pending);
++                let _ = self.requests.send(thread_id);
++            }
++        }
++    }
++
++    fn for_row(&self, row: &Row) -> MessageCount {
++        row.thread_id
++            .and_then(|thread_id| self.values.get(&thread_id))
++            .copied()
++            .unwrap_or(MessageCount::Pending)
++    }
++
++    pub(super) fn sort_value(&self, row: &Row) -> u64 {
++        match self.for_row(row) {
++            MessageCount::Ready(value) => value,
++            MessageCount::Pending | MessageCount::Failed => 0,
++        }
++    }
++
++    pub(super) fn display_value(&self, row: &Row) -> String {
++        match self.for_row(row) {
++            MessageCount::Ready(value) => value.to_string(),
++            MessageCount::Pending => "0".to_string(),
++            MessageCount::Failed => "Error".to_string(),
++        }
++    }
++}
++
++impl PickerState {
++    pub(super) fn start_message_counts(&mut self) {
++        let request_token = self.allocate_request_token();
++        let (requests, receiver) = mpsc::unbounded_channel();
++        let cancellation = CancellationToken::new();
++        self.sort_key = PickerSortKey::MessageCount(MessageCounts {
++            request_token,
++            values: HashMap::new(),
++            requests,
++            _cancellation: cancellation.clone().drop_guard(),
++        });
++        (self.picker_loader)(PickerLoadRequest::MessageCounts {
++            request_token,
++            requests: receiver,
++            cancellation,
++        });
++    }
++
++    pub(super) fn message_count_finished(
++        &mut self,
++        request_token: usize,
++        thread_id: ThreadId,
++        result: std::io::Result<u64>,
++    ) {
++        let PickerSortKey::MessageCount(counts) = &mut self.sort_key else {
++            return;
++        };
++        if counts.request_token != request_token || !counts.values.contains_key(&thread_id) {
++            return;
++        }
++        let value = match result {
++            Ok(value) => MessageCount::Ready(value),
++            Err(error) => {
++                self.inline_error = Some(format!(
++                    "Could not count messages: {error} (session {thread_id})"
++                ));
++                MessageCount::Failed
++            }
++        };
++        counts.values.insert(thread_id, value);
++        let selected_key = self
++            .filtered_rows
++            .get(self.selected)
++            .and_then(Row::seen_key);
++        // A count changes ordering, not the input context or a pending key chord.
++        self.sort_filtered_rows(selected_key);
++    }
++}
++
++pub(super) async fn run(
++    handle: AppServerRequestHandle,
++    request_token: usize,
++    mut requests: mpsc::UnboundedReceiver<ThreadId>,
++    cancellation: CancellationToken,
++    bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
++) {
++    loop {
++        let thread_id = tokio::select! {
++            biased;
++            _ = cancellation.cancelled() => break,
++            next = requests.recv() => match next {
++                Some(thread_id) => thread_id,
++                None => break,
++            },
++        };
++        let result = tokio::select! {
++            biased;
++            _ = cancellation.cancelled() => break,
++            result = handle.request_typed::<ThreadMessageCountReadResponse>(
++                ClientRequest::ThreadMessageCountRead {
++                    request_id: RequestId::String(format!("resume-picker-count-{}", Uuid::new_v4())),
++                    params: ThreadMessageCountReadParams { thread_id: thread_id.to_string() },
++                },
++            ) => result.map(|response| response.message_count).map_err(std::io::Error::other),
++        };
++        if bg_tx
++            .send(BackgroundEvent::MessageCount {
++                request_token,
++                thread_id,
++                result,
++            })
++            .is_err()
++        {
++            break;
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "message_count_tests.rs"]
++mod tests;
+diff --git a/docs/resume-picker-pinning.md b/docs/resume-picker-pinning.md
+--- a/docs/resume-picker-pinning.md
++++ b/docs/resume-picker-pinning.md
+@@ -3,7 +3,8 @@
+ - A saved title containing exactly one whitespace-delimited word pins its session above other sessions in the resume picker.
+ - Leading and trailing whitespace is ignored.
+ - An empty title or a single-word conversation preview does not pin a session.
+-- Each group preserves the selected backend time order.
++- Each group preserves the selected time order for Updated and Created.
++- Messages orders each group by descending message count.
+ - One blank row separates the pinned group from the ordinary sessions when both are visible.
+ - The separator is not selectable and does not add a second blank row in comfortable view.
+ - Existing directory, provider, status and search filters still apply.
+@@ -14,3 +15,36 @@
+ - Titles changed outside the picker are reflected on the next listing reload.
+ - Discovering all eligible pinned sessions reads all eligible listing pages without reading their transcripts.
+ - The fork picker retains its existing order and on-demand pagination.
++
++# Message Count Sorting
++
++- The resume picker's Sort controls cycle through Updated, Created and Messages.
++- Message counts are requested and computed only after selecting Messages.
++- Counts include user messages and every assistant message phase, including commentary, partial answers, final answers and older messages without a phase.
++- Reasoning, tool activity and other non-message items are excluded.
++- Messages replaces the existing time field in comfortable and dense views.
++- Title rendering remains unchanged.
++- Message counts add no column.
++- Expanded session details also show the count while Messages is selected.
++- Pending counts display 0.
++- Failed reads display Error.
++- The picker reports the server's count-read error.
++- Read failures do not become successful zero counts.
++- The existing asynchronous listing continues across all eligible pages.
++- Older sessions participate in count sorting.
++- Single-word titles remain pinned.
++- Count ties use descending creation time.
++- Existing directory, provider, status and search filters still apply.
++- Count requests and calculation leave navigation and other picker operations available.
++- Changing the sort cancels queued count work.
++- Reloading the listing cancels queued count work.
++- Closing the picker cancels queued count work.
++- Stale results do not change the current listing.
++- An already admitted native read may finish after cancellation.
++- Counts remain in the current picker listing only.
++- A new Messages listing reads counts again.
++- Message counting adds no standing index.
++- Message counting adds no disk cache.
++- Default thread listing remains unchanged.
++- Time sorting remains unchanged.
++- The fork picker retains its original two sort choices.

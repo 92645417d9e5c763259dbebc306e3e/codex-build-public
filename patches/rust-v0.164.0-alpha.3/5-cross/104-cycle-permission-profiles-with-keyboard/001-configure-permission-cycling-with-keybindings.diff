@@ -1,0 +1,67 @@
+configure-permission-cycling-with-keybindings
+
+Lane: cross
+
+Unit: cycle-permission-profiles-with-keyboard
+
+ChildPatch: configure-permission-cycling-with-keybindings
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Cycle the complete available permission-picker choices with configurable keyboard shortcuts without opening a loading picker.
+
+Requires: Unit:cross/default-to-workspace-with-never-approval
+
+Provides: Default Alt-minus and Alt-equals navigate backward and forward through the shared built-in and custom server catalog, including Never; one pending discovery retains the first direction, yields to explicit pickers or covering modals, and reports errors without changing permissions. Full Access retains the native confirmation in the input area before session-only shortcut selection.
+
+Boundary: Server discovery, settings application, managed model requirements, stale-request invalidation and session authority remain native; disabled choices are skipped, explicit keybindings remain effective, explicit permission menus and unrelated platform prompts remain unchanged, and no configuration is persisted by shortcut selection.
+
+Verification: Focused TUI tests cover both directions, built-in and custom choices, managed restrictions, discovery reuse and failure, modal precedence, inline shortcut confirmation and retained explicit-menu presentation, stale scope, picker parity, configured bindings, and server selection success and rejection.
+
+CrossGroup: workspace-permissions
+
+
+diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
+--- a/codex-rs/tui/src/keymap.rs
++++ b/codex-rs/tui/src/keymap.rs
+@@ -1717,8 +1717,8 @@ impl RuntimeKeymap {
+                 ],
+                 previous_model: default_bindings![alt(KeyCode::Char(';'))],
+                 next_model: default_bindings![alt(KeyCode::Char('\''))],
+-                previous_permission_mode: default_bindings![],
+-                next_permission_mode: default_bindings![],
++                previous_permission_mode: default_bindings![alt(KeyCode::Char('-'))],
++                next_permission_mode: default_bindings![alt(KeyCode::Char('='))],
+                 edit_queued_message: default_bindings![shift(KeyCode::Left), alt(KeyCode::Up)],
+                 prompt_stack_back: default_bindings![shift(KeyCode::Right), alt(KeyCode::Down)],
+                 skip_question: default_bindings![ctrl(KeyCode::Char(']'))],
+diff --git a/codex-rs/tui/src/keymap_setup.rs b/codex-rs/tui/src/keymap_setup.rs
+--- a/codex-rs/tui/src/keymap_setup.rs
++++ b/codex-rs/tui/src/keymap_setup.rs
+@@ -1127,6 +1127,15 @@ mod tests {
+     #[test]
+     fn picker_unbound_tab_lists_default_unbound_actions() {
+         let runtime = RuntimeKeymap::defaults();
++        for (action, binding) in [
++            ("previous_permission_mode", "alt-minus"),
++            ("next_permission_mode", "alt-="),
++        ] {
++            assert_eq!(
++                active_binding_specs(&runtime, "chat", action).expect("permission shortcut"),
++                [binding]
++            );
++        }
+         for (context, action) in [
+             ("vim_normal", "jump_top"),
+             ("vim_operator", "motion_jump_top"),
+@@ -1152,8 +1161,6 @@ mod tests {
+             vec![
+                 ("Open Agents", Some("unbound"), false),
+                 ("Toggle Vim Mode", Some("unbound"), false),
+-                ("Previous Permission Mode", Some("unbound"), false),
+-                ("Next Permission Mode", Some("unbound"), false),
+                 ("Kill Whole Line", Some("unbound"), false),
+             ]
+         );

@@ -35,8 +35,8 @@ type BaselineCoverageOptions struct {
 }
 
 type nativeReleaseBaselineResult struct {
-	Result, PredecessorTag string
-	Bootstrap, Ready       bool
+	Result, PredecessorTag, Output string
+	Bootstrap, Ready               bool
 }
 
 type ReleaseRouteResult struct {
@@ -232,6 +232,9 @@ func RunReleaseCleanup(options ReleaseBaselineOptions) (ReleaseRouteResult, erro
 		return result, err
 	}
 	native, err := runReleaseBaselineNative(options, "release-cleanup", window)
+	if err == nil && native.Result == "Input" {
+		return result, errors.New(native.Output)
+	}
 	if err != nil || native.Result != "Cleaned" || native.PredecessorTag != options.predecessorTag {
 		effect := "None"
 		currentIndex, indexErr := readRegularNoFollow(filepath.Join(options.ScratchRoot, "tasks", "index.json"))
@@ -434,6 +437,8 @@ type PatchReplayOptions struct {
 	ForkRetainedParents                    string
 	ParentFork                             string
 	ActiveTask                             string
+	taskPreimage                           []byte
+	coverageMode                           string
 	OnLive                                 func()
 	OnPhase                                func(string)
 	onTerminal                             func(nativePatchReplayResult) error
@@ -662,6 +667,9 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 		}
 	}
 	exportedSource := sourcePrefix != ""
+	if options.Mode == "list" && !exportedSource {
+		options.coverageMode = "prefix"
+	}
 	if options.Mode == "apply" {
 		if !options.worktrees.productPath(options.Tag, options.Target) {
 			return result, errors.New("replay target is not this release's registered Current")
@@ -677,6 +685,12 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 		err = errors.Join(selectorErr, err)
 		if err != nil {
 			return result, err
+		}
+		if !exportedSource && options.Source != "" {
+			if _, err := taskPatchSelector(taskBytes, true); err != nil {
+				return result, err
+			}
+			options.taskPreimage = taskBytes
 		}
 	}
 	if options.Mode == "commit" {
@@ -783,10 +797,13 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 		}
 	}
 	native, stderr, err := runPatchReplayNative(options)
+	if native.Result == "ApplyFailed" {
+		err = errors.Join(err, errors.New(native.Output))
+	}
 	currentTask, taskErr := readRegularNoFollow(options.ActiveTask)
 	if taskErr != nil {
 		err = errors.Join(err, taskErr, errors.New("patch replay active task is unreadable after execution"))
-	} else if !bytes.Equal(currentTask, taskBytes) {
+	} else if len(options.taskPreimage) == 0 && !bytes.Equal(currentTask, taskBytes) {
 		err = errors.Join(err, errors.New("patch replay active task changed"))
 	}
 	if err == nil && native.Result == "Finalized" && listed("Current Committed", native.Output) {
@@ -802,6 +819,9 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 	result.Diagnostics = native.Diagnostics
 	if err != nil {
 		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
+		if options.Mode == "apply" && len(native.AppliedRows) != 0 {
+			result.ProductEffect = "TargetPrefix"
+		}
 		if native.Result == "Finalized" && native.Output == "Committed" {
 			result.ProductEffect = "TargetCommit"
 		}
@@ -1255,16 +1275,17 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 		if options.StartUnit != "" || options.StartFlatPatch != "" {
 			selector, _ = options.startSelector()
 		}
-		arguments = []string{options.Source, options.Tag, options.PredecessorTag, selector}
+		arguments = []string{options.Source, options.Tag, options.PredecessorTag, selector, options.WorkingRoot, options.ActiveTask, options.coverageMode}
 	case "apply":
 		start, _ := options.startSelector()
 		end, _ := options.endSelector()
 		arguments = []string{options.Source, options.Target, options.Tag, start, end, options.rustfmt, root, options.PredecessorTag, options.ChildPatchSequence}
 		arguments = append(arguments, filepath.Join(options.SkillRoot, "bin"), options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, core.StageDeadline().String())
+		arguments = append(arguments, options.ActiveTask, string(options.taskPreimage))
 	case "revise":
 		kind, identity, patch, _ := options.mutationIdentity()
 		_, name, _ := strings.Cut(identity, "/")
-		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, root, options.ChildPatchSequence, options.ExpectedTerminal, contract}
+		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, root, options.ChildPatchSequence, options.ExpectedTerminal, contract, options.WorkingRoot, options.ActiveTask}
 	case "prepare":
 		arguments = []string{options.Target, options.Tag, options.ExpectedTerminal}
 	case "finalize":
@@ -1274,9 +1295,9 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 	case "commit":
 		kind, identity, patch, _ := options.mutationIdentity()
 		_, name, _ := strings.Cut(identity, "/")
-		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, options.ChildPatchSequence, strconv.FormatBool(options.SkipLineLimit), contract}
+		arguments = []string{options.Target, options.Tag, options.Lane, kind, name, patch, options.Form, options.Segment, options.rustfmt, options.ChildPatchSequence, strconv.FormatBool(options.SkipLineLimit), contract, options.WorkingRoot, options.ActiveTask}
 	case "export":
-		arguments = []string{options.Source, options.WorkingRoot, options.ScratchRoot, exportRepositoryRoot(options.WorkingRoot), options.Tag, options.ExportOpen, strconv.FormatBool(options.SkipLineLimit)}
+		arguments = []string{options.Source, options.WorkingRoot, options.ScratchRoot, exportRepositoryRoot(options.WorkingRoot), options.Tag, options.ExportOpen, strconv.FormatBool(options.SkipLineLimit), options.ActiveTask}
 	}
 	output := filepath.Join(root, "result")
 	arguments = append(arguments, output)

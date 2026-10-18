@@ -1,0 +1,734 @@
+consume-usage-observations-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: consume-usage-observations-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -220,6 +220,7 @@ mod composer_hints;
+ mod config_panel;
+ mod config_persistence;
+ mod connector_mentions;
++mod control_center_data;
+ mod daemon_control;
+ mod daemon_menu;
+ mod daybreak;
+@@ -577,6 +578,7 @@ pub(crate) struct App {
+ 
+     // Alternate-screen overlays: transcript, diff, and analytics.
+     pub(crate) overlay: Option<Overlay>,
++    usage_request: Option<control_center_data::UsageRequest>,
+     pub(crate) retained_analytics: Option<Box<crate::analytics::AnalyticsView>>,
+     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
+     has_emitted_history_lines: bool,
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -167,6 +167,10 @@ impl App {
+         app_server_client: &AppServerSession,
+         notification: ServerNotification,
+     ) {
++        if let ServerNotification::UsageBuildProgress(update) = notification {
++            self.update_usage_progress(update);
++            return;
++        }
+         if let ServerNotification::ResponseAttemptUpdated(update) = notification {
+             self.chat_widget.on_response_attempt_updated(update.attempt);
+             return;
+diff --git a/codex-rs/tui/src/app/control_center_data.rs b/codex-rs/tui/src/app/control_center_data.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_data.rs
+@@ -0,0 +1,120 @@
++//! Request shared accounting snapshots and retain request-scoped build observations.
++use super::App;
++use crate::app_event::AppEvent;
++use crate::pager_overlay::Overlay;
++use crate::tui;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::UsageBuildProgress;
++use codex_app_server_protocol::UsageBuildProgressNotification;
++use codex_app_server_protocol::UsageReadResponse;
++use std::sync::Arc;
++use std::time::Instant;
++use tokio::sync::watch;
++use uuid::Uuid;
++
++pub(super) struct UsageRequest {
++    pub(super) id: Uuid,
++    pub(super) rpc_id: Option<RequestId>,
++    pub(super) started_at: Instant,
++    pub(super) progress: watch::Sender<Option<UsageBuildProgress>>,
++}
++
++impl UsageRequest {
++    pub(super) fn new() -> Self {
++        let (progress, _) = watch::channel(None);
++        Self {
++            id: Uuid::new_v4(),
++            rpc_id: None,
++            started_at: Instant::now(),
++            progress,
++        }
++    }
++}
++
++impl App {
++    pub(super) fn open_control_center(&mut self, tui: &mut tui::Tui) {
++        if let Err(error) = tui.enter_alt_screen() {
++            self.chat_widget
++                .add_error_message(format!("Could not open control center: {error}"));
++            tui.frame_requester().schedule_frame();
++            return;
++        }
++        let start_load = self.usage_request.is_none();
++        let request = self.usage_request.get_or_insert_with(UsageRequest::new);
++        let request_id = request.id;
++        self.overlay = Some(Overlay::new_control_center_loading(
++            &self.keymap,
++            request_id,
++            tui.terminal.last_known_screen_size.width,
++            self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
++            tui.frame_requester(),
++            self.app_event_tx.clone(),
++            Arc::clone(&self.model_catalog),
++        ));
++        if start_load {
++            self.app_event_tx.send(AppEvent::LoadUsage {
++                request_id,
++                refresh: false,
++            });
++        }
++        tui.frame_requester().schedule_frame();
++    }
++
++    pub(super) fn refresh_usage(&mut self, tui: &mut tui::Tui) {
++        let Some(Overlay::ControlCenter(view)) = &mut self.overlay else {
++            return;
++        };
++        if self.usage_request.is_some() {
++            return;
++        }
++        let request = UsageRequest::new();
++        let request_id = request.id;
++        self.usage_request = Some(request);
++        view.begin_usage_refresh(request_id);
++        self.app_event_tx.send(AppEvent::LoadUsage {
++            request_id,
++            refresh: true,
++        });
++        tui.frame_requester().schedule_frame();
++    }
++
++    pub(super) fn finish_usage(
++        &mut self,
++        tui: &mut tui::Tui,
++        request_id: Uuid,
++        result: Result<UsageReadResponse, String>,
++    ) {
++        let Some(active_request) = &self.usage_request else {
++            return;
++        };
++        if active_request.id != request_id {
++            return;
++        }
++        self.usage_request = None;
++        if !self
++            .overlay
++            .as_ref()
++            .is_some_and(|overlay| overlay.accepts_usage_request(request_id) && !overlay.is_done())
++        {
++            return;
++        }
++        if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
++            view.set_report(result.map(|response| response.report));
++        }
++        tui.frame_requester().schedule_frame();
++    }
++
++    pub(super) fn update_usage_progress(&self, update: UsageBuildProgressNotification) {
++        if let Some(request) = &self.usage_request
++            && request.rpc_id.as_ref() == Some(&update.request_id)
++        {
++            request
++                .progress
++                .send_modify(|progress| *progress = Some(update.progress));
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "control_center_data_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app/control_center_data_tests.rs b/codex-rs/tui/src/app/control_center_data_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_data_tests.rs
+@@ -0,0 +1,276 @@
++use super::*;
++use crate::pager_overlay::CenterScreen;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn stale_scan_cannot_replace_a_newer_or_closed_overlay() -> anyhow::Result<()> {
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let old_request = Uuid::new_v4();
++    let request = UsageRequest::new();
++    let current_request = request.id;
++    app.usage_request = Some(request);
++    app.open_control_center(&mut tui);
++    app.finish_usage(
++        &mut tui,
++        old_request,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
++    assert_eq!(
++        app.usage_request.as_ref().map(|request| request.id),
++        Some(current_request)
++    );
++    assert!(
++        app.overlay
++            .as_ref()
++            .unwrap()
++            .accepts_usage_request(current_request)
++    );
++    app.finish_usage(&mut tui, current_request, Err("fixture error".to_owned()));
++    assert!(app.usage_request.is_none());
++    assert!(
++        !app.overlay
++            .as_ref()
++            .unwrap()
++            .accepts_usage_request(current_request)
++    );
++    app.overlay = None;
++    app.finish_usage(&mut tui, current_request, Err("late".to_owned()));
++    assert!(app.overlay.is_none());
++    Ok(())
++}
++
++#[tokio::test]
++async fn loading_and_failed_usage_reports_close_with_escape() -> anyhow::Result<()> {
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    for failure in [false, true] {
++        if failure {
++            let request = UsageRequest::new();
++            let request_id = request.id;
++            app.usage_request = Some(request);
++            app.open_control_center(&mut tui);
++            app.finish_usage(&mut tui, request_id, Err("fixture error".into()));
++        } else {
++            app.open_control_center(&mut tui);
++        }
++        for key in [
++            KeyCode::Char('q').into(),
++            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
++            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
++        ] {
++            app.overlay
++                .as_mut()
++                .unwrap()
++                .handle_event(&mut tui, crate::tui::TuiEvent::Key(key))?;
++            assert!(!app.overlay.as_ref().unwrap().is_done());
++        }
++        app.overlay
++            .as_mut()
++            .unwrap()
++            .handle_event(&mut tui, crate::tui::TuiEvent::Key(KeyCode::Esc.into()))?;
++        assert!(app.overlay.as_ref().unwrap().is_done());
++        app.overlay = None;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn closed_report_stays_closed_and_reopening_reuses_only_the_pending_request()
++-> anyhow::Result<()> {
++    let (mut app, mut events, _ops) = crate::app::tests::make_test_app_with_channels().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let request = UsageRequest::new();
++    let request_id = request.id;
++    app.usage_request = Some(request);
++    let report = Arc::new(crate::usage::test_report());
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::clone(&report),
++            refreshed: true,
++        }),
++    );
++    assert!(app.overlay.is_none());
++    assert!(app.usage_request.is_none());
++    app.open_control_center(&mut tui);
++    let current = app.usage_request.as_ref().unwrap().id;
++    // Reopening during the request keeps its owner and returns to Summary.
++    app.open_control_center(&mut tui);
++    assert_eq!(
++        app.usage_request.as_ref().map(|request| request.id),
++        Some(current)
++    );
++    let requests = std::iter::from_fn(|| events.try_recv().ok())
++        .filter_map(|event| match event {
++            AppEvent::LoadUsage {
++                request_id,
++                refresh,
++            } => Some((request_id, refresh)),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(requests, vec![(current, false)]);
++    app.finish_usage(
++        &mut tui,
++        current,
++        Ok(UsageReadResponse {
++            report: Arc::clone(&report),
++            refreshed: false,
++        }),
++    );
++    assert!(app.usage_request.is_none());
++    assert!(matches!(&app.overlay, Some(Overlay::ControlCenter(overlay))
++            if overlay.screen == CenterScreen::Summary
++                && Arc::ptr_eq(overlay.report().unwrap(), &report)
++                && overlay.report().unwrap().build_duration_ms == Some(1234)));
++    Ok(())
++}
++
++#[tokio::test]
++async fn cached_reads_use_the_producer_duration_for_new_clients_and_new_snapshots()
++-> anyhow::Result<()> {
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let report = Arc::new(crate::usage::test_report());
++    app.open_control_center(&mut tui);
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::clone(&report),
++            refreshed: false,
++        }),
++    );
++    let duration = |app: &App| {
++        let Some(Overlay::ControlCenter(view)) = &app.overlay else {
++            panic!("center")
++        };
++        view.report().and_then(|report| report.build_duration_ms)
++    };
++    assert_eq!(duration(&app), Some(1234));
++
++    app.refresh_usage(&mut tui);
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    let mut refreshed = (*report).clone();
++    refreshed.build_duration_ms = Some(0);
++    let report = Arc::new(refreshed);
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::clone(&report),
++            refreshed: true,
++        }),
++    );
++    assert_eq!(duration(&app), Some(0));
++
++    for _ in 0..2 {
++        app.close_transcript_overlay(&mut tui);
++        app.open_control_center(&mut tui);
++        let request_id = app.usage_request.as_ref().unwrap().id;
++        app.finish_usage(
++            &mut tui,
++            request_id,
++            Ok(UsageReadResponse {
++                report: Arc::clone(&report),
++                refreshed: false,
++            }),
++        );
++        assert_eq!(duration(&app), Some(0));
++    }
++
++    let mut another_client = crate::app::test_support::make_test_app().await;
++    let mut another_tui = crate::tui::test_support::make_test_tui()?;
++    another_client.open_control_center(&mut another_tui);
++    let request_id = another_client.usage_request.as_ref().unwrap().id;
++    another_client.finish_usage(
++        &mut another_tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::clone(&report),
++            refreshed: false,
++        }),
++    );
++    assert_eq!(duration(&another_client), Some(0));
++
++    let mut newer = (*report).clone();
++    newer.refreshed_at += chrono::Duration::seconds(1);
++    newer.build_duration_ms = Some(9876);
++    app.close_transcript_overlay(&mut tui);
++    app.open_control_center(&mut tui);
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(newer),
++            refreshed: false,
++        }),
++    );
++    assert_eq!(duration(&app), Some(9876));
++    Ok(())
++}
++
++#[tokio::test]
++async fn progress_matches_the_rpc_and_retains_its_clock_and_latest_value_across_reopening()
++-> anyhow::Result<()> {
++    use codex_app_server_protocol::UsageBuildPhase;
++
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let mut request = UsageRequest::new();
++    let request_id = request.id;
++    let started_at = request.started_at;
++    let observed = request.progress.subscribe();
++    request.rpc_id = Some(RequestId::Integer(73));
++    app.usage_request = Some(request);
++    app.open_control_center(&mut tui);
++    let reading = UsageBuildProgress {
++        phase: UsageBuildPhase::Reading,
++        files_processed: 2,
++        files_total: Some(5),
++    };
++    app.update_usage_progress(UsageBuildProgressNotification {
++        request_id: RequestId::String("73".into()),
++        progress: reading.clone(),
++    });
++    assert!(observed.borrow().is_none());
++    app.update_usage_progress(UsageBuildProgressNotification {
++        request_id: RequestId::Integer(73),
++        progress: reading.clone(),
++    });
++    assert_eq!(*observed.borrow(), Some(reading));
++    app.close_transcript_overlay(&mut tui);
++    let aggregating = UsageBuildProgress {
++        phase: UsageBuildPhase::Aggregating,
++        files_processed: 5,
++        files_total: Some(5),
++    };
++    app.update_usage_progress(UsageBuildProgressNotification {
++        request_id: RequestId::Integer(73),
++        progress: aggregating.clone(),
++    });
++    app.open_control_center(&mut tui);
++    let retained = app.usage_request.as_ref().unwrap();
++    assert_eq!(retained.id, request_id);
++    assert_eq!(retained.started_at, started_at);
++    assert_eq!(*retained.progress.borrow(), Some(aggregating.clone()));
++    app.finish_usage(&mut tui, request_id, Err("scan failed".into()));
++    assert!(observed.has_changed().is_err());
++    app.update_usage_progress(UsageBuildProgressNotification {
++        request_id: RequestId::Integer(73),
++        progress: aggregating,
++    });
++    assert!(app.usage_request.is_none());
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2106,6 +2106,33 @@ impl App {
+                 self.overlay = Some(Overlay::Analytics(view));
+                 tui.frame_requester().schedule_frame();
+             }
++            AppEvent::LoadUsage { request_id, refresh } => {
++                let request_handle = app_server.request_handle();
++                let rpc_id = app_server.next_request_id();
++                if let Some(request) = &mut self.usage_request
++                    && request.id == request_id
++                {
++                    request.rpc_id = Some(rpc_id.clone());
++                }
++                let app_event_tx = self.app_event_tx.clone();
++                tokio::spawn(async move {
++                    let result = request_handle.request_typed::<codex_app_server_protocol::UsageReadResponse>(
++                        codex_app_server_protocol::ClientRequest::UsageRead {
++                            request_id: rpc_id,
++                            params: codex_app_server_protocol::UsageReadParams { refresh },
++                        },
++                    ).await.map(|mut response| {
++                        // Explicit refresh also rebuilds on an older running daemon that
++                        // does not yet report whether a normal read used its cache.
++                        response.refreshed |= refresh;
++                        response
++                    }).map_err(|error| error.to_string());
++                    app_event_tx.send(AppEvent::UsageLoaded { request_id, result });
++                });
++            }
++            AppEvent::UsageLoaded { request_id, result } => {
++                self.finish_usage(tui, request_id, result);
++            }
+             AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
+             AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
+                 if self.current_displayed_thread_id() == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -924,6 +924,7 @@ See the Codex keymap documentation for supported actions and examples."
+             last_thread_usage_status_cell: None,
+             pending_thread_usage_history_refresh: false,
+             overlay: None,
++            usage_request: None,
+             retained_analytics: None,
+             deferred_history_lines: Vec::new(),
+             has_emitted_history_lines: false,
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -52,6 +52,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
+         last_thread_usage_status_cell: None,
+         pending_thread_usage_history_refresh: false,
+         overlay: None,
++        usage_request: None,
+         retained_analytics: None,
+         deferred_history_lines: Vec::new(),
+         has_emitted_history_lines: false,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6418,6 +6418,7 @@ async fn make_test_app() -> Box<App> {
+         last_thread_usage_status_cell: None,
+         pending_thread_usage_history_refresh: false,
+         overlay: None,
++        usage_request: None,
+         retained_analytics: None,
+         deferred_history_lines: Vec::new(),
+         has_emitted_history_lines: false,
+@@ -6548,6 +6549,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+             last_thread_usage_status_cell: None,
+             pending_thread_usage_history_refresh: false,
+             overlay: None,
++            usage_request: None,
+             retained_analytics: None,
+             deferred_history_lines: Vec::new(),
+             has_emitted_history_lines: false,
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -862,6 +862,18 @@ pub(crate) enum AppEvent {
+         result: Result<ThreadUsageOutcome, String>,
+     },
+ 
++    /// Fetch the server's shared accounting snapshot without blocking overlay input.
++    LoadUsage {
++        request_id: Uuid,
++        refresh: bool,
++    },
++
++    /// Publish a shared local accounting snapshot and refresh its requesting overlay.
++    UsageLoaded {
++        request_id: Uuid,
++        result: Result<codex_app_server_protocol::UsageReadResponse, String>,
++    },
++
+     /// Restore response timing when the displayed thread changes.
+     RefreshResponseTiming {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -70,6 +70,7 @@ pub(crate) struct ControlCenter {
+     is_done: bool,
+     report: std::result::Result<Option<Arc<UsageReport>>, String>,
+     pub(crate) request_id: Option<Uuid>,
++    pub(crate) usage_refresh_elapsed: Option<std::time::Duration>,
+     pub(crate) screen: CenterScreen,
+     pub(crate) responses: ResponseTab,
+     selected_day: Option<NaiveDate>,
+@@ -97,6 +98,7 @@ impl ControlCenter {
+             is_done: false,
+             report: Ok(report),
+             request_id: None,
++            usage_refresh_elapsed: None,
+             screen: CenterScreen::Summary,
+             responses: ResponseTab::new(keymap.list.clone(), frames.clone(), events, catalog),
+             selected_day,
+@@ -114,6 +116,15 @@ impl ControlCenter {
+         self.report.as_ref().ok()?.as_ref()
+     }
+ 
++    pub(crate) fn begin_usage_refresh(&mut self, request_id: Uuid) {
++        self.report = Ok(None);
++        self.request_id = Some(request_id);
++        self.selected_quota = 0;
++        self.selected_day = None;
++        self.view.scroll_offset = 0;
++        self.refresh();
++    }
++
+     pub(crate) fn set_report(&mut self, result: std::result::Result<Arc<UsageReport>, String>) {
+         self.report = result.map(Some);
+         self.request_id = None;
+@@ -122,6 +133,7 @@ impl ControlCenter {
+             .report()
+             .and_then(|report| crate::usage::latest_usage_day(report));
+         self.refresh();
++        self.usage_refresh_elapsed = None;
+     }
+ 
+     pub(super) fn is_done(&self) -> bool {
+@@ -577,20 +589,30 @@ impl ControlCenter {
+             field("Peak tokens", Cell::tokens(report.map(|_| peak))),
+             field("Longest streak", Cell::text(streak(longest))),
+             field("Current streak", Cell::text(streak(current))),
+-            field(
+-                "Latest record",
+-                Cell::text(
+-                    report
+-                        .and_then(|report| {
+-                            report
+-                                .latest_usage_at
+-                                .map(|at| timestamp(at.with_timezone(report.refreshed_at.offset())))
+-                        })
+-                        .unwrap_or_else(|| "--".into()),
++        ];
++        lines.push(match report {
++            Some(report) => match report.build_duration_ms {
++                Some(millis) => field(
++                    "Build duration",
++                    Cell::text(crate::response_timing::seconds(millis)),
+                 ),
++                None => Cell::lines(vec![Line::from("Build duration unavailable").dim()]),
++            },
++            None => field("Build duration", Cell::text("--")),
++        });
++        lines.push(field(
++            "Latest record",
++            Cell::text(
++                report
++                    .and_then(|report| {
++                        report
++                            .latest_usage_at
++                            .map(|at| timestamp(at.with_timezone(report.refreshed_at.offset())))
++                    })
++                    .unwrap_or_else(|| "--".into()),
+             ),
+-            Cell::lines(vec![Line::default()]),
+-        ];
++        ));
++        lines.push(Cell::lines(vec![Line::default()]));
+         lines.extend(
+             self.details
+                 .iter()
+@@ -1045,6 +1067,15 @@ mod tests {
+             .unwrap();
+         assert!(row_text(&buffer, latest).contains(&format!("Latest record: {timestamp}")));
+         assert!(!sidebar.iter().any(|line| line.starts_with("Updated:")));
++        assert!(row_text(&buffer, latest - 1).contains("Build duration: 1.23s"));
++        assert_eq!(
++            sidebar
++                .iter()
++                .take_while(|line| !line.is_empty())
++                .last()
++                .unwrap(),
++            &format!("Latest record: {timestamp}")
++        );
+         assert_eq!(buffer[(80, 2)].symbol(), "U");
+         let footer = row_text(&buffer, 23);
+         assert!(footer.contains("general") && footer.contains("esc back"));
+@@ -1154,6 +1185,28 @@ mod tests {
+         assert_eq!(statistics(&overlay)[0], "Lifetime tokens: --");
+     }
+ 
++    #[test]
++    fn older_snapshots_show_unavailable_build_duration() {
++        let mut report = crate::usage::test_report();
++        report.build_duration_ms = None;
++        let center = test_center(Some(Arc::new(report)), CenterScreen::Summary, 120, 1.0);
++        let lines = center
++            .sidebar()
++            .into_iter()
++            .flat_map(|cell| cell.lines)
++            .collect::<Vec<_>>();
++        assert!(
++            lines
++                .iter()
++                .any(|line| line.to_string() == "Build duration unavailable")
++        );
++        assert!(
++            !lines
++                .iter()
++                .any(|line| line.to_string().contains("Refresh time"))
++        );
++    }
++
+     #[test]
+     fn replacing_usage_snapshots_reorders_every_report_without_navigation() {
+         use codex_app_server_protocol::UsageCreditPeriod;
+@@ -1442,6 +1495,50 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn usage_refresh_reserves_build_duration_without_showing_stale_values() {
++        let sidebar = |overlay: &ControlCenter| {
++            overlay
++                .sidebar()
++                .into_iter()
++                .flat_map(|cell| cell.lines)
++                .map(|line| line.to_string())
++                .collect::<Vec<_>>()
++        };
++        let mut overlay = test_center(None, CenterScreen::Summary, 120, 1.0);
++        let initial = sidebar(&overlay);
++        assert_eq!(initial[6], "Build duration: --");
++        assert_eq!(initial[7], "Latest record: --");
++        let mut report = crate::usage::test_report();
++        report.build_duration_ms = Some(0);
++        let report = Arc::new(report);
++        overlay.set_report(Ok(Arc::clone(&report)));
++        assert_eq!(sidebar(&overlay)[6], "Build duration: 0.00s");
++        overlay.view.scroll_offset = 40;
++        let request_id = Uuid::new_v4();
++        overlay.begin_usage_refresh(request_id);
++        assert_eq!(overlay.request_id, Some(request_id));
++        assert_eq!(overlay.view.scroll_offset, 0);
++        assert!(overlay.selected_day.is_none());
++        assert!(overlay.report().is_none());
++        let refreshing = sidebar(&overlay);
++        assert_eq!(&refreshing[..8], &initial[..8]);
++        assert!(!refreshing.iter().any(|line| line.starts_with("Status:")));
++        overlay.set_report(Err("usage build failed".into()));
++        assert_eq!(&sidebar(&overlay)[..8], &initial[..8]);
++        overlay.set_report(Ok(report));
++        assert!(overlay.request_id.is_none());
++        assert_eq!(sidebar(&overlay)[6], "Build duration: 0.00s");
++        assert!(sidebar(&overlay)[7].starts_with("Latest record: "));
++        let duration = overlay.report().unwrap().build_duration_ms;
++        overlay.render(
++            Rect::new(0, 0, 120, 24),
++            &mut Buffer::empty(Rect::new(0, 0, 120, 24)),
++        );
++        assert_eq!(overlay.report().unwrap().build_duration_ms, duration);
++        assert_eq!(duration, Some(0));
++    }
++
+     #[test]
+     fn snapshot_age_uses_normalized_day_hour_minute_and_second_units() {
+         for (seconds, expected) in [

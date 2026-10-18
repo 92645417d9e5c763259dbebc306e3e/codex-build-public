@@ -1,0 +1,1156 @@
+select-workspace-and-never-by-default
+
+Lane: cross
+
+Unit: default-to-workspace-with-never-approval
+
+ChildPatch: select-workspace-and-never-by-default
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Default to the built-in Workspace profile with Never approval, with matching permission choices and status.
+
+Requires: Unit:cross/configure-workspace-roots-from-project-directory, Unit:cross/enable-network-for-workspace-profiles
+
+Provides: Select Never and built-in Workspace when unset regardless of project trust or projectless TUI entrypoint; retain explicit server and launch approval choices; offer the sandboxed Never choice and present approval consistently in permission menus, status and setup previews.
+
+Boundary: Filesystem roots and project-directory preparation remain with configure-workspace-roots-from-project-directory, and the Workspace network default remains with enable-network-for-workspace-profiles. Explicit policies including Granular, managed restrictions, restored task settings, read-only profiles and trust-controlled configuration and hooks retain their behavior. Full Access retains confirmation and keyboard cycle ordering remains separate.
+
+Verification: Core tests cover unset defaults, explicit settings and managed restrictions. TUI startup, new-session, directory-change and agents-overview tests verify Never through thread/start while preserving explicit server and launch policies and saved resume settings. Permission menus, status and preview tests verify the Never choice. Prompt-caching coverage retains a real permission transition and exact cached-prefix assertions.
+
+CrossGroup: workspace-permissions
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -1927,15 +1927,13 @@ model_reasoning_effort = "high"
+         .with_codex_home(codex_home.path())
+         .build_initialized()
+         .await?;
+-    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+ 
+-    let first_response = mcp
+-        .start_thread(ThreadStartParams {
+-            cwd: Some(workspace.path().display().to_string()),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
+-            ..Default::default()
+-        })
+-        .await?;
++    mcp.start_thread(ThreadStartParams {
++        cwd: Some(workspace.path().display().to_string()),
++        sandbox: Some(SandboxMode::WorkspaceWrite),
++        ..Default::default()
++    })
++    .await?;
+ 
+     let ThreadStartResponse {
+         approval_policy,
+@@ -1949,26 +1947,15 @@ model_reasoning_effort = "high"
+         .await?;
+ 
+     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    if cfg!(windows) {
+-        assert_eq!(
+-            first_response.sandbox,
+-            codex_app_server_protocol::SandboxPolicy::ReadOnly {
+-                network_access: false,
+-            }
+-        );
+-        assert_eq!(reasoning_effort, None);
+-        assert_eq!(config_toml, config_before);
+-    } else {
+-        assert_eq!(approval_policy, AskForApproval::OnRequest);
+-        assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+-        let workspace_abs = workspace.path().to_path_buf().abs();
+-        let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
+-            .await
+-            .unwrap_or(workspace_abs);
+-        let trusted_root_key = project_trust_key(trusted_root.as_path());
+-        assert!(config_toml.contains(&trusted_root_key));
+-        assert!(config_toml.contains("trust_level = \"trusted\""));
+-    }
++    assert_eq!(approval_policy, AskForApproval::Never);
++    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
++    let workspace_abs = workspace.path().to_path_buf().abs();
++    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
++        .await
++        .unwrap_or(workspace_abs);
++    let trusted_root_key = project_trust_key(trusted_root.as_path());
++    assert!(config_toml.contains(&trusted_root_key));
++    assert!(config_toml.contains("trust_level = \"trusted\""));
+ 
+     Ok(())
+ }
+@@ -2245,7 +2232,7 @@ model_reasoning_effort = "high"
+         })
+         .await?;
+ 
+-    assert_eq!(approval_policy, AskForApproval::OnRequest);
++    assert_eq!(approval_policy, AskForApproval::Never);
+     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+ 
+     let config_after = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1817,6 +1817,7 @@ async fn network_proxy_feature_is_no_op_without_sandbox_network() -> std::io::Re
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml {
+             features: Some(toml::from_str("network_proxy = true").expect("valid features")),
++            default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+             ..Default::default()
+         },
+         ConfigOverrides {
+@@ -4066,8 +4067,7 @@ async fn implicit_builtin_workspace_does_not_expand_for_additional_directories()
+ }
+ 
+ #[tokio::test]
+-async fn empty_config_defaults_to_builtin_read_only_without_trust_decision() -> std::io::Result<()>
+-{
++async fn empty_config_defaults_to_never_workspace_without_trust_decision() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+     let cwd = TempDir::new()?;
+ 
+@@ -4084,15 +4084,69 @@ async fn empty_config_defaults_to_builtin_read_only_without_trust_decision() ->
+     let policy = config.permissions.file_system_sandbox_policy();
+     assert!(
+         policy.can_read_local_path_with_cwd(cwd.path(), cwd.path()),
+-        "expected :read-only to allow reads, policy: {policy:?}"
++        "expected :workspace to allow reads, policy: {policy:?}"
+     );
+     assert!(
+-        !policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
+-        "expected :read-only to deny writes, policy: {policy:?}"
++        policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
++        "expected :workspace to allow writes, policy: {policy:?}"
++    );
++    assert_eq!(
++        config.permissions.approval_policy.value(),
++        AskForApproval::Never
+     );
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn never_workspace_default_preserves_explicit_permissions_and_network() -> std::io::Result<()>
++{
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    for (input, approval, writable, network) in [
++        (
++            "[sandbox_workspace_write]\nnetwork_access = true",
++            AskForApproval::Never,
++            true,
++            NetworkSandboxPolicy::Enabled,
++        ),
++        (
++            "approval_policy = 'on-request'\ndefault_permissions = ':read-only'",
++            AskForApproval::OnRequest,
++            false,
++            NetworkSandboxPolicy::Restricted,
++        ),
++        (
++            "approval_policy = 'on-request'\nsandbox_mode = 'danger-full-access'",
++            AskForApproval::OnRequest,
++            true,
++            NetworkSandboxPolicy::Enabled,
++        ),
++    ] {
++        let config = Config::load_from_base_config_with_overrides(
++            toml::from_str(input).expect("valid permissions config"),
++            ConfigOverrides {
++                cwd: Some(cwd.path().to_path_buf()),
++                ..Default::default()
++            },
++            codex_home.abs(),
++        )
++        .await?;
++        assert_eq!(
++            (
++                config.permissions.approval_policy.value(),
++                config
++                    .permissions
++                    .file_system_sandbox_policy()
++                    .can_write_local_path_with_cwd(cwd.path(), cwd.path()),
++                config.permissions.network_sandbox_policy(),
++            ),
++            (approval, writable, network),
++            "config: {input}"
++        );
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn default_permissions_can_select_builtin_full_access_profile() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+@@ -11285,7 +11339,7 @@ mcp_oauth_callback_url = "https://example.com/callback"
+ }
+ 
+ #[tokio::test]
+-async fn untrusted_parent_repo_with_incomplete_child_git_keeps_unless_trusted_approval_policy()
++async fn untrusted_parent_repo_with_incomplete_child_git_defaults_to_never_approval()
+ -> anyhow::Result<()> {
+     let codex_home = TempDir::new()?;
+     let repo = TempDir::new()?;
+@@ -11314,13 +11368,13 @@ async fn untrusted_parent_repo_with_incomplete_child_git_keeps_unless_trusted_ap
+ 
+     assert_eq!(
+         config.permissions.approval_policy.value(),
+-        AskForApproval::UnlessTrusted
++        AskForApproval::Never
+     );
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow::Result<()> {
++async fn untrusted_project_defaults_to_never_workspace() -> anyhow::Result<()> {
+     let codex_home = TempDir::new()?;
+     let test_project_dir = TempDir::new()?;
+     let test_path = test_project_dir.path();
+@@ -11343,31 +11397,15 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
+     )
+     .await?;
+ 
+-    // Verify that untrusted projects get the internal always-prompt policy.
+     assert_eq!(
+         config.permissions.approval_policy.value(),
+-        AskForApproval::UnlessTrusted,
+-        "Expected UnlessTrusted approval policy for untrusted project"
++        AskForApproval::Never
+     );
+ 
+-    // Verify that untrusted projects still get WorkspaceWrite sandbox (or ReadOnly on Windows)
+-    if cfg!(target_os = "windows") {
+-        assert!(
+-            matches!(
+-                &config.legacy_sandbox_policy(),
+-                SandboxPolicy::ReadOnly { .. }
+-            ),
+-            "Expected ReadOnly on Windows"
+-        );
+-    } else {
+-        assert!(
+-            matches!(
+-                &config.legacy_sandbox_policy(),
+-                SandboxPolicy::WorkspaceWrite { .. }
+-            ),
+-            "Expected WorkspaceWrite sandbox for untrusted project"
+-        );
+-    }
++    assert!(matches!(
++        &config.legacy_sandbox_policy(),
++        SandboxPolicy::WorkspaceWrite { .. }
++    ));
+ 
+     Ok(())
+ }
+@@ -11430,7 +11468,8 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
+     let codex_home = TempDir::new()?;
+     std::fs::write(
+         codex_home.path().join(CONFIG_TOML_FILE),
+-        r#"sandbox_mode = "danger-full-access"
++        r#"approval_policy = "on-request"
++sandbox_mode = "danger-full-access"
+ "#,
+     )?;
+ 
+@@ -11713,6 +11752,7 @@ async fn permission_profile_override_falls_back_when_disallowed_by_requirements(
+         .codex_home(codex_home.path().to_path_buf())
+         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+         .harness_overrides(ConfigOverrides {
++            approval_policy: Some(AskForApproval::OnRequest),
+             permission_profile: Some(PermissionProfile::Disabled),
+             ..Default::default()
+         })
+@@ -11749,10 +11789,12 @@ async fn active_profile_is_cleared_when_requirements_force_fallback() -> std::io
+     let codex_home = TempDir::new()?;
+     for overrides in [
+         ConfigOverrides {
++            approval_policy: Some(AskForApproval::OnRequest),
+             default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+             ..Default::default()
+         },
+         ConfigOverrides {
++            approval_policy: Some(AskForApproval::OnRequest),
+             persisted_permission_profile_id: Some(
+                 BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string(),
+             ),
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -153,7 +153,6 @@ use std::time::Duration;
+ 
+ use crate::config::permissions::BUILT_IN_READ_ONLY_PROFILE;
+ use crate::config::permissions::BUILT_IN_WORKSPACE_PROFILE;
+-use crate::config::permissions::default_builtin_permission_profile_name;
+ use crate::config::permissions::network_proxy_config_for_profile_selection;
+ use crate::config::permissions::validate_user_permission_profile_names;
+ use crate::responses_metadata::validate_extra_metadata;
+@@ -3793,12 +3792,7 @@ impl Config {
+                     // without broadening network behavior.
+                     let default_permissions = effective_permission_selection
+                         .selected_profile_id
+-                        .unwrap_or_else(|| {
+-                            default_builtin_permission_profile_name(
+-                                &active_project,
+-                                legacy_windows_sandbox_level,
+-                            )
+-                        });
++                        .unwrap_or(BUILT_IN_WORKSPACE_PROFILE);
+                     network_proxy_config_for_profile_selection(
+                         effective_permission_selection.profiles.as_ref(),
+                         default_permissions,
+@@ -3816,12 +3810,7 @@ impl Config {
+         } else if profiles_are_active {
+             let default_permissions = effective_permission_selection
+                 .selected_profile_id
+-                .unwrap_or_else(|| {
+-                    default_builtin_permission_profile_name(
+-                        &active_project,
+-                        legacy_windows_sandbox_level,
+-                    )
+-                });
++                .unwrap_or(BUILT_IN_WORKSPACE_PROFILE);
+             let builtin_workspace_write_settings = if using_implicit_builtin_profile {
+                 cfg.sandbox_workspace_write.as_ref().map(|settings| WorkspaceWriteSettings {
+                     writable_roots: settings.writable_roots.iter().map(PathUri::from_abs_path).collect(),
+@@ -3945,15 +3934,7 @@ impl Config {
+             approval_policy_override.is_some() || cfg.approval_policy.is_some();
+         let mut approval_policy = approval_policy_override
+             .or(cfg.approval_policy)
+-            .unwrap_or_else(|| {
+-                if active_project.is_trusted() {
+-                    AskForApproval::OnRequest
+-                } else if active_project.is_untrusted() {
+-                    AskForApproval::UnlessTrusted
+-                } else {
+-                    AskForApproval::default()
+-                }
+-            });
++            .unwrap_or(AskForApproval::Never);
+         if !approval_policy_was_explicit
+             && let Err(err) = constrained_approval_policy.can_set(&approval_policy)
+         {
+diff --git a/codex-rs/core/src/config/permissions.rs b/codex-rs/core/src/config/permissions.rs
+--- a/codex-rs/core/src/config/permissions.rs
++++ b/codex-rs/core/src/config/permissions.rs
+@@ -23,7 +23,6 @@ use codex_network_proxy::NetworkMode;
+ use codex_network_proxy::NetworkProxyConfig;
+ #[cfg(test)]
+ use codex_network_proxy::NetworkUnixSocketPermission as ProxyNetworkUnixSocketPermission;
+-use codex_protocol::config_types::WindowsSandboxLevel;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+@@ -38,7 +37,6 @@ use codex_protocol::permissions::project_roots_glob_pattern;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_path_uri::PathUri;
+ 
+-use super::ProjectConfig;
+ use super::permission_path;
+ #[cfg(test)]
+ use super::permission_path::contains_glob_chars_for_platform;
+@@ -65,19 +63,6 @@ pub(super) fn active_arg0_helper_dir(
+         .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
+ }
+ 
+-pub(crate) fn default_builtin_permission_profile_name(
+-    active_project: &ProjectConfig,
+-    windows_sandbox_level: WindowsSandboxLevel,
+-) -> &'static str {
+-    if (active_project.is_trusted() || active_project.is_untrusted())
+-        && !(cfg!(target_os = "windows") && windows_sandbox_level == WindowsSandboxLevel::Disabled)
+-    {
+-        BUILT_IN_WORKSPACE_PROFILE
+-    } else {
+-        BUILT_IN_READ_ONLY_PROFILE
+-    }
+-}
+-
+ pub(crate) fn is_builtin_permission_profile_name(profile_name: &str) -> bool {
+     matches!(
+         profile_name,
+diff --git a/codex-rs/core/src/guardian/tests.rs b/codex-rs/core/src/guardian/tests.rs
+--- a/codex-rs/core/src/guardian/tests.rs
++++ b/codex-rs/core/src/guardian/tests.rs
+@@ -3927,6 +3927,10 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
+ #[tokio::test]
+ async fn guardian_review_session_config_preserves_parent_network_proxy() {
+     let mut parent_config = test_config().await;
++    parent_config
++        .permissions
++        .set_permission_profile(PermissionProfile::read_only())
++        .expect("set parent read-only permissions");
+     let network = NetworkProxySpec::from_config_and_constraints(
+         NetworkProxyConfig::default(),
+         Some(NetworkConstraints {
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -77,6 +77,7 @@ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::config_types::TrustLevel;
+ use codex_protocol::exec_output::ExecToolCallOutput;
+ use codex_protocol::models::AgentMessageInputContent;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+ use codex_protocol::models::FileSystemPermissions;
+ use codex_protocol::models::FunctionCallOutputBody;
+ use codex_protocol::models::FunctionCallOutputContentItem;
+@@ -4991,6 +4992,9 @@ async fn build_test_config(codex_home: &Path) -> Config {
+         .codex_home(codex_home.to_path_buf())
+         .harness_overrides(ConfigOverrides {
+             model: Some("gpt-5.5".to_string()),
++            // Keep session fixtures independent of the product's permission defaults.
++            approval_policy: Some(AskForApproval::OnRequest),
++            default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+             ..Default::default()
+         })
+         .build()
+diff --git a/codex-rs/core/tests/suite/auto_review.rs b/codex-rs/core/tests/suite/auto_review.rs
+--- a/codex-rs/core/tests/suite/auto_review.rs
++++ b/codex-rs/core/tests/suite/auto_review.rs
+@@ -130,6 +130,7 @@ async fn approval_review_contributor_skips_existing_guardian_model_call() -> Res
+         .with_extensions(Arc::new(extensions.build()))
+         .with_config(|config| {
+             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
++            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+             config
+                 .features
+                 .enable(Feature::RequestPermissionsTool)
+diff --git a/codex-rs/core/tests/suite/guardian_context_budget.rs b/codex-rs/core/tests/suite/guardian_context_budget.rs
+--- a/codex-rs/core/tests/suite/guardian_context_budget.rs
++++ b/codex-rs/core/tests/suite/guardian_context_budget.rs
+@@ -13,6 +13,7 @@ use codex_features::Feature;
+ use codex_history::RolloutItem;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::models::ContentItem;
++use codex_protocol::models::PermissionProfile;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::AutoReviewMessages;
+ use codex_protocol::protocol::AskForApproval;
+@@ -265,6 +266,12 @@ async fn review_respects_complete_context_budget(
+             model.auto_review_model_override = Some("gpt-5.6-luna".to_owned());
+         })
+         .with_config(move |config| {
++            // Keep the fixed-window fixture's original read-only prefix. Its compaction
++            // targets are the later inspection output and retained review history.
++            config
++                .permissions
++                .set_permission_profile(PermissionProfile::read_only())
++                .expect("set bounded review fixture permissions");
+             config
+                 .features
+                 .enable(Feature::TokenBudget)
+@@ -478,7 +485,14 @@ async fn review_respects_complete_context_budget(
+                 | ReviewerResponse::CachedCompactionContinuation
+                 | ReviewerResponse::FileImageContinuation
+         );
+-        assert_eq!(requests.len(), if recovered { 4 } else { 3 });
++        assert_eq!(
++            requests.len(),
++            if recovered { 4 } else { 3 },
++            "parent resumed with: {:?}",
++            requests
++                .last()
++                .and_then(|request| request.function_call_output_text("exec-over-budget"))
++        );
+         assert_eq!(guardian_requests.len(), if recovered { 2 } else { 1 });
+         if recovered {
+             assert_eq!(compact_requests.len(), 1);
+diff --git a/codex-rs/core/tests/suite/prompt_caching.rs b/codex-rs/core/tests/suite/prompt_caching.rs
+--- a/codex-rs/core/tests/suite/prompt_caching.rs
++++ b/codex-rs/core/tests/suite/prompt_caching.rs
+@@ -6,6 +6,7 @@ use std::path::Path;
+ use std::sync::Arc;
+ 
+ use codex_core::TurnInputRequest;
++use codex_core::config::Constrained;
+ use codex_core::shell::default_user_shell;
+ use codex_features::Feature;
+ use codex_models_manager::bundled_models_response;
+@@ -494,6 +495,11 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
+     } = test_codex()
+         .with_pre_build_hook(write_global_instructions)
+         .with_config(|config| {
++            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
++            config
++                .permissions
++                .set_permission_profile(PermissionProfile::read_only())
++                .expect("start with read-only permissions before the override");
+             config
+                 .features
+                 .enable(Feature::CollaborationModes)
+@@ -511,9 +517,8 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
+         .await?;
+     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+ 
+-    let writable = TempDir::new().unwrap();
+     let permission_profile = PermissionProfile::workspace_write_with(
+-        &[writable.abs()],
++        &[],
+         NetworkSandboxPolicy::Enabled,
+         /*exclude_tmpdir_env_var*/ true,
+         /*exclude_slash_tmp*/ true,
+@@ -579,7 +584,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
+             && env_text.contains("<file_system type=\"restricted\">")
+             && env_text.contains(&format!(
+                 "<entry access=\"write\"><path>{}</path></entry>",
+-                writable.abs().display()
++                config.cwd.display()
+             )),
+         "expected workspace-write filesystem profile in environment context: {env_text}"
+     );
+diff --git a/codex-rs/core/tests/suite/turn_state.rs b/codex-rs/core/tests/suite/turn_state.rs
+--- a/codex-rs/core/tests/suite/turn_state.rs
++++ b/codex-rs/core/tests/suite/turn_state.rs
+@@ -1,6 +1,7 @@
+ #![allow(clippy::unwrap_used)]
+ 
+ use anyhow::Result;
++use codex_protocol::models::PermissionProfile;
+ use core_test_support::responses::WebSocketConnectionConfig;
+ use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+@@ -122,7 +123,12 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
+     }])
+     .await;
+ 
+-    let mut builder = test_codex();
++    let mut builder = test_codex().with_config(|config| {
++        config
++            .permissions
++            .set_permission_profile(PermissionProfile::read_only())
++            .expect("set initial read-only permission profile");
++    });
+     let test = builder.build_with_websocket_server(&server).await?;
+     // Phase 1: startup prewarm uses the connection without generating a response.
+     // Wait before submitting a turn, which changes the session's sandbox policy.
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/extension_tests.rs b/codex-rs/ext/guardian-v2/src/async_scorer/extension_tests.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/extension_tests.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/extension_tests.rs
+@@ -4,6 +4,7 @@ use std::sync::Mutex;
+ use std::time::Duration;
+ 
+ use anyhow::Result;
++use codex_config::Constrained;
+ use codex_core::config::Config;
+ use codex_core::config::ConfigBuilder;
+ use codex_core::config::LoaderOverrides;
+@@ -51,6 +52,7 @@ use codex_protocol::openai_models::GuardianV2ModelConfig;
+ use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::ReviewDecision;
+@@ -975,6 +977,8 @@ async fn sample_configured_conversation_history_with_delivery(
+             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+             config.guardian_policy_config = guardian_policy;
+             if code_mode {
++                config.permissions.approval_policy =
++                    Constrained::allow_any(AskForApproval::OnRequest);
+                 for feature in [
+                     Feature::Apps,
+                     Feature::CodeMode,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -8242,17 +8242,13 @@ async fn in_app_resume_session_cwd_without_metadata_is_non_fatal() -> Result<()>
+ 
+ #[tokio::test]
+ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()> {
+-    // Keep the large setup and resume futures off the Windows test stack.
++    // Keep the large setup and resume futures off the test stack.
+     let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+     let local_cwd = app.config.cwd.to_path_buf();
+     let local_workspace_roots = Box::pin(app.rebuild_config_for_cwd(local_cwd.clone()))
+         .await?
+         .workspace_roots;
+-    let remote_cwd = if cfg!(windows) {
+-        PathBuf::from("/srv/remote/project")
+-    } else {
+-        PathBuf::from(r"C:\remote\project")
+-    };
++    let remote_cwd = PathBuf::from(r"C:\remote\project");
+     let filename_timestamp = "2025-01-05T12-00-00";
+     let thread_id = app_test_support::create_fake_rollout(
+         app.config.codex_home.as_path(),
+@@ -8275,15 +8271,19 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
+         },
+     };
+     app.harness_overrides.cwd = Some(remote_cwd.clone());
+-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
++    // Exercise remote request semantics as well as the App's remote target.
++    let (mut app_server, _requests, proxy) =
++        Box::pin(session_lifecycle_requests::start_recording_remote_app_server(&app.config))
++            .await?;
+     let backend_id = app_server.backend_id();
+-    Box::pin(app_server.resume_thread(
++    let server_session = Box::pin(app_server.resume_thread(
+         &crate::local_settings::LocalSettings::from(&app.config),
+         app.config.clone(),
+         ThreadId::from_string(&thread_id)?,
+         crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+     ))
+-    .await?;
++    .await?
++    .session;
+     let mut tui = crate::tui::test_support::make_test_tui()?;
+     app.runtime_approval_policy_override = Some(RuntimeApprovalPolicyOverride::Restored(
+         AskForApproval::Never,
+@@ -8317,8 +8317,24 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
+     ));
+     assert_eq!(app.config.workspace_roots, local_workspace_roots);
+     assert_eq!(app.runtime_approval_policy_override, None);
++    assert_eq!(
++        app.chat_widget.config_ref().approvals_reviewer,
++        server_session.approvals_reviewer,
++    );
++    // The active widget owns the server's permission snapshot. Resume clears
++    // stale restored overrides instead of turning that snapshot into a new override.
++    assert_eq!(
++        RuntimePermissionProfileOverride::from_restored_config(app.chat_widget.config_ref()),
++        RuntimePermissionProfileOverride {
++            permission_profile: server_session.permission_profile,
++            active_permission_profile: server_session.active_permission_profile,
++            network: None,
++            turn_override: RuntimePermissionProfileTurnOverride::Preserve,
++        }
++    );
+     assert!(app.runtime_permission_profile_override.is_none());
+     app_server.shutdown().await?;
++    proxy.await??;
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/tui/src/app/tests/background_task_defaults_tests.rs b/codex-rs/tui/src/app/tests/background_task_defaults_tests.rs
+--- a/codex-rs/tui/src/app/tests/background_task_defaults_tests.rs
++++ b/codex-rs/tui/src/app/tests/background_task_defaults_tests.rs
+@@ -229,7 +229,7 @@ async fn command_center_new_reads_server_defaults_for_actual_destination() -> Re
+         std::fs::write(
+             client_home.path().join("config.toml"),
+             format!(
+-                "model = \"{}\"\nmodel_reasoning_effort = \"low\"\n{}",
++                "model = \"{}\"\nmodel_reasoning_effort = \"low\"\napproval_policy = \"on-request\"\n{}",
+                 if mode == "remote-null-fast" {
+                     "gpt-5.2"
+                 } else {
+diff --git a/codex-rs/tui/src/app/tests/projectless_tests.rs b/codex-rs/tui/src/app/tests/projectless_tests.rs
+--- a/codex-rs/tui/src/app/tests/projectless_tests.rs
++++ b/codex-rs/tui/src/app/tests/projectless_tests.rs
+@@ -1,12 +1,21 @@
+ //! Exercise implicit defaults and permission inheritance through TUI session requests.
+ 
+ use super::session_lifecycle_requests::HistoryCapabilities;
++use super::session_lifecycle_requests::recorded_params;
+ use super::session_lifecycle_requests::start_recording_app_server_with_history;
+ use super::*;
++use codex_protocol::protocol::AskForApproval as Approval;
++use codex_protocol::protocol::GranularApprovalConfig;
+ use pretty_assertions::assert_eq;
+ 
+ #[tokio::test]
+-async fn projectless_permissions_survive_session_transitions_without_trust() -> Result<()> {
++async fn projectless_never_defaults_survive_session_transitions_without_trust() -> Result<()> {
++    boxed_future!(projectless_never_defaults_survive_session_transitions_without_trust_scenario())
++        .await
++}
++
++async fn projectless_never_defaults_survive_session_transitions_without_trust_scenario()
++-> Result<()> {
+     let (mut app, mut events, _) = make_test_app_with_channels().await;
+     let home = tempfile::tempdir()?;
+     app.config.codex_home = home.path().to_path_buf().abs();
+@@ -63,10 +72,10 @@ sandbox = "unelevated"
+             .file_system_sandbox_policy()
+             .can_write_local_path_with_cwd(source.path(), source.path())
+     );
+-    assert!(matches!(
++    assert_eq!(
+         app.config.permissions.approval_policy.value(),
+-        codex_protocol::protocol::AskForApproval::Granular(_)
+-    ));
++        Approval::Never
++    );
+     // Saving history must not turn implicit writable defaults into read-only on /cd.
+     server
+         .thread_inject_items(
+@@ -89,10 +98,10 @@ sandbox = "unelevated"
+             app.config.permissions.active_permission_profile(),
+             Some(ActivePermissionProfile::new(":workspace"))
+         );
+-        assert!(matches!(
++        assert_eq!(
+             app.config.permissions.approval_policy.value(),
+-            codex_protocol::protocol::AskForApproval::Granular(_)
+-        ));
++            Approval::Never
++        );
+     }
+     let mut readonly = app.config.clone();
+     readonly
+@@ -101,6 +110,10 @@ sandbox = "unelevated"
+             PermissionProfile::read_only(),
+             ActivePermissionProfile::new(":read-only"),
+         ))?;
++    readonly
++        .permissions
++        .approval_policy
++        .set(Approval::OnRequest)?;
+     let saved = server.start_thread(&readonly).await?;
+     server
+         .thread_inject_items(
+@@ -124,10 +137,21 @@ sandbox = "unelevated"
+     )
+     .await?;
+     assert_eq!(app.chat_widget.thread_id(), Some(saved.session.thread_id));
++    assert_eq!(
++        app.config.permissions.approval_policy.value(),
++        Approval::OnRequest
++    );
+     assert_eq!(
+         app.config.permissions.active_permission_profile(),
+         Some(ActivePermissionProfile::new(":read-only"))
+     );
++    assert!(
++        !app.config
++            .permissions
++            .effective_permission_profile()
++            .file_system_sandbox_policy()
++            .can_write_local_path_with_cwd(source.path(), source.path())
++    );
+     // A normal turn must leave the saved profile on the server, even though the
+     // widget knows its ID. Complete the turn so /cd exercises saved history.
+     while events.try_recv().is_ok() {}
+@@ -170,6 +194,7 @@ sandbox = "unelevated"
+         next.permissions.permission_profile(),
+         &PermissionProfile::workspace_write()
+     );
++    assert_eq!(next.permissions.approval_policy.value(), Approval::Never);
+     let before = app.chat_widget.thread_id();
+     app.change_working_directory(
+         &mut tui,
+@@ -179,8 +204,13 @@ sandbox = "unelevated"
+     .await;
+     assert_eq!(app.config.cwd.as_path(), destination.path());
+     assert_ne!(app.chat_widget.thread_id(), before);
++    assert_eq!(
++        app.config.permissions.approval_policy.value(),
++        Approval::Never
++    );
++    // Resumed permissions belong to the saved task; /cd loads destination defaults.
+     assert!(
+-        !app.config
++        app.config
+             .permissions
+             .effective_permission_profile()
+             .file_system_sandbox_policy()
+@@ -204,10 +234,7 @@ sandbox = "unelevated"
+             app.config.cwd.as_path(),
+             app.config.permissions.approval_policy.value()
+         ),
+-        (
+-            untrusted.path(),
+-            codex_protocol::protocol::AskForApproval::UnlessTrusted
+-        )
++        (untrusted.path(), Approval::Never)
+     );
+     // A new task in a marked project still gets implicit defaults when leaving it.
+     std::fs::create_dir(untrusted.path().join(".codex"))?;
+@@ -215,6 +242,10 @@ sandbox = "unelevated"
+     crate::config_update::write_trusted_project(server.request_handle(), untrusted.path()).await?;
+     app.new_agents_overview_session(&mut tui, &mut server, Some(untrusted.path().abs()))
+         .await?;
++    assert_eq!(
++        app.config.permissions.approval_policy.value(),
++        Approval::Never
++    );
+     server
+         .thread_inject_items(
+             app.chat_widget.thread_id().expect("new project task"),
+@@ -233,18 +264,23 @@ sandbox = "unelevated"
+             Some(ActivePermissionProfile::new(":workspace"))
+         )
+     );
++    app.new_agents_overview_session(&mut tui, &mut server, Some(source.path().abs()))
++        .await?;
++    assert_eq!(
++        app.config.permissions.approval_policy.value(),
++        Approval::Never
++    );
+     server.shutdown().await?;
+     Ok(())
+ }
+ 
+ #[tokio::test]
+ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings() -> Result<()> {
+-    use codex_protocol::protocol::AskForApproval as Approval;
+     for (settings, project_marker, expected_profile, expected_approval, sandbox_ready) in [
+         ("", false, ":workspace", None, true),
+         #[cfg(target_os = "windows")]
+         ("", false, ":read-only", None, false),
+-        ("", true, ":read-only", None, true),
++        ("", true, ":workspace", None, true),
+         (
+             "sandbox_mode = \"read-only\"\n",
+             false,
+@@ -298,17 +334,6 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings()
+             .harness_overrides(overrides.clone())
+             .build()
+             .await?;
+-        let original_approval = if settings.is_empty() && !project_marker {
+-            Approval::Granular(codex_protocol::protocol::GranularApprovalConfig {
+-                sandbox_approval: false,
+-                rules: false,
+-                skill_approval: false,
+-                request_permissions: true,
+-                mcp_elicitations: true,
+-            })
+-        } else {
+-            config.permissions.approval_policy.value()
+-        };
+         if project_marker {
+             // The server must notice a project layer added after client discovery.
+             assert!(config.config_layer_stack.is_projectless());
+@@ -318,7 +343,7 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings()
+                 "model = \"untrusted-model\"\n",
+             )?;
+         }
+-        let (server, _, proxy) = start_recording_app_server_with_history(
++        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+             &config,
+             HistoryCapabilities::Current,
+             /*blocked_thread_list*/ None,
+@@ -351,9 +376,98 @@ async fn local_projectless_defaults_respect_trust_scope_and_explicit_settings()
+                 } else {
+                     PermissionProfile::read_only()
+                 },
+-                expected_approval.unwrap_or(original_approval)
++                expected_approval.unwrap_or(Approval::Never)
+             )
+         );
++        let started = server.start_thread(&config).await?;
++        assert_eq!(
++            started.session.approval_policy.to_core(),
++            expected_approval.unwrap_or(Approval::Never)
++        );
++        assert_eq!(
++            recorded_params(&requests, "thread/start")[0]["approvalPolicy"],
++            serde_json::to_value(expected_approval.unwrap_or(Approval::Never))?
++        );
++        server.shutdown().await?;
++        proxy.await??;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn projectless_startup_honors_server_and_launch_approval_choices() -> Result<()> {
++    let granular = Approval::Granular(GranularApprovalConfig {
++        sandbox_approval: false,
++        rules: true,
++        skill_approval: false,
++        request_permissions: true,
++        mcp_elicitations: false,
++    });
++    for (server_approval, launch_approval, permission_settings) in [
++        (Approval::OnRequest, None, ""),
++        (granular, None, ""),
++        (granular, Some(Approval::Never), ""),
++        (Approval::Never, Some(Approval::OnRequest), ""),
++        (Approval::Never, Some(granular), ""),
++        (Approval::OnRequest, None, "sandbox_mode = \"read-only\"\n"),
++        (
++            granular,
++            Some(Approval::Never),
++            "sandbox_mode = \"read-only\"\n",
++        ),
++        (granular, None, "default_permissions = \":read-only\"\n"),
++    ] {
++        let home = tempfile::tempdir()?;
++        let cwd = tempfile::tempdir()?;
++        let overrides = ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            approval_policy: launch_approval,
++            ..Default::default()
++        };
++        std::fs::write(home.path().join("config.toml"), permission_settings)?;
++        let mut config = ConfigBuilder::default()
++            .codex_home(home.path().to_path_buf())
++            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
++            .harness_overrides(overrides.clone())
++            .build()
++            .await?;
++        let expected_profile = config.permissions.permission_profile().clone();
++        // Server config can change after local startup loaded its implicit policy.
++        let approval_settings = toml::to_string(&std::collections::BTreeMap::from([(
++            "approval_policy",
++            server_approval,
++        )]))?;
++        std::fs::write(
++            home.path().join("config.toml"),
++            format!("{permission_settings}{approval_settings}"),
++        )?;
++        let (mut server, requests, proxy) = start_recording_app_server_with_history(
++            &config,
++            HistoryCapabilities::Current,
++            /*blocked_thread_list*/ None,
++            /*failed_thread_name*/ None,
++            crate::app_server_session::ThreadParamsMode::Embedded,
++            LoaderOverrides::without_managed_config_for_tests(),
++        )
++        .await?;
++        crate::app::startup::prepare_fresh_startup_config(
++            &mut config,
++            &server,
++            &AppServerTarget::Embedded,
++            &[],
++            &overrides,
++            &EnvironmentManager::default_for_tests(),
++        )
++        .await?;
++        let expected = launch_approval.unwrap_or(server_approval);
++        assert_eq!(config.permissions.approval_policy.value(), expected);
++        assert_eq!(config.permissions.permission_profile(), &expected_profile);
++        let started = server.start_thread(&config).await?;
++        assert_eq!(started.session.approval_policy.to_core(), expected);
++        assert_eq!(
++            recorded_params(&requests, "thread/start")[0]["approvalPolicy"],
++            serde_json::to_value(expected)?
++        );
+         server.shutdown().await?;
+         proxy.await??;
+     }
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -4938,8 +4938,9 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+     Box::pin(app.change_working_directory(&mut tui, &mut server, untrusted.clone().abs())).await;
+     assert_eq!(app.config.active_project.trust_level, Some(T::Untrusted));
+     let approval = app.config.permissions.approval_policy.value();
+-    assert_eq!(approval, AskForApproval::UnlessTrusted.to_core());
+-    assert_eq!(rec(req, "thread/fork")[0]["approvalPolicy"], "untrusted");
++    // Trust still gates project configuration and hooks, not the Never default.
++    assert_eq!(approval, AskForApproval::Never.to_core());
++    assert_eq!(rec(req, "thread/fork")[0]["approvalPolicy"], "never");
+     let warning = "Project-local config, hooks, and exec policies are disabled";
+     assert!(history().iter().any(|line| line.contains(warning)));
+     let untrusted_permissions = app.config.permissions.permission_profile().clone();
+diff --git a/codex-rs/tui/src/app/tests/startup_defaults_tests.rs b/codex-rs/tui/src/app/tests/startup_defaults_tests.rs
+--- a/codex-rs/tui/src/app/tests/startup_defaults_tests.rs
++++ b/codex-rs/tui/src/app/tests/startup_defaults_tests.rs
+@@ -453,9 +453,10 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
+         let server_home = tempdir()?;
+         let destination = tempdir()?;
+         let launch_cwd = tempdir()?;
++        // Startup forwards the client's permission choice while rereading model defaults.
+         std::fs::write(
+             client_home.path().join("config.toml"),
+-            "model = \"stale-client-model\"\nmodel_reasoning_effort = \"low\"\nmodel_reasoning_summary = \"detailed\"\nfeatures.concurrent_reasoning_summaries = true\n",
++            "model = \"stale-client-model\"\nmodel_reasoning_effort = \"low\"\nsandbox_mode = \"read-only\"\nmodel_reasoning_summary = \"detailed\"\nfeatures.concurrent_reasoning_summaries = true\n",
+         )?;
+         std::fs::write(
+             server_home.path().join("config.toml"),
+@@ -545,6 +546,8 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
+         let latest = starts.last().unwrap();
+         assert_eq!(latest["model"], serde_json::Value::Null);
+         assert!(latest["config"].get("model_reasoning_effort").is_none());
++        assert_eq!(latest["sandbox"], "read-only");
++        assert!(latest["permissions"].is_null());
+         for start in &starts {
+             assert!(start["config"].get("model_reasoning_summary").is_none());
+             assert!(
+diff --git a/codex-rs/tui/src/app/thread_session_state.rs b/codex-rs/tui/src/app/thread_session_state.rs
+--- a/codex-rs/tui/src/app/thread_session_state.rs
++++ b/codex-rs/tui/src/app/thread_session_state.rs
+@@ -403,6 +403,11 @@ mod tests {
+     #[tokio::test]
+     async fn thread_read_fallback_uses_active_permission_settings() {
+         let mut app = make_test_app().await;
++        // Keep the stale App snapshot distinct from the active workspace session.
++        app.config
++            .permissions
++            .set_permission_profile(PermissionProfile::read_only())
++            .expect("set stale App permissions");
+         let primary_thread_id =
+             ThreadId::from_string("00000000-0000-0000-0000-000000000404").expect("valid thread");
+         let read_thread_id =
+diff --git a/codex-rs/tui/src/chatwidget/tests/quick_dials_tests.rs b/codex-rs/tui/src/chatwidget/tests/quick_dials_tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests/quick_dials_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/quick_dials_tests.rs
+@@ -39,7 +39,7 @@ async fn current_settings_offer_model_permissions_and_status_layouts() {
+         Ok(AppEvent::OpenQuickDialEditor {
+             target: QuickDialEditorTarget::PickSlot,
+             dial: Some(QuickDial { input, label: None }),
+-        }) if input == "/permissions :workspace --approval-policy=on-request --reviewer=user"
++        }) if input == "/permissions :workspace --approval-policy=never --reviewer=user"
+     );
+ 
+     chat.open_quick_dial_prefills();
+@@ -102,7 +102,7 @@ async fn current_settings_offer_model_permissions_and_status_layouts() {
+         Ok(AppEvent::OpenQuickDialEditor {
+             target: QuickDialEditorTarget::PickSlot,
+             dial: Some(QuickDial { input, label: None }),
+-        }) if input == "/permissions :workspace --approval-policy=on-request --reviewer=auto_review"
++        }) if input == "/permissions :workspace --approval-policy=never --reviewer=auto_review"
+     );
+ 
+     let granular = AskForApproval::Granular {
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -4105,7 +4105,10 @@ requires_openai_auth = {requires_openai_auth}
+     }
+ 
+     #[tokio::test]
+-    async fn config_rebuild_changes_trust_defaults_with_cwd() -> std::io::Result<()> {
++    async fn config_rebuild_preserves_never_workspace_defaults_across_trust() -> std::io::Result<()>
++    {
++        use codex_protocol::config_types::TrustLevel;
++
+         let temp_dir = TempDir::new()?;
+         let codex_home = temp_dir.path().to_path_buf();
+         let trusted = temp_dir.path().join("trusted");
+@@ -4138,11 +4141,21 @@ trust_level = "untrusted"
+             .await?;
+         assert_eq!(
+             AskForApproval::from(trusted_config.permissions.approval_policy.value()),
+-            AskForApproval::OnRequest
++            AskForApproval::Never
++        );
++        assert_eq!(
++            trusted_config.active_project.trust_level,
++            Some(TrustLevel::Trusted)
++        );
++        assert!(
++            trusted_config
++                .permissions
++                .file_system_sandbox_policy()
++                .can_write_local_path_with_cwd(&trusted, &trusted)
+         );
+ 
+         let untrusted_overrides = ConfigOverrides {
+-            cwd: Some(untrusted),
++            cwd: Some(untrusted.clone()),
+             ..trusted_overrides
+         };
+         let untrusted_config = ConfigBuilder::default()
+@@ -4153,7 +4166,17 @@ trust_level = "untrusted"
+             .await?;
+         assert_eq!(
+             AskForApproval::from(untrusted_config.permissions.approval_policy.value()),
+-            AskForApproval::UnlessTrusted
++            AskForApproval::Never
++        );
++        assert_eq!(
++            untrusted_config.active_project.trust_level,
++            Some(TrustLevel::Untrusted)
++        );
++        assert!(
++            untrusted_config
++                .permissions
++                .file_system_sandbox_policy()
++                .can_write_local_path_with_cwd(&untrusted, &untrusted)
+         );
+         Ok(())
+     }
+diff --git a/codex-rs/tui/src/projectless.rs b/codex-rs/tui/src/projectless.rs
+--- a/codex-rs/tui/src/projectless.rs
++++ b/codex-rs/tui/src/projectless.rs
+@@ -1,4 +1,4 @@
+-//! Select desktop-like execution defaults for positively discovered local projectless folders.
++//! Apply server choices and workspace setup for positively discovered local projectless folders.
+ //! Saved trust, explicit choices, managed policy, and remote execution retain their own defaults.
+ 
+ use crate::app_server_session::AppServerSession;
+@@ -9,8 +9,6 @@ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::models::PermissionProfileSnapshot;
+-use codex_protocol::protocol::AskForApproval;
+-use codex_protocol::protocol::GranularApprovalConfig;
+ 
+ /// Returns whether eligible implicit permissions require Windows sandbox setup.
+ pub(crate) fn apply_defaults(
+@@ -26,10 +24,6 @@ pub(crate) fn apply_defaults(
+         layer["name"]["type"] == "project"
+     }))
+         || app_server.uses_remote_workspace()
+-        || defaults.sandbox_mode.is_some()
+-        || defaults.sandbox_workspace_write.is_some()
+-        || ["default_permissions", "permissions", "network"].iter()
+-            .any(|key| defaults.additional.get(*key).is_some_and(|value| !value.is_null()))
+         // Reuse local discovery only when server markers and trust decisions agree.
+         || ["project_root_markers", "projects"].iter().any(|key|
+             serde_json::to_value(effective.get(*key)).ok().as_ref()
+@@ -39,6 +33,29 @@ pub(crate) fn apply_defaults(
+         || config.workspace_roots.len() != 1
+         || config.workspace_roots.first() != Some(&config.cwd)
+         || !has_only_local_environments(environments)
++    {
++        return false;
++    }
++    // Core owns implicit approval; an explicit server policy is independent of filesystem setup.
++    if overrides.approval_policy.is_none()
++        && effective.get("approval_policy").is_none()
++        && let Some(approval_policy) = defaults.approval_policy.as_ref()
++    {
++        let _ = config
++            .permissions
++            .approval_policy
++            .set(approval_policy.to_core());
++    }
++    if defaults.sandbox_mode.is_some()
++        || defaults.sandbox_workspace_write.is_some()
++        || ["default_permissions", "permissions", "network"]
++            .iter()
++            .any(|key| {
++                defaults
++                    .additional
++                    .get(*key)
++                    .is_some_and(|value| !value.is_null())
++            })
+         || overrides.sandbox_mode.is_some()
+         || overrides.permission_profile.is_some()
+         || overrides.default_permissions.is_some()
+@@ -63,20 +80,6 @@ pub(crate) fn apply_defaults(
+     {
+         return false;
+     }
+-    let granular = AskForApproval::Granular(GranularApprovalConfig {
+-        sandbox_approval: false,
+-        rules: false,
+-        skill_approval: false,
+-        request_permissions: true,
+-        mcp_elicitations: true,
+-    });
+-    if overrides.approval_policy.is_none() && effective.get("approval_policy").is_none() {
+-        let granular = defaults
+-            .approval_policy
+-            .as_ref()
+-            .map_or(granular, |policy| policy.to_core());
+-        let _ = config.permissions.approval_policy.set(granular);
+-    }
+     #[cfg(target_os = "windows")]
+     if config.effective_local_windows_sandbox_type() == codex_sandboxing::SandboxType::None {
+         return true;
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -690,6 +690,11 @@ async fn status_permissions_broadened_workspace_profile_shows_builtin_label() {
+ async fn status_permissions_user_defined_profile_shows_name() {
+     let temp_home = TempDir::new().expect("temp home");
+     let mut config = test_config(&temp_home).await;
++    config
++        .permissions
++        .approval_policy
++        .set(AskForApproval::OnRequest.to_core())
++        .expect("select the approval policy displayed with the custom profile");
+     config
+         .permissions
+         .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(

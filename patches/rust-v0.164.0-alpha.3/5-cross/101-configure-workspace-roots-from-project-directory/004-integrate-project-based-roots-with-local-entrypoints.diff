@@ -1,0 +1,1131 @@
+integrate-project-based-roots-with-local-entrypoints
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: integrate-project-based-roots-with-local-entrypoints
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/src/request_processors/command_exec_processor.rs b/codex-rs/app-server/src/request_processors/command_exec_processor.rs
+--- a/codex-rs/app-server/src/request_processors/command_exec_processor.rs
++++ b/codex-rs/app-server/src/request_processors/command_exec_processor.rs
+@@ -3,6 +3,7 @@ use codex_core::exec_env::inject_apply_patch_env;
+ use codex_core::windows_sandbox::local_binding_policy_for_sandbox;
+ use codex_core::windows_sandbox::managed_proxy_routing_for_windows_sandbox;
+ use codex_protocol::shell_environment::is_non_inheritable_env_var;
++use std::borrow::Cow;
+ 
+ #[derive(Clone)]
+ pub(crate) struct CommandExecRequestProcessor {
+@@ -151,8 +152,49 @@ impl CommandExecRequestProcessor {
+         }
+ 
+         let cwd = cwd.map_or_else(|| self.config.cwd.clone(), |cwd| self.config.cwd.join(cwd));
++        let config = if let Some(permission_profile) = permission_profile {
++            let config = self
++                .config_manager
++                .load_for_cwd(
++                    None,
++                    ConfigOverrides {
++                        cwd: Some(cwd.to_path_buf()),
++                        default_permissions: Some(permission_profile),
++                        ..Default::default()
++                    },
++                    Some(self.config.cwd.to_path_buf()),
++                )
++                .await
++                .map_err(|err| invalid_request(format!("invalid permission profile: {err}")))?;
++            if let Some(warning) = config.startup_warnings.iter().find(|warning| {
++                warning.contains("Configured value for `permission_profile` is disallowed")
++            }) {
++                return Err(invalid_request(format!(
++                    "invalid permission profile: {warning}"
++                )));
++            }
++            Cow::Owned(config)
++        } else {
++            Cow::Borrowed(self.config.as_ref())
++        };
++        let network_proxy_permission_profile = config.permissions.permission_profile().clone();
++        let config = if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
++            let mut config = config.into_owned();
++            config
++                .permissions
++                .set_legacy_sandbox_policy(policy, &config.cwd)
++                .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
++            Cow::Owned(config)
++        } else {
++            config
++        };
++        let permissions = config.prepare_local_permissions().map_err(|error| {
++            internal_error(format!(
++                "failed to prepare local execution environment: {error:#}"
++            ))
++        })?;
+         let mut env = create_env(
+-            &self.config.permissions.shell_environment_policy,
++            &permissions.shell_environment_policy,
+             /*thread_id*/ None,
+         );
+         if let Some(env_overrides) = env_overrides {
+@@ -199,68 +241,7 @@ impl CommandExecRequestProcessor {
+         } else {
+             ExecCapturePolicy::ShellTool
+         };
+-        let sandbox_cwd = if permission_profile.is_some() {
+-            cwd.clone()
+-        } else {
+-            self.config.cwd.clone()
+-        };
+-        let (
+-            effective_permission_profile,
+-            network_proxy_spec,
+-            network_proxy_permission_profile,
+-            managed_network_requirements_enabled,
+-            windows_sandbox_workspace_roots,
+-        ) = if let Some(permission_profile) = permission_profile {
+-            let overrides = ConfigOverrides {
+-                cwd: Some(cwd.to_path_buf()),
+-                default_permissions: Some(permission_profile),
+-                ..Default::default()
+-            };
+-            let config = self
+-                .config_manager
+-                .load_for_cwd(
+-                    /*request_overrides*/ None,
+-                    overrides,
+-                    Some(self.config.cwd.to_path_buf()),
+-                )
+-                .await
+-                .map_err(|err| invalid_request(format!("invalid permission profile: {err}")))?;
+-            if let Some(warning) = config.startup_warnings.iter().find(|warning| {
+-                warning.contains("Configured value for `permission_profile` is disallowed")
+-            }) {
+-                return Err(invalid_request(format!(
+-                    "invalid permission profile: {warning}"
+-                )));
+-            }
+-            (
+-                config.permissions.effective_permission_profile(),
+-                config.permissions.network.clone(),
+-                config.permissions.permission_profile().clone(),
+-                config.managed_network_requirements_enabled(),
+-                config.effective_workspace_roots(),
+-            )
+-        } else if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
+-            let mut permissions = self.config.permissions.clone();
+-            permissions
+-                .set_legacy_sandbox_policy(policy, &sandbox_cwd)
+-                .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
+-            (
+-                permissions.effective_permission_profile(),
+-                self.config.permissions.network.clone(),
+-                self.config.permissions.permission_profile().clone(),
+-                self.config.managed_network_requirements_enabled(),
+-                self.config.effective_workspace_roots(),
+-            )
+-        } else {
+-            (
+-                self.config.permissions.effective_permission_profile(),
+-                self.config.permissions.network.clone(),
+-                self.config.permissions.permission_profile().clone(),
+-                self.config.managed_network_requirements_enabled(),
+-                self.config.effective_workspace_roots(),
+-            )
+-        };
+-        let started_network_proxy = match network_proxy_spec.as_ref() {
++        let started_network_proxy = match config.permissions.network.as_ref() {
+             Some(spec) => match spec
+                 .start_proxy(
+                     &network_proxy_permission_profile,
+@@ -273,7 +254,7 @@ impl CommandExecRequestProcessor {
+                     ),
+                     /*policy_decider*/ None,
+                     /*blocked_request_observer*/ None,
+-                    managed_network_requirements_enabled,
++                    config.managed_network_requirements_enabled(),
+                     NetworkProxyAuditMetadata::default(),
+                 )
+                 .await
+@@ -316,9 +297,9 @@ impl CommandExecRequestProcessor {
+ 
+         let exec_request = codex_core::exec::build_exec_request(
+             exec_params,
+-            &effective_permission_profile,
+-            &sandbox_cwd,
+-            windows_sandbox_workspace_roots.as_slice(),
++            &permissions.effective_permission_profile(),
++            &config.cwd,
++            config.effective_workspace_roots().as_slice(),
+             &codex_linux_sandbox_exe,
+             &self.arg0_paths.codex_self_exe,
+             self.config.effective_local_windows_sandbox_type(),
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -20,7 +20,6 @@ use codex_app_server_protocol::McpServerStatusDetail;
+ use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::SandboxMode;
+-#[cfg(not(windows))]
+ use codex_app_server_protocol::SandboxPolicy;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::TextPosition;
+@@ -71,6 +70,352 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
+ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+ const EXEC_POLICY_PARSE_WARNING_SUMMARY: &str = "Error parsing rules; custom rules not applied.";
+ 
++#[tokio::test]
++async fn published_workspace_roots_survive_start_resume_and_permission_selection() -> Result<()> {
++    use app_test_support::MockResponsesConfig;
++    use app_test_support::create_fake_rollout;
++    use codex_app_server_protocol::CommandExecParams;
++    use codex_app_server_protocol::CommandExecResponse;
++    use codex_app_server_protocol::ThreadResumeParams;
++    use codex_app_server_protocol::ThreadResumeResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdateParams;
++    use codex_app_server_protocol::ThreadSettingsUpdateResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
++    use codex_utils_absolute_path::AbsolutePathBuf;
++
++    let fixture = TempDir::new()?;
++    let codex_home = fixture.path().join("home");
++    let cwd = fixture.path().join("workspace");
++    std::fs::create_dir_all(&codex_home)?;
++    std::fs::create_dir_all(&cwd)?;
++    let variables = [
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "REPOS_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ];
++    let roots = variables.map(|name| fixture.path().join(name));
++    for root in std::iter::once(&cwd).chain(&roots) {
++        std::fs::create_dir_all(root)?;
++        for name in [".git", ".agents", ".codex", ".aws"] {
++            std::fs::create_dir(root.join(name))?;
++        }
++    }
++    let env_overrides: Vec<_> = variables
++        .iter()
++        .zip(&roots)
++        .map(|(name, root)| (*name, root.to_str()))
++        .collect();
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    MockResponsesConfig::new(&server.uri())
++        .with_sandbox_mode("workspace-write")
++        .with_extra_config("[sandbox_workspace_write]\nnetwork_access = true")
++        .write(&codex_home)?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(&codex_home)
++        .without_auto_env()
++        .with_env_overrides(&env_overrides)
++        .build_initialized()
++        .await?;
++    let cwd = AbsolutePathBuf::from_absolute_path(cwd)?;
++    let assert_storage = |policy: &SandboxPolicy| {
++        let SandboxPolicy::WorkspaceWrite {
++            writable_roots,
++            exclude_tmpdir_env_var,
++            exclude_slash_tmp,
++            ..
++        } = policy
++        else {
++            panic!("expected Workspace, got {policy:?}");
++        };
++        for root in &roots {
++            assert!(writable_roots.iter().any(|path| path.as_path() == root));
++        }
++        assert!(*exclude_tmpdir_env_var);
++        assert!(*exclude_slash_tmp);
++    };
++    for params in [
++        ThreadStartParams::default(),
++        ThreadStartParams {
++            sandbox: Some(SandboxMode::WorkspaceWrite),
++            ..Default::default()
++        },
++        ThreadStartParams {
++            permissions: Some(":workspace".to_string()),
++            ..Default::default()
++        },
++    ] {
++        let expected_network = params.permissions.is_none();
++        let response: ThreadStartResponse = app
++            .request(|request_id| ClientRequest::ThreadStart {
++                request_id,
++                params: ThreadStartParams {
++                    cwd: Some(cwd.as_path().to_string_lossy().into_owned()),
++                    runtime_workspace_roots: Some(vec![cwd.clone()]),
++                    approval_policy: Some(AskForApproval::Never),
++                    ..params
++                },
++            })
++            .await?;
++        assert_storage(&response.sandbox);
++        assert_eq!(response.approval_policy, AskForApproval::Never);
++        let SandboxPolicy::WorkspaceWrite { network_access, .. } = response.sandbox else {
++            unreachable!();
++        };
++        assert_eq!(network_access, expected_network);
++    }
++
++    let writable_files = std::iter::once(cwd.as_path())
++        .chain(roots.iter().map(PathBuf::as_path))
++        .flat_map(|root| {
++            [
++                "write-probe",
++                ".git/write-probe",
++                ".agents/write-probe",
++                ".codex/write-probe",
++                ".aws/write-probe",
++            ]
++            .map(|path| root.join(path))
++        })
++        .collect::<Vec<_>>();
++    let command = std::iter::once("/usr/bin/touch".to_string())
++        .chain(
++            writable_files
++                .iter()
++                .map(|path| path.to_string_lossy().into_owned()),
++        )
++        .collect();
++    let request = CommandExecParams {
++        command,
++        process_id: None,
++        tty: false,
++        stream_stdin: false,
++        stream_stdout_stderr: false,
++        output_bytes_cap: None,
++        disable_output_cap: false,
++        disable_timeout: false,
++        timeout_ms: None,
++        cwd: Some(cwd.to_path_buf()),
++        env: None,
++        size: None,
++        sandbox_policy: None,
++        // command/exec is thread-independent; selecting the profile binds its roots to this cwd.
++        permission_profile: Some(":workspace".to_string()),
++    };
++    let request_id = app.send_command_exec_request(request.clone()).await?;
++    let written: CommandExecResponse = app.read_response(request_id).await?;
++    assert_eq!(written.exit_code, 0, "{}", written.stderr);
++    assert!(writable_files.iter().all(|path| path.is_file()));
++
++    let outside = fixture.path().join("outside-workspace");
++    let request_id = app
++        .send_command_exec_request(CommandExecParams {
++            command: vec![
++                "/usr/bin/touch".into(),
++                outside.to_string_lossy().into_owned(),
++            ],
++            ..request
++        })
++        .await?;
++    let denied: CommandExecResponse = app.read_response(request_id).await?;
++    assert_ne!(denied.exit_code, 0);
++    assert!(!outside.exists());
++
++    let thread_id = create_fake_rollout(
++        &codex_home,
++        "2026-01-01T12-00-00",
++        "2026-01-01T12:00:00Z",
++        "saved prompt",
++        Some("mock_provider"),
++        /*git_info*/ None,
++    )?;
++    let resumed: ThreadResumeResponse = app
++        .request(|request_id| ClientRequest::ThreadResume {
++            request_id,
++            params: ThreadResumeParams {
++                thread_id: thread_id.clone(),
++                cwd: Some(cwd.as_path().to_string_lossy().into_owned()),
++                runtime_workspace_roots: Some(vec![cwd.clone()]),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_storage(&resumed.sandbox);
++    let _: ThreadSettingsUpdateResponse = app
++        .request(|request_id| ClientRequest::ThreadSettingsUpdate {
++            request_id,
++            params: ThreadSettingsUpdateParams {
++                thread_id,
++                permissions: Some(":workspace".to_string()),
++                approval_policy: Some(AskForApproval::Never),
++                ..Default::default()
++            },
++        })
++        .await?;
++    let notification = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app.read_stream_until_notification_message("thread/settings/updated"),
++    )
++    .await??;
++    let notification: ThreadSettingsUpdatedNotification =
++        serde_json::from_value(notification.params.context("settings notification")?)?;
++    assert_storage(&notification.thread_settings.sandbox_policy);
++    assert_eq!(
++        notification.thread_settings.approval_policy,
++        AskForApproval::Never
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn workspace_roots_follow_selected_project_in_settings_and_standalone_commands() -> Result<()>
++{
++    use app_test_support::MockResponsesConfig;
++    use codex_app_server_protocol::CommandExecParams;
++    use codex_app_server_protocol::CommandExecResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdateParams;
++    use codex_app_server_protocol::ThreadSettingsUpdateResponse;
++    use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
++
++    let fixture = TempDir::new()?;
++    let home = fixture.path().join("codex");
++    let user_home = fixture.path().join("home");
++    let temporary = fixture.path().join("tmp");
++    let harness = fixture.path().join("harness");
++    let first = fixture.path().join("work/first");
++    let second = fixture.path().join("work/second");
++    for path in [&home, &user_home, &temporary, &harness, &first, &second] {
++        std::fs::create_dir_all(path)?;
++    }
++    let overrides = [
++        ("HOME", user_home.to_str()),
++        ("TMPDIR", temporary.to_str()),
++        ("CODEX_HARNESS", harness.to_str()),
++        ("PROJECT_SCRATCH_ROOT", None),
++        ("PROJECT_RUNTIME_ROOT", None),
++        ("PROJECT_PERSISTENT_ROOT", None),
++        ("REPOS_ROOT", None),
++        ("SKILLS_ROOT", None),
++        ("SKILLS_SCRATCH_ROOT", None),
++    ];
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    MockResponsesConfig::new(&server.uri()).write(&home)?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(&home)
++        .without_auto_env()
++        .with_env_overrides(&overrides)
++        .build_initialized()
++        .await?;
++    let started: ThreadStartResponse = app
++        .request(|request_id| ClientRequest::ThreadStart {
++            request_id,
++            params: ThreadStartParams {
++                cwd: Some(first.to_string_lossy().into_owned()),
++                permissions: Some(":workspace".into()),
++                approval_policy: Some(AskForApproval::Never),
++                ..Default::default()
++            },
++        })
++        .await?;
++    let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &started.sandbox else {
++        panic!("Workspace policy required");
++    };
++    assert!(
++        writable_roots
++            .iter()
++            .any(|path| path.as_path() == harness.join("work/first"))
++    );
++
++    let _: ThreadSettingsUpdateResponse = app
++        .request(|request_id| ClientRequest::ThreadSettingsUpdate {
++            request_id,
++            params: ThreadSettingsUpdateParams {
++                thread_id: started.thread.id,
++                cwd: Some(second.clone()),
++                ..Default::default()
++            },
++        })
++        .await?;
++    let notification = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app.read_stream_until_notification_message("thread/settings/updated"),
++    )
++    .await??;
++    let updated: ThreadSettingsUpdatedNotification =
++        serde_json::from_value(notification.params.context("settings notification")?)?;
++    let SandboxPolicy::WorkspaceWrite { writable_roots, .. } =
++        &updated.thread_settings.sandbox_policy
++    else {
++        panic!("Workspace policy required");
++    };
++    for expected in [
++        harness.join("work/second"),
++        temporary.join("second"),
++        user_home.join("second"),
++    ] {
++        assert!(
++            writable_roots.iter().any(|path| path.as_path() == expected),
++            "missing {expected:?}"
++        );
++    }
++    for previous in [
++        &first,
++        &harness.join("work/first"),
++        &temporary.join("first"),
++        &user_home.join("first"),
++    ] {
++        assert!(
++            !writable_roots.iter().any(|path| path.as_path() == previous),
++            "retained {previous:?}"
++        );
++    }
++    assert_eq!(updated.thread_settings.cwd.as_path(), second);
++    assert_eq!(
++        updated.thread_settings.approval_policy,
++        AskForApproval::Never
++    );
++
++    let request_id = app
++        .send_command_exec_request(CommandExecParams {
++            command: vec!["/usr/bin/env".into()],
++            process_id: None,
++            tty: false,
++            stream_stdin: false,
++            stream_stdout_stderr: false,
++            output_bytes_cap: None,
++            disable_output_cap: false,
++            disable_timeout: false,
++            timeout_ms: None,
++            cwd: Some(second.clone()),
++            env: None,
++            size: None,
++            sandbox_policy: None,
++            permission_profile: Some(":workspace".into()),
++        })
++        .await?;
++    let output: CommandExecResponse = app.read_response(request_id).await?;
++    assert_eq!(output.exit_code, 0, "{}", output.stderr);
++    for (name, path) in [
++        ("PROJECT_SCRATCH_ROOT", harness.join("work/second")),
++        ("PROJECT_RUNTIME_ROOT", temporary.join("second")),
++        ("PROJECT_PERSISTENT_ROOT", user_home.join("second")),
++        ("REPOS_ROOT", user_home.join("repos")),
++        ("SKILLS_ROOT", home.join("skills")),
++        ("SKILLS_SCRATCH_ROOT", harness.join("skills")),
++    ] {
++        let expected = format!("{name}={}", path.display());
++        assert!(
++            output.stdout.lines().any(|line| line == expected),
++            "missing {expected}: {}",
++            output.stdout
++        );
++        assert!(path.is_dir(), "missing {path:?}");
++    }
++    Ok(())
++}
++
+ fn is_exec_policy_config_warning(notification: &JSONRPCNotification) -> bool {
+     notification.method == "configWarning"
+         && notification
+@@ -539,7 +884,16 @@ async fn thread_start_history_mode_accepts_legacy_and_paginated() -> Result<()>
+ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
+-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
++    create_config_toml(
++        codex_home.path(),
++        &server.uri(),
++        "default_permissions = \"runtime-roots\"",
++        r#"
++[permissions.runtime-roots.filesystem]
++":root" = "read"
++":workspace_roots" = "write"
++"#,
++    )?;
+ 
+     let cwd_tmp = TempDir::new()?;
+     let cwd = cwd_tmp.path().to_path_buf();
+@@ -555,7 +909,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+         .send_thread_start_request(ThreadStartParams {
+             cwd: Some(cwd.to_string_lossy().to_string()),
+             runtime_workspace_roots: Some(vec![extra_root.abs()]),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
++            permissions: Some("runtime-roots".to_string()),
+             ..Default::default()
+         })
+         .await?;
+@@ -590,7 +944,7 @@ async fn thread_start_accepts_absolute_runtime_workspace_roots() -> Result<()> {
+         .send_thread_start_request(ThreadStartParams {
+             runtime_workspace_roots: Some(vec![extra_root.abs()]),
+             environments: Some(vec![environment]),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
++            permissions: Some("runtime-roots".to_string()),
+             ..Default::default()
+         })
+         .await?;
+diff --git a/codex-rs/cli/src/debug_sandbox.rs b/codex-rs/cli/src/debug_sandbox.rs
+--- a/codex-rs/cli/src/debug_sandbox.rs
++++ b/codex-rs/cli/src/debug_sandbox.rs
+@@ -255,8 +255,9 @@ async fn run_command_under_sandbox(
+     // remaining cwd-dependent policy resolution. `:workspace_roots` entries in
+     // the effective profile have already been materialized from config roots.
+     let sandbox_policy_cwd = cwd.clone();
++    let permissions = config.prepare_local_permissions()?;
+     let env = create_env(
+-        &config.permissions.shell_environment_policy,
++        &permissions.shell_environment_policy,
+         /*thread_id*/ None,
+     );
+     let mut permission_profile = match sandbox_state.as_ref() {
+@@ -270,7 +271,7 @@ async fn run_command_under_sandbox(
+             }
+             permission_profile => permission_profile.clone(),
+         },
+-        None => config.permissions.effective_permission_profile(),
++        None => permissions.effective_permission_profile(),
+     };
+     if matches!(permission_profile, PermissionProfile::Disabled) && sandbox_state_disable_network {
+         anyhow::bail!(
+diff --git a/codex-rs/cli/tests/worktree.rs b/codex-rs/cli/tests/worktree.rs
+--- a/codex-rs/cli/tests/worktree.rs
++++ b/codex-rs/cli/tests/worktree.rs
+@@ -10,8 +10,6 @@ use std::path::Path;
+ use std::process::Command;
+ use std::time::Duration;
+ use std::time::Instant;
+-#[cfg(not(unix))]
+-use tempfile::TempDir;
+ use wiremock::Mock;
+ use wiremock::MockServer;
+ use wiremock::ResponseTemplate;
+@@ -139,20 +137,13 @@ async fn interactive_worktree_start_and_fork_bind_owner_before_turn() -> anyhow:
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-#[cfg_attr(
+-    windows,
+-    ignore = "requires a non-elevated terminal with daemon breakaway support"
+-)]
+ async fn daemon_worktree_start_and_fork_bind_owner_before_turn() -> anyhow::Result<()> {
+     worktree_start_and_fork("daemon").await
+ }
+ 
+ async fn worktree_start_and_fork(backend: &str) -> anyhow::Result<()> {
+-    // Leave room for the local control socket on Unix platforms with short sun_path limits.
+-    #[cfg(unix)]
++    // Leave room for the local control socket's short sun_path limit.
+     let root = tempfile::Builder::new().tempdir_in("/tmp")?;
+-    #[cfg(not(unix))]
+-    let root = TempDir::new()?;
+     let root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(root.path())?
+         .canonicalize()?
+         .into_path_buf();
+@@ -196,9 +187,11 @@ check_for_update_on_startup = false
+ features.daemon_auto_start = {}
+ model_provider = "local"
+ model = "test-model"
+-sandbox_mode = "workspace-write"
+-windows.sandbox = "unelevated"
++default_permissions = "worktree"
+ tui.disable_paste_burst = true
++[permissions.worktree.filesystem]
++":root" = "read"
++":workspace_roots" = "write"
+ [otel]
+ metrics_exporter = "none"
+ [model_providers.local]
+@@ -235,17 +228,6 @@ trust_level = "trusted"
+         codex_config::types::AuthCredentialsStoreMode::File,
+     )?;
+     let program = codex_utils_cargo_bin::cargo_bin("codex")?;
+-    // Keep cold Rosetta translation outside the timed startup assertions.
+-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+-    anyhow::ensure!(
+-        Command::new(&program)
+-            .env("CODEX_HOME", &home)
+-            .arg("--version")
+-            .output()?
+-            .status
+-            .success(),
+-        "failed to prepare CLI test executable"
+-    );
+     let mut env: HashMap<String, String> = std::env::vars().collect();
+     env.insert("CODEX_HOME".into(), home.display().to_string());
+     env.insert("CODEX_HARNESS".into(), harness.display().to_string());
+@@ -282,13 +264,8 @@ trust_level = "trusted"
+     let _daemon = if backend == "daemon" {
+         let bin = home.join("packages/app-server-daemon/current/bin");
+         fs::create_dir_all(&bin)?;
+-        let managed = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+-        // Hard links change the executable's ctime and invalidate Rosetta's translation cache.
+-        #[cfg(unix)]
++        let managed = bin.join("codex");
+         std::os::unix::fs::symlink(program.canonicalize()?, &managed)?;
+-        #[cfg(not(unix))]
+-        fs::hard_link(&program, &managed)
+-            .or_else(|_| codex_utils_cargo_bin::copy_executable(&program, &managed))?;
+         fs::create_dir(harness.join("app-server-daemon"))?;
+         fs::write(
+             harness.join("app-server-daemon/settings.json"),
+@@ -640,16 +617,14 @@ trust_level = "trusted"
+         }
+         let exit =
+             tokio::time::timeout(Duration::from_secs(/*secs*/ 10), spawned.exit_rx).await??;
+-        // Include shutdown output: ConPTY can retain the channel after process exit.
++        // Include shutdown output before checking the process result.
+         let _ = tokio::time::timeout(Duration::from_secs(/*secs*/ 1), async {
+             while let Some(bytes) = stdout.recv().await {
+                 output.push_str(&String::from_utf8_lossy(&bytes));
+             }
+         })
+         .await;
+-        let elevated_handoff = cfg!(windows)
+-            && output.contains("start the Windows daemon from a non-elevated terminal");
+-        assert_eq!(exit, i32::from(elevated_handoff), "{output}");
++        assert_eq!(exit, 0, "{output}");
+         assert!(!output.contains("The checkout was kept"), "{output}");
+         let metrics = server
+             .received_requests()
+@@ -714,10 +689,6 @@ trust_level = "trusted"
+                 ("update_interval_setting", "default"),
+                 ("shutdown_grace_setting", "default"),
+             ]);
+-            #[cfg(windows)]
+-            if codex_app_server_daemon::is_elevated()? {
+-                expected_tags.insert("daemon_selection_reason", "elevated_windows");
+-            }
+             if backend == "daemon" {
+                 expected_tags.extend([
+                     ("auto_update", "disabled"),
+diff --git a/codex-rs/exec/tests/suite/worktree.rs b/codex-rs/exec/tests/suite/worktree.rs
+--- a/codex-rs/exec/tests/suite/worktree.rs
++++ b/codex-rs/exec/tests/suite/worktree.rs
+@@ -78,7 +78,7 @@ async fn worktree_start_and_fork_use_host_pool_and_preserve_legacy_resume() -> a
+     fs::write(
+         home.join("config.toml"),
+         format!(
+-            "sandbox_mode = \"workspace-write\"\nfeatures.worktrees = true\n[desktop]\ngit-worktree-root = {}\n[projects.{}]\ntrust_level = \"trusted\"\n",
++            "default_permissions = \"worktree\"\nfeatures.worktrees = true\n[permissions.worktree.filesystem]\n\":root\" = \"read\"\n\":workspace_roots\" = \"write\"\n[desktop]\ngit-worktree-root = {}\n[projects.{}]\ntrust_level = \"trusted\"\n",
+             serde_json::to_string(&pool)?,
+             serde_json::to_string(&source)?,
+         ),
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -4444,6 +4444,125 @@ terminal_visualization_instructions = true
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn slash_cd_rebinds_project_roots_and_workspace_permissions() -> Result<()> {
++    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
++    let home = tempdir()?;
++    let source = home.path().join("source");
++    let destination = home.path().join("destination");
++    for cwd in [&source, &destination] {
++        std::fs::create_dir(cwd)?;
++        crate::legacy_core::config::set_project_trust_level(
++            home.path(),
++            cwd,
++            codex_protocol::config_types::TrustLevel::Trusted,
++        )
++        .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
++    }
++    app.config.codex_home = home.path().to_path_buf().abs();
++    app.harness_overrides.default_permissions = Some(":workspace".to_string());
++    app.config = app.rebuild_config_for_cwd(source.clone()).await?;
++    app.local_settings = crate::local_settings::LocalSettings::from(&app.config);
++    let (mut server, requests, proxy) = start_recording_app_server(
++        &app.config,
++        /*blocked_thread_list*/ None,
++        /*failed_thread_name*/ None,
++    )
++    .await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let started = server.start_thread(&app.config).await?;
++    app.replace_chat_widget_with_app_server_thread(
++        &mut tui,
++        started,
++        crate::app::session_lifecycle::ThreadAttachPresentation::Fresh,
++        /*initial_user_message*/ None,
++    )
++    .await?;
++    assert_eq!(app.chat_widget.config_ref().cwd, source.clone().abs());
++    let original = app.chat_widget.thread_id().expect("source thread");
++    let item = serde_json::from_value(serde_json::json!({
++        "type": "message",
++        "role": "assistant",
++        "content": [{"type": "output_text", "text": "saved history"}],
++    }))?;
++    server.thread_inject_items(original, vec![item]).await?;
++    requests.lock().expect("request recorder lock").clear();
++
++    app.chat_widget.insert_str("/cd ../destination");
++    app.chat_widget
++        .handle_key_event(KeyEvent::from(KeyCode::Enter));
++    let event = std::iter::from_fn(|| events.try_recv().ok())
++        .find(|event| matches!(event, AppEvent::ChangeWorkingDirectory { .. }))
++        .expect("slash command requests a directory change");
++    // Match the live event loop's heap-pinned dispatch instead of embedding its future here.
++    Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
++    let pending = app
++        .pending_working_directory_change
++        .take()
++        .expect("directory change is queued");
++    Box::pin(app.finish_working_directory_change(&mut tui, &mut server, pending)).await;
++
++    let configured = app.primary_session_configured.as_ref().expect("session");
++    assert_ne!(configured.thread_id, original);
++    assert_eq!(configured.cwd, destination.clone().abs());
++    assert_eq!(app.config.cwd, configured.cwd);
++    assert_eq!(app.chat_widget.config_ref().cwd, configured.cwd);
++    assert_eq!(recorded_params(&requests, "thread/fork").len(), 1);
++    assert!(recorded_params(&requests, "thread/start").is_empty());
++
++    let roots = app
++        .config
++        .local_storage_environment()
++        .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
++    assert_eq!(roots.len(), 6);
++    for root in roots.values() {
++        assert!(Path::new(root).is_dir(), "root was not prepared: {root}");
++    }
++    for language in ["go", "rust", "python"] {
++        assert!(
++            Path::new(&roots["PROJECT_SCRATCH_ROOT"])
++                .join(language)
++                .is_dir()
++        );
++    }
++    for profile in [
++        app.config.permissions.permission_profile(),
++        app.chat_widget
++            .config_ref()
++            .permissions
++            .permission_profile(),
++        &configured.permission_profile,
++    ] {
++        let policy = profile.file_system_sandbox_policy();
++        for root in std::iter::once(destination.as_path()).chain(roots.values().map(Path::new)) {
++            assert!(
++                policy.can_write_local_path_with_cwd(
++                    &root.join(".codex/config.toml"),
++                    &configured.cwd
++                ),
++                "root is not fully writable after /cd: {}",
++                root.display()
++            );
++        }
++        // The old cwd is writable only if an explicit storage root still contains it.
++        let source_is_storage = roots.values().any(|root| source.starts_with(root));
++        assert_eq!(
++            policy.can_write_local_path_with_cwd(&source.join("file"), &configured.cwd),
++            source_is_storage,
++        );
++    }
++    assert_eq!(
++        server
++            .thread_read(original, /*include_turns*/ false)
++            .await?
++            .cwd,
++        source.abs().canonicalize()?,
++    );
++    server.shutdown().await?;
++    proxy.await??;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn changing_directory_preserves_project_trust_permissions_history_and_hooks() -> Result<()> {
+     use codex_protocol::config_types::TrustLevel as T;
+@@ -4489,8 +4608,8 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+     let (rec, plain, req) = (recorded_params, crate::key_hint::plain, &requests);
+     let mut tui = crate::tui::test_support::make_test_tui()?;
+     let (source, message, name) = (None, None, Some("Previous project".to_string()));
+-    app.start_fresh_session(&mut tui, &mut server, source, message, name)
+-        .await;
++    // Match the live event loop's heap-pinned lifecycle dispatch throughout this scenario.
++    Box::pin(app.start_fresh_session(&mut tui, &mut server, source, message, name)).await;
+     let original = app.chat_widget.thread_id().expect("original thread");
+     let rollout = app.chat_widget.rollout_path().expect("original rollout");
+     let json = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"saved history"}]}"#;
+@@ -4616,8 +4735,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+             app.thread_event_channels.remove(&child);
+         }
+         let thread_id = [original, ThreadId::new()][usize::from(kind == "stale")];
+-        app.handle_event(&mut tui, &mut server, change(thread_id, path))
+-            .await?;
++        Box::pin(app.handle_event(&mut tui, &mut server, change(thread_id, path))).await?;
+         if let Some(pending) = app.pending_working_directory_change.take() {
+             Box::pin(app.finish_working_directory_change(&mut tui, &mut server, pending)).await;
+         }
+@@ -4673,8 +4791,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+                 .await?;
+         }
+         requests.lock().expect("request recorder lock").clear();
+-        app.change_working_directory(&mut tui, &mut server, failed.clone().abs())
+-            .await;
++        Box::pin(app.change_working_directory(&mut tui, &mut server, failed.clone().abs())).await;
+         assert_eq!(
+             recorded_params(&requests, "thread/backgroundTerminals/list"),
+             vec![json!({"threadId": original.to_string(), "cursor": null, "limit": 1})],
+@@ -4693,8 +4810,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+         Some(RuntimePermissionProfileOverride::from_config(&app.config));
+     for (path, expected) in [(&failed, 0), (&trusted, 2)] {
+         requests.lock().expect("request recorder lock").clear();
+-        app.change_working_directory(&mut tui, &mut server, path.clone().abs())
+-            .await;
++        Box::pin(app.change_working_directory(&mut tui, &mut server, path.clone().abs())).await;
+         assert_eq!(app.chat_widget.thread_id(), Some(original));
+         assert_eq!(app.config.cwd, current.clone().abs());
+         assert_eq!(rec(&requests, "thread/unsubscribe").len(), expected);
+@@ -4705,8 +4821,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+     assert_eq!(removed[0]["threadId"], original.to_string());
+     assert_eq!(archived[0]["threadId"], removed[1]["threadId"]);
+     requests.lock().expect("request recorder lock").clear();
+-    app.handle_event(&mut tui, &mut server, change(original, "../trusted"))
+-        .await?;
++    Box::pin(app.handle_event(&mut tui, &mut server, change(original, "../trusted"))).await?;
+     // Dispatch only queues /cd: configuration loading happens on a fresh loop iteration.
+     assert_eq!(app.config.cwd, current.clone().abs());
+     let pending = app
+@@ -4748,7 +4863,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+         cwd: current.clone(),
+     };
+     for event in [diff, skills, plugins, branch] {
+-        app.handle_event(&mut tui, &mut server, event).await?;
++        Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
+     }
+     let path = trusted.to_str().expect("trusted path");
+     let output = history().join("").replace(path, "<PROJECT>");
+@@ -4789,8 +4904,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+         .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+     app.harness_overrides.bypass_hook_trust = Some(true);
+     requests.lock().expect("request recorder lock").clear();
+-    app.change_working_directory(&mut tui, &mut server, trusted.clone().abs())
+-        .await;
++    Box::pin(app.change_working_directory(&mut tui, &mut server, trusted.clone().abs())).await;
+     assert!(app.config.bypass_hook_trust && !app.chat_widget.has_active_view());
+     assert!(recorded_params(&requests, "hooks/list").is_empty());
+     app.harness_overrides.bypass_hook_trust = None;
+@@ -4802,8 +4916,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+         RuntimePermissionProfileOverride::from_restored_config(&app.config),
+     );
+     requests.lock().expect("request recorder lock").clear();
+-    app.change_working_directory(&mut tui, &mut server, untrusted.clone().abs())
+-        .await;
++    Box::pin(app.change_working_directory(&mut tui, &mut server, untrusted.clone().abs())).await;
+     assert_eq!(app.config.active_project.trust_level, Some(T::Untrusted));
+     let approval = app.config.permissions.approval_policy.value();
+     assert_eq!(approval, AskForApproval::UnlessTrusted.to_core());
+@@ -4811,19 +4924,60 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
+     let warning = "Project-local config, hooks, and exec policies are disabled";
+     assert!(history().iter().any(|line| line.contains(warning)));
+     let untrusted_permissions = app.config.permissions.permission_profile().clone();
+-    app.change_working_directory(&mut tui, &mut server, trusted.clone().abs())
+-        .await;
+-    assert_eq!(app.config.cwd, trusted.abs());
++    let untrusted_profile = app.config.permissions.active_permission_profile();
++    let untrusted_roots = app
++        .config
++        .local_storage_environment()
++        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
++    Box::pin(app.change_working_directory(&mut tui, &mut server, trusted.clone().abs())).await;
++    assert_eq!(app.config.cwd, trusted.clone().abs());
++    assert_eq!(app.config.permissions.approval_policy.value(), approval);
+     assert_eq!(
+-        (
+-            app.config.permissions.approval_policy.value(),
+-            app.config.permissions.permission_profile()
+-        ),
+-        (
+-            AskForApproval::UnlessTrusted.to_core(),
+-            &untrusted_permissions
+-        )
++        app.config.permissions.active_permission_profile(),
++        untrusted_profile
+     );
++    let trusted_permissions = app.config.permissions.permission_profile();
++    assert_eq!(
++        trusted_permissions.network_sandbox_policy(),
++        untrusted_permissions.network_sandbox_policy()
++    );
++    let before = untrusted_permissions.file_system_sandbox_policy();
++    let after = trusted_permissions.file_system_sandbox_policy();
++    let trusted_roots = app
++        .config
++        .local_storage_environment()
++        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))?;
++    // Preserve the selected access mode while rebinding all seven trees to the destination.
++    let roots = std::iter::once((untrusted.as_path(), trusted.as_path())).chain(
++        untrusted_roots
++            .iter()
++            .map(|(key, path)| (Path::new(path), Path::new(&trusted_roots[key]))),
++    );
++    for (source, destination) in roots {
++        for suffix in [
++            "file",
++            ".git/config",
++            ".agents/file",
++            ".codex/config.toml",
++            ".aws/credentials",
++        ] {
++            assert_eq!(
++                after.can_write_local_path_with_cwd(&destination.join(suffix), &trusted),
++                before.can_write_local_path_with_cwd(&source.join(suffix), &untrusted),
++                "permission changed for {}",
++                destination.join(suffix).display()
++            );
++        }
++        if !source.starts_with(&trusted)
++            && !trusted_roots.values().any(|root| source.starts_with(root))
++        {
++            assert!(
++                !after.can_write_local_path_with_cwd(&source.join("file"), &trusted),
++                "previous project tree remains writable: {}",
++                source.display()
++            );
++        }
++    }
+     server.shutdown().await?;
+     proxy.await??;
+     Ok(())
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -2508,21 +2508,16 @@ fn display_permission_profile_from_thread_response(
+     config: &Config,
+     thread_params_mode: ThreadParamsMode,
+ ) -> PermissionProfile {
++    let sandbox = sandbox.to_core();
+     match thread_params_mode {
+-        ThreadParamsMode::Embedded
+-            if matches!(
+-                config.permissions.effective_permission_profile(),
+-                PermissionProfile::Disabled
+-            ) && !matches!(
+-                sandbox,
+-                codex_app_server_protocol::SandboxPolicy::DangerFullAccess
+-            ) =>
+-        {
+-            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
++        ThreadParamsMode::Embedded if config.permissions.legacy_sandbox_policy(cwd) == sandbox => {
++            // Retain split rules that the legacy response cannot express only when
++            // the server confirms the same effective sandbox. Local Workspace roots
++            // are bound by the server, after Config loading.
++            config.permissions.effective_permission_profile()
+         }
+-        ThreadParamsMode::Embedded => config.permissions.effective_permission_profile(),
+-        ThreadParamsMode::Remote => {
+-            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox.to_core(), cwd)
++        ThreadParamsMode::Embedded | ThreadParamsMode::Remote => {
++            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox, cwd)
+         }
+     }
+ }
+@@ -4360,9 +4355,9 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn embedded_thread_response_uses_local_config_profile() {
++    async fn embedded_thread_response_preserves_rich_local_rules_when_sandbox_matches() {
+         let temp_dir = tempfile::tempdir().expect("tempdir");
+-        let config = ConfigBuilder::default()
++        let mut config = ConfigBuilder::default()
+             .codex_home(temp_dir.path().to_path_buf())
+             .harness_overrides(ConfigOverrides {
+                 default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+@@ -4372,7 +4367,31 @@ mod tests {
+             .await
+             .expect("config should build");
+         let cwd = test_path_buf("/tmp/project").abs();
++        let profile = PermissionProfile::from_runtime_permissions(
++            &codex_protocol::permissions::FileSystemSandboxPolicy::restricted(vec![
++                FileSystemSandboxEntry::new(
++                    temp_dir.path().to_path_buf().abs().into(),
++                    FileSystemAccessMode::Read,
++                ),
++            ]),
++            NetworkSandboxPolicy::Restricted,
++        );
++        config
++            .permissions
++            .set_permission_profile(profile.clone())
++            .unwrap();
+ 
++        assert_eq!(
++            display_permission_profile_from_thread_response(
++                &codex_app_server_protocol::SandboxPolicy::ReadOnly {
++                    network_access: false
++                },
++                cwd.as_path(),
++                &config,
++                ThreadParamsMode::Embedded,
++            ),
++            profile
++        );
+         assert_eq!(
+             display_permission_profile_from_thread_response(
+                 &codex_app_server_protocol::SandboxPolicy::DangerFullAccess,
+@@ -4380,7 +4399,7 @@ mod tests {
+                 &config,
+                 ThreadParamsMode::Embedded,
+             ),
+-            PermissionProfile::read_only()
++            PermissionProfile::Disabled
+         );
+     }
+ 
+diff --git a/codex-rs/tui/src/app_server_session/rollout_history_tests.rs b/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
+--- a/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
++++ b/codex-rs/tui/src/app_server_session/rollout_history_tests.rs
+@@ -23,8 +23,23 @@ async fn build_config(temp_dir: &TempDir) -> Config {
+         .expect("config should build")
+ }
+ 
+-#[tokio::test]
+-async fn remote_resume_restores_saved_server_profile_without_permission_overrides() -> Result<()> {
++#[test]
++fn remote_resume_restores_saved_server_profile_without_permission_overrides() -> Result<()> {
++    // Cold resume runs the real server and Core on the CLI's 16 MiB async stack budget.
++    std::thread::Builder::new()
++        .name("saved-profile-resume".to_string())
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            let runtime = tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()?;
++            runtime.block_on(check_saved_server_profile_resume())
++        })?
++        .join()
++        .expect("saved-profile resume test thread")
++}
++
++async fn check_saved_server_profile_resume() -> Result<()> {
+     let home = tempfile::tempdir()?;
+     std::fs::write(
+         home.path().join("config.toml"),
+@@ -225,12 +240,16 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
+         resumed.session.runtime_workspace_roots,
+         config.workspace_roots
+     );
++    let policy = resumed
++        .session
++        .permission_profile
++        .file_system_sandbox_policy();
+     assert!(
+-        resumed
+-            .session
+-            .permission_profile
+-            .file_system_sandbox_policy()
+-            .can_write_local_path_with_cwd(extra.path(), config.cwd.as_path())
++        !policy.can_write_local_path_with_cwd(extra.path(), config.cwd.as_path()),
++        "--add-dir retains the folder without broadening the seven Workspace trees"
++    );
++    assert!(
++        policy.can_write_local_path_with_cwd(&config.cwd.join(".git/config"), config.cwd.as_path())
+     );
+     server.shutdown().await?;
+     Ok(())

@@ -1,0 +1,207 @@
+initialize-tmpdir-before-process-startup
+
+Lane: normalization
+
+FlatPatch: initialize-tmpdir-before-process-startup
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Ensure and publish a canonical temporary root before normal process startup creates worker threads.
+
+Requires: none
+
+Provides: After specialized helper dispatch and native dotenv loading, preserve a nonempty TMPDIR override or remove an empty override and select the standard-library host temporary root; create and canonicalize the selected directory, propagate errors, and publish TMPDIR before alias preparation.
+
+Boundary: Home and harness selection, component-specific staging, and sandbox temporary-directory policy remain separate responsibilities; specialized helper invocations retain their early dispatch.
+
+Verification: arg0 normal_dispatch_normalizes_empty_tmpdir_before_alias_setup checks process and dotenv empty overrides at the actual alias startup boundary; home-dir ensure_tmpdir_creates_selected_override verifies directory creation and canonical paths.
+
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -13,6 +13,7 @@ use codex_install_context::InstallContext;
+ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+ use codex_utils_home_dir::ensure_codex_harness;
+ use codex_utils_home_dir::ensure_codex_home;
++use codex_utils_home_dir::ensure_tmpdir;
+ use codex_utils_home_dir::find_codex_home;
+ #[cfg(target_os = "windows")]
+ use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
+@@ -60,7 +61,9 @@ impl Arg0PathEntryGuard {
+     }
+ }
+ 
+-pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
++/// Dispatches helper invocations, or initializes temporary storage and process aliases.
++/// Normal startup returns an error if its temporary directory cannot be prepared.
++pub fn arg0_dispatch() -> std::io::Result<Option<Arg0PathEntryGuard>> {
+     #[cfg(target_os = "linux")]
+     codex_utils_pty::init_spawn_helper(std::env::args_os());
+     // Determine if we were invoked via the special alias.
+@@ -135,6 +138,17 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
+     // before creating any threads/the Tokio runtime.
+     load_dotenv();
+ 
++    let tmpdir_env = std::env::var_os("TMPDIR").filter(|value| !value.is_empty());
++    if tmpdir_env.is_none() {
++        // SAFETY: this runs before creating worker threads. Removing an empty override lets the
++        // standard library resolve the host's native temporary root before alias preparation.
++        unsafe { std::env::remove_var("TMPDIR") };
++    }
++    let tmpdir_path = tmpdir_env.map_or_else(std::env::temp_dir, PathBuf::from);
++    let tmpdir = ensure_tmpdir(&tmpdir_path)?;
++    // SAFETY: this runs before creating worker threads.
++    unsafe { std::env::set_var("TMPDIR", tmpdir.as_path()) };
++
+     let (path_entry_guard, updated_path_env_var) = prepare_path_env_var_with_aliases(
+         InstallContext::current(),
+         std::env::var_os("PATH"),
+@@ -147,7 +161,7 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
+             std::env::set_var("PATH", updated_path_env_var);
+         }
+     }
+-    path_entry_guard
++    Ok(path_entry_guard)
+ }
+ 
+ fn prepare_path_env_var_with_aliases(
+@@ -201,7 +215,7 @@ where
+     // Retain the TempDir so it exists for the lifetime of the invocation of
+     // this executable. Admittedly, we could invoke `keep()` on it, but it
+     // would be nice to avoid leaving temporary directories behind, if possible.
+-    let path_entry_guard = arg0_dispatch();
++    let path_entry_guard = arg0_dispatch()?;
+     let codex_home = ensure_codex_home()?;
+     // SAFETY: this runs before creating worker threads.
+     unsafe { std::env::set_var("CODEX_HOME", codex_home.as_path()) };
+@@ -562,6 +576,51 @@ mod tests {
+             .open(lock_path)
+     }
+ 
++    #[test]
++    fn normal_dispatch_normalizes_empty_tmpdir_before_alias_setup() -> anyhow::Result<()> {
++        if std::env::var_os("CODEX_TEST_EMPTY_TMPDIR").is_some() {
++            let guard = super::arg0_dispatch()?.expect("arg0 aliases");
++            let tmpdir = std::env::temp_dir();
++            assert!(!tmpdir.as_os_str().is_empty());
++            assert_eq!(tmpdir, tmpdir.canonicalize()?);
++            assert!(!guard._temp_dir.path().starts_with(&tmpdir));
++            return Ok(());
++        }
++
++        for from_dotenv in [false, true] {
++            let root = tempfile::tempdir_in(
++                std::env::var_os("CODEX_HARNESS").expect("test harness root"),
++            )?;
++            let home = root.path().join("home");
++            let harness = root.path().join("harness");
++            fs::create_dir(&home)?;
++            fs::create_dir(&harness)?;
++            if from_dotenv {
++                fs::write(home.join(".env"), "TMPDIR=\n")?;
++            }
++            let output = std::process::Command::new(std::env::current_exe()?)
++                .args([
++                    "--exact",
++                    "tests::normal_dispatch_normalizes_empty_tmpdir_before_alias_setup",
++                    "--nocapture",
++                ])
++                .env("CODEX_TEST_EMPTY_TMPDIR", "1")
++                .env("CODEX_HOME", home)
++                .env("CODEX_HARNESS", harness)
++                .env(
++                    "TMPDIR",
++                    if from_dotenv {
++                        root.path().join("unused-temp")
++                    } else {
++                        PathBuf::new()
++                    },
++                )
++                .output()?;
++            assert!(output.status.success(), "dotenv={from_dotenv}: {output:?}");
++        }
++        Ok(())
++    }
++
+     fn package_path_test_fixture() -> anyhow::Result<PackagePathTestFixture> {
+         let temp_dir = TempDir::new()?;
+         let arg0_dir = temp_dir.path().join("arg0");
+diff --git a/codex-rs/core/tests/common/lib.rs b/codex-rs/core/tests/common/lib.rs
+--- a/codex-rs/core/tests/common/lib.rs
++++ b/codex-rs/core/tests/common/lib.rs
+@@ -59,7 +59,8 @@ fn enable_deterministic_unified_exec_process_ids_for_tests() {
+ 
+ #[ctor]
+ fn configure_arg0_dispatch_for_test_binaries() {
+-    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
++    let _ = TEST_ARG0_PATH_ENTRY
++        .get_or_init(|| codex_arg0::arg0_dispatch().expect("initialize arg0 dispatch"));
+ }
+ 
+ #[ctor]
+diff --git a/codex-rs/test-binary-support/lib.rs b/codex-rs/test-binary-support/lib.rs
+--- a/codex-rs/test-binary-support/lib.rs
++++ b/codex-rs/test-binary-support/lib.rs
+@@ -41,7 +41,7 @@ where
+     let argv1 = args.next();
+     match classify(exe_name, argv1.as_deref().and_then(|arg| arg.to_str())) {
+         TestBinaryDispatchMode::DispatchArg0Only => {
+-            let _ = arg0_dispatch();
++            let _ = arg0_dispatch().expect("initialize arg0 dispatch");
+             None
+         }
+         TestBinaryDispatchMode::Skip => None,
+@@ -62,7 +62,7 @@ where
+                 std::env::set_var("CODEX_HARNESS", codex_harness.path());
+             }
+ 
+-            let arg0 = match arg0_dispatch() {
++            let arg0 = match arg0_dispatch().expect("initialize arg0 dispatch") {
+                 Some(arg0) => arg0,
+                 None => panic!("failed to configure arg0 dispatch aliases for test binary"),
+             };
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -43,6 +43,12 @@ pub fn ensure_codex_harness() -> std::io::Result<AbsolutePathBuf> {
+     ensure_codex_harness_from_env(codex_harness_env.as_deref())
+ }
+ 
++/// Creates the selected temporary root and returns its canonical path.
++pub fn ensure_tmpdir(path: &std::path::Path) -> std::io::Result<AbsolutePathBuf> {
++    std::fs::create_dir_all(path)?;
++    AbsolutePathBuf::from_absolute_path(path.canonicalize()?)
++}
++
+ fn ensure_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
+     ensure_directory_from_env(codex_home_env, DEFAULT_CODEX_HOME)
+ }
+@@ -115,6 +121,7 @@ mod tests {
+     use super::DEFAULT_CODEX_HOME;
+     use super::ensure_codex_harness_from_env;
+     use super::ensure_codex_home_from_env;
++    use super::ensure_tmpdir;
+     use super::find_codex_harness_from_env;
+     use super::find_codex_home_from_env;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -224,4 +231,17 @@ mod tests {
+ 
+         assert_eq!(resolved.as_path(), selected.canonicalize().unwrap());
+     }
++
++    #[test]
++    fn ensure_tmpdir_creates_selected_override() {
++        let root = TempDir::new().expect("temp root");
++        let selected = root.path().join("selected-temp");
++
++        let resolved = ensure_tmpdir(&selected).expect("ensure selected temporary root");
++
++        assert_eq!(
++            resolved.as_path(),
++            selected.canonicalize().expect("canonical selected temp")
++        );
++    }
+ }

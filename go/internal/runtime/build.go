@@ -86,6 +86,10 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	if err != nil || !validGitCommit(options.sourceCommit) {
 		return result, errors.Join(err, errors.New("BuildInstall Main commit is absent"))
 	}
+	if domain, err := buildTaskCoverage(options); err != nil {
+		result.FailureDomain = domain
+		return result, err
+	}
 	dist := filepath.Join(options.WorkingRoot, "build", "dist")
 	result.FailureDomain = failureDomainHelper
 	preparation, preparedAssets, err := prepareBuildInspectionTools(options)
@@ -205,6 +209,49 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	return result, nil
 }
 
+func buildTaskCoverage(options BuildInstallOptions) (string, error) {
+	var index outcomeTaskIndex
+	_, err := readCanonicalValue(filepath.Join(options.ScratchRoot, "tasks", "index.json"), &index)
+	if errors.Is(err, os.ErrNotExist) {
+		return failureDomainNone, nil
+	}
+	if err != nil {
+		return failureDomainInput, err
+	}
+	if len(index.ActiveTask) == 0 {
+		return failureDomainInput, validateReleaseTaskIndex(options.ScratchRoot, index, "")
+	}
+	task, err := activeTaskPath(options.ScratchRoot, options.Tag, "")
+	if err != nil {
+		return failureDomainInput, err
+	}
+	data, err := readRegularNoFollow(task)
+	if err != nil {
+		return failureDomainInput, err
+	}
+	fields, err := taskGraphFields(data, "CurrentWorktree", "RetainedParents")
+	if err != nil || fields["CurrentWorktree"] != options.source || fields["RetainedParents"] != "" {
+		return failureDomainInput, errors.Join(err, errors.New("build requires the reconciled Main task frontier"))
+	}
+	replay := PatchReplayOptions{
+		endpointOptions: options.endpointOptions, Mode: "list", Source: options.source, Tag: options.Tag,
+		WorkingRoot: options.WorkingRoot, ScratchRoot: options.ScratchRoot, RuntimeRoot: options.RuntimeRoot,
+		ActiveTask: task, coverageMode: "build", OnLive: options.OnLive,
+	}
+	native, stderr, err := runPatchReplayProcess(replay, "", newDeadline(options.Deadline, options.Cancellation))
+	if err != nil {
+		return failureDomainHelper, errors.Join(err, errors.New(stderr))
+	}
+	current, err := readRegularNoFollow(task)
+	if err != nil || !bytes.Equal(data, current) {
+		return failureDomainInput, errors.Join(err, errors.New("build active task changed during source coverage"))
+	}
+	if native.Result != "Listed" {
+		return failureDomainInput, fmt.Errorf("build source coverage refused: %s", native.Output)
+	}
+	return failureDomainNone, nil
+}
+
 func bindBuildInstallCleanup(result *BuildInstallResult, resultErr *error, path string) {
 	if err := removeOwnedPaths(path); err != nil {
 		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
@@ -217,7 +264,7 @@ func prepareBuildInspectionTools(options BuildInstallOptions) (preparation build
 	if err != nil {
 		return preparation, nil, err
 	}
-	attempt := filepath.Join(options.RuntimeRoot, "build-tools", id)
+	attempt := filepath.Join(options.WorkingRoot, "build", "tmp", "build-tools", id)
 	for _, path := range []string{attempt, filepath.Join(attempt, "home")} {
 		if err := ensureDirectoryNoFollow(path, 0o700); err != nil {
 			return preparation, nil, errors.Join(err, removeOwnedPaths(attempt))

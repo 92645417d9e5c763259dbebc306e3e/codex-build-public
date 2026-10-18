@@ -14,6 +14,9 @@ ClosedPrefixExportOwner
 - When Current is Main, a task-open Patch already in its history returns Blocked/Input before projection. TaskWorkspace owns closure, even when every Child Patch is committed.
 - An absent future selection does not block the preceding prefix.
 - Export proves artifact publication, not full-suite acceptance or release completion. It selects no tests. A closed prefix may advance after export without a suite. Complete verification occurs only when selected by the current user; Export never fabricates a result.
+- Before staging a projection, native export consumes ReleaseRollForward's source-coverage admission against Main and the active task's approved source changes.
+- A short closed prefix remains publishable only when every source responsibility through its frontier is accounted for.
+- Current Git-to-export equality cannot excuse a source responsibility missing from both.
 - Resolve this single argv from the current task and clean Git frontier.
 
 ```text

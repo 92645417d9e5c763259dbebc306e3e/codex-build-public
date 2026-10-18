@@ -14,6 +14,7 @@ description: Maintain Codex Rust CLI patch releases, product verification, build
 - [TaskWorkspace](/codex/skills/codex-build/reference/task-workspace.md) owns task placement and continuation; Records owns encoding and lifecycle joins.
 - ReleaseRollForward's OriginalPatchPurposeOwner owns purpose and classification before replay. PatchFormat defines the representation, PatchAcceptance reviews actual behavior, and ProtectedCoreAreas preserves protected boundaries.
 - RunnerEnv owns a private build-attempt guest `/tmp`, including `TMPDIR`; callers select only payloads.
+- Existing helpers derive every Cargo home, compiler cache, build directory, target and bulk preparation temporary input beneath the effective working root's build directory; callers never select a separate host Cargo workspace or target.
 - RepositoryFormatting owns repository-selected formatter execution and its writable source postimage.
 - RepositoryMaintenance owns the fixed workspace Cargo lock update and the separate repository-selected Bazel lock recipe, each with its exact writable source postimage.
 - FullSuiteAudit owns product verification.
@@ -25,7 +26,7 @@ description: Maintain Codex Rust CLI patch releases, product verification, build
 ```
 TopLevelReleaseTerms
 +-- Baseline: establish or align baseline then clean and stop
-+-- Roll: automatically migrate the sole task's complete declared Patch set; ReleaseRollForward owns material decisions
++-- Roll: migrate the declared Patch set within approved boundaries; Unit and Lane transitions require user approval
 +-- Install: commands/build-install.md selects the package and verifies its launch entry
 +-- Sync: commands/sync.md publishes manually requested public snapshots
 `-- Cleanup: restore Attached main, retire drained helper temporaries, and optionally retire one explicitly selected task
@@ -45,26 +46,31 @@ TopLevelReleaseTerms
 - The complete formal prefix remains independent of draft, whose consumers may use complete shared formal interfaces.
 - One `export` publishes registered MainWorktree's ordered closed Git prefix, never a fork, isolated lane, or release-completion decision. Semantic artifacts are `.diff`: one per Flat Patch or Unit Child Patch, accompanied by PatchExport's lane documents. `owner` is effect authority, not Patch structure.
 - Apply advances an unchanged Patch only after ReleaseRollForward establishes its authorized purpose and placement. Conflict retains the successful prefix; reconstruct within that boundary and publish through Commit or terminal Revise. Exports remain read-only purpose evidence.
+- ReleaseRollForward requires measured consumer benefit before retaining a performance-motivated addition; functional correctness and fewer apparent operations do not establish that benefit.
+- Before leaving the approved Unit or crossing a Lane, obtain explicit user approval for the concrete next scope; continuing within the same unchanged approved Unit needs no repeated approval.
 - Establish Baseline once as comparison evidence. During Roll, uncovered upstream packages join automatically and explicit user-requested coverage alignment may add or remove them at any registered frontier. Tests remain freely selected diagnostics; only the user requests a complete suite. No suite gates Patch closure, Fork, convergence, export, or install. A failed selected suite remains evidence for focused repair, not a rerun demand. An automatic Roll rewrite or non-idempotent fixup fold runs corresponding focused tests before advancing.
 - Finalize and Prepare own generated tail only when selected. Full-suite results come directly from Finalize; focused snapshots stay private.
 - Version-root notes own shared product constraints; lane notes add only lane-specific guards. PatchAcceptance consumes both scopes before each selected Unit or Flat Patch.
 - Every cross lane has a maintained `relationships.txt` ASCII graph under PatchExport's document lifecycle. OriginalPatchPurposeOwner and PatchAcceptance consume its functional relationships without treating the diagram as authority or a dependency database.
-- The helper owns baseline preparation, TaskIndex admission, fork ordinals, declared patch transport, mechanical generated-tail terminal synchronization, and task retirement. Product work owns responsibilities, source selection, topology, and judgment.
+- The helper owns baseline preparation, TaskIndex admission, fork ordinals, declared patch transport, mechanical retained-range and generated-tail task synchronization, and task retirement. Product work owns responsibilities, source selection, topology, and judgment.
 - Baseline interruption resumes the same tag, task, global topology and Plan/Stage/Result chain.
 - Every Roll entry reads TaskIndex and the sole ActiveTask through its trailing Additional Instructions, then consumes TaskWorkspace's reconciliation and handoff route before a response. LoadGraph expands this anchor, never replaces it.
 - Forward work stays on Current; ordinary editing of an earlier committed Lane child forks and retains its parent.
 - The terminal Unit may revise a middle Child Patch on Current; failure or committed status alone selects no Fork.
 - Only a user-selected full Finalize Product failure after declared Patch completion and Main convergence starts temporary Main fixup, which later folds by Fork.
 - An explicit draft quick-iteration request instead selects ReleaseRollForward's native draft-only fixup and fold on converged Main.
-- Apply copies one absent Flat Patch or whole Unit, or appends a declared Child Patch suffix; Commit records one Patch without collapsing a Unit.
+- Apply copies an absent Flat Patch, a whole Unit, an approved unchanged retained range, or a declared Child Patch suffix.
+- After a rewrite, ReleaseRollForward selects one continuous retained Apply range up to the next planned rewrite or unapproved boundary instead of repeated per-Unit calls.
+- Commit records one Patch without collapsing a Unit.
 - A Unit or Flat Patch includes its approved behavior, exact structure, and complete producer seams required by approved dependents. Its first commit owns the responsibility contract; other Child Patches do not repeat it.
 - ReleaseRollForward selects rewrite triggers and complete Patch responsibility boundaries. The lang skill's [Rust language owner](/codex/skills/lang/references/rust.md) supplies `PurposeBoundRustChange` to construct and review code inside them before dependent edits and source publication.
 - Feature additions, removals and upstream fulfillment consume ReleaseRollForward's behavior-change decision independently of textual conflicts.
-- Roll is one linear product-agent process with no subagents or delegation. PatchAcceptance owns cumulative source acceptance before publication and continuation.
+- Roll implementation stays with one product agent.
+- PatchAcceptance owns cumulative source acceptance and the user-selected subagent permission for reviewing multiple Units or Flat Patches.
 - Repository-wide discovery for purpose reconstruction is a reduction step, never a model-context payload. The command performing a broad search emits only aggregate counts and at most sixteen sorted unique exact path or commit identifiers; inspect only the minimum exact ranges needed for the current causal decision. If that set is insufficient, narrow the predicate outside model context before another bounded result. Raw broad matches and transport truncation never select evidence.
 - Verification refuting a candidate's completeness returns through ReleaseRollForward before any correction, including fixtures or settings. Rejection grants no feature withdrawal or Git effect; substantive contract or structure changes need new authority.
 - Before a rewrite, reconcile Main's complete Lane children and retained frontiers with the proposed start, deciding reuse or authorized withdrawal in the task.
-- A closed nonfinal Lane exports Main's ordered prefix and advances without a test gate. ReleaseRollForward owns local responsibility selection and changes to the retained order.
+- A closed nonfinal Lane exports Main's ordered prefix without a test gate, then reaches ReleaseRollForward's next-boundary approval decision.
 - Authored or reconstructed source selects focused tests from actual risk and prior findings after helper Commit. Results cannot establish classification or authorize changed contracts.
 - A helper Pass or below-limit diff cannot supply semantic acceptance. The existing line ceiling is not a design budget and splitting compensation does not resolve its cause.
 - Commit as `nobody <nobody@nobody>` unless the user authorizes another identity for that exact commit.

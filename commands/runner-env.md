@@ -12,7 +12,7 @@ ProjectedRunnerExecutionOwner
 - ProjectedRunner binds read-only source, private runtime/result, fixed Cargo/toolchain inputs, and no Git.
 - FullSuiteAudit owns RustSuite rounds; RunnerEnv transports one native producer, process, attempt, deadline, and reap without inferring retries.
 - BuildInstall package input lives at build/tmp/published-output/AttemptIdentity until consumption, separate from diagnostic raw output.
-- Only installed RunnerExec, RustSuite, and Finalize execute Rust; RepositoryFormatting owns writable just fmt and PatchReplay compared rustfmt.
+- Rust compilation and verification use only installed RunnerExec, RustSuite, Finalize and BuildInstall through ProjectedRunner; RepositoryFormatting owns writable just fmt and PatchReplay compared rustfmt.
 - Config-schema uses the same Runner projection, CargoLock, toolchain, deadline, custody, and cleanup. It transports one declared overlay fixture while real source stays read-only; it is neither a test nor generic writable mode.
 
 
@@ -122,6 +122,8 @@ BaselineSnapshotAssertionOwner
 
 ## Cargo And Temporary Storage
 
+- The existing helpers derive Cargo homes, compiler caches, build directories, targets and bulk preparation temporaries beneath the effective working root's build directory, including NativeToolchain bootstrap and BuildInstall tool preparation.
+- Direct host Cargo builds, checks or tests, standalone rustc and caller-selected scratch targets are not diagnostic or fallback routes.
 - Cold selection initializes materialization. A compatible unchanged SourceSelection uses ReusedWorkspace without advancing generation or invoking cargo clean, including revised bytes at the stable projected workspace path.
 - Cargo owns file freshness and rebuilding within that workspace. A changed physical workspace selection still advances generation and invalidates workspace-member artifacts before use, preserving cross-worktree isolation. Incompatible toolchain or target state rejects, and no helper fingerprint, source copy, or automatic retry is introduced.
 - EffectiveReuse CargoManaged denotes compatible workspace retention, not an invented cache-hit count. Other retained-cache claims still require the current sccache statistics.

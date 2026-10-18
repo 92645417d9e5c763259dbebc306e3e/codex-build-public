@@ -60,7 +60,7 @@ PatchGitDiffLineAdmission
 
 ## Responsibility Classification
 
-- ReleaseRollForward's OriginalPatchPurposeOwner makes the single semantic classification decision before metadata or transport.
+- ReleaseRollForward's OriginalPatchPurposeOwner owns classification; proposed shape and placement remain read-only until its separate behavior and structural authority decision is satisfied.
 - Current user decisions fix observable behavior, explicit group members, exclusions, and maturity; metadata records the resulting assignment.
 - Backend owns a complete non-presentation feature and its interfaces.
 - Mixed owns a feature with one backend responsibility paired with one frontend responsibility.
@@ -73,7 +73,10 @@ PatchGitDiffLineAdmission
 - Recording an independent feature or calling its utility does not move that feature into the recorder's or caller's group.
 - A shared widget qualifies only when the assigned features require coordinated changes to its observable behavior.
 - Neither a real private dependency nor generation impact establishes group membership.
-- Bugfix and normalization retain their existing purposes before formal feature Lanes.
+- Bugfix contains local repairs of demonstrated defects in existing upstream behavior rather than optional optimization features.
+- A defect in an existing private responsibility remains with that owner unless the user explicitly approves a different assignment.
+- A performance correction is a bugfix only when evidence establishes the breached existing performance obligation; a request to optimize or a measured faster alternative alone does not establish that classification.
+- Normalization retains its existing purpose before formal feature Lanes.
 - Backend, mixed, frontend and cross form the formal prefix; draft retains unfinished or unpromoted features.
 - An approved future integration informs the functional boundary without implementing it or promoting its draft consumers.
 - The complete formal prefix must build and preserve its approved behavior and tests without draft.

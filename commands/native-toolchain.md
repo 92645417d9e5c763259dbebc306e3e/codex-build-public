@@ -19,6 +19,7 @@
 - The producer accepts no caller override of the source-owned Rust, V8, GStreamer or Opus requirements.
 - Unavailable or conflicting requirements stop before publication instead of selecting a guessed version, weakening a capability, or falling back to host tools.
 - Rust bootstrap uses the official target rustup initializer only inside the preparation attempt, never reads or writes host Rust state, and copies the selected installed toolchain into the staged fixed root.
+- The existing preparation owner derives its attempt beneath the effective working root at build/tmp/native-toolchain; downloads, Rustup and Cargo homes, native compilation and temporary files stay in that attempt until its exact cleanup.
 - The producer downloads the selected official release payloads directly into its attempt, validates semantic versions and required regular postimages, writes one semantic-only `native-toolchain.json` after the complete payload exists, and then publishes once by first-root rename or replacement-root directory exchange.
 - A standalone executable download is copied into an exclusively created pending file under the publication stage, validated at that staged postimage, and renamed only within the publication filesystem.
 - cargo-nextest admission parses the semantic release from its leading version line and ignores only additional release metadata lines; the parsed release, fixed target archive, executable postimage, and manifest field must still match exactly.

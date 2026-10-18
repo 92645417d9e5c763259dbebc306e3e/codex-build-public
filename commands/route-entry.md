@@ -25,7 +25,7 @@ TopLevelReleaseTermOwner
 ```
 
 - Baseline maps to `release-baseline` and BaselineEstablishedAndCleanupComplete.
-- Roll selects ReleaseRollForward for the sole task. Automatic Roll follows every declared Patch; an explicit interactive Unit, Flat Patch, or Lane stop consumes its requested read-only exploration before handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
+- Roll selects ReleaseRollForward for the sole task and continues only within approved boundaries. Unit and Lane transitions consume its explicit user-approval decision. Requested read-only exploration still precedes its handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
 - Before BuildInstall, consume TaskWorkspace's pending-obligation decision.
 - Resolve the requested package-only or installation terminal from user intent; ask only when it is ambiguous.
 - Install selects `build-install --install`, without a home-link, candidate or export predecessor.
@@ -40,11 +40,13 @@ TopLevelReleaseTermOwner
 
 ## Routes
 
-- ReviewArtifacts selects direct read-only artifact review by the product agent.
+- ReviewArtifacts selects read-only artifact review, with requested subagent use governed by PatchAcceptance.
 - InspectClosedPrefix selects PatchExport's `export` at registered MainWorktree's closed Git frontier, independently of a fork remaining Current.
-- Roll invokes no subagent, delegation, parallel review, or reviewer wait. Source publication consumes the same agent's complete current-native design and cumulative Patch acceptance before process construction.
-- PreparePatchForApproval consumes ReleaseRollForward's material contract and requirement-cost decisions or an explicitly requested interactive choice.
-- Automatic Roll enters ReleaseRollForward directly; task text grants no scope change.
+- Roll implementation and cumulative source acceptance remain with the product agent.
+- Requested subagent review follows PatchAcceptance without creating a parallel implementation or acceptance owner.
+- Source publication consumes the product agent's complete current-native design and cumulative Patch acceptance before process construction.
+- PreparePatchForApproval consumes ReleaseRollForward's next-Unit or next-Lane decision, material contract and requirement-cost choices, or an explicitly requested interactive choice.
+- A general Roll request supplies no blanket approval for later boundaries or unmeasured optimization additions.
 - ConvergeAcceptedWorktrees precedes next-Patch or Fork selection after Unit or Flat Patch closure and on reentry. GitCustody removes covered numbered parents independently of Main's suffix; full Main coverage then promotes. Return to the selected successor without a helper topology command or test gate.
 - DraftIssue selects claim-reviewed UpstreamBugReport.
 - EditNamedTask selects TaskWorkspace's reconciliation, publication and requested recap.

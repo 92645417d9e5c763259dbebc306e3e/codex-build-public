@@ -1,0 +1,263 @@
+publish-client-count-for-app-server
+
+Lane: cross
+
+Unit: coordinate-client-lifecycle-for-local-daemons
+
+ChildPatch: publish-client-count-for-app-server
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+Purpose: Expose real connected app-server clients and a control-center Quit operation that stops the managed local daemon only when the requester is last and existing app-server sessions are idle, completing normal SQLite shutdown.
+
+Requires: none
+
+Provides: Publish initialized client counts excluding daemon and backend probes; bind shutdown requests to the existing client connection; check last-client and globally idle eligibility without side effects before confirmation and atomically revalidate it on actual shutdown; return actionable refusals and request errors without disconnecting or adding chat history; provide callable TUI check and shutdown operations and an accepted-shutdown exit summary; retain app-scoped count observations across thread switches and clear them on disconnect. Drain accepted ordinary logs after normal producer shutdown, then explicitly close the native state-runtime and initialized local-history pools so SQLite can checkpoint and remove closed sidecars. Retain native message-board pools across thread teardown and await accepted board posts before their SQLite connections close.
+
+Boundary: Native connection sessions, request dispatch, turn admission, recovery, forced shutdown and logging failure reporting retain their ownership. Disposable internal ephemeral work remains subject to native shutdown and cleanup without feature-specific admission hooks. Preserve upstream slash quits and ordinary key exits, embedded and remote operation, and ordinary disconnects. Count notifications do not enter exec output or the status line. Response-writer draining belongs to response recording. Control-center layout, action keys and confirmation or refusal dialogs remain with its interface consumer.
+
+Verification: Protocol serialization; admission and global thread-status shutdown tests; managed-daemon integration for probe exclusion, disconnect survival, check-only eligibility without closing admission, other-client refusal, last-client idle shutdown and background-turn refusal; TUI callable check and shutdown results, preserved drafts and connections on refusal, native slash dispatch, exit summaries, global count routing and disconnect clearing. Log-writer and managed-daemon tests verify final queued logs, normal pool closure, closed sidecars and standalone database reopening. Local message-board tests preserve canceled-caller post completion and verify shutdown waits for final commits before standalone reopening.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -2025,6 +2025,7 @@ server_notification_definitions! {
+     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
++    ConnectedClientCountChanged => "appServer/connectedClientCount/changed" (v2::ConnectedClientCountChangedNotification),
+     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
+     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+     FsChanged => "fs/changed" (v2::FsChangedNotification),
+@@ -2131,6 +2132,22 @@ mod tests {
+         test_path_buf(&path).display().to_string()
+     }
+ 
++    #[test]
++    fn connected_client_count_has_one_v2_notification_shape() {
++        let notification = ServerNotification::ConnectedClientCountChanged(
++            v2::ConnectedClientCountChangedNotification {
++                connected_client_count: 2,
++            },
++        );
++        assert_eq!(
++            serde_json::to_value(notification).expect("serialize connected client count"),
++            json!({
++                "method": "appServer/connectedClientCount/changed",
++                "params": { "connectedClientCount": 2 }
++            })
++        );
++    }
++
+     fn absolute_path(path: &str) -> AbsolutePathBuf {
+         let path = format!("/{}", path.trim_start_matches('/'));
+         test_path_buf(&path).abs()
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+@@ -5,6 +5,14 @@ use crate::TS;
+ use serde::Deserialize;
+ use serde::Serialize;
+ 
++/// Number of initialized clients currently connected to the app server.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ConnectedClientCountChangedNotification {
++    pub connected_client_count: usize,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -32,6 +32,7 @@ use crate::outgoing_message::OutgoingEnvelope;
+ use crate::outgoing_message::OutgoingMessageSender;
+ use crate::outgoing_message::QueuedOutgoingMessage;
+ use crate::plugin_config_reload::PluginStartupConfig;
++use crate::request_processors::is_originating_client_name;
+ use crate::transport::CHANNEL_CAPACITY;
+ use crate::transport::ConnectionOrigin;
+ use crate::transport::ConnectionState;
+@@ -49,6 +50,7 @@ use crate::transport::start_stdio_connection;
+ use crate::transport::start_websocket_acceptor;
+ use codex_analytics::AppServerRpcTransport;
+ use codex_app_server_protocol::ConfigWarningNotification;
++use codex_app_server_protocol::ConnectedClientCountChangedNotification;
+ use codex_app_server_protocol::JSONRPCMessage;
+ use codex_app_server_protocol::RemoteControlPairingStartParams;
+ use codex_app_server_protocol::ServerNotification;
+@@ -87,6 +89,14 @@ use tracing_subscriber::util::SubscriberInitExt;
+ 
+ const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database";
+ 
++fn counts_as_connected_client(connection: &ConnectionState) -> bool {
++    connection.session.initialized()
++        && connection
++            .session
++            .app_server_client_name()
++            .is_some_and(is_originating_client_name)
++}
++
+ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
+     err.get_ref().is_some_and(
+         <dyn std::error::Error + Send + Sync + 'static>::is::<
+@@ -1217,6 +1227,7 @@ pub async fn run_main_with_transport_options(
+                                 let Some(connection_state) = connections.remove(&connection_id) else {
+                                     continue;
+                                 };
++                                let was_counted = counts_as_connected_client(&connection_state);
+                                 let stdio_closed = connection_state.origin == ConnectionOrigin::Stdio;
+                                 connection_state.session.rpc_gate.close().await;
+                                 let outbound_closed = outbound_control_tx
+@@ -1232,6 +1243,21 @@ pub async fn run_main_with_transport_options(
+                                 if !outbound_closed {
+                                     break "outbound_router_closed";
+                                 }
++                                if was_counted {
++                                    let connected_client_count = connections
++                                        .values()
++                                        .filter(|connection| counts_as_connected_client(connection))
++                                        .count();
++                                    initialize_notification_sender
++                                        .send_server_notification(
++                                            ServerNotification::ConnectedClientCountChanged(
++                                                ConnectedClientCountChangedNotification {
++                                                    connected_client_count,
++                                                },
++                                            ),
++                                        )
++                                        .await;
++                                }
+                                 if single_client_mode && stdio_closed {
+                                     // Pending remote enrollment must stop before RPCs drain.
+                                     remote_control_shutdown_token.cancel();
+@@ -1306,6 +1332,21 @@ pub async fn run_main_with_transport_options(
+                                             connection_state
+                                                 .outbound_initialized
+                                                 .store(true, std::sync::atomic::Ordering::Release);
++                                            if counts_as_connected_client(connection_state) {
++                                                let connected_client_count = connections
++                                                    .values()
++                                                    .filter(|connection| counts_as_connected_client(connection))
++                                                    .count();
++                                                initialize_notification_sender
++                                                    .send_server_notification(
++                                                        ServerNotification::ConnectedClientCountChanged(
++                                                            ConnectedClientCountChangedNotification {
++                                                                connected_client_count,
++                                                            },
++                                                        ),
++                                                    )
++                                                    .await;
++                                            }
+                                         }
+                                     }
+                                     JSONRPCMessage::Response(response) => {
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -105,6 +105,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::AppListUpdated(_)
+         | ServerNotification::RemoteControlStatusChanged(_)
++        | ServerNotification::ConnectedClientCountChanged(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::FsChanged(_)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -589,6 +589,7 @@ pub(crate) use feedback_processor::FeedbackRequestProcessor;
+ pub(crate) use fs_processor::FsRequestProcessor;
+ pub(crate) use git_processor::GitRequestProcessor;
+ pub(crate) use initialize_processor::InitializeRequestProcessor;
++pub(crate) use initialize_processor::is_originating_client_name;
+ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+ pub(crate) use mcp_event_stream::McpEventStreamReady;
+ pub(crate) use mcp_event_stream::McpEventStreams;
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -18,6 +18,10 @@ use crate::transport::ConnectionOrigin;
+ 
+ const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
+ 
++pub(crate) fn is_originating_client_name(name: &str) -> bool {
++    !NON_ORIGINATING_CLIENT_NAMES.contains(&name)
++}
++
+ #[derive(Clone)]
+ pub(crate) struct InitializeRequestProcessor {
+     gateway_login_control: Arc<codex_login::GatewayLoginControl>,
+@@ -129,7 +133,7 @@ impl InitializeRequestProcessor {
+         }
+         let originator = name.clone();
+         let user_agent_suffix = format!("{name}; {version}");
+-        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
++        let mutates_global_identity = is_originating_client_name(&name);
+         let codex_home = self.config.codex_home.clone();
+         if session
+             .initialize(InitializedConnectionSessionState {
+diff --git a/codex-rs/exec/src/event_processor_with_human_output.rs b/codex-rs/exec/src/event_processor_with_human_output.rs
+--- a/codex-rs/exec/src/event_processor_with_human_output.rs
++++ b/codex-rs/exec/src/event_processor_with_human_output.rs
+@@ -305,6 +305,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
+             ServerNotification::ModelMembershipChanged(_) => CodexStatus::Running,
++            ServerNotification::ConnectedClientCountChanged(_) => CodexStatus::Running,
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                 self.last_total_token_usage = Some(notification.token_usage);
+                 CodexStatus::Running
+diff --git a/codex-rs/exec/src/event_processor_with_jsonl_output.rs b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+--- a/codex-rs/exec/src/event_processor_with_jsonl_output.rs
++++ b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+@@ -507,6 +507,7 @@ impl EventProcessorWithJsonOutput {
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
+             ServerNotification::ModelMembershipChanged(_) => CodexStatus::Running,
++            ServerNotification::ConnectedClientCountChanged(_) => CodexStatus::Running,
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                 self.last_total_token_usage = Some(notification.token_usage);
+                 CodexStatus::Running
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -1716,6 +1716,7 @@ fn should_process_notification(
+             notification.thread_id == thread_id && notification.turn_id == turn_id
+         }
+         ServerNotification::ModelMembershipChanged(_) => false,
++        ServerNotification::ConnectedClientCountChanged(_) => false,
+         ServerNotification::ThreadTokenUsageUpdated(notification) => {
+             notification.thread_id == thread_id && notification.turn_id == turn_id
+         }
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -213,6 +213,7 @@ pub(super) fn server_notification_thread_target(
+         | ServerNotification::EnvironmentConnected(_)
+         | ServerNotification::EnvironmentDisconnected(_)
+         | ServerNotification::RemoteControlStatusChanged(_)
++        | ServerNotification::ConnectedClientCountChanged(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::DeprecationNotice(_)
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -263,6 +263,7 @@ impl ChatWidget {
+                     }
+                 }
+             }
++            ServerNotification::ConnectedClientCountChanged(_) => {}
+             ServerNotification::AuthRecoveryStarted(notification) => {
+                 self.add_info_message(notification.message, /*hint*/ None)
+             }

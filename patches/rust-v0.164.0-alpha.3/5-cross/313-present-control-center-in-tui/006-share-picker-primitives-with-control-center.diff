@@ -1,0 +1,25 @@
+share-picker-primitives-with-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: share-picker-primitives-with-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -132,7 +132,7 @@ mod transcript_preview;
+ pub(crate) use transcript_preview::load_transcript_preview;
+ 
+ const PAGE_SIZE: usize = 25;
+-const LOAD_NEAR_THRESHOLD: usize = 5;
++pub(crate) const LOAD_NEAR_THRESHOLD: usize = 5;
+ const SESSION_META_INDENT_WIDTH: usize = 2;
+ const SESSION_META_DATE_WIDTH: usize = 12;
+ const SESSION_META_FIELD_GAP_WIDTH: usize = 2;

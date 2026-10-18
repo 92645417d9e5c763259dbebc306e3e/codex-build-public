@@ -1,0 +1,1488 @@
+estimate-quota-capacity-from-usage
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: estimate-quota-capacity-from-usage
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/usage/aggregate.rs b/codex-rs/app-server/src/usage/aggregate.rs
+--- a/codex-rs/app-server/src/usage/aggregate.rs
++++ b/codex-rs/app-server/src/usage/aggregate.rs
+@@ -2,6 +2,8 @@ use super::Error;
+ use super::Rows;
+ use super::UsageRange;
+ use super::UsageReport;
++use super::credits;
++use super::quota;
+ use super::reader;
+ use super::types::Usage;
+ use chrono::DateTime;
+@@ -17,7 +19,11 @@ use std::path::Path;
+ 
+ fn period_date(date: NaiveDate, period: UsageRange) -> NaiveDate {
+     match period {
+-        UsageRange::Today | UsageRange::Yesterday | UsageRange::Daily | UsageRange::Heatmap => date,
++        UsageRange::Today
++        | UsageRange::Yesterday
++        | UsageRange::Daily
++        | UsageRange::Heatmap
++        | UsageRange::Quota => date,
+         UsageRange::Weekly => {
+             date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+         }
+@@ -32,7 +38,8 @@ fn period_key(date: NaiveDate, period: UsageRange) -> String {
+         | UsageRange::Yesterday
+         | UsageRange::Daily
+         | UsageRange::Weekly
+-        | UsageRange::Heatmap => date.to_string(),
++        | UsageRange::Heatmap
++        | UsageRange::Quota => date.to_string(),
+         UsageRange::Monthly => date.format("%Y-%m").to_string(),
+         UsageRange::Yearly => date.format("%Y").to_string(),
+     }
+@@ -51,8 +58,8 @@ pub(super) fn load(
+     let reader::Events {
+         mut events,
+         models,
+-        observations: _,
+-        credits: _,
++        mut observations,
++        mut credits,
+         mut diagnostics,
+     } = reader::load(home)?;
+     // Native records are immutable response observations. Preserve the first
+@@ -106,6 +113,8 @@ pub(super) fn load(
+     diagnostics.unique_events = events.len();
+     let mut groups = BTreeMap::<(NaiveDate, usize), Usage>::new();
+     let mut missing_prices = BTreeSet::new();
++    let mut costs = BTreeMap::new();
++    let recent = now.saturating_sub(quota::RECENT_DAYS * 24 * 60 * 60 * 1_000);
+     for event in events {
+         let Some(time) = DateTime::<Utc>::from_timestamp_millis(event.millis) else {
+             continue;
+@@ -126,6 +135,9 @@ pub(super) fn load(
+             );
+             (quote.usd, quote.input_threshold != 0)
+         });
++        if event.quota_millis >= recent && event.quota_millis <= now {
++            *costs.entry(event.quota_millis).or_default() += cost;
++        }
+         groups
+             .entry((date, event.model))
+             .or_default()
+@@ -149,6 +161,8 @@ pub(super) fn load(
+                 .add_usage(&row);
+         }
+     }
++    let quota = quota::estimate(&costs, &mut observations, now);
++    let credits = credits::summarize(&costs, &mut credits, now);
+     Ok(UsageReport {
+         refreshed_at,
+         today,
+@@ -158,6 +172,8 @@ pub(super) fn load(
+         monthly_rows,
+         yearly_rows,
+         prices,
++        quota,
++        credits,
+         missing_prices,
+         diagnostics,
+     })
+diff --git a/codex-rs/app-server/src/usage/aggregate_tests.rs b/codex-rs/app-server/src/usage/aggregate_tests.rs
+--- a/codex-rs/app-server/src/usage/aggregate_tests.rs
++++ b/codex-rs/app-server/src/usage/aggregate_tests.rs
+@@ -492,6 +492,234 @@ fn mixed_context_totals_retain_token_partitions_and_the_prices_used() {
+     );
+ }
+ 
++#[test]
++fn weekly_quota_uses_priced_canonical_snapshots_without_counting_repeated_delivery() {
++    let directory = tempfile::tempdir().unwrap();
++    let reset = DateTime::parse_from_rfc3339("2026-02-08T00:00:00Z")
++        .unwrap()
++        .timestamp();
++    let mut events = Vec::new();
++    for (at, input, total, percent) in [
++        ("2026-02-01T00:00:00Z", 100_000, 100_000, 20.0),
++        ("2026-02-01T00:10:00Z", 50_000, 150_000, 40.0),
++    ] {
++        let mut event = count(at, usage(input, 0), usage(total, 0));
++        event["payload"]["rate_limits"] = json!({"primary":{
++            "used_percent":percent,"window_minutes":10080,"resets_at":reset
++        }});
++        events.push(event);
++    }
++    events.push(events[1].clone());
++    write_rollout(
++        directory.path(),
++        "sessions/quota.jsonl",
++        "quota",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert_eq!(report.quota.len(), 1);
++    let cycle = &report.quota[0];
++    assert_eq!(cycle.sample_count, 2);
++    assert_eq!(cycle.status, quota::Status::Provisional);
++    // The second response's 40% reports usage through the first response. Its
++    // own $0.10 belongs in accounting, but not in this quota measurement yet.
++    assert!((cycle.observed_cost_usd - 0.2).abs() < 1e-12);
++    assert!((cycle.estimated_weekly_cost_usd - 1.0).abs() < 1e-12);
++    assert!((report.rows["2026-02-01"]["gpt-5.4"].cost - 0.3).abs() < 1e-12);
++    let now = DateTime::parse_from_rfc3339("2026-02-01T04:00:00Z")
++        .unwrap()
++        .timestamp_millis();
++    let unpriced = load(directory.path(), Prices::new(), report.timezone, now).unwrap();
++    assert!(unpriced.quota.is_empty());
++    assert!(unpriced.missing_prices.contains("gpt-5.4"));
++    assert_eq!(unpriced.rows["2026-02-01"]["gpt-5.4"].tokens.total, 150_000);
++}
++
++#[test]
++fn credit_intervals_leave_all_accounting_totals_intact_and_resume_on_the_previous_request() {
++    let directory = tempfile::tempdir().unwrap();
++    let reset = DateTime::parse_from_rfc3339("2026-02-07T00:00:00Z")
++        .unwrap()
++        .timestamp();
++    // The replacement week begins when the preceding request ran, at 00:04.
++    let next_reset = DateTime::parse_from_rfc3339("2026-02-08T00:04:00Z")
++        .unwrap()
++        .timestamp();
++    let mut total = 0;
++    let mut events = Vec::new();
++    for (index, (output, percent, balance)) in [
++        (20_000, 0.0, "100.0"),
++        (5_000, 80.0, "100.0000"),
++        (175_000, 100.0, "100"),
++        (200_000, 100.0, "90"),
++        (2_500, 100.0, "90"),
++        (10_000, 10.0, "90"),
++        (30_750, 50.0, "90"),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        total += output;
++        let mut event = count(
++            &format!("2026-02-01T00:0{index}:00Z"),
++            usage(0, output),
++            usage(0, total),
++        );
++        event["payload"]["rate_limits"] = json!({
++            "primary": {
++                "used_percent":percent,
++                "window_minutes":10080,
++                "resets_at":if index < 5 { reset } else { next_reset }
++            },
++            "credits": {"balance":balance}
++        });
++        events.push(event);
++        if index == 3 {
++            events.push(events.last().unwrap().clone());
++        }
++    }
++    // Closure is visible at the first decrease and survives duplicate delivery
++    // and further credit-funded requests while the same weekly cycle continues.
++    for end in [4, 5, 6] {
++        write_rollout(
++            directory.path(),
++            "sessions/credits.jsonl",
++            "credits",
++            None,
++            &events[..end],
++        );
++        let during_credit = report(directory.path());
++        assert_eq!(during_credit.quota.len(), 1);
++        assert_eq!(during_credit.quota[0].status, quota::Status::Completed);
++        assert_eq!(during_credit.quota[0].ended_at, "2026-02-01T00:02:00Z");
++        assert_eq!(during_credit.quota[0].sample_count, 3);
++        assert!((during_credit.quota[0].observed_cost_usd - 0.1).abs() < 1e-12);
++        assert!((during_credit.quota[0].estimated_weekly_cost_usd - 0.1).abs() < 1e-12);
++    }
++    write_rollout(
++        directory.path(),
++        "sessions/credits.jsonl",
++        "credits",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert_eq!(report.diagnostics.unique_events, 7);
++    assert_eq!(report.credits.len(), 1);
++    assert_eq!(report.credits[0].started_at, "2026-02-01T00:02:00Z");
++    assert_eq!(report.credits[0].ended_at, "2026-02-01T00:04:00Z");
++    assert_eq!(report.credits[0].used_credits, 10.0);
++    assert_eq!(report.credits[0].sample_count, 3);
++    assert!((report.credits[0].observed_cost_usd - 1.5).abs() < 1e-12);
++    assert_eq!(report.quota.len(), 2);
++    assert_eq!(report.quota[0].ended_at, "2026-02-01T00:02:00Z");
++    assert!((report.quota[0].observed_cost_usd - 0.1).abs() < 1e-12);
++    assert_eq!(report.quota[1].started_at, "2026-02-01T00:04:00Z");
++    assert!((report.quota[1].observed_cost_usd - 0.05).abs() < 1e-12);
++    for estimate in &report.quota {
++        assert!((estimate.estimated_weekly_cost_usd - 0.1).abs() < 1e-12);
++    }
++    for (rows, period) in [
++        (&report.rows, "2026-02-01"),
++        (&report.weekly_rows, "2026-01-26"),
++        (&report.monthly_rows, "2026-02"),
++        (&report.yearly_rows, "2026"),
++    ] {
++        let usage = &rows[period]["gpt-5.4"];
++        assert_eq!(usage.tokens.total, 443_250);
++        assert!((usage.cost - 1.773).abs() < 1e-12);
++    }
++}
++
++#[test]
++fn current_quota_recovers_from_delayed_credit_without_losing_accounted_usage() {
++    let directory = tempfile::tempdir().unwrap();
++    let reset = DateTime::parse_from_rfc3339("2026-02-08T00:00:00Z")
++        .unwrap()
++        .timestamp();
++    let mut total = 0;
++    let mut events = Vec::new();
++    for (index, (output, percent, balance)) in [
++        (175_000, 0.0, "100"),
++        (4_000, 0.0, "90"),
++        (4_000, 16.0, "90"),
++        (30_000, 32.0, "90"),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        total += output;
++        let mut event = count(
++            &format!("2026-02-01T00:0{index}:00Z"),
++            usage(0, output),
++            usage(0, total),
++        );
++        event["payload"]["rate_limits"] = json!({
++            "primary": {
++                "used_percent":percent,"window_minutes":10080,"resets_at":reset
++            },
++            "credits": {"balance":balance}
++        });
++        events.push(event);
++    }
++    write_rollout(
++        directory.path(),
++        "sessions/current-quota.jsonl",
++        "current-quota",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert_eq!(report.quota.len(), 1);
++    let current = &report.quota[0];
++    assert_eq!(current.status, quota::Status::Provisional);
++    assert_eq!(current.used_percent_end, 32.0);
++    assert!((current.observed_cost_usd - 0.032).abs() < 1e-12);
++    assert!((current.estimated_weekly_cost_usd - 0.1).abs() < 1e-12);
++    assert_eq!(report.diagnostics.unique_events, 4);
++    let usage = &report.rows["2026-02-01"]["gpt-5.4"];
++    assert_eq!(usage.tokens.total, 213_000);
++    assert!((usage.cost - 0.852).abs() < 1e-12);
++}
++
++#[test]
++fn credit_only_snapshots_keep_actual_deductions_and_all_accounting_totals() {
++    let directory = tempfile::tempdir().unwrap();
++    let events = ["100.00", "99.50", "99.25"]
++        .into_iter()
++        .enumerate()
++        .map(|(index, balance)| {
++            let mut event = count(
++                &format!("2026-02-01T00:0{index}:00Z"),
++                usage(0, 100_000),
++                usage(0, (index as u64 + 1) * 100_000),
++            );
++            event["payload"]["rate_limits"] = json!({"credits": {"balance": balance}});
++            event
++        })
++        .collect::<Vec<_>>();
++    write_rollout(
++        directory.path(),
++        "sessions/credits.jsonl",
++        "credits",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert!(report.quota.is_empty());
++    assert_eq!(report.credits.len(), 1);
++    let period = &report.credits[0];
++    assert_eq!(period.started_at, "2026-02-01T00:00:00Z");
++    assert_eq!(period.ended_at, "2026-02-01T00:02:00Z");
++    assert_eq!(period.used_credits, 0.75);
++    assert!((period.observed_cost_usd - 0.8).abs() < 1e-12);
++    assert_eq!(period.sample_count, 3);
++    let usage = &report.rows["2026-02-01"]["gpt-5.4"];
++    assert_eq!(usage.tokens.output, 300_000);
++    assert!((usage.cost - 1.2).abs() < 1e-12);
++}
++
+ #[test]
+ fn native_response_records_keep_incomplete_costs_and_deduplicate_copies_by_identity() {
+     let directory = tempfile::tempdir().unwrap();
+@@ -565,3 +793,61 @@ fn deferred_snapshot_does_not_move_a_response_to_another_calendar_day() {
+     assert_eq!(report.monthly_rows["2026-01"]["gpt-5.4"].tokens.total, 110);
+     assert!(!report.monthly_rows.contains_key("2026-02"));
+ }
++
++#[test]
++fn native_response_records_preserve_preceding_request_quota_and_credit_costs() {
++    for credit_spending in [false, true] {
++        let directory = tempfile::tempdir().unwrap();
++        let mut values = Vec::new();
++        let mut total = 0;
++        for (index, input) in [100_000, 50_000, 25_000].into_iter().enumerate() {
++            total += input;
++            let record = json!({"type":"token_usage_record",
++                "timestamp":format!("2026-02-01T00:0{index}:00Z"),
++                "payload":{"thread_id":"thread","response_id":format!("response-{index}"),
++                    "usage":usage(input, 0)}});
++            let mut snapshot = count(
++                &format!("2026-02-01T00:0{index}:00.001Z"),
++                usage(0, 0),
++                usage(total, 0),
++            );
++            snapshot["payload"]["rate_limits"] = json!({
++                "primary":{"window_minutes":10080,"used_percent":20.0*(index+1) as f64,
++                    "resets_at":1770508800},
++                "credits":{"balance":if credit_spending { (100-index).to_string() } else { "100".to_string() }},
++            });
++            if index == 1 {
++                write_rollout(
++                    directory.path(),
++                    "sessions/copy.jsonl",
++                    "thread",
++                    None,
++                    &[record.clone()],
++                );
++            }
++            values.extend([record, snapshot]);
++        }
++        write_rollout(
++            directory.path(),
++            "sessions/records.jsonl",
++            "thread",
++            None,
++            &values,
++        );
++        let report = report(directory.path());
++        assert_eq!(report.diagnostics.duplicate_events, 1);
++        assert_eq!(report.diagnostics.unique_events, 3);
++        assert!((report.rows["2026-02-01"]["gpt-5.4"].cost - 0.35).abs() < 1e-12);
++        if credit_spending {
++            assert_eq!(report.credits.len(), 1);
++            assert_eq!(report.credits[0].used_credits, 2.0);
++            assert_eq!(report.credits[0].sample_count, 3);
++            assert!((report.credits[0].observed_cost_usd - 0.3).abs() < 1e-12);
++        } else {
++            assert_eq!(report.quota.len(), 1);
++            assert_eq!(report.quota[0].sample_count, 3);
++            assert!((report.quota[0].observed_cost_usd - 0.3).abs() < 1e-12);
++            assert!((report.quota[0].estimated_weekly_cost_usd - 0.75).abs() < 1e-12);
++        }
++    }
++}
+diff --git a/codex-rs/app-server/src/usage/credits.rs b/codex-rs/app-server/src/usage/credits.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/credits.rs
+@@ -0,0 +1,80 @@
++use super::quota::RECENT_DAYS;
++use super::types::CreditObservation;
++pub(super) use codex_app_server_protocol::UsageCreditPeriod as Period;
++use std::collections::BTreeMap;
++
++pub(super) fn summarize(
++    costs: &BTreeMap<i64, f64>,
++    observations: &mut Vec<CreditObservation>,
++    now: i64,
++) -> Vec<Period> {
++    let since = now.saturating_sub(RECENT_DAYS * 24 * 60 * 60 * 1_000);
++    observations.retain(|sample| sample.millis >= since && sample.millis <= now);
++    observations.sort_by_key(|sample| sample.millis);
++    let mut periods = Vec::new();
++    let mut current: Option<(Period, f64)> = None;
++    let mut previous: Option<(&CreditObservation, f64)> = None;
++    let mut costs = costs.iter().peekable();
++    let mut cumulative_cost = 0.0;
++    for same_instant in observations.chunk_by(|left, right| left.millis == right.millis) {
++        let sample = &same_instant[0];
++        // Returned balances describe the preceding request, just like quota observations.
++        while let Some((_, cost)) = costs.next_if(|(millis, _)| **millis < sample.millis) {
++            cumulative_cost += cost;
++        }
++        let prior = previous.replace((sample, cumulative_cost));
++        let interval = if same_instant.iter().any(|other| {
++            other.balance != sample.balance || other.quota_exhausted != sample.quota_exhausted
++        }) {
++            // A conflicting instant cannot choose either side of a billing interval.
++            previous = None;
++            None
++        } else {
++            prior.and_then(|(prior, prior_cost)| {
++                prior
++                    .balance
++                    .zip(sample.balance)
++                    .map(|(before, after)| (prior, prior_cost, before, after))
++            })
++        };
++        if let Some((prior, prior_cost, before, after)) = interval {
++            let cost = cumulative_cost - prior_cost;
++            if let Some((period, lowest_balance)) = &mut current {
++                // Concurrent responses can return an older, higher balance. Only a
++                // new low proves additional spending; a plateau is not recovery.
++                if after < *lowest_balance || sample.quota_exhausted {
++                    period.ended_at.clone_from(&sample.timestamp);
++                    period.used_credits += (*lowest_balance - after).max(0.0);
++                    *lowest_balance = lowest_balance.min(after);
++                    period.observed_cost_usd += cost;
++                    period.sample_count += 1;
++                    continue;
++                }
++            } else if after < before {
++                current = Some((
++                    Period {
++                        started_at: prior.timestamp.clone(),
++                        ended_at: sample.timestamp.clone(),
++                        used_credits: before - after,
++                        observed_cost_usd: cost,
++                        model_usage: None,
++                        sample_count: 2,
++                    },
++                    after,
++                ));
++                continue;
++            }
++        }
++        if let Some((period, _)) = current.take() {
++            periods.push(period);
++        }
++    }
++    if let Some((period, _)) = current {
++        periods.push(period);
++    }
++    periods
++}
++
++#[cfg(test)]
++#[path = "credits_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/credits_tests.rs b/codex-rs/app-server/src/usage/credits_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/credits_tests.rs
+@@ -0,0 +1,160 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++const BASE: i64 = 1_790_000_000_000;
++
++fn sample(seconds: i64, balance: Option<f64>) -> CreditObservation {
++    let millis = BASE + seconds * 1_000;
++    CreditObservation {
++        timestamp: chrono::DateTime::from_timestamp_millis(millis)
++            .unwrap()
++            .to_rfc3339(),
++        millis,
++        balance,
++        quota_exhausted: false,
++    }
++}
++
++fn costs(entries: &[(i64, f64)]) -> BTreeMap<i64, f64> {
++    entries
++        .iter()
++        .map(|(seconds, cost)| (BASE + seconds * 1_000, *cost))
++        .collect()
++}
++
++#[test]
++fn credit_only_deductions_use_preceding_costs_and_stop_at_unchanged_or_higher_balances() {
++    let mut observations = [1000.0, 999.75, 998.5, 998.5, 1098.5, 1098.0, 1097.99]
++        .into_iter()
++        .enumerate()
++        .map(|(index, balance)| sample(index as i64 * 10, Some(balance)))
++        .collect();
++    let periods = summarize(
++        &costs(&[
++            (0, 2.0),
++            (10, 3.0),
++            (20, 77.0),
++            (30, 88.0),
++            (40, 4.0),
++            (50, 0.08),
++            (60, 999.0),
++        ]),
++        &mut observations,
++        BASE + 70_000,
++    );
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].started_at, sample(0, None).timestamp);
++    assert_eq!(periods[0].ended_at, sample(20, None).timestamp);
++    assert_eq!(periods[0].used_credits, 1.5);
++    assert_eq!(periods[0].observed_cost_usd, 5.0);
++    assert_eq!(periods[0].sample_count, 3);
++    assert_eq!(periods[1].started_at, sample(40, None).timestamp);
++    assert_eq!(periods[1].ended_at, sample(60, None).timestamp);
++    assert!((periods[1].used_credits - 0.51).abs() < 1e-9);
++    assert!((periods[1].observed_cost_usd - 4.08).abs() < 1e-9);
++    assert_eq!(periods[1].sample_count, 3);
++}
++
++#[test]
++fn duplicate_delivery_does_not_bridge_missing_or_conflicting_balances() {
++    let mut observations = vec![
++        sample(0, Some(100.0)),
++        sample(10, Some(90.0)),
++        sample(10, Some(90.0)),
++        sample(20, None),
++        sample(30, Some(80.0)),
++        sample(40, Some(79.0)),
++        sample(40, Some(78.0)),
++        sample(50, Some(70.0)),
++        sample(60, Some(69.0)),
++    ];
++    for observation in &mut observations {
++        observation.quota_exhausted = true;
++    }
++    observations.reverse();
++    let periods = summarize(
++        &costs(&[
++            (0, 1.0),
++            (10, 500.0),
++            (20, 500.0),
++            (30, 500.0),
++            (40, 500.0),
++            (50, 2.0),
++        ]),
++        &mut observations,
++        BASE + 70_000,
++    );
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].used_credits, 10.0);
++    assert_eq!(periods[0].observed_cost_usd, 1.0);
++    assert_eq!(periods[0].sample_count, 2);
++    assert_eq!(periods[1].started_at, sample(50, None).timestamp);
++    assert_eq!(periods[1].used_credits, 1.0);
++    assert_eq!(periods[1].observed_cost_usd, 2.0);
++    assert_eq!(periods[1].sample_count, 2);
++}
++
++#[test]
++fn report_window_does_not_infer_deductions_from_old_or_future_balances() {
++    let mut observations = vec![
++        sample(-91 * 86_400, Some(1000.0)),
++        sample(0, Some(100.0)),
++        sample(10, Some(99.5)),
++        sample(30, Some(10.0)),
++    ];
++    let periods = summarize(
++        &costs(&[(0, 2.0), (10, 999.0)]),
++        &mut observations,
++        BASE + 20_000,
++    );
++    assert_eq!(periods.len(), 1);
++    assert_eq!(periods[0].started_at, sample(0, None).timestamp);
++    assert_eq!(periods[0].ended_at, sample(10, None).timestamp);
++    assert_eq!(periods[0].used_credits, 0.5);
++    assert_eq!(periods[0].observed_cost_usd, 2.0);
++}
++
++#[test]
++fn exhausted_windows_keep_plateaus_and_delayed_balances_until_deductions_stop_after_recovery() {
++    let mut observations: Vec<_> = [
++        (100.0, true),
++        (99.0, true),
++        (99.0, true),
++        (99.5, true),
++        (98.0, true),
++        (98.0, true),
++        (97.0, false),
++        (96.0, false),
++        (96.0, false),
++        (96.0, false),
++        (96.0, true),
++        (95.0, true),
++        (95.0, false),
++    ]
++    .into_iter()
++    .enumerate()
++    .map(|(index, (balance, quota_exhausted))| CreditObservation {
++        quota_exhausted,
++        ..sample(index as i64 * 10, Some(balance))
++    })
++    .collect();
++    let charges = costs(&(0..13).map(|index| (index * 10, 1.0)).collect::<Vec<_>>());
++    let periods = summarize(&charges, &mut observations, BASE + 130_000);
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].started_at, observations[0].timestamp);
++    assert_eq!(periods[0].ended_at, observations[7].timestamp);
++    assert_eq!(periods[0].used_credits, 4.0);
++    assert_eq!(periods[0].observed_cost_usd, 7.0);
++    assert_eq!(periods[0].sample_count, 8);
++    assert_eq!(periods[1].started_at, observations[10].timestamp);
++    assert_eq!(periods[1].ended_at, observations[11].timestamp);
++    assert_eq!(periods[1].used_credits, 1.0);
++    assert_eq!(periods[1].observed_cost_usd, 1.0);
++
++    observations.truncate(6);
++    let open = summarize(&charges, &mut observations, BASE + 130_000);
++    assert_eq!(open.len(), 1);
++    assert_eq!(open[0].ended_at, observations[5].timestamp);
++    assert_eq!(open[0].used_credits, 2.0);
++    assert_eq!(open[0].observed_cost_usd, 5.0);
++}
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+--- a/codex-rs/app-server/src/usage/mod.rs
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -1,5 +1,7 @@
+ //! Local paginated-rollout accounting, with no external process or network dependency.
+ mod aggregate;
++mod credits;
++mod quota;
+ mod reader;
+ mod types;
+ mod wire;
+@@ -27,6 +29,7 @@ pub(crate) enum UsageRange {
+     Monthly,
+     Yearly,
+     Heatmap,
++    Quota,
+ }
+ 
+ impl UsageRange {
+@@ -39,6 +42,7 @@ impl UsageRange {
+             Self::Monthly => "monthly",
+             Self::Yearly => "yearly",
+             Self::Heatmap => "heatmap",
++            Self::Quota => "weekly quota",
+         }
+     }
+ }
+@@ -51,6 +55,8 @@ pub(crate) struct UsageReport {
+     monthly_rows: Rows,
+     yearly_rows: Rows,
+     prices: Prices,
++    quota: Vec<quota::Estimate>,
++    credits: Vec<credits::Period>,
+     missing_prices: BTreeSet<String>,
+     diagnostics: Diagnostics,
+     today: NaiveDate,
+@@ -66,9 +72,11 @@ impl UsageReport {
+             UsageRange::Weekly => &self.weekly_rows,
+             UsageRange::Monthly => &self.monthly_rows,
+             UsageRange::Yearly => &self.yearly_rows,
+-            UsageRange::Today | UsageRange::Yesterday | UsageRange::Daily | UsageRange::Heatmap => {
+-                &self.rows
+-            }
++            UsageRange::Today
++            | UsageRange::Yesterday
++            | UsageRange::Daily
++            | UsageRange::Heatmap
++            | UsageRange::Quota => &self.rows,
+         };
+         let bounds = match range {
+             UsageRange::Today => Some((self.today, self.today)),
+@@ -77,6 +85,10 @@ impl UsageReport {
+                 Some((yesterday, yesterday))
+             }
+             UsageRange::Heatmap => Some((self.today - chrono::Duration::days(364), self.today)),
++            UsageRange::Quota => Some((
++                self.today - chrono::Duration::days(quota::RECENT_DAYS),
++                self.today,
++            )),
+             UsageRange::Daily | UsageRange::Weekly | UsageRange::Monthly | UsageRange::Yearly => {
+                 None
+             }
+diff --git a/codex-rs/app-server/src/usage/quota.rs b/codex-rs/app-server/src/usage/quota.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/quota.rs
+@@ -0,0 +1,246 @@
++use std::collections::BTreeMap;
++
++use super::types::Observation;
++pub(super) use codex_app_server_protocol::UsageQuotaEstimate as Estimate;
++pub(super) use codex_app_server_protocol::UsageQuotaStatus as Status;
++
++pub(super) const RECENT_DAYS: i64 = 90;
++
++/// One continuous measurement with no intervening credit-funded interval.
++struct Segment<'a> {
++    start: &'a Observation,
++    end: &'a Observation,
++    start_percent: f64,
++    start_cost: f64,
++    observed_cost: f64,
++    mean_percent: f64,
++    mean_cost: f64,
++    percent_variance: f64,
++    percent_cost_covariance: f64,
++    count: usize,
++}
++
++impl<'a> Segment<'a> {
++    fn new(observation: &'a Observation, cumulative_cost: f64, start_percent: f64) -> Self {
++        Self {
++            start: observation,
++            end: observation,
++            start_percent,
++            start_cost: cumulative_cost,
++            observed_cost: 0.0,
++            mean_percent: start_percent,
++            mean_cost: 0.0,
++            percent_variance: 0.0,
++            percent_cost_covariance: 0.0,
++            count: 1,
++        }
++    }
++
++    fn observe(&mut self, observation: &'a Observation, cumulative_cost: f64) {
++        self.end = observation;
++        self.observed_cost = cumulative_cost - self.start_cost;
++        self.count += 1;
++        // Each interval estimates 100 * delta_cost / delta_percent. Weighting
++        // by delta_percent^2 reduces the effect of 1%-precision rounding on short
++        // intervals. Across all pairs, that average is 100 * covariance / variance.
++        // Centered online sums compute it in O(1) time and memory per observation.
++        let percent_delta = observation.used_percent - self.mean_percent;
++        let cost_delta = self.observed_cost - self.mean_cost;
++        self.mean_percent += percent_delta / self.count as f64;
++        self.mean_cost += cost_delta / self.count as f64;
++        self.percent_variance += percent_delta * (observation.used_percent - self.mean_percent);
++        self.percent_cost_covariance += percent_delta * (self.observed_cost - self.mean_cost);
++    }
++
++    fn span(&self) -> f64 {
++        self.end.used_percent - self.start_percent
++    }
++}
++
++struct Cycle<'a> {
++    reset_horizon: i64,
++    segments: Vec<Segment<'a>>,
++    current: Option<Segment<'a>>,
++    completed: bool,
++}
++
++impl<'a> Cycle<'a> {
++    fn new(reset_horizon: i64, segment: Segment<'a>) -> Self {
++        Self {
++            reset_horizon,
++            segments: Vec::new(),
++            current: Some(segment),
++            completed: false,
++        }
++    }
++
++    fn observe(
++        &mut self,
++        sample: &'a Observation,
++        cumulative_cost: f64,
++        credit_balances: Option<(f64, f64)>,
++    ) {
++        if credit_balances.is_some_and(|(before, after)| before != after) {
++            // The balance describes the preceding request. Keep the measurements
++            // before it and exclude this interval, not the rest of the cycle.
++            if let Some(segment) = self.current.take() {
++                self.segments.push(segment);
++            }
++            self.completed |= sample.used_percent == 100.0
++                && credit_balances.is_some_and(|(before, after)| after < before);
++        }
++        let last = self.current.as_ref().or_else(|| self.segments.last());
++        if self.completed
++            || last.is_some_and(|segment| sample.used_percent < segment.end.used_percent)
++        {
++            return;
++        }
++        match self.current.as_mut() {
++            Some(segment) => segment.observe(sample, cumulative_cost),
++            None => {
++                self.current = Some(Segment::new(sample, cumulative_cost, sample.used_percent));
++            }
++        }
++    }
++
++    fn estimate(&self, status: Status) -> Option<Estimate> {
++        let mut segments = self
++            .segments
++            .iter()
++            .chain(self.current.iter())
++            .filter(|segment| segment.span() > 0.0);
++        let first = segments.next()?;
++        let mut last = first;
++        let mut span = first.span();
++        let mut observed_cost = first.observed_cost;
++        let mut count = first.count;
++        // All-pairs covariance/variance sums equal n times the centered sums.
++        // Combine only within-segment pairs so no estimate spans a credit gap.
++        let mut covariance = first.count as f64 * first.percent_cost_covariance;
++        let mut variance = first.count as f64 * first.percent_variance;
++        for segment in segments {
++            last = segment;
++            span += segment.span();
++            observed_cost += segment.observed_cost;
++            count += segment.count;
++            covariance += segment.count as f64 * segment.percent_cost_covariance;
++            variance += segment.count as f64 * segment.percent_variance;
++        }
++        if span <= 5.0 || observed_cost <= 0.0 {
++            return None;
++        }
++        Some(Estimate {
++            started_at: first.start.timestamp.clone(),
++            ended_at: last.end.timestamp.clone(),
++            used_percent_start: first.start_percent,
++            used_percent_end: last.end.used_percent,
++            observed_cost_usd: observed_cost,
++            model_usage: None,
++            estimated_weekly_cost_usd: 100.0 * covariance / variance,
++            sample_count: count,
++            status,
++        })
++    }
++}
++
++pub(super) fn estimate(
++    costs: &BTreeMap<i64, f64>,
++    observations: &mut Vec<Observation>,
++    now: i64,
++) -> Vec<Estimate> {
++    let since = now.saturating_sub(RECENT_DAYS * 24 * 60 * 60 * 1_000);
++    observations.retain(|sample| {
++        sample.millis >= since
++            && sample.millis <= now
++            && (0.0..=100.0).contains(&sample.used_percent)
++    });
++    observations.sort_by(|left, right| {
++        left.millis
++            .cmp(&right.millis)
++            .then_with(|| left.used_percent.total_cmp(&right.used_percent))
++            .then_with(|| left.resets_at.cmp(&right.resets_at))
++    });
++    observations.dedup_by(|left, right| {
++        left.millis == right.millis
++            && left.used_percent == right.used_percent
++            && left.resets_at == right.resets_at
++            && left.credit_balance == right.credit_balance
++    });
++    let mut estimates = Vec::new();
++    let mut cycle: Option<Cycle<'_>> = None;
++    let mut costs = costs.iter().peekable();
++    let mut cumulative_cost = 0.0;
++    let mut previous: Option<(&Observation, f64)> = None;
++    let mut index = 0;
++    while index < observations.len() {
++        let sample = &observations[index];
++        let mut end = index + 1;
++        while end < observations.len() && observations[end].millis == sample.millis {
++            end += 1;
++        }
++        let conflicting = end != index + 1;
++        index = end;
++        if conflicting {
++            continue;
++        }
++        // A response reports quota through the preceding request. Its own usage
++        // enters the next observation, so include the start and exclude the end.
++        while let Some((_, cost)) = costs.next_if(|(millis, _)| **millis < sample.millis) {
++            cumulative_cost += cost;
++        }
++        let Some(current) = cycle.as_mut() else {
++            cycle = Some(Cycle::new(
++                sample.resets_at,
++                Segment::new(sample, cumulative_cost, sample.used_percent),
++            ));
++            previous = Some((sample, cumulative_cost));
++            continue;
++        };
++        // Old concurrent responses can carry an earlier reset horizon. They do
++        // not change this cycle's identity or suspend later valid measurements.
++        if sample.resets_at < current.reset_horizon.saturating_sub(300) {
++            continue;
++        }
++        let (prior, prior_cost) = previous
++            .replace((sample, cumulative_cost))
++            .expect("an existing cycle has a preceding observation");
++        let credit_balances = prior.credit_balance.zip(sample.credit_balance);
++        let credit_changed = credit_balances.is_some_and(|(before, after)| before != after);
++        if sample.resets_at > current.reset_horizon.saturating_add(300) {
++            if let Some(estimate) = current.estimate(Status::Completed) {
++                estimates.push(estimate);
++            }
++            // Only a preceding request inside the new weekly window can supply
++            // its zero baseline. Idle gaps and early resets leave older records
++            // and their costs in the previous cycle.
++            let prior_in_cycle =
++                prior.millis.div_euclid(1_000) >= sample.resets_at.saturating_sub(7 * 24 * 60 * 60);
++            let segment = if credit_changed || !prior_in_cycle {
++                Segment::new(sample, cumulative_cost, sample.used_percent)
++            } else {
++                let mut restored = Segment::new(prior, prior_cost, 0.0);
++                restored.observe(sample, cumulative_cost);
++                restored
++            };
++            cycle = Some(Cycle::new(sample.resets_at, segment));
++            continue;
++        }
++        current.reset_horizon = current.reset_horizon.max(sample.resets_at);
++        current.observe(sample, cumulative_cost, credit_balances);
++    }
++    if let Some(cycle) = cycle {
++        let status = if cycle.completed {
++            Status::Completed
++        } else {
++            Status::Provisional
++        };
++        if let Some(estimate) = cycle.estimate(status) {
++            estimates.push(estimate);
++        }
++    }
++    estimates
++}
++
++#[cfg(test)]
++#[path = "quota_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/quota_tests.rs b/codex-rs/app-server/src/usage/quota_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/quota_tests.rs
+@@ -0,0 +1,524 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++const BASE: i64 = 1_790_000_000_000;
++
++fn sample(seconds: i64, percent: f64, reset: i64) -> Observation {
++    let millis = BASE + seconds * 1_000;
++    Observation {
++        timestamp: chrono::DateTime::from_timestamp_millis(millis)
++            .unwrap()
++            .to_rfc3339(),
++        millis,
++        used_percent: percent,
++        resets_at: BASE / 1_000 + reset,
++        credit_balance: None,
++    }
++}
++
++fn costs(entries: &[(i64, f64)]) -> BTreeMap<i64, f64> {
++    entries
++        .iter()
++        .map(|(seconds, cost)| (BASE + seconds * 1_000, *cost))
++        .collect()
++}
++
++#[test]
++fn reset_closes_previous_cycle_and_keeps_current_provisional() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ 0, /*percent*/ 0.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 100.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 700, /*percent*/ 7.0, /*reset*/ 20_000,
++        ),
++        sample(
++            /*seconds*/ 800, /*percent*/ 57.0, /*reset*/ 20_000,
++        ),
++    ];
++    let estimates = estimate(
++        &costs(&[(0, 100.0), (600, 7.0), (700, 50.0), (800, 9.0)]),
++        &mut observations,
++        BASE + 900_000,
++    );
++    assert_eq!(estimates.len(), 2);
++    assert_eq!(estimates[0].status, Status::Completed);
++    assert_eq!(estimates[1].status, Status::Provisional);
++    // Each returned percentage excludes its own request. Charge the request at
++    // the start, not the one at the end, independently for each reset cycle.
++    assert_eq!(estimates[0].observed_cost_usd, 100.0);
++    // The first returned percentage after reset also includes the preceding
++    // request, even though that request still carried the old quota snapshot.
++    assert_eq!(estimates[1].started_at, observations[1].timestamp);
++    assert_eq!(estimates[1].used_percent_start, 0.0);
++    assert_eq!(estimates[1].observed_cost_usd, 57.0);
++    assert_eq!(estimates[1].estimated_weekly_cost_usd, 100.0);
++}
++
++#[test]
++fn reset_after_idle_gap_does_not_reuse_previous_cycle_or_costs() {
++    let day = 24 * 60 * 60;
++    let first_new = 3 * day + 4 * 60 * 60;
++    let last_new = 10 * day - 60;
++    let mut observations = vec![
++        sample(-4 * day, 0.0, 3 * day),
++        sample(0, 100.0, 3 * day),
++        sample(first_new, 0.0, 10 * day),
++        sample(last_new, 99.0, 10 * day),
++        sample(10 * day + 10, 0.0, 17 * day),
++    ];
++    let estimates = estimate(
++        &costs(&[
++            (-4 * day, 100.0),
++            (0, 900.0),
++            (first_new, 990.0),
++            (last_new, 9.0),
++        ]),
++        &mut observations,
++        BASE + (10 * day + 20) * 1_000,
++    );
++    assert_eq!(estimates.len(), 2);
++    assert_eq!(estimates[0].observed_cost_usd, 100.0);
++    let current = &estimates[1];
++    assert_eq!(current.started_at, observations[2].timestamp);
++    assert_eq!(current.ended_at, observations[3].timestamp);
++    assert_eq!(current.used_percent_start, 0.0);
++    assert_eq!(current.used_percent_end, 99.0);
++    assert_eq!(current.observed_cost_usd, 990.0);
++    assert_eq!(current.estimated_weekly_cost_usd, 1_000.0);
++    assert_eq!(current.sample_count, 2);
++    assert_eq!(current.status, Status::Completed);
++    for cycle in &estimates {
++        let start = chrono::DateTime::parse_from_rfc3339(&cycle.started_at).unwrap();
++        let end = chrono::DateTime::parse_from_rfc3339(&cycle.ended_at).unwrap();
++        assert!(end - start <= chrono::Duration::days(7));
++    }
++}
++
++#[test]
++fn early_reset_skips_small_cycle_without_carrying_its_cost() {
++    let hour = 60 * 60;
++    let week = 7 * 24 * hour;
++    for short_percent in [1.0, 2.0] {
++        let natural_reset = week;
++        let early_reset = natural_reset + 4 * hour;
++        let mut observations = vec![
++            sample(0, 0.0, natural_reset),
++            sample(natural_reset - hour, 100.0, natural_reset),
++            sample(natural_reset + 10, 0.0, natural_reset + week),
++            sample(
++                natural_reset + 3 * hour,
++                short_percent,
++                natural_reset + week,
++            ),
++            sample(early_reset + 10, 0.0, early_reset + week),
++            sample(early_reset + hour, 20.0, early_reset + week),
++        ];
++        let estimates = estimate(
++            &costs(&[
++                (0, 1_000.0),
++                (natural_reset - hour, 9.0),
++                (natural_reset + 10, short_percent * 10.0),
++                (natural_reset + 3 * hour, 7.0),
++                (early_reset + 10, 200.0),
++            ]),
++            &mut observations,
++            BASE + (early_reset + hour + 10) * 1_000,
++        );
++        assert_eq!(estimates.len(), 2);
++        assert_eq!(estimates[0].observed_cost_usd, 1_000.0);
++        assert_eq!(estimates[0].status, Status::Completed);
++        let current = &estimates[1];
++        assert_eq!(current.started_at, observations[4].timestamp);
++        assert_eq!(current.ended_at, observations[5].timestamp);
++        assert_eq!(current.used_percent_start, 0.0);
++        assert_eq!(current.used_percent_end, 20.0);
++        assert_eq!(current.observed_cost_usd, 200.0);
++        assert_eq!(current.estimated_weekly_cost_usd, 1_000.0);
++        assert_eq!(current.sample_count, 2);
++        assert_eq!(current.status, Status::Provisional);
++    }
++}
++
++#[test]
++fn credit_decrease_with_exhausted_quota_closes_the_billing_window_before_reset() {
++    for (balance, percent, status) in [
++        (90.0, 100.0, Status::Completed),
++        (110.0, 100.0, Status::Provisional),
++        (90.0, 90.0, Status::Provisional),
++    ] {
++        let mut observations = vec![
++            sample(0, 0.0, 10_000),
++            sample(10, 80.0, 10_000),
++            sample(20, 100.0, 10_000),
++            sample(30, percent, 10_000),
++        ];
++        for (index, observation) in observations.iter_mut().enumerate() {
++            observation.credit_balance = Some(if index < 3 { 100.0 } else { balance });
++        }
++        let estimates = estimate(
++            &costs(&[(0, 80.0), (10, 20.0), (20, 700.0), (30, 800.0)]),
++            &mut observations,
++            BASE + 40_000,
++        );
++        assert_eq!(estimates.len(), 1);
++        assert_eq!(estimates[0].status, status);
++        assert_eq!(estimates[0].ended_at, observations[2].timestamp);
++        assert_eq!(estimates[0].observed_cost_usd, 100.0);
++        assert_eq!(estimates[0].estimated_weekly_cost_usd, 100.0);
++        assert_eq!(estimates[0].sample_count, 3);
++    }
++}
++
++#[test]
++fn credit_change_excludes_the_preceding_request_until_quota_recovers() {
++    for changed_balance in [90.0, 110.0] {
++        let mut observations = vec![
++            sample(0, 0.0, 10_000),
++            sample(10, 80.0, 10_000),
++            sample(20, 100.0, 10_000),
++            sample(30, 100.0, 10_000),
++            sample(40, 100.0, 10_000),
++            sample(50, 10.0, 20_000),
++            sample(60, 50.0, 20_000),
++        ];
++        for (index, observation) in observations.iter_mut().enumerate() {
++            observation.credit_balance = Some(if index < 3 { 100.0 } else { changed_balance });
++        }
++        let estimates = estimate(
++            &costs(&[
++                (0, 80.0),
++                (10, 20.0),
++                (20, 700.0),
++                (30, 800.0),
++                (40, 10.0),
++                (50, 40.0),
++                (60, 123.0),
++            ]),
++            &mut observations,
++            BASE + 70_000,
++        );
++        assert_eq!(estimates.len(), 2);
++        assert_eq!(estimates[0].ended_at, observations[2].timestamp);
++        assert_eq!(estimates[0].observed_cost_usd, 100.0);
++        assert_eq!(estimates[0].estimated_weekly_cost_usd, 100.0);
++        assert_eq!(estimates[0].sample_count, 3);
++        assert_eq!(estimates[0].status, Status::Completed);
++        assert_eq!(estimates[1].started_at, observations[4].timestamp);
++        assert_eq!(estimates[1].observed_cost_usd, 50.0);
++        assert_eq!(estimates[1].estimated_weekly_cost_usd, 100.0);
++        assert_eq!(estimates[1].sample_count, 3);
++        assert_eq!(estimates[1].status, Status::Provisional);
++    }
++}
++
++#[test]
++fn credit_change_at_quota_reset_keeps_the_last_credit_request_excluded() {
++    let mut observations = vec![
++        sample(0, 0.0, 10_000),
++        sample(10, 80.0, 10_000),
++        sample(20, 100.0, 10_000),
++        sample(30, 0.0, 20_000),
++        sample(40, 50.0, 20_000),
++    ];
++    for (index, observation) in observations.iter_mut().enumerate() {
++        observation.credit_balance = Some(if index < 3 {
++            62466.1997075
++        } else {
++            62466.1131575
++        });
++    }
++    let estimates = estimate(
++        &costs(&[(0, 80.0), (10, 20.0), (20, 700.0), (30, 50.0), (40, 123.0)]),
++        &mut observations,
++        BASE + 50_000,
++    );
++    assert_eq!(estimates.len(), 2);
++    assert_eq!(estimates[0].observed_cost_usd, 100.0);
++    assert_eq!(estimates[1].started_at, observations[3].timestamp);
++    assert_eq!(estimates[1].observed_cost_usd, 50.0);
++    assert_eq!(estimates[1].estimated_weekly_cost_usd, 100.0);
++}
++
++#[test]
++fn stale_reset_horizon_does_not_suspend_valid_measurements() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ 0, /*percent*/ 0.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 20.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 700, /*percent*/ 40.0, /*reset*/ 9_000,
++        ),
++        sample(
++            /*seconds*/ 800, /*percent*/ 70.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 900, /*percent*/ 0.0, /*reset*/ 20_000,
++        ),
++        sample(
++            /*seconds*/ 1000, /*percent*/ 50.0, /*reset*/ 20_000,
++        ),
++    ];
++    let estimates = estimate(
++        &costs(&[(0, 20.0), (600, 30.0), (700, 50.0), (900, 50.0)]),
++        &mut observations,
++        BASE + 1_100_000,
++    );
++    assert_eq!(estimates.len(), 2);
++    assert_eq!(estimates[0].used_percent_end, 70.0);
++    assert_eq!(estimates[0].observed_cost_usd, 100.0);
++    assert_eq!(estimates[0].sample_count, 3);
++}
++
++#[test]
++fn delayed_credit_balance_after_reset_does_not_hide_the_current_cycle() {
++    for changed_balance in [90.0, 110.0] {
++        let mut observations = vec![
++            sample(0, 0.0, 10_000),
++            sample(10, 100.0, 10_000),
++            sample(20, 0.0, 20_000),
++            sample(37, 0.0, 20_001),
++            sample(60, 16.0, 20_000),
++            sample(80, 32.0, 20_002),
++        ];
++        for (index, observation) in observations.iter_mut().enumerate() {
++            observation.credit_balance = Some(if index < 3 { 100.0 } else { changed_balance });
++        }
++        let estimates = estimate(
++            &costs(&[(0, 100.0), (20, 700.0), (37, 16.0), (60, 16.0), (80, 900.0)]),
++            &mut observations,
++            BASE + 90_000,
++        );
++        assert_eq!(estimates.len(), 2);
++        assert_eq!(estimates[0].status, Status::Completed);
++        assert_eq!(estimates[0].observed_cost_usd, 100.0);
++        let current = &estimates[1];
++        assert_eq!(current.status, Status::Provisional);
++        assert_eq!(current.started_at, observations[3].timestamp);
++        assert_eq!(current.ended_at, observations[5].timestamp);
++        assert_eq!(current.used_percent_start, 0.0);
++        assert_eq!(current.used_percent_end, 32.0);
++        assert_eq!(current.observed_cost_usd, 32.0);
++        assert_eq!(current.estimated_weekly_cost_usd, 100.0);
++        assert_eq!(current.sample_count, 3);
++    }
++}
++
++#[test]
++fn one_cycle_combines_valid_segments_without_measuring_across_a_credit_gap() {
++    let mut observations = vec![
++        sample(0, 0.0, 10_000),
++        sample(10, 20.0, 10_000),
++        sample(20, 40.0, 10_000),
++        sample(30, 60.0, 10_000),
++    ];
++    for (index, observation) in observations.iter_mut().enumerate() {
++        observation.credit_balance = Some(if index < 2 { 100.0 } else { 90.0 });
++    }
++    let estimates = estimate(
++        &costs(&[(0, 20.0), (10, 999.0), (20, 40.0)]),
++        &mut observations,
++        BASE + 40_000,
++    );
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].used_percent_start, 0.0);
++    assert_eq!(estimates[0].used_percent_end, 60.0);
++    assert_eq!(estimates[0].observed_cost_usd, 60.0);
++    assert_eq!(estimates[0].estimated_weekly_cost_usd, 150.0);
++    assert_eq!(estimates[0].sample_count, 4);
++    assert_eq!(estimates[0].status, Status::Provisional);
++}
++
++#[test]
++fn percentage_rollback_without_horizon_change_is_ignored() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ 0, /*percent*/ 0.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 20.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 700, /*percent*/ 5.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 800, /*percent*/ 40.0, /*reset*/ 10_000,
++        ),
++    ];
++    let estimates = estimate(
++        &costs(&[(0, 20.0), (600, 10.0), (700, 10.0)]),
++        &mut observations,
++        BASE + 900_000,
++    );
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].used_percent_end, 40.0);
++    assert_eq!(estimates[0].sample_count, 3);
++    assert_eq!(estimates[0].estimated_weekly_cost_usd, 100.0);
++}
++
++#[test]
++fn conflicting_instant_is_rejected_but_duplicate_observation_is_one_sample() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ 0, /*percent*/ 0.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 10.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 20.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 800, /*percent*/ 40.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 800, /*percent*/ 40.0, /*reset*/ 10_000,
++        ),
++    ];
++    let estimates = estimate(&costs(&[(0, 40.0)]), &mut observations, BASE + 900_000);
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].sample_count, 2);
++    assert_eq!(estimates[0].estimated_weekly_cost_usd, 100.0);
++}
++
++#[test]
++fn late_previous_horizon_at_reset_handoff_does_not_freeze_new_cycle() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ 0, /*percent*/ 0.0, /*reset*/ 20_000,
++        ),
++        sample(
++            /*seconds*/ 60, /*percent*/ 100.0, /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 50.0, /*reset*/ 20_000,
++        ),
++    ];
++    let estimates = estimate(&costs(&[(0, 50.0)]), &mut observations, BASE + 900_000);
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].used_percent_end, 50.0);
++    assert_eq!(estimates[0].sample_count, 2);
++}
++
++#[test]
++fn requires_more_than_five_points_and_uses_only_recent_nonfuture_samples() {
++    let mut observations = vec![
++        sample(
++            /*seconds*/ -91 * 86400,
++            /*percent*/ 0.0,
++            /*reset*/ 10_000,
++        ),
++        sample(
++            /*seconds*/ 0, /*percent*/ 20.0, /*reset*/ 20_000,
++        ),
++        sample(
++            /*seconds*/ 600, /*percent*/ 25.0, /*reset*/ 20_000,
++        ),
++        sample(
++            /*seconds*/ 1000, /*percent*/ 100.0, /*reset*/ 20_000,
++        ),
++    ];
++    let timeline = costs(&[(-91 * 86400, 1_000_000.0), (0, 10.0)]);
++    assert!(estimate(&timeline, &mut observations, BASE + 900_000).is_empty());
++    observations.push(sample(
++        /*seconds*/ 700, /*percent*/ 26.0, /*reset*/ 20_000,
++    ));
++    let estimates = estimate(&timeline, &mut observations, BASE + 900_000);
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].used_percent_start, 20.0);
++    assert_eq!(estimates[0].used_percent_end, 26.0);
++    assert_eq!(estimates[0].observed_cost_usd, 10.0);
++}
++
++#[test]
++fn continuous_intervals_use_plateaus_instead_of_only_the_endpoints() {
++    let mut observations = vec![sample(0, 20.0, 10_000)];
++    let mut charges = Vec::new();
++    let mut previous_cost = 0.0;
++    // True usage starts at 20.9% of a $100 quota. The first and last integer
++    // observations alone suggest $92; averaging intermediate intervals reduces
++    // that endpoint rounding bias without pretending the result is exact.
++    for step in 1..=10 {
++        for cost in [f64::from(step) - 0.8, f64::from(step)] {
++            if cost > 9.2 {
++                break;
++            }
++            let seconds = observations.len() as i64 * 10;
++            charges.push((seconds - 10, cost - previous_cost));
++            observations.push(sample(seconds, (20.9 + cost).floor(), 10_000));
++            previous_cost = cost;
++        }
++    }
++    let estimates = estimate(&costs(&charges), &mut observations, BASE + 900_000);
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].sample_count, observations.len());
++    assert!((estimates[0].observed_cost_usd - 9.2).abs() < 1e-12);
++    let endpoint_estimate = estimates[0].observed_cost_usd * 100.0
++        / (estimates[0].used_percent_end - estimates[0].used_percent_start);
++    assert!((endpoint_estimate - 92.0).abs() < 1e-12);
++    assert!(
++        (estimates[0].estimated_weekly_cost_usd - 100.0).abs()
++            < (endpoint_estimate - 100.0).abs() / 2.0
++    );
++}
++
++#[test]
++fn incremental_average_matches_all_weighted_intervals_across_rounding_phases() {
++    for capacity in [10.0, 100.0, 1000.0] {
++        for phase in [0.01, 0.49, 0.99] {
++            let mut observations = vec![sample(0, 23.0, 10_000)];
++            let mut charges = Vec::new();
++            let mut points = vec![(0.0, 23.0)];
++            let mut cost = 0.0;
++            let mut weighted_estimates = 0.0;
++            let mut total_weight = 0.0;
++            for index in 1..128 {
++                let charge = capacity * f64::from(index % 7) / 1000.0;
++                charges.push((i64::from(index - 1), charge));
++                cost += charge;
++                let percent = (23.0 + phase + cost * 100.0 / capacity).floor();
++                for (previous_cost, previous_percent) in &points {
++                    let span = percent - previous_percent;
++                    if span > 0.0 {
++                        let interval_estimate = 100.0 * (cost - previous_cost) / span;
++                        let weight = span * span;
++                        weighted_estimates += interval_estimate * weight;
++                        total_weight += weight;
++                    }
++                }
++                points.push((cost, percent));
++                observations.push(sample(i64::from(index), percent, 10_000));
++            }
++            let estimates = estimate(&costs(&charges), &mut observations, BASE + 900_000);
++            assert_eq!(estimates.len(), 1);
++            let expected = weighted_estimates / total_weight;
++            assert!((estimates[0].estimated_weekly_cost_usd - expected).abs() < 1e-9);
++        }
++    }
++}
++
++#[test]
++fn differing_interval_estimates_remain_an_approximation_instead_of_disappearing() {
++    let mut observations = vec![
++        sample(0, 0.0, 10_000),
++        sample(10, 10.0, 10_000),
++        sample(20, 20.0, 10_000),
++        sample(30, 30.0, 10_000),
++    ];
++    let estimates = estimate(
++        &costs(&[(0, 10.0), (10, 90.0), (20, 20.0)]),
++        &mut observations,
++        BASE + 40_000,
++    );
++    assert_eq!(estimates.len(), 1);
++    assert_eq!(estimates[0].observed_cost_usd, 120.0);
++    // Six intervals average to $450 with span-squared weights. The first-to-last
++    // interval alone would report $400 and discard the other observations.
++    assert!((estimates[0].estimated_weekly_cost_usd - 450.0).abs() < 1e-12);
++}

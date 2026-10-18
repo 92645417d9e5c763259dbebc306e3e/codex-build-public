@@ -1291,6 +1291,76 @@ def transport_rows(repository, tag, complete=False, partial=False):
         validate_history(rows, complete, partial)
     return base, rows
 
+def transport_source_coverage(rows, working, task_path, tag, complete=False):
+    task = release_task_fields(regular_bytes(task_path))
+    prefixes = task.get("SourcePrefixes", "").split(", ")
+    changes = task.get("SourcePatchChanges", "").split(", ") if "SourcePatchChanges" in task else []
+    def reject(scope, field, expected, actual):
+        raise LaneStructureError(scope, field, expected, actual)
+    if not prefixes or prefixes[0] == tag or len(set(prefixes)) != len(prefixes) or any(not re.fullmatch(r"rust-v[0-9A-Za-z._-]+", prefix) for prefix in prefixes):
+        reject(task_path, "SourcePrefixes", "unique canonical tags with a distinct primary predecessor", prefixes)
+    if len(set(changes)) != len(changes) or any(not re.fullmatch(r"(?:Unit|FlatPatch):(?:" + "|".join(LANES) + r")/[a-z0-9]+(?:-[a-z0-9]+)+", change) for change in changes):
+        reject(task_path, "SourcePatchChanges", "unique typed source selectors joined by comma-space", changes)
+    sources, known = [], set()
+    for index, prefix in enumerate(prefixes):
+        path = join(working, "build", "patches", "private", prefix)
+        if not exists(path) and index == 0:
+            baselines, _ = release_read(join(dir_name(task_path), "rust-suite-baselines.json"))
+            inherited = baselines.get(prefix, {}).get("Established", {})
+            if inherited.get("Selection", {}).get("Tag") == prefix:
+                continue
+        if not kind(path, DIRECTORY):
+            reject(path, "SourcePrefix", "the declared canonical source inventory", "absent or not a directory")
+        groups = [group for group in transport_groups(transport_export_rows(path, prefix, tag)) if group[1] != "Transform"]
+        sources.append((path, groups))
+        known.update(map(transport_group_selector, groups))
+    for change in changes:
+        if change not in known:
+            reject(task_path, "SourcePatchChanges", "a selector present in a declared source", change)
+    actual = [group for group in transport_groups(rows) if group[1] != "Transform"]
+    present = {transport_group_selector(group): (index, group) for index, group in enumerate(actual)}
+    last_lane = max((LANES.index(group[0]) for group in actual), default=-1)
+    flat_lanes = {group[0] for group in actual if group[1] == "FlatPatch"}
+    open_unit = "Unit:" + task["OpenUnit"] if "OpenUnit" in task else ""
+    declared = task.get("ChildPatchSequence", "").split(", ")
+    for path, groups in sources:
+        expected = [group for group in groups if transport_group_selector(group) not in changes]
+        consumed = [index for index, group in enumerate(expected) if transport_group_selector(group) in present or LANES.index(group[0]) < last_lane or group[0] in flat_lanes and group[1] == "Unit"]
+        frontier = max(consumed, default=-1)
+        if complete:
+            frontier = len(expected) - 1
+        previous = -1
+        for group in expected[:frontier + 1]:
+            selector = transport_group_selector(group)
+            if selector not in present:
+                reject(path, "SourceCoverage", selector, "missing before the consumed frontier")
+            position, target = present[selector]
+            if position <= previous:
+                reject(path, "SourceOrder", selector, "reordered before an earlier source responsibility")
+            previous = position
+            children, target_children = [row[5] for row in group[3]], [row[5] for row in target[3]]
+            partial = not complete and position == len(actual) - 1 and selector == open_unit and declared == children and target_children == children[:len(target_children)]
+            if target_children != children and not partial:
+                reject(path + ":" + selector, "ChildPatchSequence", children, target_children)
+
+def transport_build_rows(repository, tag, task_path):
+    base = transport_base(repository, tag)
+    task = release_task_fields(regular_bytes(task_path))
+    terminals = [(kind, task[name]) for kind, name in (("Unit", "CurrentTerminalUnit"), ("FlatPatch", "CurrentTerminalFlatPatch"), ("Transform", "CurrentTerminalTransform")) if name in task]
+    if not terminals and repository.text("rev-parse", "HEAD") == repository.text("rev-parse", base):
+        return []
+    if len(terminals) != 1:
+        raise LaneStructureError(task_path, "CurrentTerminal", "one canonical task terminal", terminals)
+    kind, identity = terminals[0]
+    _, separator, name = identity.partition("/")
+    lane = identity.split("/", 1)[0]
+    if not separator or lane not in LANES:
+        raise LaneStructureError(task_path, "CurrentTerminal", "a canonical Lane/name", identity)
+    commits = repository.text("log", "--first-parent", "--format=%H", "--extended-regexp", "--all-match", "--grep=^Lane: " + re.escape(lane) + "$", "--grep=^" + kind + ": " + re.escape(name) + "$", base + "..HEAD").splitlines()
+    if not commits or fields(repository, commits[0])[:3] != (lane, kind, name):
+        raise LaneStructureError(task_path, "CurrentTerminal", "the canonical task frontier reachable from Main", identity)
+    return validate_history(history_rows(repository, base, commits[0]), partial=True)
+
 def transport_export_rows(root, predecessor, current_tag=""):
     root = os.path.abspath(root)
     private = transport_repository(dir_name(root))
@@ -1599,9 +1669,43 @@ def transport_snapshot_postimages(target, metadata, updates):
 def source_prefix_preimage(root):
     return tuple((path, stat.S_IMODE(os.lstat(join(root, path)).st_mode), regular_bytes(join(root, path))) for path in root_inventory(root, dir_name(root)))
 
+def transport_apply_task_postimage(data, terminal, following):
+    fields = release_task_fields(data)
+    terminal_fields = [name for name in fields if name in ("CurrentTerminalUnit", "CurrentTerminalFlatPatch", "CurrentTerminalTransform")]
+    open_fields = [name for name in fields if name in ("OpenUnit", "OpenFlatPatch", "OpenTransform")]
+    must(len(terminal_fields) == len(open_fields) == 1)
+    next_fields = []
+    if following:
+        lane, form, group, members = following
+        next_fields.append(f"Open{form}: {lane}/{group}")
+        if form == "Unit":
+            next_fields.append("ChildPatchSequence: " + ", ".join(row[5] for row in members))
+        elif form == "Transform":
+            next_fields.append("TransformPatch: " + members[0][5])
+    postimage = []
+    for line in data.splitlines(keepends=True):
+        if not line.startswith((b"+-- ", b"`-- ")):
+            postimage.append(line)
+            continue
+        name = line[4:].partition(b": ")[0].decode()
+        ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+        if name == terminal_fields[0]:
+            postimage.append(line[:4] + f"CurrentTerminal{terminal[1]}: {terminal[0]}/{terminal[2]}".encode() + ending)
+        elif name == open_fields[0]:
+            for index, value in enumerate(next_fields):
+                prefix = line[:4] if index == len(next_fields) - 1 else b"+-- "
+                postimage.append(prefix + value.encode() + ending)
+        elif name not in ("ChildPatchSequence", "TransformPatch"):
+            postimage.append(line)
+    return b"".join(postimage)
+
 def transport_apply(arguments):
-    must(len(arguments) == 15)
-    source_path, target_path, tag, start_selector, end_value, rustfmt, asset_root, predecessor, child_patch_sequence, endpoint, working, scratch, runtime, deadline, output = arguments
+    must(len(arguments) == 17)
+    source_path, target_path, tag, start_selector, end_value, rustfmt, asset_root, predecessor, child_patch_sequence, endpoint, working, scratch, runtime, deadline, task_path, task_text, output = arguments
+    task_before = task_text.encode()
+    must(bool(task_before) == bool(source_path and not predecessor))
+    if task_before:
+        roll_require(regular_bytes(task_path) == task_before, task_path, "Preimage", "unchanged admitted task", "changed")
     target = transport_repository(target_path, True)
     source = transport_repository(source_path, True) if source_path and not predecessor else None
     must((source is None or source.path != target.path) and kind(rustfmt, REGULAR))
@@ -1652,27 +1756,55 @@ def transport_apply(arguments):
     must(not {group[:3] for group in prefix} & {group[:3] for group in selected})
     prospective = target_rows + [row for _, _, _, members in selected for row in members]
     validate_history(prospective, partial=True)
+    if source_path:
+        transport_source_coverage(prospective, working, task_path, tag)
     applied = []
-    for lane, form, group, members in selected:
-        if predecessor:
-            must(source_prefix_preimage(source_path) == source_before)
-        original_tip = target.text("rev-parse", "HEAD")
-        failure = transport_apply_unit(source, target, members, rustfmt, asset_root, formatter, source_bytes)
-        if predecessor:
-            try:
+    previous_handler = signal.signal(signal.SIGTERM, transport_interrupt) if task_before else None
+    try:
+        for index, (lane, form, group, members) in enumerate(selected):
+            if task_before:
+                roll_require(regular_bytes(task_path) == task_before, task_path, "Preimage", "unchanged current task", "changed")
+            if predecessor:
                 must(source_prefix_preimage(source_path) == source_before)
-            except BaseException:
-                target.run("reset", "--quiet", "--hard", original_tip)
-                raise
-        if failure:
-            transport_write_result(output, {"AppliedRows": applied, **transport_result_identity(form, lane, group), "Output": failure, "Result": "Conflict"})
-            return
-        record = transport_patch_record((lane, form, group, members))
-        if form == "Unit" and (lane, form, group) == selected[0][:3]:
-            record["ChildPatches"] = declared
-        applied.append(record)
-        transport_rows(target, tag)
-    transport_write_result(output, {"AppliedRows": applied, "FirstLaneChild": start_selector, "LastLaneChild": end_value or start_selector, "Result": "Applied"})
+            original_tip = target.text("rev-parse", "HEAD")
+            failure = transport_apply_unit(source, target, members, rustfmt, asset_root, formatter, source_bytes)
+            if predecessor:
+                try:
+                    must(source_prefix_preimage(source_path) == source_before)
+                except BaseException:
+                    target.run("reset", "--quiet", "--hard", original_tip)
+                    raise
+            if failure:
+                if task_before:
+                    roll_require(regular_bytes(task_path) == task_before, task_path, "Preimage", "unchanged current task", "changed during rejected transport")
+                transport_write_result(output, {"AppliedRows": applied, "Rows": transport_patch_records(target_rows), **transport_result_identity(form, lane, group), "Output": failure, "Result": "Conflict"})
+                return
+            record = transport_patch_record((lane, form, group, members))
+            if form == "Unit" and index == 0:
+                record["ChildPatches"] = declared
+            applied.append(record)
+            _, target_rows = transport_rows(target, tag)
+            if task_before:
+                following = selected[index + 1] if index + 1 < len(selected) else None
+                postimage = transport_apply_task_postimage(task_before, transport_groups(target_rows)[-1], following)
+                roll_require(regular_bytes(task_path) == task_before, task_path, "Preimage", "unchanged current task", "changed after transport")
+                release_replace(task_path, task_before, postimage)
+                task_before = postimage
+                roll_require(regular_bytes(task_path) == task_before, task_path, "Postimage", "published current task", "changed")
+    except BaseException as error:
+        if not task_text:
+            raise
+        result = {"AppliedRows": applied, "Output": str(error) or type(error).__name__, "Result": "ApplyFailed"}
+        try:
+            result["Rows"] = transport_patch_records(transport_rows(target, tag, partial=True)[1])
+        except Exception as rows_error:
+            result["Output"] += "; actual rows unavailable: " + str(rows_error)
+        transport_write_result(output, result)
+        return
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
+    transport_write_result(output, {"AppliedRows": applied, "Rows": transport_patch_records(target_rows), "FirstLaneChild": start_selector, "LastLaneChild": end_value or start_selector, "Result": "Applied"})
 
 def transport_prepare(arguments):
     must(len(arguments) == 4)
@@ -1800,9 +1932,11 @@ def transport_config_schema(arguments):
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 def transport_list(arguments):
-    must(len(arguments) == 5)
-    source_path, tag, predecessor, selector, output = arguments
-    rows = transport_export_rows(source_path, predecessor, tag) if predecessor else transport_rows(transport_repository(source_path, True), tag, partial=True)[1]
+    must(len(arguments) == 8)
+    source_path, tag, predecessor, selector, working, task_path, coverage, output = arguments
+    must(coverage in ("", "prefix", "build"))
+    repository = transport_repository(source_path, True) if not predecessor else None
+    rows = transport_export_rows(source_path, predecessor, tag) if predecessor else transport_build_rows(repository, tag, task_path) if coverage == "build" else transport_rows(repository, tag, partial=True)[1]
     groups = transport_groups(rows)
     if selector:
         selected = next((group for group in groups if transport_group_selector(group) == selector), None)
@@ -1810,7 +1944,13 @@ def transport_list(arguments):
             raise LaneStructureError(selector, "Selection", "an existing Unit or Flat Patch", selector)
         visible = {selector, *selected[3][0][9]["Requires"]}
         groups = [group for group in groups if transport_group_selector(group) in visible]
-    transport_write_result(output, {"Rows": [transport_patch_record(group, bool(selector)) for group in groups], "Result": "Listed"})
+    result = {"Rows": [transport_patch_record(group, bool(selector)) for group in groups], "Result": "Listed"}
+    if coverage and not predecessor:
+        try:
+            transport_source_coverage(rows, working, task_path, tag)
+        except LaneStructureError as error:
+            result.update(Result="Input", Output=str(error))
+    transport_write_result(output, result)
 
 def transport_patch_record(group, include_contract=False):
     lane, kind, name, members = group
@@ -1912,8 +2052,8 @@ def transport_replay_materialized(target, members, patches, artifacts, rustfmt):
     return True, None
 
 def transport_revise(arguments):
-    must(len(arguments) == 14)
-    target_path, tag, lane, patch_kind, group, patch, form, segment, rustfmt, asset_root, child_patch_sequence, terminal_selector, contract_data, output = arguments
+    must(len(arguments) == 16)
+    target_path, tag, lane, patch_kind, group, patch, form, segment, rustfmt, asset_root, child_patch_sequence, terminal_selector, contract_data, working, task_path, output = arguments
     target = transport_repository(target_path, False)
     metadata = (lane, patch_kind, group, patch, form, segment)
     identity = f"{lane}/{group}"
@@ -1939,6 +2079,7 @@ def transport_revise(arguments):
     declared = child_patch_sequence.split(", ") if child_patch_sequence else []
     committed = [row[5] for row in reviewed[3]]
     must((patch_kind == "Unit" and len(declared) >= 2 and committed == declared[:len(committed)]) or patch_kind != "Unit" and not declared)
+    transport_source_coverage(rows, working, task_path, tag)
     suffix = reviewed[3][patch_index + 1:]
     patches = [patch_bytes(target, row[1], row[0], row[1]) for row in suffix]
     artifacts = {row[0]: artifact for row, artifact in projected_patch_rows([row for row in rows if row[6] == "GitDiff"])}
@@ -2014,9 +2155,9 @@ def transport_revise(arguments):
         raise
 
 def transport_commit(arguments):
-    must(len(arguments) == 13)
+    must(len(arguments) == 15)
     target = transport_repository(arguments[0])
-    tag, lane, patch_kind, group, patch, form, segment, rustfmt, child_patch_sequence, skip_line_limit, contract_data, output = arguments[1:]
+    tag, lane, patch_kind, group, patch, form, segment, rustfmt, child_patch_sequence, skip_line_limit, contract_data, working, task_path, output = arguments[1:]
     must(kind(rustfmt, REGULAR) and form == "GitDiff" and skip_line_limit in ("true", "false"))
     metadata = (lane, patch_kind, group, patch, form, segment)
     identity = f"{lane}/{group}"
@@ -2040,6 +2181,7 @@ def transport_commit(arguments):
     if clean and rows and rows[-1][2:8] == metadata:
         if rows[-1][9] != contract:
             return reject("Contract", "the committed contract", contract)
+        transport_source_coverage(rows, working, task_path, tag)
         transport_write_result(output, result)
         return
     must(not clean)
@@ -2054,6 +2196,7 @@ def transport_commit(arguments):
     must(classification == "source")
     prospective = rows + [("new", "HEAD", *metadata, classification, contract)]
     validate_history(prospective, partial=True)
+    transport_source_coverage(prospective, working, task_path, tag)
     snapshot = transport_dirty_snapshot(target, identity)
 
     def restore_input():
@@ -2111,9 +2254,9 @@ def exchange_export_directory(current, staged):
         raise OSError(error, os.strerror(error), current)
 
 def transport_export(arguments):
-    must(len(arguments) == 8)
+    must(len(arguments) == 9)
     source = transport_repository(arguments[0], True)
-    working, scratch, private_root, tag, open_patch, skip_line_limit, output = arguments[1:]
+    working, scratch, private_root, tag, open_patch, skip_line_limit, task_path, output = arguments[1:]
     must(skip_line_limit in ("true", "false"))
     working, private_root = os.path.abspath(working), os.path.abspath(private_root)
     must(os.path.isabs(scratch) and kind(scratch, DIRECTORY) and os.path.realpath(scratch) == scratch)
@@ -2126,6 +2269,7 @@ def transport_export(arguments):
     if open_patch in map(transport_group_selector, transport_groups(rows)):
         transport_write_result(output, {"Result": "Input", "Output": str(RollInputError(open_patch, "OpenPatch", "TaskWorkspace closure before export", open_patch))})
         return
+    transport_source_coverage(rows, working, task_path, tag)
     projected, findings = project(source, base, head, skip_line_limit=skip_line_limit == "true")
     if findings:
         transport_write_result(output, findings[0])
@@ -2297,14 +2441,14 @@ def release_task_fields(data):
     for line in data.decode().splitlines():
         if line.startswith(("+-- ", "`-- ")):
             name, separator, value = line[4:].partition(": ")
-            if name in ("CurrentWorktree", "CurrentTerminalUnit", "CurrentTerminalFlatPatch", "CurrentTerminalTransform", "RemainingSuffix", "RetainedParents", "OpenUnit", "OpenFlatPatch", "OpenTransform", "SourcePrefixes"):
+            if name in ("CurrentWorktree", "CurrentTerminalUnit", "CurrentTerminalFlatPatch", "CurrentTerminalTransform", "RetainedParents", "OpenUnit", "OpenFlatPatch", "OpenTransform", "SourcePrefixes", "SourcePatchChanges", "ChildPatchSequence"):
                 must(separator and value and value == value.strip() and name not in fields)
                 fields[name] = value
     return fields
 
 def release_task_export_frontier(data, main):
     fields = release_task_fields(data)
-    must(fields.get("CurrentWorktree") == main and fields.get("RemainingSuffix") == "empty")
+    must(fields.get("CurrentWorktree") == main)
     open_fields = [name for name in ("OpenUnit", "OpenFlatPatch", "OpenTransform") if name in fields]
     terminal_fields = [(kind, fields[name]) for kind, name in (("Unit", "CurrentTerminalUnit"), ("FlatPatch", "CurrentTerminalFlatPatch"), ("Transform", "CurrentTerminalTransform")) if name in fields]
     must("RetainedParents" not in fields and not open_fields and len(terminal_fields) == 1)
@@ -2552,6 +2696,7 @@ def release_cleanup(arguments):
     rows = validate_history(history_rows(main, transport_base(main, tag)))
     if task_before:
         transport_completed_frontier(transport_patch_records(rows), release_task_export_frontier(task_before, main_path))
+        transport_source_coverage(rows, working, task_path, tag, complete=True)
     private = transport_repository(join(working, "build", "patches", "private"))
     must(private.branch() == "main" and valid_export_commit(private, tag))
     project_matches_export(main, transport_base(main, tag), join(private.path, tag))
@@ -2596,6 +2741,6 @@ must(len(sys.argv) > 1 and sys.argv[1] in COMMANDS)
 try:
     COMMANDS[sys.argv[1]](sys.argv[2:])
 except LaneStructureError as error:
-    if not sys.argv[1].startswith("patch-replay-"):
+    if not sys.argv[1].startswith("patch-replay-") and sys.argv[1] != "release-cleanup":
         raise
     transport_write_result(sys.argv[-1], {"Output": str(error), "Result": "Input"})

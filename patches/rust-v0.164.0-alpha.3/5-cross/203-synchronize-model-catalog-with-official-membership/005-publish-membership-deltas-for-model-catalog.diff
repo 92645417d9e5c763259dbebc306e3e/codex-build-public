@@ -1,0 +1,480 @@
+publish-membership-deltas-for-model-catalog
+
+Lane: cross
+
+Unit: synchronize-model-catalog-with-official-membership
+
+ChildPatch: publish-membership-deltas-for-model-catalog
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -2035,6 +2035,7 @@ server_notification_definitions! {
+     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
+     ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
+     ModelVerification => "model/verification" (v2::ModelVerificationNotification),
++    ModelMembershipChanged => "model/membership/changed" (v2::ModelMembershipChangedNotification),
+     AuthRecoveryStarted => "modelProvider/authRecoveryStarted" (v2::AuthRecoveryNotification),
+     AuthRecoveryCompleted => "modelProvider/authRecoveryCompleted" (v2::AuthRecoveryNotification),
+     #[experimental("turn/moderationMetadata")]
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/model.rs b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/model.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+@@ -181,6 +181,15 @@ pub struct ModelListResponse {
+     pub next_cursor: Option<String>,
+ }
+ 
++/// Official online catalog membership changes for a logged-in personal account.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ModelMembershipChangedNotification {
++    pub added: Vec<String>,
++    pub removed: Vec<String>,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -391,7 +391,11 @@ impl MessageProcessor {
+             thread_manager.get_models_manager(),
+             Arc::clone(&auth_manager),
+         ));
+-        let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
++        let models_refresh_worker = crate::models_refresh_worker::spawn(
++            &model_catalog,
++            Arc::clone(&auth_manager),
++            Arc::clone(&outgoing),
++        );
+         let turn_cost_worker =
+             TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
+         thread_manager
+diff --git a/codex-rs/app-server/src/model_catalog.rs b/codex-rs/app-server/src/model_catalog.rs
+--- a/codex-rs/app-server/src/model_catalog.rs
++++ b/codex-rs/app-server/src/model_catalog.rs
+@@ -6,6 +6,7 @@ use std::sync::Arc;
+ use codex_core::config::Config;
+ use codex_features::Feature;
+ use codex_login::AuthManager;
++use codex_models_manager::manager::OfficialModelsObservation;
+ use codex_models_manager::manager::RefreshStrategy;
+ use codex_models_manager::manager::SharedModelsManager;
+ use codex_protocol::openai_models::ModelPreset;
+@@ -104,6 +105,18 @@ impl ModelCatalog {
+             .await
+     }
+ 
++    pub(crate) async fn observe_official_online_models(
++        &self,
++    ) -> std::io::Result<Option<OfficialModelsObservation>> {
++        let (config, models_manager) = self.current().await?;
++        self.config_manager
++            .check_thread_model_provider(&config)
++            .await?;
++        Ok(models_manager
++            .observe_official_online_models(config.http_client_factory())
++            .await)
++    }
++
+     pub(crate) async fn list_models_from_snapshot(
+         &self,
+         config: Arc<Config>,
+diff --git a/codex-rs/app-server/src/models_refresh_worker.rs b/codex-rs/app-server/src/models_refresh_worker.rs
+--- a/codex-rs/app-server/src/models_refresh_worker.rs
++++ b/codex-rs/app-server/src/models_refresh_worker.rs
+@@ -1,11 +1,18 @@
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
++use codex_app_server_protocol::ModelMembershipChangedNotification;
++use codex_app_server_protocol::ServerNotification;
++use codex_login::AuthManager;
++use codex_models_manager::manager::OfficialModelsObservation;
+ use codex_models_manager::manager::RefreshStrategy;
++use codex_protocol::account::PlanType;
++use codex_protocol::auth::AuthMode;
+ use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
+ 
+ use crate::model_catalog::ModelCatalog;
++use crate::outgoing_message::OutgoingMessageSender;
+ 
+ const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60 + 30);
+ 
+@@ -27,18 +34,30 @@ impl Drop for ModelsRefreshWorker {
+     }
+ }
+ 
+-pub(crate) fn spawn(model_catalog: &Arc<ModelCatalog>) -> ModelsRefreshWorker {
+-    spawn_with_interval(model_catalog, MODELS_REFRESH_INTERVAL)
++pub(crate) fn spawn(
++    model_catalog: &Arc<ModelCatalog>,
++    auth_manager: Arc<AuthManager>,
++    outgoing: Arc<OutgoingMessageSender>,
++) -> ModelsRefreshWorker {
++    spawn_with_interval(
++        model_catalog,
++        auth_manager,
++        outgoing,
++        MODELS_REFRESH_INTERVAL,
++    )
+ }
+ 
+ fn spawn_with_interval(
+     model_catalog: &Arc<ModelCatalog>,
++    auth_manager: Arc<AuthManager>,
++    outgoing: Arc<OutgoingMessageSender>,
+     refresh_interval: Duration,
+ ) -> ModelsRefreshWorker {
+     let model_catalog = Arc::downgrade(model_catalog);
+     let shutdown = CancellationToken::new();
+     let worker_shutdown = shutdown.clone();
+     let task = tokio::spawn(async move {
++        let mut previous_observation: Option<OfficialModelsObservation> = None;
+         loop {
+             if worker_shutdown.is_cancelled() {
+                 break;
+@@ -46,9 +65,41 @@ fn spawn_with_interval(
+             let Some(model_catalog) = model_catalog.upgrade() else {
+                 break;
+             };
+-            if let Err(err) = model_catalog.list_models(RefreshStrategy::Online).await {
+-                // Parser diagnostics can include provider credentials from the source TOML.
+-                tracing::warn!(error_kind = ?err.kind(), "model catalog refresh blocked by provider requirements");
++            let refresh = if personal_chatgpt_account(&auth_manager) {
++                model_catalog
++                    .observe_official_online_models()
++                    .await
++                    .map(|observation| {
++                        if personal_chatgpt_account(&auth_manager)
++                            && let Some(observation) = observation
++                        {
++                            let delta =
++                                membership_delta(previous_observation.as_ref(), &observation);
++                            previous_observation = Some(observation);
++                            delta
++                        } else {
++                            previous_observation = None;
++                            None
++                        }
++                    })
++            } else {
++                previous_observation = None;
++                model_catalog
++                    .list_models(RefreshStrategy::Online)
++                    .await
++                    .map(|_| None)
++            };
++            match refresh {
++                Ok(Some(delta)) => {
++                    outgoing
++                        .send_server_notification(ServerNotification::ModelMembershipChanged(delta))
++                        .await;
++                }
++                Ok(None) => {}
++                Err(err) => {
++                    // Parser diagnostics can include provider credentials from the source TOML.
++                    tracing::warn!(error_kind = ?err.kind(), "model catalog refresh blocked by provider requirements");
++                }
+             }
+             drop(model_catalog);
+ 
+@@ -64,6 +115,34 @@ fn spawn_with_interval(
+     }
+ }
+ 
++fn personal_chatgpt_account(auth_manager: &AuthManager) -> bool {
++    personal_chatgpt_plan(
++        auth_manager.auth_mode(),
++        auth_manager
++            .auth_cached()
++            .and_then(|auth| auth.account_plan_type()),
++    )
++}
++
++fn personal_chatgpt_plan(auth_mode: Option<AuthMode>, plan_type: Option<PlanType>) -> bool {
++    auth_mode == Some(AuthMode::Chatgpt)
++        && matches!(
++            plan_type,
++            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++        )
++}
++
++fn membership_delta(
++    previous: Option<&OfficialModelsObservation>,
++    current: &OfficialModelsObservation,
++) -> Option<ModelMembershipChangedNotification> {
++    let previous = previous.filter(|previous| previous.identity == current.identity)?;
++    let added = current.slugs.difference(&previous.slugs).cloned().collect();
++    let removed = previous.slugs.difference(&current.slugs).cloned().collect();
++    let delta = ModelMembershipChangedNotification { added, removed };
++    (!delta.added.is_empty() || !delta.removed.is_empty()).then_some(delta)
++}
++
+ #[cfg(test)]
+ #[path = "models_refresh_worker_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/app-server/src/models_refresh_worker_tests.rs b/codex-rs/app-server/src/models_refresh_worker_tests.rs
+--- a/codex-rs/app-server/src/models_refresh_worker_tests.rs
++++ b/codex-rs/app-server/src/models_refresh_worker_tests.rs
+@@ -1,3 +1,4 @@
++use std::collections::BTreeSet;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+@@ -28,6 +29,47 @@ use tracing_subscriber::layer::SubscriberExt;
+ 
+ use super::*;
+ 
++#[test]
++fn model_change_notifications_are_personal_chatgpt_only() {
++    for plan in [PlanType::Plus, PlanType::Pro, PlanType::ProLite] {
++        assert!(personal_chatgpt_plan(Some(AuthMode::Chatgpt), Some(plan)));
++        assert!(!personal_chatgpt_plan(Some(AuthMode::ApiKey), Some(plan)));
++    }
++    for plan in [
++        PlanType::Free,
++        PlanType::SelfServeBusinessProLite,
++        PlanType::Enterprise,
++    ] {
++        assert!(!personal_chatgpt_plan(Some(AuthMode::Chatgpt), Some(plan)));
++    }
++}
++
++#[test]
++fn membership_delta_only_reports_same_identity_slug_changes() {
++    let first = OfficialModelsObservation {
++        identity: "account-a".to_string(),
++        slugs: BTreeSet::from(["old".to_string()]),
++    };
++    let second = OfficialModelsObservation {
++        identity: "account-a".to_string(),
++        slugs: BTreeSet::from(["new".to_string()]),
++    };
++    assert_eq!(membership_delta(None, &first), None);
++    assert_eq!(membership_delta(Some(&first), &first), None);
++    assert_eq!(
++        membership_delta(Some(&first), &second),
++        Some(ModelMembershipChangedNotification {
++            added: vec!["new".to_string()],
++            removed: vec!["old".to_string()],
++        })
++    );
++    let different_account = OfficialModelsObservation {
++        identity: "account-b".to_string(),
++        slugs: second.slugs.clone(),
++    };
++    assert_eq!(membership_delta(Some(&first), &different_account), None);
++}
++
+ #[derive(Debug)]
+ struct TestModelsEndpoint {
+     fetch_count: AtomicUsize,
+@@ -134,9 +176,19 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
+         Some(config.cwd.to_path_buf()),
+         config,
+         Arc::clone(&models_manager),
+-        auth_manager,
++        Arc::clone(&auth_manager),
++    ));
++    let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
++    let outgoing = Arc::new(OutgoingMessageSender::new(
++        outgoing_tx,
++        codex_analytics::AnalyticsEventsClient::disabled(),
+     ));
+-    let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
++    let worker = spawn_with_interval(
++        &catalog,
++        auth_manager,
++        outgoing,
++        Duration::from_millis(/*millis*/ 10),
++    );
+ 
+     endpoint.wait_for_fetch_count(/*expected*/ 2).await;
+     drop(worker);
+@@ -215,14 +267,24 @@ async fn background_refresh_blocks_invalid_requirements_then_recovers() -> anyho
+         Some(config.cwd.to_path_buf()),
+         config,
+         models_manager,
+-        auth_manager,
++        Arc::clone(&auth_manager),
+     ));
+     let feedback = CodexFeedback::new();
+     // This test uses Tokio's current-thread runtime, so spawned refreshes share the subscriber.
+     let _subscriber_guard = tracing::subscriber::set_default(
+         tracing_subscriber::registry().with(feedback.logger_layer()),
+     );
+-    let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
++    let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
++    let outgoing = Arc::new(OutgoingMessageSender::new(
++        outgoing_tx,
++        codex_analytics::AnalyticsEventsClient::disabled(),
++    ));
++    let worker = spawn_with_interval(
++        &catalog,
++        auth_manager,
++        outgoing,
++        Duration::from_millis(/*millis*/ 10),
++    );
+     tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+         for expected in 1..=2 {
+             checks_rx.recv().await.unwrap().send(/*t*/ None).unwrap();
+@@ -309,8 +371,8 @@ async fn catalog_reload_recovers_after_cloud_failure() -> anyhow::Result<()> {
+     assert_eq!(catalog.current().await?.0.model_provider_id, "openai");
+     assert!(catalog.list_models(RefreshStrategy::Offline).await.is_err());
+     failed.store(false, Ordering::SeqCst);
+-    // Exercise the same online request used by the periodic background worker.
+-    catalog.list_models(RefreshStrategy::Online).await?;
++    // Personal-account refreshes use the same reload and policy boundary as model lists.
++    assert_eq!(catalog.observe_official_online_models().await?, None);
+     assert_eq!(catalog.current().await?.0.model_provider_id, "ollama");
+     assert!(
+         !catalog
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -114,6 +114,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::ContextCompacted(_)
+         | ServerNotification::ModelRerouted(_)
+         | ServerNotification::ModelVerification(_)
++        | ServerNotification::ModelMembershipChanged(_)
+         | ServerNotification::AuthRecoveryStarted(_)
+         | ServerNotification::AuthRecoveryCompleted(_)
+         | ServerNotification::TurnModerationMetadata(_)
+diff --git a/codex-rs/app-server/src/transport_tests.rs b/codex-rs/app-server/src/transport_tests.rs
+--- a/codex-rs/app-server/src/transport_tests.rs
++++ b/codex-rs/app-server/src/transport_tests.rs
+@@ -1,6 +1,7 @@
+ use super::*;
+ use codex_app_server_protocol::AuthRecoveryNotification;
+ use codex_app_server_protocol::ConfigWarningNotification;
++use codex_app_server_protocol::ModelMembershipChangedNotification;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ServerNotificationEnvelope;
+@@ -31,6 +32,62 @@ fn app_server_notification(notification: ServerNotification) -> OutgoingMessage
+     })
+ }
+ 
++#[tokio::test]
++async fn model_membership_notification_broadcast_reaches_each_initialized_client() {
++    let (sender, mut outgoing) = mpsc::channel(1);
++    let sender = crate::outgoing_message::OutgoingMessageSender::new(
++        sender,
++        codex_analytics::AnalyticsEventsClient::disabled(),
++    );
++    sender
++        .send_server_notification(ServerNotification::ModelMembershipChanged(
++            ModelMembershipChangedNotification {
++                added: vec!["new".into()],
++                removed: vec!["old".into()],
++            },
++        ))
++        .await;
++    let envelope = outgoing
++        .recv()
++        .await
++        .expect("one model-change notification");
++    let OutgoingEnvelope::Broadcast { message } = &envelope else {
++        panic!("model changes must use the global broadcast sender");
++    };
++    let expected = serde_json::to_value(message).expect("serialize model-change notification");
++    assert_eq!(expected["method"], "model/membership/changed");
++    assert_eq!(
++        expected["params"],
++        json!({"added": ["new"], "removed": ["old"]})
++    );
++
++    let mut connections = HashMap::new();
++    let mut receivers = Vec::new();
++    for connection_id in [ConnectionId(1), ConnectionId(2)] {
++        let (writer, receiver) = mpsc::channel(1);
++        connections.insert(
++            connection_id,
++            OutboundConnectionState::new(
++                writer,
++                Arc::new(AtomicBool::new(true)),
++                Arc::new(AtomicBool::new(false)),
++                Arc::new(RwLock::new(HashSet::new())),
++                /*disconnect_sender*/ None,
++            ),
++        );
++        receivers.push(receiver);
++    }
++    route_outgoing_envelope(&mut connections, envelope).await;
++    for mut receiver in receivers {
++        let delivered = receiver
++            .recv()
++            .await
++            .expect("initialized client receives the event");
++        assert_eq!(serde_json::to_value(delivered.message).unwrap(), expected);
++        assert!(receiver.try_recv().is_err(), "one event per client");
++    }
++}
++
+ #[tokio::test]
+ async fn to_connection_notification_respects_opt_out_filters() {
+     let connection_id = ConnectionId(7);
+diff --git a/codex-rs/exec/src/event_processor_with_human_output.rs b/codex-rs/exec/src/event_processor_with_human_output.rs
+--- a/codex-rs/exec/src/event_processor_with_human_output.rs
++++ b/codex-rs/exec/src/event_processor_with_human_output.rs
+@@ -304,6 +304,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
+                 CodexStatus::Running
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
++            ServerNotification::ModelMembershipChanged(_) => CodexStatus::Running,
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                 self.last_total_token_usage = Some(notification.token_usage);
+                 CodexStatus::Running
+diff --git a/codex-rs/exec/src/event_processor_with_jsonl_output.rs b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+--- a/codex-rs/exec/src/event_processor_with_jsonl_output.rs
++++ b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+@@ -506,6 +506,7 @@ impl EventProcessorWithJsonOutput {
+                 CodexStatus::Running
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
++            ServerNotification::ModelMembershipChanged(_) => CodexStatus::Running,
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                 self.last_total_token_usage = Some(notification.token_usage);
+                 CodexStatus::Running
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -1715,6 +1715,7 @@ fn should_process_notification(
+         ServerNotification::ModelVerification(notification) => {
+             notification.thread_id == thread_id && notification.turn_id == turn_id
+         }
++        ServerNotification::ModelMembershipChanged(_) => false,
+         ServerNotification::ThreadTokenUsageUpdated(notification) => {
+             notification.thread_id == thread_id && notification.turn_id == turn_id
+         }
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -209,6 +209,7 @@ pub(super) fn server_notification_thread_target(
+         | ServerNotification::GatewayOAuthChanged(_)
+         | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::AppListUpdated(_)
++        | ServerNotification::ModelMembershipChanged(_)
+         | ServerNotification::EnvironmentConnected(_)
+         | ServerNotification::EnvironmentDisconnected(_)
+         | ServerNotification::RemoteControlStatusChanged(_)
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -242,6 +242,7 @@ impl ChatWidget {
+             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+                 self.on_model_safety_buffering_updated(notification, replay_kind)
+             }
++            ServerNotification::ModelMembershipChanged(_) => {}
+             ServerNotification::AuthRecoveryStarted(notification) => {
+                 self.add_info_message(notification.message, /*hint*/ None)
+             }
