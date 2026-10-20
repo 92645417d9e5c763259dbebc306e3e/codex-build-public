@@ -1,0 +1,114 @@
+configure-model-navigation-with-keybindings
+
+Lane: frontend
+
+Unit: control-model-and-reasoning-with-keyboard
+
+ChildPatch: configure-model-navigation-with-keybindings
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Control the active model and reasoning effort through configurable session-local keyboard shortcuts and display reasoning strength in the TUI status line.
+
+Requires: none
+
+Provides: Previous and next model actions default to Alt-semicolon and Alt-apostrophe, follow visible picker order with wraparound, reset effort to the selected model default, and reject model changes during active turns. Reasoning shortcuts reach advertised Max and Ultra without persisting selections or opening a scope prompt. TUI reasoning uses six severity-colored cells with the red fast label immediately after them, matching live previews while terminal titles and other interface modes retain words.
+
+Boundary: Own keymap configuration, runtime bindings and setup actions, shortcut dispatch, and reasoning status-line rendering. Preserve modal input, parent-owned input, reserve-model constraints, ordinary setting updates, native warnings and unrelated status items. Do not persist shortcut choices or alter provider/model discovery.
+
+Verification: Focused configuration, keymap resolution, shortcut cycling and blocking, Plan scope, advanced reasoning, six-cell styling, fast-label order, terminal-title preservation, neighboring items and live preview tests.
+
+
+diff --git a/codex-rs/config/src/tui_keymap.rs b/codex-rs/config/src/tui_keymap.rs
+--- a/codex-rs/config/src/tui_keymap.rs
++++ b/codex-rs/config/src/tui_keymap.rs
+@@ -181,6 +181,10 @@ pub struct TuiChatKeymap {
+     pub decrease_reasoning_effort: Option<KeybindingsSpec>,
+     /// Increase the active reasoning effort.
+     pub increase_reasoning_effort: Option<KeybindingsSpec>,
++    /// Select the previous model in model-picker order.
++    pub previous_model: Option<KeybindingsSpec>,
++    /// Select the next model in model-picker order.
++    pub next_model: Option<KeybindingsSpec>,
+     /// Switch to the previous available permission mode.
+     pub previous_permission_mode: Option<KeybindingsSpec>,
+     /// Switch to the next available permission mode.
+@@ -756,6 +760,21 @@ mod tests {
+     use super::*;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn model_navigation_shortcuts_are_configurable() {
++        let keymap: TuiKeymap =
++            toml::from_str("[chat]\nprevious_model = 'alt-;'\nnext_model = \"alt-'\"\n")
++                .expect("model navigation bindings");
++        assert_eq!(
++            keymap.chat.previous_model,
++            Some(KeybindingsSpec::One(KeybindingSpec("alt-;".to_string())))
++        );
++        assert_eq!(
++            keymap.chat.next_model,
++            Some(KeybindingsSpec::One(KeybindingSpec("alt-'".to_string())))
++        );
++    }
++
+     #[test]
+     fn action_under_global_context_is_accepted() {
+         let toml_input = r#"
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4814,8 +4814,10 @@
+               "edit_queued_message": null,
+               "increase_reasoning_effort": null,
+               "interrupt_turn": null,
++              "next_model": null,
+               "next_permission_mode": null,
+               "open_presets": null,
++              "previous_model": null,
+               "previous_permission_mode": null,
+               "prompt_stack_back": null,
+               "skip_question": null,
+@@ -5351,6 +5353,14 @@
+           ],
+           "description": "Interrupt the active turn."
+         },
++        "next_model": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/KeybindingsSpec"
++            }
++          ],
++          "description": "Select the next model in model-picker order."
++        },
+         "next_permission_mode": {
+           "allOf": [
+             {
+@@ -5367,6 +5377,14 @@
+           ],
+           "description": "Open saved prompts and slash commands."
+         },
++        "previous_model": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/KeybindingsSpec"
++            }
++          ],
++          "description": "Select the previous model in model-picker order."
++        },
+         "previous_permission_mode": {
+           "allOf": [
+             {
+@@ -5817,8 +5835,10 @@
+             "edit_queued_message": null,
+             "increase_reasoning_effort": null,
+             "interrupt_turn": null,
++            "next_model": null,
+             "next_permission_mode": null,
+             "open_presets": null,
++            "previous_model": null,
+             "previous_permission_mode": null,
+             "prompt_stack_back": null,
+             "skip_question": null,

@@ -1,0 +1,625 @@
+observe-stream-rtt-in-tui
+
+Lane: cross
+
+Unit: measure-websocket-round-trips-with-ping-pong
+
+ChildPatch: observe-stream-rtt-in-tui
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -614,6 +614,8 @@ pub(crate) struct App {
+     proxy_alias: Option<String>,
+     proxy_address: Option<String>,
+     storage_capacity: Option<codex_app_server_protocol::GetStorageCapacityResponse>,
++    remote_control_connection_status:
++        Option<codex_app_server_protocol::RemoteControlStatusChangedNotification>,
+     reconnect: reconnect::ReconnectState,
+     pending_right_click_paste: Option<right_click_paste::PendingPaste>,
+     right_click_paste_environment: right_click_paste::PasteEnvironment,
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -145,6 +145,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::ResponsesStreamConnectionStatus(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::TurnModerationMetadata(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+@@ -250,6 +253,7 @@ mod tests {
+     use codex_app_server_protocol::GuardianWarningNotification;
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
++    use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadAttachmentOperation;
+     use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
+@@ -338,6 +342,23 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn responses_stream_connection_notifications_route_to_threads() {
++        let thread_id = ThreadId::new();
++        let notification = ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected: true,
++                rtt_ms: Some(42),
++            },
++        );
++
++        assert_eq!(
++            server_notification_thread_target(&notification),
++            ServerNotificationThreadTarget::Thread(thread_id)
++        );
++    }
++
+     #[test]
+     fn guardian_warning_notifications_route_to_threads() {
+         let thread_id = ThreadId::new();
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -151,6 +151,8 @@ impl App {
+                 self.proxy_alias = None;
+                 self.proxy_address = None;
+                 self.storage_capacity = None;
++                self.remote_control_connection_status = None;
++                self.chat_widget.clear_responses_stream_connection_status();
+                 // The request result distinguishes a refused start from a lost reply.
+                 if self.pending_startup_thread_start
+                     && !matches!(self.app_server_target, crate::AppServerTarget::Embedded)
+@@ -181,6 +183,13 @@ impl App {
+             self.proxy_address = notification.active_address.clone();
+             return;
+         }
++        if let ServerNotification::RemoteControlStatusChanged(notification) = &notification {
++            self.remote_control_connection_status = (self.chat_widget.stream_rtt_enabled()
++                && notification.status
++                    != codex_app_server_protocol::RemoteControlConnectionStatus::Disabled)
++                .then(|| notification.clone());
++            return;
++        }
+         // A picker can leave an old runtime's close notification queued while the same thread
+         // is resumed. Thread IDs survive reloads, so confirm that the displayed thread is still
+         // unloaded before routing a close that would exit the TUI or switch away from it.
+@@ -380,6 +389,9 @@ impl App {
+                 }
+                 self.chat_widget
+                     .on_rolling_rate_limit_snapshot(notification.rate_limits.clone());
++                if !self.chat_widget.stream_rtt_enabled() {
++                    self.remote_control_connection_status = None;
++                }
+                 if workspace_hard_stop && self.chat_widget.has_chatgpt_account() {
+                     // Background inference may publish a hard stop without a foreground Error.
+                     self.refresh_rate_limits(app_server_client, RateLimitRefreshOrigin::Recovery);
+@@ -387,6 +399,7 @@ impl App {
+                 return;
+             }
+             ServerNotification::AccountUpdated(notification) => {
++                self.remote_control_connection_status = None;
+                 self.agents_overview.usage.clear();
+                 self.agents_overview.pending_usage = None;
+                 self.agents_overview.usage_disabled = false;
+diff --git a/codex-rs/tui/src/app/backend_events.rs b/codex-rs/tui/src/app/backend_events.rs
+--- a/codex-rs/tui/src/app/backend_events.rs
++++ b/codex-rs/tui/src/app/backend_events.rs
+@@ -24,6 +24,7 @@ impl App {
+                         | ServerNotification::AccountRateLimitsUpdated(_)
+                         | ServerNotification::ConnectedClientCountChanged(_)
+                         | ServerNotification::ProxyUpdated(_)
++                        | ServerNotification::RemoteControlStatusChanged(_)
+                 ),
+                 AppServerEvent::ServerRequest(_) => false,
+             }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2075,6 +2075,9 @@ impl App {
+                 }
+                 None => {}
+                 }
++                if !self.chat_widget.stream_rtt_enabled() {
++                    self.remote_control_connection_status = None;
++                }
+                 if (accepted || matches!(
+                     origin,
+                     RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
+diff --git a/codex-rs/tui/src/app/reconnect.rs b/codex-rs/tui/src/app/reconnect.rs
+--- a/codex-rs/tui/src/app/reconnect.rs
++++ b/codex-rs/tui/src/app/reconnect.rs
+@@ -568,6 +568,7 @@ impl App {
+         self.reconnect.offline = false;
+         self.proxy_alias = bootstrap.proxy_alias;
+         self.proxy_address = bootstrap.proxy_address;
++        self.remote_control_connection_status = None;
+         self.chat_widget.update_account_state(
+             bootstrap.status_account_display,
+             bootstrap.plan_type,
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -945,6 +945,7 @@ See the Codex keymap documentation for supported actions and examples."
+             proxy_alias: bootstrap.proxy_alias,
+             proxy_address: bootstrap.proxy_address,
+             storage_capacity: None,
++            remote_control_connection_status: None,
+             pending_right_click_paste: None,
+             right_click_paste_environment: super::right_click_paste::PasteEnvironment::detect(),
+             reconnect: ReconnectState {
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -77,6 +77,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
+         proxy_alias: None,
+         proxy_address: None,
+         storage_capacity: None,
++        remote_control_connection_status: None,
+         pending_right_click_paste: None,
+         right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+             primary: false,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -106,6 +106,8 @@ mod startup_frame_tests;
+ mod startup_warnings_tests;
+ #[path = "tests/stream_animation_tests.rs"]
+ mod stream_animation_tests;
++#[path = "tests/stream_rtt.rs"]
++mod stream_rtt;
+ #[path = "tests/streaming_interleave_e2e.rs"]
+ mod streaming_interleave_e2e;
+ #[path = "tests/thread_usage.rs"]
+@@ -6453,6 +6455,7 @@ async fn make_test_app() -> Box<App> {
+         proxy_alias: None,
+         proxy_address: None,
+         storage_capacity: None,
++        remote_control_connection_status: None,
+         reconnect: Default::default(),
+         pending_right_click_paste: None,
+         right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+@@ -6583,6 +6586,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+             proxy_alias: None,
+             proxy_address: None,
+             storage_capacity: None,
++            remote_control_connection_status: None,
+             reconnect: Default::default(),
+             pending_right_click_paste: None,
+             right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+@@ -9221,6 +9225,11 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
+         harness_available_bytes: 1024,
+     };
+     app.storage_capacity = Some(capacity.clone());
++    let remote_control_status = stream_rtt::remote_control_status(
++        codex_app_server_protocol::RemoteControlConnectionStatus::Connected,
++        Some(55),
++    );
++    app.remote_control_connection_status = Some(remote_control_status.clone());
+     let receiver_thread_id =
+         ThreadId::from_string("019cff70-2599-75e2-af72-b958ce5dc1cc").expect("valid thread");
+     app.agent_navigation.upsert(
+@@ -9256,6 +9265,10 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
+     assert_eq!(app.proxy_alias.as_deref(), Some("stable-lan"));
+     assert_eq!(app.proxy_address.as_deref(), Some("proxy.test:8443"));
+     assert_eq!(app.storage_capacity, Some(capacity));
++    assert_eq!(
++        app.remote_control_connection_status,
++        Some(remote_control_status)
++    );
+ 
+     app.replay_thread_snapshot(
+         ThreadEventSnapshot {
+diff --git a/codex-rs/tui/src/app/tests/backend_event_tests.rs b/codex-rs/tui/src/app/tests/backend_event_tests.rs
+--- a/codex-rs/tui/src/app/tests/backend_event_tests.rs
++++ b/codex-rs/tui/src/app/tests/backend_event_tests.rs
+@@ -30,6 +30,11 @@ async fn foreign_backend_events_leave_thread_cache_and_connection_untouched() ->
+     app.connected_client_count = Some(2);
+     app.proxy_alias = Some("displayed-proxy".into());
+     app.proxy_address = Some("displayed.test:8080".into());
++    let remote_control_status = super::stream_rtt::remote_control_status(
++        codex_app_server_protocol::RemoteControlConnectionStatus::Connected,
++        Some(42),
++    );
++    app.remote_control_connection_status = Some(remote_control_status.clone());
+     let foreign = BackendId::new();
+     let request = exec_approval_request(id, "foreign-turn", "command", /*approval_id*/ None);
+     for event in [
+@@ -68,6 +73,14 @@ async fn foreign_backend_events_leave_thread_cache_and_connection_untouched() ->
+                 active_address: Some("background.test:8080".into()),
+             },
+         ))),
++        AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::RemoteControlStatusChanged(
++                super::stream_rtt::remote_control_status(
++                    codex_app_server_protocol::RemoteControlConnectionStatus::Connected,
++                    Some(9),
++                ),
++            ),
++        )),
+         AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
+             AccountUpdatedNotification {
+                 auth_mode: None,
+@@ -97,6 +110,10 @@ async fn foreign_backend_events_leave_thread_cache_and_connection_untouched() ->
+     assert_eq!(app.connected_client_count, Some(2));
+     assert_eq!(app.proxy_alias.as_deref(), Some("displayed-proxy"));
+     assert_eq!(app.proxy_address.as_deref(), Some("displayed.test:8080"));
++    assert_eq!(
++        app.remote_control_connection_status,
++        Some(remote_control_status)
++    );
+     assert!(
+         !app.pending_app_server_requests
+             .contains_server_request(&request)
+diff --git a/codex-rs/tui/src/app/tests/stream_rtt.rs b/codex-rs/tui/src/app/tests/stream_rtt.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/stream_rtt.rs
+@@ -0,0 +1,167 @@
++use super::*;
++use codex_app_server_client::AppServerEvent;
++use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
++use codex_app_server_protocol::AccountUpdatedNotification;
++use codex_app_server_protocol::RateLimitSnapshot;
++use codex_app_server_protocol::RemoteControlConnectionStatus;
++use codex_app_server_protocol::RemoteControlStatusChangedNotification;
++use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
++use codex_protocol::account::PlanType;
++use pretty_assertions::assert_eq;
++
++pub(super) fn remote_control_status(
++    status: RemoteControlConnectionStatus,
++    rtt_ms: Option<u64>,
++) -> RemoteControlStatusChangedNotification {
++    RemoteControlStatusChangedNotification {
++        status,
++        server_name: "server".to_string(),
++        installation_id: "installation".to_string(),
++        environment_id: Some("environment".to_string()),
++        rtt_ms,
++    }
++}
++
++#[tokio::test]
++async fn remote_control_rtt_is_global_and_clears_on_scope_or_connection_changes() -> Result<()> {
++    let mut app = make_test_app().await;
++    let server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    assert!(app.active_thread_id.is_none());
++    let connected = remote_control_status(RemoteControlConnectionStatus::Connected, Some(0));
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::RemoteControlStatusChanged(connected.clone()),
++        )),
++    )
++    .await;
++    assert!(app.remote_control_connection_status.is_none());
++
++    app.chat_widget
++        .update_account_state(None, Some(PlanType::Plus), true, true);
++    let responses = ResponsesStreamConnectionStatusNotification {
++        thread_id: ThreadId::new().to_string(),
++        connected: true,
++        rtt_ms: Some(42),
++    };
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(responses.clone()),
++        None,
++    );
++    for (status, rtt_ms) in [
++        (RemoteControlConnectionStatus::Connected, Some(0)),
++        (RemoteControlConnectionStatus::Connected, None),
++        (RemoteControlConnectionStatus::Connecting, None),
++        (RemoteControlConnectionStatus::Errored, None),
++        (RemoteControlConnectionStatus::Disabled, None),
++    ] {
++        let notification = remote_control_status(status, rtt_ms);
++        app.handle_app_server_event(
++            &server,
++            AppServerEvent::ServerNotification(Box::new(
++                ServerNotification::RemoteControlStatusChanged(notification.clone()),
++            )),
++        )
++        .await;
++        assert_eq!(
++            app.remote_control_connection_status,
++            (status != RemoteControlConnectionStatus::Disabled).then_some(notification),
++        );
++        assert_eq!(
++            app.chat_widget.responses_stream_connection_status(),
++            Some(&responses),
++        );
++    }
++
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::RemoteControlStatusChanged(connected.clone()),
++        )),
++    )
++    .await;
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountRateLimitsUpdated(
++            AccountRateLimitsUpdatedNotification {
++                rate_limits: RateLimitSnapshot {
++                    limit_id: Some("codex".to_string()),
++                    limit_name: None,
++                    normal_model_slug: None,
++                    primary: None,
++                    secondary: None,
++                    credits: None,
++                    individual_limit: None,
++                    spend_control_reached: None,
++                    plan_type: Some(PlanType::Business),
++                    rate_limit_reached_type: None,
++                },
++            },
++        ))),
++    )
++    .await;
++    assert!(app.remote_control_connection_status.is_none());
++    assert!(
++        app.chat_widget
++            .responses_stream_connection_status()
++            .is_none()
++    );
++    app.chat_widget
++        .update_account_state(None, Some(PlanType::Plus), true, true);
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(responses.clone()),
++        None,
++    );
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::RemoteControlStatusChanged(connected.clone()),
++        )),
++    )
++    .await;
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(ServerNotification::AccountUpdated(
++            AccountUpdatedNotification {
++                auth_mode: None,
++                plan_type: None,
++            },
++        ))),
++    )
++    .await;
++    assert!(app.remote_control_connection_status.is_none());
++    assert!(
++        app.chat_widget
++            .responses_stream_connection_status()
++            .is_none()
++    );
++
++    app.chat_widget
++        .update_account_state(None, Some(PlanType::Plus), true, true);
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(responses),
++        None,
++    );
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(
++            ServerNotification::RemoteControlStatusChanged(connected),
++        )),
++    )
++    .await;
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::Disconnected {
++            message: "closed".to_string(),
++        },
++    )
++    .await;
++    assert!(app.remote_control_connection_status.is_none());
++    assert!(
++        app.chat_widget
++            .responses_stream_connection_status()
++            .is_none()
++    );
++    server.shutdown().await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -394,6 +394,7 @@ mod status_controls;
+ mod status_surface_commands;
+ mod status_surfaces;
+ use self::status_surface_commands::StatusSurfaceOverrides;
++mod stream_rtt;
+ mod streaming;
+ use self::status_surfaces::CachedProjectRootName;
+ mod thread_usage;
+@@ -575,6 +576,8 @@ pub(crate) struct ChatWidget {
+     token_usage_pending: bool,
+     // Status and polling use account usage reads; response streams may identify meters differently.
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
++    responses_stream_connection_status:
++        Option<codex_app_server_protocol::ResponsesStreamConnectionStatusNotification>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+     next_status_refresh_request_id: u64,
+     pending_rate_limit_reset_request_id: Option<u64>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -150,6 +150,7 @@ impl ChatWidget {
+             token_info: None,
+             token_usage_pending: false,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
++            responses_stream_connection_status: None,
+             refreshing_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
+             pending_rate_limit_reset_request_id: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -245,6 +245,9 @@ impl ChatWidget {
+             ServerNotification::ModelChanged(_) => {}
+             ServerNotification::ConnectedClientCountChanged(_) => {}
+             ServerNotification::ProxyUpdated(_) => {}
++            ServerNotification::ResponsesStreamConnectionStatus(notification) => {
++                self.on_responses_stream_connection_status(notification);
++            }
+             ServerNotification::AuthRecoveryStarted(notification) => {
+                 self.add_info_message(notification.message, /*hint*/ None)
+             }
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -283,6 +283,9 @@ impl ChatWidget {
+                     });
+             }
+             self.plan_type = snapshot.plan_type.or(self.plan_type);
++            if !self.stream_rtt_enabled() {
++                self.responses_stream_connection_status = None;
++            }
+ 
+             if is_codex_limit
+                 && (matches!(source, RateLimitSnapshotSource::AccountUsage)
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -242,6 +242,7 @@ impl ChatWidget {
+         // Account-update notifications are the identity boundary. The visible account fields can
+         // be identical across two accounts, so always invalidate account-scoped requests and data.
+         self.model_popup_request_id = None;
++        self.responses_stream_connection_status = None;
+         let api_key_changed = self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+             || status_account_display == Some(StatusAccountDisplay::ApiKey);
+         self.invalidate_permission_discovery();
+diff --git a/codex-rs/tui/src/chatwidget/stream_rtt.rs b/codex-rs/tui/src/chatwidget/stream_rtt.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/stream_rtt.rs
+@@ -0,0 +1,31 @@
++use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
++use codex_protocol::account::PlanType;
++
++use super::ChatWidget;
++
++impl ChatWidget {
++    pub(crate) fn responses_stream_connection_status(
++        &self,
++    ) -> Option<&ResponsesStreamConnectionStatusNotification> {
++        self.responses_stream_connection_status.as_ref()
++    }
++
++    pub(super) fn on_responses_stream_connection_status(
++        &mut self,
++        notification: ResponsesStreamConnectionStatusNotification,
++    ) {
++        self.responses_stream_connection_status = self.stream_rtt_enabled().then_some(notification);
++    }
++
++    pub(crate) fn clear_responses_stream_connection_status(&mut self) {
++        self.responses_stream_connection_status = None;
++    }
++
++    pub(crate) fn stream_rtt_enabled(&self) -> bool {
++        self.has_chatgpt_account
++            && matches!(
++                self.plan_type,
++                Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++            )
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -302,6 +302,7 @@ mod status_command_tests;
+ #[path = "tests/status_surface_command_tests.rs"]
+ mod status_surface_command_tests;
+ mod status_surface_previews;
++mod stream_rtt;
+ #[path = "tests/subagent_activity_tests.rs"]
+ mod subagent_activity;
+ #[path = "tests/terminal_program_status.rs"]
+diff --git a/codex-rs/tui/src/chatwidget/tests/stream_rtt.rs b/codex-rs/tui/src/chatwidget/tests/stream_rtt.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/stream_rtt.rs
+@@ -0,0 +1,70 @@
++use super::*;
++use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
++
++#[tokio::test]
++async fn responses_rtt_preserves_connection_samples_only_for_personal_accounts() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    for (plan, signed_in, enabled) in [
++        (Some(PlanType::Plus), true, true),
++        (Some(PlanType::Pro), true, true),
++        (Some(PlanType::ProLite), true, true),
++        (Some(PlanType::ProMax), true, false),
++        (Some(PlanType::Business), true, false),
++        (Some(PlanType::Unknown), true, false),
++        (None, true, false),
++        (Some(PlanType::Plus), false, false),
++    ] {
++        chat.update_account_state(None, plan, signed_in, signed_in);
++        assert!(chat.responses_stream_connection_status().is_none());
++        for (connected, rtt_ms) in [
++            (true, None),
++            (true, Some(0)),
++            (true, Some(42)),
++            (false, None),
++        ] {
++            let notification = ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected,
++                rtt_ms,
++            };
++            chat.handle_server_notification(
++                ServerNotification::ResponsesStreamConnectionStatus(notification.clone()),
++                None,
++            );
++            assert_eq!(
++                chat.responses_stream_connection_status(),
++                enabled.then_some(&notification),
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn account_and_plan_changes_clear_responses_rtt() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
++    chat.update_account_state(None, Some(PlanType::Plus), true, true);
++    let notification = ResponsesStreamConnectionStatusNotification {
++        thread_id: ThreadId::new().to_string(),
++        connected: true,
++        rtt_ms: Some(42),
++    };
++    chat.on_responses_stream_connection_status(notification.clone());
++    chat.update_account_state(None, Some(PlanType::Plus), true, true);
++    assert!(chat.responses_stream_connection_status().is_none());
++    chat.on_responses_stream_connection_status(notification);
++    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
++        limit_id: Some("codex".to_string()),
++        limit_name: None,
++        normal_model_slug: None,
++        primary: None,
++        secondary: None,
++        credits: None,
++        individual_limit: None,
++        spend_control_reached: None,
++        plan_type: Some(PlanType::Business),
++        rate_limit_reached_type: None,
++    }));
++    assert!(chat.responses_stream_connection_status().is_none());
++}

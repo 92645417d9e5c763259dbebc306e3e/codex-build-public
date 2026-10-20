@@ -1,0 +1,172 @@
+style-empty-composer-hints-in-tui
+
+Lane: frontend
+
+Unit: style-conversation-surfaces-with-theme
+
+ChildPatch: style-empty-composer-hints-in-tui
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -13,6 +13,7 @@
+ //! loss cancels the pending paste; a late clipboard result cannot overwrite newer input.
+ //! The live voice strip renders after effort ignition, followed by the Astra sparkle when eligible.
+ //! Owned transcripts keep persistent status below the composer and hints on a separate final row.
++//! Their empty-draft placeholder has an extra two-column inset without moving input or the cursor.
+ //! Shortcut help expands above the composer, with its close hint replacing the final shortcuts row
+ //! so input and persistent status stay anchored when help opens or closes.
+ //! Escape dismisses visible shortcut help before editing, transcript backtracking, or interruption.
+@@ -303,7 +304,6 @@ use crossterm::event::KeyModifiers;
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Constraint;
+ use ratatui::layout::Layout;
+-use ratatui::layout::Margin;
+ use ratatui::layout::Rect;
+ use ratatui::style::Modifier;
+ use ratatui::style::Style;
+@@ -4962,7 +4962,17 @@ impl ChatComposer {
+             };
+             if !textarea_rect.is_empty() {
+                 let placeholder = Span::from(text).dim();
+-                Line::from(vec![placeholder]).render(textarea_rect.inner(Margin::new(0, 0)), buf);
++                let hint_rect = if options.fullscreen_transcript {
++                    Rect::new(
++                        textarea_rect.x.saturating_add(2),
++                        textarea_rect.y,
++                        textarea_rect.width.saturating_sub(2),
++                        textarea_rect.height,
++                    )
++                } else {
++                    textarea_rect
++                };
++                Line::from(vec![placeholder]).render(hint_rect, buf);
+             }
+         }
+         // The reserved right margin indicates hidden rows without changing wrapping.
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -68,6 +68,8 @@ pub(crate) enum CommandPopupPlacement {
+ /// A borrowed presentation shared by measurement, painting, and cursor placement.
+ #[derive(Clone, Copy, Default)]
+ pub(crate) struct ComposerRenderOptions<'a> {
++    /// Offset the placeholder only on the TUI conversation surface.
++    pub(crate) fullscreen_transcript: bool,
+     /// Fullscreen limits the composer independently of activity and modal views.
+     pub(crate) max_height: Option<u16>,
+     pub(crate) rendered_selection:
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
+@@ -57,6 +57,56 @@ fn render_with_height(
+     (text, composer.cursor_pos_with_options(area, options))
+ }
+ 
++#[test]
++fn tui_composer_offsets_only_the_hint_without_changing_fill_layout_or_cursor() {
++    let mut composer = composer();
++    let inline = ComposerRenderOptions {
++        separate_status_line: true,
++        ..Default::default()
++    };
++    let fullscreen = ComposerRenderOptions {
++        fullscreen_transcript: true,
++        ..inline
++    };
++    for draft in ["", "typed text"] {
++        composer.set_text_content(draft.into(), Vec::new(), Vec::new());
++        let width = 40;
++        let height = composer.desired_height_with_options(width, fullscreen);
++        let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
++        let layout = composer.layout_with_options(area, fullscreen);
++        assert_eq!(
++            layout.textarea,
++            composer.layout_with_options(area, inline).textarea
++        );
++        assert_eq!(
++            composer.cursor_pos_with_options(area, fullscreen),
++            composer.cursor_pos_with_options(area, inline)
++        );
++        let mut actual = Buffer::empty(area);
++        let mut expected = Buffer::empty(area);
++        composer.render_with_options(area, &mut actual, /*mask_char*/ None, fullscreen);
++        composer.render_with_options(area, &mut expected, /*mask_char*/ None, inline);
++        if !draft.is_empty() {
++            assert_eq!(actual, expected);
++            continue;
++        }
++        for y in [layout.composer.y, layout.composer.bottom() - 1] {
++            for x in 0..width {
++                assert_eq!(
++                    actual[(x, y)].bg,
++                    user_message_style().bg.unwrap_or(Color::Reset)
++                );
++            }
++        }
++        let (x, y) = (layout.textarea.x, layout.textarea.y);
++        assert_eq!(actual[(x - LIVE_PREFIX_COLS, y)].symbol(), "›");
++        assert_eq!(expected[(x, y)].symbol(), "A");
++        assert_eq!(actual[(x, y)].symbol(), " ");
++        assert_eq!(actual[(x + 2, y)].symbol(), "A");
++        insta::assert_snapshot!(format!("inline={expected:?}\nfullscreen={actual:?}"));
++    }
++}
++
+ #[test]
+ fn passive_activity_keeps_shortcuts_only_when_the_complete_hint_fits() {
+     let mut composer = composer();
+diff --git a/codex-rs/tui/src/chatwidget/rendering.rs b/codex-rs/tui/src/chatwidget/rendering.rs
+--- a/codex-rs/tui/src/chatwidget/rendering.rs
++++ b/codex-rs/tui/src/chatwidget/rendering.rs
+@@ -253,6 +253,7 @@ impl ChatWidget {
+                 self.ambient_pet_wrap_reserved_cols()
+             };
+             options.rendered_selection = Some(&self.rendered_selection);
++            options.fullscreen_transcript = self.local_settings.tui.fullscreen_transcript;
+             options.warning_count = self.warning_display_state.count;
+             options.textarea_right_reserve = right_reserve;
+             options.separate_status_line = options.command_popup_placement
+diff --git a/codex-rs/tui/src/startup_draft_layout.rs b/codex-rs/tui/src/startup_draft_layout.rs
+--- a/codex-rs/tui/src/startup_draft_layout.rs
++++ b/codex-rs/tui/src/startup_draft_layout.rs
+@@ -33,6 +33,7 @@ impl<'a> OwnedStartupLayout<'a> {
+             bottom: pump
+                 .bottom_pane
+                 .as_renderable_with_options(ComposerRenderOptions {
++                    fullscreen_transcript: true,
+                     separate_status_line: true,
+                     command_popup_placement: CommandPopupPlacement::Overlay,
+                     ..ComposerRenderOptions::default()
+diff --git a/codex-rs/tui/src/startup_draft_layout_tests.rs b/codex-rs/tui/src/startup_draft_layout_tests.rs
+--- a/codex-rs/tui/src/startup_draft_layout_tests.rs
++++ b/codex-rs/tui/src/startup_draft_layout_tests.rs
+@@ -2,6 +2,23 @@
+ 
+ use super::*;
+ 
++#[test]
++fn owned_startup_uses_the_same_tui_hint_inset() {
++    let pump = crate::startup_draft::tests::quiet_startup_test_pump();
++    let layout = OwnedStartupLayout::new(&pump);
++    let area = Rect::new(
++        /*x*/ 0, /*y*/ 0, /*width*/ 48, /*height*/ 16,
++    );
++    let mut buffer = Buffer::empty(area);
++    layout.render(area, &mut buffer);
++    let (x, y) = layout.cursor_pos(area).expect("empty composer cursor");
++    assert_eq!(buffer[(x, y)].symbol(), " ");
++    assert_eq!(buffer[(x + 2, y)].symbol(), "A");
++    insta::assert_snapshot!(
++        format!("{buffer:?}").replace(crate::version::CODEX_CLI_VERSION, "<VERSION>")
++    );
++}
++
+ #[test]
+ fn owned_startup_keeps_the_live_bottom_geometry() {
+     let mut pump = crate::startup_draft::tests::quiet_startup_test_pump();

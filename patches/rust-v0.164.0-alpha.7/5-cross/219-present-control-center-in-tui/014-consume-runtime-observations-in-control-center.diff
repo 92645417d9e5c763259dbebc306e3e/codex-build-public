@@ -1,0 +1,510 @@
+consume-runtime-observations-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: consume-runtime-observations-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -223,6 +223,7 @@ mod config_panel;
+ mod config_persistence;
+ mod connector_mentions;
+ mod control_center_data;
++mod control_center_observations;
+ mod daemon_control;
+ mod daemon_menu;
+ mod daybreak;
+@@ -1121,6 +1122,7 @@ impl App {
+             _ => {}
+         }
+ 
++        self.refresh_control_center_details(app_server, &event);
+         if self.overlay.is_some() {
+             let _ = self
+                 .handle_backtrack_overlay_event(tui, app_server, event)
+diff --git a/codex-rs/tui/src/app/control_center_observations.rs b/codex-rs/tui/src/app/control_center_observations.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_observations.rs
+@@ -0,0 +1,208 @@
++//! Observe shared runtime status without reloading usage accounting.
++use super::App;
++use crate::app_event::AppEvent;
++use crate::app_server_session::AppServerSession;
++use crate::control_center_table::Palette;
++use crate::pager_overlay::CenterScreen;
++use crate::pager_overlay::Overlay;
++use crate::tui;
++use crate::tui::TuiEvent;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::GithubReadResponse;
++use codex_app_server_protocol::RemoteControlConnectionStatus;
++use codex_app_server_protocol::RequestId;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use std::sync::Arc;
++use std::time::Duration;
++use std::time::Instant;
++use uuid::Uuid;
++
++impl App {
++    pub(super) fn refresh_control_center_details(
++        &mut self,
++        app_server: &AppServerSession,
++        event: &TuiEvent,
++    ) {
++        if !matches!(self.overlay, Some(Overlay::ControlCenter(_))) {
++            return;
++        }
++        if matches!(
++            event,
++            TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::FocusGained | TuiEvent::Resume
++        ) {
++            self.refresh_control_center_github(app_server);
++            let details = self.control_center_details();
++            if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
++                view.details = details;
++                view.responses.catalog = Arc::clone(&self.model_catalog);
++            }
++        }
++    }
++
++    fn refresh_control_center_github(&mut self, app_server: &AppServerSession) {
++        if self.reconnect.offline {
++            return;
++        }
++        let Some(Overlay::ControlCenter(view)) = &mut self.overlay else {
++            return;
++        };
++        let now = Instant::now();
++        if view.screen != CenterScreen::Summary
++            || view.github_request.is_some()
++            || view
++                .github_read_at
++                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
++        {
++            return;
++        }
++        let request_id = Uuid::new_v4();
++        view.github_request = Some(request_id);
++        view.github_read_at = Some(now);
++        let handle = app_server.request_handle();
++        let events = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let result = handle
++                .request_typed(ClientRequest::GithubRead {
++                    request_id: RequestId::String(request_id.to_string()),
++                    params: None,
++                })
++                .await
++                .map_err(|error| error.to_string());
++            events.send(AppEvent::ControlCenterGithubLoaded { request_id, result });
++        });
++    }
++
++    pub(super) fn finish_control_center_github(
++        &mut self,
++        tui: &mut tui::Tui,
++        request_id: Uuid,
++        result: Result<GithubReadResponse, String>,
++    ) {
++        if let Some(Overlay::ControlCenter(view)) = &mut self.overlay
++            && view.github_request == Some(request_id)
++        {
++            view.github_request = None;
++            view.github = result.ok().and_then(|response| response.status);
++            tui.frame_requester().schedule_frame();
++        }
++    }
++
++    pub(super) fn control_center_details(&self) -> Vec<Line<'static>> {
++        let github = match &self.overlay {
++            Some(Overlay::ControlCenter(view)) => view.github.as_ref(),
++            _ => None,
++        };
++        let palette = Palette::current();
++        let heading = |text: &str, index| Line::styled(text.to_owned(), palette.model(index));
++        let metric = |label, value| metric(&palette, label, value);
++        let rtt = |connected: bool, ms: Option<u64>| {
++            if connected {
++                ms.map(|ms| format!("{ms}ms"))
++            } else {
++                Some("Disconnected".into())
++            }
++        };
++        vec![
++            heading("WebSocket RTT", 2),
++            metric(
++                "Responses",
++                self.chat_widget
++                    .responses_stream_connection_status()
++                    .and_then(|status| rtt(status.connected, status.rtt_ms)),
++            ),
++            metric(
++                "Remote",
++                self.remote_control_connection_status
++                    .as_ref()
++                    .and_then(|status| {
++                        rtt(
++                            status.status == RemoteControlConnectionStatus::Connected,
++                            status.rtt_ms,
++                        )
++                    }),
++            ),
++            Line::default(),
++            heading("Storage free", 4),
++            metric(
++                "Home",
++                self.storage_capacity
++                    .as_ref()
++                    .map(|capacity| format_capacity_bytes(capacity.home_available_bytes)),
++            ),
++            metric(
++                "Harness",
++                self.storage_capacity
++                    .as_ref()
++                    .map(|capacity| format_capacity_bytes(capacity.harness_available_bytes)),
++            ),
++            Line::default(),
++            heading("GitHub", 7),
++            metric(
++                "Release",
++                github.and_then(|status| {
++                    status
++                        .latest_release
++                        .as_ref()
++                        .map(|release| release.version.clone())
++                }),
++            ),
++            metric(
++                "Pre-release",
++                github.and_then(|status| {
++                    status
++                        .latest_prerelease
++                        .as_ref()
++                        .map(|release| release.version.clone())
++                }),
++            ),
++            metric(
++                "Last checked",
++                github.and_then(|status| {
++                    chrono::DateTime::from_timestamp(status.checked_at, 0).map(|at| {
++                        at.with_timezone(&chrono::Local)
++                            .format("%Y-%m-%d %H:%M:%S")
++                            .to_string()
++                    })
++                }),
++            ),
++            metric(
++                "Remaining points",
++                github.and_then(|status| status.remaining.map(|value| value.to_string())),
++            ),
++            Line::default(),
++            heading("Proxy", 5),
++            metric("Name", self.proxy_alias.clone()),
++            metric("Address", self.proxy_address.clone()),
++            Line::default(),
++            heading("Miscellaneous", 6),
++            metric(
++                "Clients",
++                self.connected_client_count.map(|count| count.to_string()),
++            ),
++        ]
++    }
++}
++
++pub(super) fn metric(palette: &Palette, label: &str, value: Option<String>) -> Line<'static> {
++    Line::from(vec![
++        format!("{label}: ").dim(),
++        Span::styled(value.unwrap_or_default(), palette.intensity(16)),
++    ])
++}
++
++fn format_capacity_bytes(bytes: u64) -> String {
++    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
++    let mut value = bytes as f64;
++    let mut unit = 0;
++    while value >= 1024.0 && unit + 1 < UNITS.len() {
++        value /= 1024.0;
++        unit += 1;
++    }
++    format!("{value:.2}{}", UNITS[unit])
++}
++
++#[cfg(test)]
++#[path = "control_center_observations_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app/control_center_observations_tests.rs b/codex-rs/tui/src/app/control_center_observations_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_observations_tests.rs
+@@ -0,0 +1,209 @@
++use super::*;
++use itertools::Itertools;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn github_status_refreshes_independently_and_rejects_stale_results() -> crate::app::Result<()>
++{
++    use codex_app_server_protocol::GithubRelease;
++    use codex_app_server_protocol::GithubStatus;
++    use codex_app_server_protocol::JSONRPCMessage;
++    use futures::SinkExt;
++    use futures::StreamExt;
++    use tokio_tungstenite::tungstenite::Message;
++
++    let (mut app, mut events, _ops) = crate::app::tests::make_test_app_with_channels().await;
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++    let url = format!("ws://{}", listener.local_addr()?);
++    let home = app.config.codex_home.display().to_string();
++    let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel();
++    let (release_old, hold_old) = tokio::sync::oneshot::channel();
++    let server: tokio::task::JoinHandle<crate::app::Result<()>> = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await?;
++        let mut socket = tokio_tungstenite::accept_async(stream).await?;
++        let mut reads = 0;
++        let mut hold_old = Some(hold_old);
++        while let Some(Ok(Message::Text(text))) = socket.next().await {
++            let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
++                continue;
++            };
++            let response = match request.method.as_str() {
++                "initialize" => serde_json::json!({
++                    "id": request.id, "result": {"userAgent": "test", "codexHome": home}
++                }),
++                "github/read" => {
++                    assert!(request.params.is_none());
++                    reads += 1;
++                    read_tx.send(reads).unwrap();
++                    if reads == 4 {
++                        hold_old.take().unwrap().await?;
++                    }
++                    if reads == 2 {
++                        serde_json::json!({"id": request.id, "error": {
++                            "code": -32600, "message": "Status unavailable"
++                        }})
++                    } else {
++                        let status = match reads {
++                            1 | 4 => Some(GithubStatus {
++                                latest_release: Some(GithubRelease {
++                                    version: if reads == 1 { "0.163.0" } else { "stale" }.into(),
++                                    url: "https://github.com/openai/codex/releases/tag/rust-v0.163.0".into(),
++                                }),
++                                latest_prerelease: Some(GithubRelease {
++                                    version: "0.164.0-alpha.3".into(),
++                                    url: "https://github.com/openai/codex/releases/tag/rust-v0.164.0-alpha.3".into(),
++                                }),
++                                checked_at: 1_792_346_400,
++                                remaining: Some(4999),
++                            }),
++                            3 => None,
++                            5 => Some(GithubStatus {
++                                latest_release: None,
++                                latest_prerelease: None,
++                                checked_at: 1_792_346_400,
++                                remaining: Some(0),
++                            }),
++                            _ => panic!("unexpected status read {reads}"),
++                        };
++                        serde_json::json!({"id": request.id, "result": GithubReadResponse {
++                            configured: true, status
++                        }})
++                    }
++                }
++                method => panic!(
++                    "local status polling must not request network checks, Telegram, usage or response data: {method}"
++                ),
++            };
++            socket
++                .send(Message::Text(response.to_string().into()))
++                .await?;
++        }
++        assert_eq!(reads, 5);
++        Ok(())
++    });
++    let client = crate::connect_remote_app_server(crate::RemoteAppServerEndpoint::WebSocket {
++        websocket_url: url,
++        auth_token: None,
++    })
++    .await?;
++    let mut session = AppServerSession::new(
++        crate::backend_id::BackendId::new(),
++        client,
++        crate::app_server_session::ThreadParamsMode::Remote,
++    );
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let blank = app.control_center_details().iter().join("\n");
++    for label in ["Release", "Pre-release", "Last checked", "Remaining points"] {
++        assert!(
++            blank.lines().any(|line| line == format!("{label}: ")),
++            "{blank}"
++        );
++    }
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    let Some(Overlay::ControlCenter(view)) = &app.overlay else {
++        unreachable!()
++    };
++    let first_request = view.github_request.unwrap();
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.github_request == Some(first_request))
++    );
++    consume_github_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    let text = app.control_center_details().iter().join("\n");
++    assert!(
++        !text.contains("Telegram") && !text.contains("Sent messages"),
++        "{text}"
++    );
++    assert!(text.contains("Release: 0.163.0"), "{text}");
++    assert!(text.contains("Pre-release: 0.164.0-alpha.3"), "{text}");
++    assert!(text.contains("Remaining points: 4999"), "{text}");
++    assert!(
++        text.lines()
++            .any(|line| line.starts_with("Last checked: ") && line.len() > "Last checked: ".len())
++    );
++    for (before, after) in [
++        ("Storage free\n", "GitHub\n"),
++        ("GitHub\n", "Proxy\n"),
++        ("Proxy\n", "Miscellaneous\n"),
++    ] {
++        assert!(text.find(before).unwrap() < text.find(after).unwrap());
++    }
++    app.refresh_control_center_github(&session);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.github_request.is_none())
++    );
++
++    for _ in 0..2 {
++        let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++            unreachable!()
++        };
++        view.github_read_at = Some(Instant::now() - Duration::from_secs(2));
++        app.refresh_control_center_github(&session);
++        consume_github_result(&mut app, &mut tui, &mut session, &mut events).await?;
++        assert!(
++            matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.github.is_none())
++        );
++    }
++
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.github_read_at = Some(Instant::now() - Duration::from_secs(2));
++    view.screen = CenterScreen::Responses;
++    app.refresh_control_center_github(&session);
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(view.github_request.is_none());
++    view.screen = CenterScreen::Summary;
++    app.refresh_control_center_github(&session);
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while read_rx.recv().await.expect("status read") != 4 {}
++    })
++    .await?;
++    let Some(Overlay::ControlCenter(view)) = &app.overlay else {
++        unreachable!()
++    };
++    let stale_request = view.github_request.unwrap();
++    app.close_transcript_overlay(&mut tui);
++    app.open_control_center(&mut tui);
++    app.refresh_control_center_github(&session);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.github_request != Some(stale_request))
++    );
++    release_old.send(()).unwrap();
++    for _ in 0..2 {
++        consume_github_result(&mut app, &mut tui, &mut session, &mut events).await?;
++        assert!(
++            matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.github.as_ref().is_none_or(|status| status.latest_release.as_ref().is_none_or(|release| release.version != "stale")))
++        );
++    }
++    let text = app.control_center_details().iter().join("\n");
++    assert!(text.contains("Remaining points: 0"), "{text}");
++    assert!(!text.contains("4999"), "{text}");
++    assert!(text.lines().any(|line| line == "Release: "));
++    assert!(text.lines().any(|line| line == "Pre-release: "));
++    session.shutdown().await?;
++    server.await??;
++    Ok(())
++}
++
++async fn consume_github_result(
++    app: &mut App,
++    tui: &mut tui::Tui,
++    session: &mut AppServerSession,
++    events: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++) -> crate::app::Result<()> {
++    let event = tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            let event = events.recv().await.expect("GitHub status result");
++            if matches!(event, AppEvent::ControlCenterGithubLoaded { .. }) {
++                break event;
++            }
++        }
++    })
++    .await?;
++    app.handle_event(tui, session, event).await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2131,6 +2131,9 @@ impl App {
+             AppEvent::UsageLoaded { request_id, result } => {
+                 self.finish_usage(tui, request_id, result);
+             }
++            AppEvent::ControlCenterGithubLoaded { request_id, result } => {
++                self.finish_control_center_github(tui, request_id, result);
++            }
+             AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
+             AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
+                 if self.current_displayed_thread_id() == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -865,6 +865,11 @@ pub(crate) enum AppEvent {
+         result: Result<codex_app_server_protocol::UsageReadResponse, String>,
+     },
+ 
++    ControlCenterGithubLoaded {
++        request_id: Uuid,
++        result: Result<codex_app_server_protocol::GithubReadResponse, String>,
++    },
++
+     /// Restore response timing when the displayed thread changes.
+     RefreshResponseTiming {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -80,6 +80,9 @@ pub(crate) struct ControlCenter {
+     theme_revision: u64,
+     pub(crate) table_interaction: TableInteraction,
+     pub(crate) details: Vec<Line<'static>>,
++    pub(crate) github: Option<codex_app_server_protocol::GithubStatus>,
++    pub(crate) github_request: Option<Uuid>,
++    pub(crate) github_read_at: Option<Instant>,
+ }
+ 
+ impl ControlCenter {
+@@ -107,6 +110,9 @@ impl ControlCenter {
+             theme_revision: syntax_theme_revision(),
+             table_interaction: TableInteraction::new(mouse_scroll_speed, frames),
+             details: Vec::new(),
++            github: None,
++            github_request: None,
++            github_read_at: None,
+         };
+         overlay.refresh();
+         overlay

@@ -1,0 +1,422 @@
+consume-response-history-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: consume-response-history-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -224,6 +224,7 @@ mod config_persistence;
+ mod connector_mentions;
+ mod control_center_data;
+ mod control_center_observations;
++mod control_center_responses;
+ mod control_center_statistics;
+ mod daemon_control;
+ mod daemon_menu;
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -35,6 +35,7 @@ use codex_protocol::ThreadId;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
+ use std::time::Duration;
++use std::time::Instant;
+ 
+ impl App {
+     async fn reject_unsupported_app_server_request(
+@@ -187,6 +188,13 @@ impl App {
+         if let ServerNotification::ResponseAttemptUpdated(update) = notification {
+             let ended_generation =
+                 update.attempt.request_kind == "generation" && update.attempt.end_reason.is_some();
++            if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++                center
++                    .responses
++                    .history
++                    .update(update.attempt.clone(), Instant::now());
++                center.responses.request(None);
++            }
+             self.chat_widget.on_response_attempt_updated(update.attempt);
+             if ended_generation {
+                 self.refresh_control_center_timing(app_server_client, true);
+diff --git a/codex-rs/tui/src/app/control_center_responses.rs b/codex-rs/tui/src/app/control_center_responses.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_responses.rs
+@@ -0,0 +1,81 @@
++//! The control center consumes filtered response pages and live observations.
++
++use super::App;
++use crate::app_event::AppEvent;
++use crate::app_server_session::AppServerSession;
++use crate::pager_overlay::Overlay;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ResponseAttemptsReadParams;
++use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_models_manager::model_pricing::Prices;
++use std::time::Instant;
++use uuid::Uuid;
++
++impl App {
++    pub(super) fn read_response_attempts(
++        &self,
++        app_server: &AppServerSession,
++        request_id: Uuid,
++        params: ResponseAttemptsReadParams,
++    ) {
++        if !matches!(&self.overlay, Some(Overlay::ControlCenter(center)) if !center.is_done() && center.responses.history.accepts(request_id))
++        {
++            return;
++        }
++        let handle = app_server.request_handle();
++        let home = self.config.codex_home.clone();
++        let events = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let prices = tokio::task::spawn_blocking(move || {
++                codex_models_manager::model_pricing::read_prices(&home)
++            });
++            let result = handle
++                .request_typed(ClientRequest::ResponseAttemptsRead {
++                    request_id: RequestId::String(request_id.to_string()),
++                    params,
++                })
++                .await
++                .map_err(|error| error.to_string());
++            let prices = prices
++                .await
++                .map_err(|error| format!("pricing task failed: {error}"))
++                .and_then(|result| result.map_err(|error| error.to_string()));
++            events.send(AppEvent::ResponseAttemptsLoaded {
++                request_id,
++                result,
++                prices,
++            });
++        });
++    }
++
++    pub(super) fn finish_response_attempts(
++        &mut self,
++        request_id: Uuid,
++        result: Result<ResponseAttemptsReadResponse, String>,
++        prices: Result<Prices, String>,
++    ) {
++        if let Some(Overlay::ControlCenter(center)) = &mut self.overlay
++            && !center.is_done()
++        {
++            if center.responses.history.accepts(request_id)
++                && result
++                    .as_ref()
++                    .is_ok_and(|page| page.persistence_error.is_some())
++            {
++                // A summary started before this error cannot establish recovery.
++                center.timing_request = None;
++            }
++            let request =
++                center
++                    .responses
++                    .history
++                    .finish(request_id, result, prices, Instant::now());
++            center.responses.request(request);
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "control_center_responses_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app/control_center_responses_tests.rs b/codex-rs/tui/src/app/control_center_responses_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_responses_tests.rs
+@@ -0,0 +1,239 @@
++use super::*;
++use crate::pager_overlay::CenterScreen;
++use crate::response_timing::tests::attempt;
++use crate::response_timing::tests::page;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn late_pages_cannot_replace_another_overlay_or_reopen_a_closed_center() -> anyhow::Result<()>
++{
++    let (mut app, mut events, _) = crate::app::tests::make_test_app_with_channels().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let request_id = loop {
++        if let AppEvent::ReadResponseAttempts { request_id, .. } = events.try_recv()? {
++            break request_id;
++        }
++    };
++    app.finish_response_attempts(Uuid::new_v4(), Err("stale".into()), Ok(Prices::new()));
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(center)) if center.responses.history.accepts(request_id))
++    );
++    app.overlay = Some(Overlay::new_static_with_lines(
++        vec!["other".into()],
++        "Other".into(),
++        app.keymap.pager.clone(),
++    ));
++    app.finish_response_attempts(request_id, Ok(page(Vec::new())), Ok(Prices::new()));
++    assert!(matches!(app.overlay, Some(Overlay::Static(_))));
++    app.overlay = None;
++    app.finish_response_attempts(request_id, Err("late".into()), Ok(Prices::new()));
++    assert!(app.overlay.is_none());
++    Ok(())
++}
++
++#[tokio::test]
++async fn response_page_errors_require_a_fresh_successful_timing_observation() -> anyhow::Result<()>
++{
++    let (mut app, mut events, _) = crate::app::tests::make_test_app_with_channels().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let page_request = loop {
++        if let AppEvent::ReadResponseAttempts { request_id, .. } = events.try_recv()? {
++            break request_id;
++        }
++    };
++    let old_timing_request = Uuid::new_v4();
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        unreachable!()
++    };
++    center.screen = CenterScreen::Responses;
++    center.timing_request = Some(old_timing_request);
++    let mut failed_page = page(Vec::new());
++    failed_page.persistence_error = Some("database is locked".into());
++    app.finish_response_attempts(Uuid::new_v4(), Ok(failed_page.clone()), Ok(Prices::new()));
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(center)) if center.timing_request == Some(old_timing_request))
++    );
++    app.finish_response_attempts(page_request, Ok(failed_page), Ok(Prices::new()));
++    let healthy = codex_app_server_protocol::ResponseTimingReadResponse {
++        models: Vec::new(),
++        successful_attempts: 0,
++        total_attempts: 0,
++        persistence_error: None,
++    };
++    app.finish_control_center_timing(&mut tui, old_timing_request, Ok(healthy.clone()));
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(center.timing_request.is_none());
++    assert!(center.timing.is_none());
++    assert_eq!(
++        center.responses.history.persistence_error.as_deref(),
++        Some("database is locked")
++    );
++    let failed_timing_request = Uuid::new_v4();
++    center.timing_request = Some(failed_timing_request);
++    app.finish_control_center_timing(&mut tui, failed_timing_request, Err("disconnected".into()));
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert_eq!(
++        center.responses.history.persistence_error.as_deref(),
++        Some("database is locked")
++    );
++    let fresh_timing_request = Uuid::new_v4();
++    center.timing_request = Some(fresh_timing_request);
++    app.finish_control_center_timing(&mut tui, fresh_timing_request, Ok(healthy));
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(center)) if center.responses.history.persistence_error.is_none())
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn native_page_read_and_global_notifications_reach_responses_while_usage_is_selected()
++-> crate::app::Result<()> {
++    use codex_app_server_client::AppServerEvent;
++    use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
++    use codex_app_server_protocol::ServerNotification;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++    let (mut app, mut events, mut ops) = crate::app::tests::make_test_app_with_channels().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let mut row = attempt(7, Some(ResponseAttemptEnd::Completed));
++    row.response_id = Some("resp_recorded".into());
++    app.active_thread_id = row.thread_id;
++    row.thread_id = None;
++    app.open_control_center(&mut tui);
++    tokio::time::timeout(std::time::Duration::from_secs(10), async {
++        loop {
++            let event = events.recv().await.expect("app event channel");
++            if let AppEvent::ReadResponseAttempts { params, .. } = &event {
++                assert_eq!(params.thread_id, None);
++            }
++            let loaded = matches!(event, AppEvent::ResponseAttemptsLoaded { .. });
++            app.handle_event(&mut tui, &mut server, event).await?;
++            if loaded {
++                break;
++            }
++        }
++        Ok::<_, color_eyre::Report>(())
++    })
++    .await
++    .map_err(color_eyre::Report::msg)??;
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(center)) if center.responses.history.count() == 0)
++    );
++    for screen in [
++        CenterScreen::Summary,
++        CenterScreen::Usage(crate::usage::UsageRange::Daily),
++        CenterScreen::Quotas,
++        CenterScreen::Responses,
++    ] {
++        if let Some(Overlay::ControlCenter(center)) = &mut app.overlay {
++            center.screen = screen;
++        }
++        row.revision += 1;
++        app.handle_backend_event(
++            &server,
++            crate::app_server_session::AppServerSessionEvent {
++                backend_id: server.backend_id(),
++                event: AppServerEvent::ServerNotification(Box::new(
++                    ServerNotification::ResponseAttemptUpdated(
++                        ResponseAttemptUpdatedNotification {
++                            thread_id: None,
++                            attempt: row.clone(),
++                        },
++                    ),
++                )),
++            },
++        )
++        .await;
++        let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++            panic!("center")
++        };
++        assert_eq!(center.responses.history.count(), 1);
++        assert_eq!(center.responses.history.rows().next().unwrap().row, row);
++        assert!(!center.responses.history.is_loading());
++        assert!(
++            std::iter::from_fn(|| events.try_recv().ok())
++                .all(|event| !matches!(event, AppEvent::ReadResponseAttempts { .. }))
++        );
++    }
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        panic!("center")
++    };
++    let area = ratatui::layout::Rect::new(0, 0, 600, 20);
++    let mut buffer = ratatui::buffer::Buffer::empty(area);
++    center
++        .responses
++        .render(area, &mut buffer, &mut center.table_interaction);
++    let line = |y| {
++        (0..area.width)
++            .map(|x| buffer[(x, y)].symbol())
++            .collect::<String>()
++    };
++    assert!(line(2).contains("Attempt ID"));
++    assert!(line(3).contains("Input"));
++    assert!(line(5).contains(&row.attempt_id.to_string()));
++    assert!(!line(5).contains("resp_recorded"));
++    assert!(ops.try_recv().is_err());
++    server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn response_filters_are_transient_and_never_write_configuration() -> anyhow::Result<()> {
++    use codex_protocol::response_metrics::ResponseAttemptStatus;
++    use crossterm::event::KeyCode;
++
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let config = app.config.codex_home.join("presentation-config.toml");
++    std::fs::write(&config, "# unchanged configuration\n")?;
++    app.local_settings.user_config_path = config.clone();
++    app.open_control_center(&mut tui);
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        panic!("center")
++    };
++    center.responses.history.models.insert("gpt-5.4".into());
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(&mut tui, crate::tui::TuiEvent::Key(KeyCode::Tab.into()))?;
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(&mut tui, crate::tui::TuiEvent::Key(KeyCode::Right.into()))?;
++    for model in [Some("gpt-5.4"), None] {
++        app.overlay
++            .as_mut()
++            .unwrap()
++            .handle_event(&mut tui, crate::tui::TuiEvent::Key(KeyCode::Left.into()))?;
++        let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++            panic!("center")
++        };
++        assert_eq!(center.responses.history.model(), model);
++        assert_eq!(
++            center.responses.history.status(),
++            Some(ResponseAttemptStatus::Working)
++        );
++        assert_eq!(
++            std::fs::read_to_string(&config)?,
++            "# unchanged configuration\n"
++        );
++    }
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(&mut tui, crate::tui::TuiEvent::Key(KeyCode::Left.into()))?;
++    app.overlay = None;
++    app.open_control_center(&mut tui);
++    let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++        panic!("center")
++    };
++    assert_eq!(center.responses.history.model(), None);
++    assert_eq!(center.responses.history.status(), None);
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2137,6 +2137,8 @@ impl App {
+             AppEvent::ControlCenterTimingLoaded { request_id, result } => {
+                 self.finish_control_center_timing(tui, request_id, result);
+             }
++            AppEvent::ReadResponseAttempts { request_id, params } => self.read_response_attempts(app_server, request_id, params),
++            AppEvent::ResponseAttemptsLoaded { request_id, result, prices } => self.finish_response_attempts(request_id, result, prices),
+             AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
+             AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
+                 if self.current_displayed_thread_id() == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -875,6 +875,15 @@ pub(crate) enum AppEvent {
+         result: Result<codex_app_server_protocol::ResponseTimingReadResponse, String>,
+     },
+ 
++    ReadResponseAttempts {
++        request_id: Uuid,
++        params: codex_app_server_protocol::ResponseAttemptsReadParams,
++    },
++    ResponseAttemptsLoaded {
++        request_id: Uuid,
++        result: Result<codex_app_server_protocol::ResponseAttemptsReadResponse, String>,
++        prices: Result<codex_models_manager::model_pricing::Prices, String>,
++    },
+     /// Restore response timing when the displayed thread changes.
+     RefreshResponseTiming {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -159,7 +159,7 @@ impl ControlCenter {
+         self.usage_refresh_elapsed = None;
+     }
+ 
+-    pub(super) fn is_done(&self) -> bool {
++    pub(crate) fn is_done(&self) -> bool {
+         self.is_done
+     }
+ 

@@ -1,0 +1,360 @@
+render-response-timing-in-status-header
+
+Lane: cross
+
+Unit: present-response-progress-with-live-timing
+
+ChildPatch: render-response-timing-in-status-header
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -576,6 +576,7 @@ pub(crate) struct ChatWidget {
+     token_usage_pending: bool,
+     // Status and polling use account usage reads; response streams may identify meters differently.
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
++    response_timing: crate::response_timing::ResponseTiming,
+     responses_stream_connection_status:
+         Option<codex_app_server_protocol::ResponsesStreamConnectionStatusNotification>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -150,6 +150,7 @@ impl ChatWidget {
+             token_info: None,
+             token_usage_pending: false,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
++            response_timing: Default::default(),
+             responses_stream_connection_status: None,
+             refreshing_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
+diff --git a/codex-rs/tui/src/chatwidget/tests/permissions.rs b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+--- a/codex-rs/tui/src/chatwidget/tests/permissions.rs
++++ b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+@@ -1139,7 +1139,7 @@ async fn windows_sandbox_setup_starts_a_fresh_status_clock() {
+     chat.show_windows_sandbox_setup_status();
+     let setup = render_bottom_popup(&chat, /*width*/ 80);
+     assert!(setup.contains("Setting up sandbox"));
+-    assert!(setup.contains("(0s"));
++    assert!(setup.lines().any(|line| line.trim_end().ends_with(" · 0s")));
+     assert_chatwidget_snapshot!(
+         "windows_sandbox_setup_fresh_clock",
+         setup.replace(&chat.config.cwd.display().to_string(), "[CWD]")
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -60,6 +60,7 @@ pub(crate) struct StatusIndicatorWidget {
+     details_max_lines: usize,
+     /// Optional suffix rendered after the elapsed/interrupt segment.
+     inline_message: Option<String>,
++    response_progress: Option<crate::response_timing::LiveResponseProgress>,
+     /// Hook activity may move below the status row when it cannot fit in full.
+     hook_status_message: Option<String>,
+     show_interrupt_hint: bool,
+@@ -101,6 +102,7 @@ impl StatusIndicatorWidget {
+             details: None,
+             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
+             inline_message: None,
++            response_progress: None,
+             hook_status_message: None,
+             show_interrupt_hint: true,
+             interrupt_binding: Some(key_hint::plain(KeyCode::Esc).into()),
+@@ -120,7 +122,7 @@ impl StatusIndicatorWidget {
+         self.effects = tui.effects;
+     }
+ 
+-    /// Update the animated header label (left of the brackets).
++    /// Update the animated header label.
+     pub(crate) fn update_header(&mut self, header: String) {
+         if self.header != header {
+             self.header = header;
+@@ -166,6 +168,13 @@ impl StatusIndicatorWidget {
+         &self.header
+     }
+ 
++    pub(crate) fn set_response_progress(
++        &mut self,
++        progress: Option<crate::response_timing::LiveResponseProgress>,
++    ) {
++        self.response_progress = progress;
++    }
++
+     #[cfg(test)]
+     pub(crate) fn details(&self) -> Option<&str> {
+         self.details.as_deref()
+@@ -227,10 +236,7 @@ impl StatusIndicator<'_> {
+     fn lines(&self, width: u16) -> Vec<Line<'static>> {
+         let row = self.row;
+         let now = Instant::now();
+-        let elapsed_duration = self.timer.display_started_at.map_or_else(
+-            || self.timer.elapsed_at(now),
+-            |started_at| now.saturating_duration_since(started_at),
+-        );
++        let elapsed_duration = self.timer.display_elapsed_at(now);
+         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
+         let progress =
+             MotionMode::from_animations_enabled(row.animations_enabled && row.effects.progress);
+@@ -247,22 +253,30 @@ impl StatusIndicator<'_> {
+             spans.push(" ".into());
+         }
+         spans.extend(summary_shimmer(
+-            &row.header,
++            if row.response_progress.is_some() {
++                "Working"
++            } else {
++                &row.header
++            },
+             now.saturating_duration_since(row.header_started_at),
+             shimmer,
+         ));
+-        if !spans.is_empty() {
+-            spans.push(" ".into());
+-        }
+         if row.show_interrupt_hint
+             && let Some(interrupt_binding) = row.interrupt_binding
+         {
+-            spans.push(format!("({pretty_elapsed} • ").dim());
++            spans.push(" · ".dim());
+             spans.extend(interrupt_binding.spans());
+-            spans.push(" to interrupt)".dim());
+-        } else {
+-            spans.push(format!("({pretty_elapsed})").dim());
++            spans.push(" to interrupt".dim());
+         }
++        spans.push(" · ".dim());
++        if let Some(progress) = &row.response_progress {
++            let color = crate::terminal_palette::rgb_color((128, 128, 128));
++            spans.push(format!("{:.1}s", progress.elapsed_ms(now) as f64 / 1000.0).fg(color));
++            spans.push(" · ".dim());
++            spans.push(progress.receive_label().fg(color));
++            spans.push(" · ".dim());
++        }
++        spans.push(pretty_elapsed.cyan().bold());
+         if let Some(message) = &row.inline_message {
+             // Keep optional context after elapsed/interrupt text so that core
+             // interrupt affordances stay in a fixed visual location.
+@@ -290,7 +304,9 @@ impl StatusIndicator<'_> {
+             usize::from(width),
+         ));
+         lines.extend(hook_overflow);
+-        lines.extend(row.wrapped_details_lines(width));
++        if row.response_progress.is_none() {
++            lines.extend(row.wrapped_details_lines(width));
++        }
+         lines
+     }
+ }
+@@ -304,7 +320,10 @@ impl Renderable for StatusIndicator<'_> {
+         if area.is_empty() {
+             return;
+         }
+-        if self.row.animations_enabled || self.timer.display_started_at.is_some() {
++        if self.row.animations_enabled
++            || self.timer.has_wall_clock()
++            || self.row.response_progress.is_some()
++        {
+             let interval_ms = if self.row.animations_enabled
+                 && (self.row.effects.progress || self.row.effects.shimmer)
+             {
+@@ -454,7 +473,11 @@ mod tests {
+             .map(ratatui::buffer::Cell::symbol)
+             .collect::<String>();
+ 
+-        assert!(line.starts_with("Working (0s • esc to interrupt)"));
++        assert!(line.starts_with("Working · esc to interrupt · 0s"));
++        let elapsed_column = display_width(&line[..line.find("0s").unwrap()]) as u16;
++        let elapsed = &terminal.backend().buffer()[(elapsed_column, 0)];
++        assert_eq!(elapsed.fg, ratatui::style::Color::Cyan);
++        assert!(elapsed.modifier.contains(ratatui::style::Modifier::BOLD));
+     }
+ 
+     #[test]
+@@ -478,6 +501,77 @@ mod tests {
+         insta::assert_snapshot!(terminal.backend());
+     }
+ 
++    #[test]
++    fn response_progress_preserves_turn_clock_and_hook_controls() {
++        let (tx, _rx) = unbounded_channel();
++        let mut row = StatusIndicatorWidget::new(
++            AppEventSender::new(tx),
++            FrameRequester::test_dummy(),
++            false,
++            Default::default(),
++        );
++        let mut timer = StatusTimer::default();
++        timer.pause_at(timer.last_resume_at);
++        timer.reset(Duration::from_secs(42));
++        row.update_header("Thinking".into());
++        row.update_details(
++            Some("Earlier reasoning".into()),
++            StatusDetailsCapitalization::Preserve,
++            3,
++        );
++        row.update_inline_message(Some("1 background terminal running".into()));
++        row.update_hook_status_message(Some("checking policy".into()));
++        let mut response = crate::response_timing::tests::attempt(1, None);
++        response.received_payload_bytes = 32768;
++        let observed =
++            crate::response_timing::ObservedResponse::new(response, true, Instant::now());
++        row.set_response_progress(Some(observed.progress()));
++        let view = StatusIndicator {
++            row: &row,
++            timer: &timer,
++        };
++        let lines = view.lines(160);
++        assert_eq!(lines.len(), 1);
++        let text = lines[0].to_string();
++        assert!(text.starts_with("Working · esc to interrupt · "));
++        assert!(
++            text.ends_with(
++                "Received 32.0KiB · 42s · 1 background terminal running · checking policy"
++            )
++        );
++        for label in ["Received 32.0KiB", "42s"] {
++            let span = lines[0]
++                .spans
++                .iter()
++                .find(|span| span.content == label)
++                .unwrap();
++            assert_eq!(
++                span.style.fg,
++                Some(if label == "42s" {
++                    ratatui::style::Color::Cyan
++                } else {
++                    crate::terminal_palette::rgb_color((128, 128, 128))
++                })
++            );
++        }
++        let narrow = view.lines(55);
++        assert_eq!(narrow.len(), 2);
++        assert!(narrow[1].to_string().contains("checking policy"));
++        row.set_response_progress(None);
++        let ended = StatusIndicator {
++            row: &row,
++            timer: &timer,
++        }
++        .lines(160);
++        assert_eq!(ended.len(), 2);
++        assert!(
++            ended[0]
++                .to_string()
++                .starts_with("Thinking · esc to interrupt · 42s")
++        );
++        assert!(ended[1].to_string().contains("Earlier reasoning"));
++    }
++
+     #[test]
+     fn hook_status_reflows_without_displacing_controls_or_details() {
+         let (tx, _rx) = unbounded_channel::<AppEvent>();
+@@ -504,7 +598,7 @@ mod tests {
+             ),
+         ] {
+             w.update_inline_message(background.map(str::to_string));
+-            let mut expected = "Working (0s • esc to interrupt)".to_string();
++            let mut expected = "Working · esc to interrupt · 0s".to_string();
+             if let Some(background) = background {
+                 expected.push_str(&format!(" · {background}"));
+             }
+diff --git a/codex-rs/tui/src/status_indicator_widget/timer.rs b/codex-rs/tui/src/status_indicator_widget/timer.rs
+--- a/codex-rs/tui/src/status_indicator_widget/timer.rs
++++ b/codex-rs/tui/src/status_indicator_widget/timer.rs
+@@ -1,11 +1,13 @@
+-//! Pause-aware status time owned independently of the optional status row.
+-//! A phase can override the displayed clock without changing turn accounting.
++//! Status clocks owned independently of the optional status row.
++//! Active turns include navigation and approval waits; local activities retain
++//! their pause-aware accounting and optional phase clock.
+ 
+ use std::time::Duration;
+ use std::time::Instant;
+ 
+ #[derive(Debug)]
+ pub(crate) struct StatusTimer {
++    pub(super) turn_started_at: Option<Instant>,
+     /// Optional wall-clock origin for the displayed phase, without resetting turn accounting.
+     pub(crate) display_started_at: Option<Instant>,
+     pub(super) elapsed_running: Duration,
+@@ -16,6 +18,7 @@ pub(crate) struct StatusTimer {
+ impl Default for StatusTimer {
+     fn default() -> Self {
+         Self {
++            turn_started_at: None,
+             display_started_at: None,
+             elapsed_running: Duration::ZERO,
+             last_resume_at: Instant::now(),
+@@ -25,6 +28,30 @@ impl Default for StatusTimer {
+ }
+ 
+ impl StatusTimer {
++    pub(crate) fn set_turn_started_at(&mut self, timestamp: Option<i64>) {
++        let now = Instant::now();
++        self.turn_started_at = timestamp.and_then(|timestamp| {
++            let elapsed = chrono::Utc::now()
++                .timestamp()
++                .saturating_sub(timestamp)
++                .max(0);
++            now.checked_sub(Duration::from_secs(elapsed as u64))
++        });
++    }
++
++    pub(crate) fn display_elapsed_at(&self, now: Instant) -> Duration {
++        self.turn_started_at
++            .or(self.display_started_at)
++            .map_or_else(
++                || self.elapsed_at(now),
++                |start| now.saturating_duration_since(start),
++            )
++    }
++
++    pub(crate) fn has_wall_clock(&self) -> bool {
++        self.turn_started_at.is_some() || self.display_started_at.is_some()
++    }
++
+     pub(crate) fn reset(&mut self, elapsed: Duration) {
+         self.elapsed_running = elapsed;
+         self.last_resume_at = Instant::now();
+@@ -47,6 +74,9 @@ impl StatusTimer {
+     }
+ 
+     pub(crate) fn elapsed_at(&self, now: Instant) -> Duration {
++        if let Some(started_at) = self.turn_started_at {
++            return now.saturating_duration_since(started_at);
++        }
+         self.elapsed_running
+             + if self.is_paused {
+                 Duration::ZERO
+diff --git a/codex-rs/tui/src/status_indicator_widget/timer_tests.rs b/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
+--- a/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
++++ b/codex-rs/tui/src/status_indicator_widget/timer_tests.rs
+@@ -1,6 +1,25 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
+ 
++#[test]
++fn active_turn_includes_waits_and_ignores_local_phase_restarts() {
++    let start = Instant::now();
++    let mut timer = StatusTimer {
++        turn_started_at: Some(start),
++        last_resume_at: start,
++        ..StatusTimer::default()
++    };
++    timer.pause_at(start + Duration::from_secs(5));
++    timer.display_started_at = Some(start + Duration::from_secs(8));
++    let now = start + Duration::from_secs(12);
++    assert_eq!(timer.elapsed_at(now), Duration::from_secs(12));
++    assert_eq!(timer.display_elapsed_at(now), Duration::from_secs(12));
++    assert!(timer.has_wall_clock());
++    timer.set_turn_started_at(None);
++    assert_eq!(timer.elapsed_at(now), Duration::from_secs(5));
++    assert_eq!(timer.display_elapsed_at(now), Duration::from_secs(4));
++}
++
+ #[test]
+ fn pauses_and_resumes_without_counting_wait_time() {
+     let baseline = Instant::now();

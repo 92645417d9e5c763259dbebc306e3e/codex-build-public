@@ -1,0 +1,994 @@
+commit-response-output-after-success
+
+Lane: cross
+
+Unit: commit-model-output-after-successful-response
+
+ChildPatch: commit-response-output-after-success
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Publish complete successful model responses without exposing failed or interrupted buffered output.
+
+Requires: Unit:cross/track-model-responses-by-attempt, Unit:mixed/recover-websocket-requests-without-http-fallback
+
+Provides: Buffer native model-output events on Plus, Pro and ProLite ChatGPT WebSocket requests until the original successful terminal. Preserve immediate controls and native event order, discard failed and interrupted output, retain reported interruption usage as spending without replacing installed context or admitting incremental continuation, and activate the existing 300-second content-progress deadline independently of observation. Preserve usage at sampling, foreground compaction and memory consumers.
+
+Boundary: Response recording and receipt progress remain with track-model-responses-by-attempt; WebSocket RTT remains independent. Preserve native authentication, retries, input steering, hard cancellation, interruption acknowledgement validation and completion retention while draining. Ordinary incomplete responses retain their original errors and usage payloads. Background compaction retains its native HTTP and budget-only accounting. HTTP, API-key and other non-admitted paths retain streaming behavior. Do not add storage, pricing, presentation controls or observer-dependent output admission.
+
+Verification: Complete-response API tests cover successful commit, transport and protocol failure, incomplete usage, interruption and content deadlines with and without observation. Account-scope, prewarm ordering, interrupted-continuation and real input-steering tests verify output admission, spending-only context accounting and completion winning an interrupt race. Foreground compaction tests preserve reported interruption spending without installing discarded output, and native background tests retain accounting isolation. HTTP absence and native cancellation tests preserve streaming and completion draining; retry tests retain progress-timeout retries without the connection-cycle wait. Real Plus WebSocket core tests flush and parse rollout JSONL after completed and incomplete responses with and without a terminal response ID, verifying exactly-once reported spending, unchanged installed context, and absence of discarded output from UI events and conversation storage.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/codex-api/src/atomic_response.rs b/codex-rs/codex-api/src/atomic_response.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/atomic_response.rs
+@@ -0,0 +1,41 @@
++//! Withhold native model-output events until the original successful terminal.
++
++use crate::common::ResponseEvent;
++
++#[derive(Default)]
++pub(crate) struct AtomicResponse {
++    events: Vec<ResponseEvent>,
++}
++
++impl AtomicResponse {
++    /// Controls remain immediate; model events retain their native order and payloads.
++    pub(crate) fn observe(&mut self, event: ResponseEvent) -> Option<ResponseEvent> {
++        match event {
++            ResponseEvent::OutputItemAdded(_)
++            | ResponseEvent::OutputItemDone(_)
++            | ResponseEvent::OutputTextDelta(_)
++            | ResponseEvent::ToolCallInputDelta { .. }
++            | ResponseEvent::ReasoningSummaryDelta { .. }
++            | ResponseEvent::ReasoningSummaryDone { .. }
++            | ResponseEvent::ReasoningContentDelta { .. }
++            | ResponseEvent::ReasoningSummaryPartAdded { .. } => {
++                self.events.push(event);
++                None
++            }
++            ResponseEvent::Created { .. }
++            | ResponseEvent::Completed { .. }
++            | ResponseEvent::Interrupted { .. }
++            | ResponseEvent::SafetyBuffering(_)
++            | ResponseEvent::ServerModel(_)
++            | ResponseEvent::ModelVerifications(_)
++            | ResponseEvent::TurnModerationMetadata(_)
++            | ResponseEvent::ServerReasoningIncluded(_)
++            | ResponseEvent::RateLimits(_)
++            | ResponseEvent::ModelsEtag(_) => Some(event),
++        }
++    }
++
++    pub(crate) fn commit(self) -> Vec<ResponseEvent> {
++        self.events
++    }
++}
+diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -105,6 +105,13 @@ pub enum ResponseEvent {
+         /// so we rely on fallback logic when this is `None`.
+         end_turn: Option<bool>,
+     },
++    /// An intentional interruption whose buffered output was discarded.
++    /// It ends sampling without admitting incremental server continuation.
++    Interrupted {
++        response_id: String,
++        token_usage: Option<TokenUsage>,
++        usage_metadata: Option<ResponseUsageMetadata>,
++    },
+     OutputTextDelta(String),
+     ToolCallInputDelta {
+         item_id: String,
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -1,3 +1,4 @@
++use crate::atomic_response::AtomicResponse;
+ use crate::auth::SharedAuthProvider;
+ use crate::common::ResponseEvent;
+ use crate::common::ResponseInterrupt;
+@@ -358,6 +359,11 @@ const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+ const OPENAI_MODEL_HEADER: &str = "openai-model";
+ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(5);
+ 
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum ResponseOutputMode {
++    Streaming,
++    Complete,
++}
+ const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
+ const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
+ const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
+@@ -428,17 +434,54 @@ impl ResponsesWebsocketConnection {
+             .is_none_or(|stream| stream.pump_task.is_finished())
+     }
+ 
++    pub async fn stream_request(
++        &self,
++        request: ResponsesWsRequest<'_>,
++        connection_reused: bool,
++        turn_state: Option<Arc<OnceLock<String>>>,
++        observer: Option<Arc<dyn ResponseObserver>>,
++    ) -> Result<ResponseStream, ApiError> {
++        self.stream_request_with_output(
++            request,
++            connection_reused,
++            turn_state,
++            ResponseOutputMode::Streaming,
++            observer,
++        )
++        .await
++    }
++
++    /// Publishes model output only after the original successful terminal.
++    /// Observation is optional and does not control output or progress tracking.
++    pub async fn stream_complete_response(
++        &self,
++        request: ResponsesWsRequest<'_>,
++        connection_reused: bool,
++        turn_state: Option<Arc<OnceLock<String>>>,
++        observer: Option<Arc<dyn ResponseObserver>>,
++    ) -> Result<ResponseStream, ApiError> {
++        self.stream_request_with_output(
++            request,
++            connection_reused,
++            turn_state,
++            ResponseOutputMode::Complete,
++            observer,
++        )
++        .await
++    }
++
+     #[instrument(
+         name = "responses_websocket.stream_request",
+         level = "info",
+         skip_all,
+         fields(transport = "responses_websocket", api.path = "/responses")
+     )]
+-    pub async fn stream_request(
++    async fn stream_request_with_output(
+         &self,
+         request: ResponsesWsRequest<'_>,
+         connection_reused: bool,
+         turn_state: Option<Arc<OnceLock<String>>>,
++        output_mode: ResponseOutputMode,
+         observer: Option<Arc<dyn ResponseObserver>>,
+     ) -> Result<ResponseStream, ApiError> {
+         let (tx_event, rx_event) =
+@@ -555,6 +598,7 @@ impl ResponsesWebsocketConnection {
+                             telemetry,
+                             turn_state.as_deref(),
+                             &timing_log_context,
++                            output_mode,
+                             observer.clone(),
+                             interrupt.clone(),
+                             &mut completion,
+@@ -938,12 +982,15 @@ async fn run_websocket_response_stream(
+     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     turn_state: Option<&OnceLock<String>>,
+     timing_log_context: &ResponsesWebsocketTimingLogContext,
++    output_mode: ResponseOutputMode,
+     observer: Option<Arc<dyn ResponseObserver>>,
+     interrupt: impl Future<Output = ResponseInterrupt> + Clone + Unpin,
+     completion: &mut Option<ResponseEvent>,
+ ) -> Result<(), ApiError> {
+     let mut last_server_model: Option<String> = None;
+     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
++    let mut pending_output =
++        (output_mode == ResponseOutputMode::Complete).then(AtomicResponse::default);
+     if matches!(
+         interrupt.clone().now_or_never(),
+         Some(ResponseInterrupt::Cancel { .. })
+@@ -957,7 +1004,7 @@ async fn run_websocket_response_stream(
+         idle_timeout,
+         telemetry.as_ref(),
+         timing_log_context.connection_reused,
+-        false,
++        output_mode == ResponseOutputMode::Complete,
+         observer.clone(),
+     )
+     .await?;
+@@ -971,8 +1018,12 @@ async fn run_websocket_response_stream(
+         let poll_start = Instant::now();
+         let response = tokio::select! {
+             response = async {
+-                tokio::time::timeout(idle_timeout, ws_stream.next()).await
+-                    .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))?
++                if output_mode == ResponseOutputMode::Complete {
++                    ws_stream.next().await
++                } else {
++                    tokio::time::timeout(idle_timeout, ws_stream.next()).await
++                        .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))?
++                }
+             } => response,
+             request = &mut interrupt_request, if response_id.is_some() => {
+                 interruption = Some(request);
+@@ -1096,11 +1147,29 @@ async fn run_websocket_response_stream(
+                 let original_completed = event.kind() == "response.completed";
+                 // Preserve terminal usage before any accompanying notification can block.
+                 let event = match process_responses_event(event) {
+-                    Ok(Some(event @ ResponseEvent::Completed { .. })) => {
++                    Ok(Some(ResponseEvent::Completed {
++                        response_id,
++                        token_usage,
++                        usage_metadata,
++                        end_turn,
++                    })) => {
+                         if original_completed && let Some(observer) = &observer {
+                             observer.ended(ResponseAttemptEnd::Completed, Instant::now());
+                         }
+-                        *completion = Some(event);
++                        *completion = Some(if pending_output.is_some() && !original_completed {
++                            ResponseEvent::Interrupted {
++                                response_id,
++                                token_usage,
++                                usage_metadata,
++                            }
++                        } else {
++                            ResponseEvent::Completed {
++                                response_id,
++                                token_usage,
++                                usage_metadata,
++                                end_turn,
++                            }
++                        });
+                         Ok(None)
+                     }
+                     event => event,
+@@ -1148,6 +1217,14 @@ async fn run_websocket_response_stream(
+                         if let ResponseEvent::Created { response_id: id } = &event {
+                             response_id.clone_from(id);
+                         }
++                        let event = if let Some(buffer) = &mut pending_output {
++                            let Some(control) = buffer.observe(event) else {
++                                continue;
++                            };
++                            control
++                        } else {
++                            event
++                        };
+                         let _ = tx_event.send(Ok(event)).await;
+                     }
+                     Ok(None) => {}
+@@ -1165,6 +1242,15 @@ async fn run_websocket_response_stream(
+                     ) {
+                         break;
+                     }
++                    if matches!(completion, Some(ResponseEvent::Completed { .. }))
++                        && let Some(buffer) = pending_output.take()
++                    {
++                        for buffered in buffer.commit() {
++                            tx_event.send(Ok(buffered)).await.map_err(|_| {
++                                ApiError::Stream("response event consumer dropped".into())
++                            })?;
++                        }
++                    }
+                     // Ordinary responses deliver completion before releasing the socket.
+                     // Preserve it if cancellation wins while delivery is backpressured.
+                     let permit = tx_event.reserve().await;
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod api_bridge;
++mod atomic_response;
+ pub(crate) mod auth;
+ pub(crate) mod common;
+ pub(crate) mod endpoint;
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -901,6 +901,26 @@ async fn drain_to_completed(
+                     output,
+                 });
+             }
++            Ok(ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                usage_metadata,
++            }) => {
++                let result = sess
++                    .record_interrupted_response_usage(
++                        turn_context,
++                        &turn_context.initial_settings,
++                        &response_id,
++                        token_usage.as_ref(),
++                        usage_metadata.as_ref(),
++                    )
++                    .await;
++                sess.send_token_count_event(turn_context).await;
++                result?;
++                return Err(CodexErr::Stream(
++                    "stream closed before response.completed".into(),
++                ));
++            }
+             Ok(_) => continue,
+             Err(e) => {
+                 if let CodexErrorDetails::ResponseIncomplete(incomplete) = e.details() {
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -451,6 +451,33 @@ async fn collect_compaction_output(
+                 completed_token_usage = token_usage;
+                 break;
+             }
++            ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                usage_metadata,
++            } => {
++                match request_kind {
++                    CompactionRequestKind::Background(_) => {
++                        if let Some(usage) = token_usage.as_ref() {
++                            sess.record_rollout_budget_usage(usage).await?;
++                        }
++                    }
++                    CompactionRequestKind::Foreground => {
++                        let result = sess
++                            .record_interrupted_response_usage(
++                                turn_context,
++                                &turn_context.initial_settings,
++                                &response_id,
++                                token_usage.as_ref(),
++                                usage_metadata.as_ref(),
++                            )
++                            .await;
++                        sess.send_token_count_event(turn_context).await;
++                        result?;
++                    }
++                }
++                break;
++            }
+             _ => {}
+         }
+     }
+@@ -1275,6 +1302,63 @@ mod tests {
+         assert!(rx.is_empty());
+     }
+ 
++    #[tokio::test]
++    async fn collect_interrupted_preserves_spending_without_installing_context() {
++        let (sess, turn_context, rx) =
++            crate::session::tests::make_session_and_context_with_rx().await;
++        let installed = TokenUsage {
++            input_tokens: 20,
++            output_tokens: 5,
++            total_tokens: 25,
++            ..Default::default()
++        };
++        sess.record_token_usage_info(
++            &turn_context,
++            &turn_context.initial_settings,
++            Some(&installed),
++            crate::session::TokenUsageContext::Sampling,
++        )
++        .await
++        .unwrap();
++        let stream = response_stream(vec![Ok(ResponseEvent::Interrupted {
++            response_id: "resp-interrupted".to_string(),
++            token_usage: Some(TokenUsage {
++                input_tokens: 100,
++                output_tokens: 20,
++                total_tokens: 120,
++                ..Default::default()
++            }),
++            usage_metadata: None,
++        })]);
++
++        let result = collect_compaction_output(
++            &sess,
++            &turn_context,
++            stream,
++            CompactionRequestKind::Foreground,
++        )
++        .await;
++
++        assert!(matches!(result, Err(ref err)
++            if matches!(err.details(), CodexErrorDetails::Stream(message)
++                if message == "remote compaction v2 stream closed before response.completed")));
++        let info = sess.token_usage_info().await.unwrap();
++        assert_eq!(info.total_token_usage.total_tokens, 145);
++        assert_eq!(info.last_token_usage, installed);
++        let event = rx.recv().await.unwrap();
++        let EventMsg::RawResponseCompleted(completed) = event.msg else {
++            panic!("expected reported response usage");
++        };
++        assert_eq!(completed.response_id, "resp-interrupted");
++        assert_eq!(completed.token_usage.unwrap().output_tokens, 20);
++        let event = rx.recv().await.unwrap();
++        let EventMsg::TokenCount(count) = event.msg else {
++            panic!("expected cumulative spending");
++        };
++        assert_eq!(count.info, Some(info));
++        assert!(rx.is_empty());
++    }
++
+     #[tokio::test]
+     async fn collect_compaction_output_accepts_additional_output_items() {
+         let compaction = ResponseItem::Compaction {
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -250,6 +250,7 @@ pub(crate) async fn handle_response_stream_error(
+         // In release builds, hide the first websocket retry notification to reduce noisy
+         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
+         let report_error = retry_count > 1
++            || matches!(err.details(), CodexErrorDetails::ResponseProgressTimeout)
+             || cfg!(debug_assertions)
+             || !sess.services.model_client.responses_websocket_enabled()
+             || client_session.personal_chatgpt_websocket_enabled();
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -130,6 +130,9 @@ async fn capacity_wait_emits_one_warning_and_remains_cancellable() {
+ 
+ #[test]
+ fn websocket_connection_cycle_requires_personal_account_after_five_retries() {
++    let stalled = CodexErr::new(CodexErrorDetails::ResponseProgressTimeout);
++    assert!(stalled.retry_delay(1).is_some());
++    assert!(!aligned_connection_cycle_eligible(5, 5, true, &stalled));
+     for disconnect in [
+         CodexErr::Stream("websocket closed".to_string()),
+         unexpected_service_unavailable(),
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -5150,6 +5150,26 @@ impl Session {
+             .await;
+     }
+ 
++    /// Discarded output contributes spending without changing installed context usage.
++    pub(crate) async fn record_interrupted_response_usage(
++        &self,
++        turn_context: &TurnContext,
++        settings: &ResolvedStepSettings,
++        response_id: &str,
++        usage: Option<&TokenUsage>,
++        usage_metadata: Option<&ResponseUsageMetadata>,
++    ) -> CodexResult<()> {
++        self.record_observed_response_completed(turn_context, response_id, usage, usage_metadata)
++            .await;
++        self.record_token_usage_info(
++            turn_context,
++            settings,
++            usage,
++            TokenUsageContext::SpendingOnly,
++        )
++        .await
++    }
++
+     pub(crate) async fn record_response_token_usage(
+         &self,
+         turn_context: &TurnContext,
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2823,6 +2823,7 @@ async fn try_run_sampling_request(
+         };
+ 
+         if cancellation_token.is_cancelled()
++            && !matches!(event.as_ref(), Some(Ok(ResponseEvent::Interrupted { .. })))
+             && !matches!(event.as_ref(), Some(Err(err))
+                 if matches!(err.details(), CodexErrorDetails::ResponseIncomplete(_)))
+         {
+@@ -2857,6 +2858,30 @@ async fn try_run_sampling_request(
+         record_turn_ttft_metric(&turn_context, &event).await;
+ 
+         match event {
++            ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                usage_metadata,
++            } => {
++                request_token_usage = token_usage.clone();
++                let budget_result = sess
++                    .record_interrupted_response_usage(
++                        &turn_context,
++                        &step_context.settings,
++                        &response_id,
++                        token_usage.as_ref(),
++                        usage_metadata.as_ref(),
++                    )
++                    .await;
++                should_emit_token_count |= token_usage.is_some();
++                if let Err(error) = budget_result {
++                    break Err(error);
++                }
++                break Ok(SamplingRequestResult {
++                    needs_follow_up: true,
++                    last_agent_message,
++                });
++            }
+             ResponseEvent::Created { response_id } => {
+                 if let Some(response_id) = response_id {
+                     turn_context
+diff --git a/codex-rs/core/src/turn_timing.rs b/codex-rs/core/src/turn_timing.rs
+--- a/codex-rs/core/src/turn_timing.rs
++++ b/codex-rs/core/src/turn_timing.rs
+@@ -402,6 +402,7 @@ fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
+         | ResponseEvent::ServerReasoningIncluded(_)
+         | ResponseEvent::ToolCallInputDelta { .. }
+         | ResponseEvent::Completed { .. }
++        | ResponseEvent::Interrupted { .. }
+         | ResponseEvent::ReasoningSummaryPartAdded { .. }
+         | ResponseEvent::RateLimits(_)
+         | ResponseEvent::ModelsEtag(_) => false,
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -82,6 +82,9 @@ use tracing_test::traced_test;
+ 
+ const MODEL: &str = "gpt-5.4";
+ 
++#[path = "client_websockets_complete_response_tests.rs"]
++mod complete_responses;
++
+ #[path = "client_websockets_recording_tests.rs"]
+ mod response_recording;
+ 
+diff --git a/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs b/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/tests/suite/client_websockets_complete_response_tests.rs
+@@ -0,0 +1,353 @@
++use super::*;
++use codex_api::AuthProvider;
++use codex_api::ResponseCreateWsRequest;
++use codex_api::ResponseObservation;
++use codex_api::ResponseObserver;
++use codex_api::ResponsesApiRequest;
++use codex_api::ResponsesWebsocketClient;
++use codex_api::ResponsesWsRequest;
++use codex_http_client::HttpClientFactory;
++use codex_protocol::protocol::TokenUsage;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_rollout::RolloutItem;
++use core_test_support::responses::ev_output_text_delta;
++use http::HeaderMap;
++use pretty_assertions::assert_eq;
++use std::sync::Mutex;
++use tokio::time::Instant;
++
++struct NoAuth;
++
++impl AuthProvider for NoAuth {
++    fn add_auth_headers(&self, _: &mut HeaderMap) {}
++}
++
++#[derive(Default)]
++struct Observations(Mutex<Vec<ResponseObservation>>);
++
++impl ResponseObserver for Observations {
++    fn prepared(&self, _: u64) {}
++    fn sent(&self, _: Instant) {}
++    fn received(&self, observation: ResponseObservation, _: Instant) {
++        self.0.lock().unwrap().push(observation);
++    }
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant) {
++        self.received(
++            ResponseObservation {
++                terminal: Some(reason),
++                ..Default::default()
++            },
++            at,
++        );
++    }
++}
++
++#[test_case::test_case("completed", false; "unobserved_success")]
++#[test_case::test_case("closed", false; "unobserved_failure")]
++#[test_case::test_case("interrupted", false; "unobserved_interruption")]
++#[test_case::test_case("failed", true; "failed_usage")]
++#[test_case::test_case("incomplete", true; "incomplete_usage")]
++#[test_case::test_case("error", true; "protocol_error_before_eof")]
++#[test_case::test_case("timeout", false; "unobserved_content_deadline")]
++#[test_case::test_case("timeout", true; "observed_content_deadline")]
++#[tokio::test]
++async fn complete_response_output_preserves_native_outcomes(ending: &str, observe: bool) {
++    skip_if_no_network!();
++    let mut events = vec![ev_response_created("r1")];
++    match ending {
++        "timeout" => events.push(json!({"type": "codex.response.metadata"})),
++        _ => events.extend([
++            ev_output_text_delta("Native output"),
++            ev_assistant_message("message", "Native output"),
++        ]),
++    }
++    let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80},
++        "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 112});
++    match ending {
++        "completed" => events.push(ev_completed("r1")),
++        "interrupted" | "incomplete" => {
++            let mut terminal = ev_completed("r1");
++            terminal["type"] = json!("response.incomplete");
++            terminal["response"]["incomplete_details"] = json!({"reason":
++                if ending == "interrupted" { "interrupted" } else { "max_output_tokens" }
++            });
++            terminal["response"]["usage"] = usage.clone();
++            events.push(terminal);
++        }
++        "failed" => events.push(json!({"type": "response.failed", "response": {
++            "id": "r1", "usage": usage, "error": {"code": "failure", "message": "failed"}
++        }})),
++        "error" => events.push(json!({"type": "error", "status": 429,
++            "error": {"code": "rate_limit_exceeded", "message": "Try later"}})),
++        "closed" | "timeout" => {}
++        _ => unreachable!(),
++    }
++    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
++        requests: vec![events],
++        response_headers: Vec::new(),
++        accept_delay: None,
++        close_after_requests: ending != "timeout",
++    }])
++    .await;
++    let provider = websocket_provider(&server).to_api_provider(None).unwrap();
++    let client = ResponsesWebsocketClient::new(provider, Arc::new(NoAuth));
++    let connection = client
++        .connect(
++            &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++            HeaderMap::new(),
++            HeaderMap::new(),
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++    let request = ResponsesApiRequest {
++        model: MODEL.into(),
++        input: vec![message_item("hello")],
++        tools: None,
++        tool_choice: "auto".into(),
++        parallel_tool_calls: true,
++        reasoning: None,
++        store: false,
++        stream: true,
++        stream_options: None,
++        include: Vec::new(),
++        service_tier: None,
++        prompt_cache_key: None,
++        text: None,
++        client_metadata: None,
++        access_programs: None,
++    };
++    let observations = Arc::new(Observations::default());
++    let observer = observe.then(|| observations.clone() as Arc<dyn ResponseObserver>);
++    let mut stream = connection
++        .stream_complete_response(
++            ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest::from(&request)),
++            false,
++            None,
++            observer,
++        )
++        .await
++        .unwrap();
++    let mut output = Vec::new();
++    let mut did_complete = false;
++    let mut interrupted = false;
++    let mut failed = false;
++    while let Some(event) = stream.next().await {
++        match event {
++            Ok(ResponseEvent::Created { .. }) if ending == "timeout" => {
++                tokio::time::pause();
++                tokio::time::advance(Duration::from_secs(301)).await;
++            }
++            Ok(ResponseEvent::OutputTextDelta(text)) => output.push(text),
++            Ok(ResponseEvent::Completed { .. }) => did_complete = true,
++            Ok(ResponseEvent::Interrupted {
++                response_id,
++                token_usage,
++                ..
++            }) => {
++                assert_eq!(response_id, "r1");
++                assert_eq!(token_usage.unwrap().output_tokens, 12);
++                interrupted = true;
++            }
++            Err(error) => {
++                failed = true;
++                if ending == "timeout" {
++                    assert!(matches!(
++                        error,
++                        codex_api::ApiError::ResponseProgressTimeout
++                    ));
++                } else if ending == "incomplete" {
++                    let codex_api::ApiError::ResponseIncomplete(incomplete) = error else {
++                        panic!("expected the original incomplete response error");
++                    };
++                    assert_eq!(incomplete.reason, "max_output_tokens");
++                    assert_eq!(incomplete.response_id.as_deref(), Some("r1"));
++                    assert_eq!(incomplete.token_usage.unwrap().output_tokens, 12);
++                }
++            }
++            _ => {}
++        }
++    }
++    assert_eq!(did_complete, ending == "completed");
++    assert_eq!(interrupted, ending == "interrupted");
++    assert_eq!(
++        failed,
++        matches!(
++            ending,
++            "closed" | "failed" | "incomplete" | "error" | "timeout"
++        )
++    );
++    assert_eq!(
++        output,
++        if did_complete {
++            vec!["Native output".to_owned()]
++        } else {
++            Vec::new()
++        }
++    );
++    if observe {
++        let records = observations.0.lock().unwrap();
++        assert!(records.iter().any(|row| row.terminal
++            == Some(if ending == "timeout" {
++                ResponseAttemptEnd::ProgressTimeout
++            } else if ending == "incomplete" {
++                ResponseAttemptEnd::Incomplete
++            } else {
++                ResponseAttemptEnd::Failed
++            })));
++        assert!(
++            !records
++                .iter()
++                .any(|row| row.terminal == Some(ResponseAttemptEnd::TransportClosed))
++        );
++        if matches!(ending, "failed" | "incomplete") {
++            assert!(records.iter().any(|row| row.usage.as_ref() == Some(&usage)));
++        }
++    }
++    server.shutdown().await;
++}
++
++#[test_case::test_case(true; "response_identity")]
++#[test_case::test_case(false; "cumulative_checkpoint")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn complete_output_persists_incomplete_spending_without_installing_output(
++    has_response_id: bool,
++) -> anyhow::Result<()> {
++    skip_if_no_network!(Ok(()));
++    let completed_usage = TokenUsage {
++        input_tokens: 120,
++        cached_input_tokens: 80,
++        cache_write_input_tokens: 0,
++        output_tokens: 30,
++        reasoning_output_tokens: 10,
++        total_tokens: 150,
++        codex_rollout_budget_units: None,
++    };
++    let incomplete_usage = TokenUsage {
++        input_tokens: 20,
++        cached_input_tokens: 10,
++        cache_write_input_tokens: 0,
++        output_tokens: 5,
++        reasoning_output_tokens: 3,
++        total_tokens: 25,
++        codex_rollout_budget_units: None,
++    };
++    let mut completed = ev_completed("accepted-response");
++    completed["response"]["usage"] = json!({
++        "input_tokens": 120, "input_tokens_details": {"cached_tokens": 80},
++        "output_tokens": 30, "output_tokens_details": {"reasoning_tokens": 10},
++        "total_tokens": 150
++    });
++    let mut incomplete = json!({"type": "response.incomplete", "response": {
++        "incomplete_details": {"reason": "max_output_tokens"},
++        "usage": {
++            "input_tokens": 20, "input_tokens_details": {"cached_tokens": 10},
++            "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 3},
++            "total_tokens": 25
++        }
++    }});
++    if has_response_id {
++        incomplete["response"]["id"] = json!("discarded-response");
++    }
++    let server = start_websocket_server(vec![vec![
++        vec![ev_response_created("prewarm"), ev_completed("prewarm")],
++        vec![
++            ev_response_created("accepted-response"),
++            ev_assistant_message("accepted-message", "accepted answer"),
++            completed,
++        ],
++        vec![
++            ev_response_created("discarded-response"),
++            ev_output_text_delta("discarded partial answer"),
++            ev_assistant_message("discarded-message", "discarded partial answer"),
++            incomplete,
++        ],
++    ]])
++    .await;
++    let test = test_codex()
++        .with_auth(CodexAuth::from_external_chatgpt_tokens(
++            "header.e30.signature",
++            "selected-account",
++            Some("plus"),
++        )?)
++        .with_config(|config| {
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.stream_max_retries = Some(2);
++        })
++        .build_with_websocket_server(&server)
++        .await?;
++    test.submit_text_turn("first").await?;
++    let before = test.codex.token_usage_info().await.unwrap();
++    assert_eq!(before.total_token_usage, completed_usage);
++    assert_eq!(before.last_token_usage, completed_usage);
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "next".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    let mut events = Vec::new();
++    wait_for_event(&test.codex, |event| {
++        events.push(event.clone());
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    let errors = events
++        .iter()
++        .filter_map(|event| match event {
++            EventMsg::Error(error) => Some(error.message.as_str()),
++            EventMsg::StreamError(_) | EventMsg::RawResponseCompleted(_) => {
++                panic!("incomplete response must retain its original terminal: {event:?}");
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(
++        errors,
++        vec!["Incomplete response returned, reason: max_output_tokens"]
++    );
++    assert!(!serde_json::to_string(&events)?.contains("discarded partial answer"));
++    let mut total_usage = completed_usage.clone();
++    total_usage.add_assign(&incomplete_usage);
++    let after = test.codex.token_usage_info().await.unwrap();
++    assert_eq!(after.total_token_usage, total_usage);
++    assert_eq!(after.last_token_usage, completed_usage);
++    test.codex.flush_rollout().await?;
++    let persisted = std::fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
++    let lines = persisted
++        .lines()
++        .map(codex_rollout::parse_rollout_line)
++        .collect::<serde_json::Result<Vec<_>>>()?;
++    assert!(persisted.contains("accepted answer"));
++    assert!(!persisted.contains("discarded partial answer"));
++    let records = lines
++        .iter()
++        .filter_map(|line| match &line.item {
++            RolloutItem::TokenUsageRecord(record) => Some(record),
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(records.len(), if has_response_id { 2 } else { 1 });
++    assert_eq!(records[0].response_id, "accepted-response");
++    assert_eq!(records[0].usage, completed_usage);
++    if has_response_id {
++        assert_eq!(records[1].response_id, "discarded-response");
++        assert_eq!(records[1].usage, incomplete_usage);
++        assert_eq!(records[1].thread_id, records[0].thread_id);
++    }
++    let checkpoint = lines
++        .iter()
++        .rev()
++        .find_map(|line| match &line.item {
++            RolloutItem::EventMsg(EventMsg::TokenCount(event)) => event.info.as_ref(),
++            _ => None,
++        })
++        .expect("durable accounting checkpoint after incomplete response");
++    assert_eq!(checkpoint.total_token_usage, total_usage);
++    assert_eq!(checkpoint.last_token_usage, completed_usage);
++    assert_eq!(server.single_connection().len(), 3);
++    test.codex.shutdown_and_wait().await?;
++    server.shutdown().await;
++    Ok(())
++}
+diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
+--- a/codex-rs/core/tests/suite/hooks.rs
++++ b/codex-rs/core/tests/suite/hooks.rs
+@@ -6144,6 +6144,62 @@ async fn model_request_hooks_report_failures_and_retries_but_cannot_veto() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn model_request_hooks_preserve_interrupted_response_usage() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut interrupted = ev_completed("interrupted");
++    interrupted["type"] = json!("response.incomplete");
++    interrupted["response"]["incomplete_details"] = json!({"reason": "interrupted"});
++    let usage = json!({"input_tokens": 100, "output_tokens": 12, "total_tokens": 112});
++    interrupted["response"]["usage"] = usage.clone();
++    let server = responses::start_websocket_server(vec![vec![
++        vec![ev_response_created("warmup"), ev_completed("warmup")],
++        vec![
++            ev_response_created("interrupted"),
++            ev_output_text_delta("discarded output"),
++            interrupted,
++        ],
++        vec![
++            ev_response_created("completed"),
++            ev_assistant_message("answer", "done"),
++            ev_completed_with_tokens("completed", 42),
++        ],
++    ]])
++    .await;
++    let test = test_codex()
++        .with_auth(codex_login::CodexAuth::from_external_chatgpt_tokens(
++            "header.e30.signature",
++            "hooks-account",
++            Some("plus"),
++        )?)
++        .with_pre_build_hook(|home| write_lifecycle_hooks(home, &["PostModelRequest"]).unwrap())
++        .with_config(trust_discovered_hooks)
++        .build_with_websocket_server(&server)
++        .await?;
++    test.submit_turn("respond").await?;
++    let post = wait_for_hook_inputs(test.codex_home_path(), "PostModelRequest", 2).await?;
++    assert_eq!(post.len(), 2);
++    assert_eq!(post[0]["status"], "cancelled");
++    assert_eq!(post[0]["error"], Value::Null);
++    assert_eq!(
++        post[0]["token_usage"]["input_tokens"],
++        usage["input_tokens"]
++    );
++    assert_eq!(
++        post[0]["token_usage"]["output_tokens"],
++        usage["output_tokens"]
++    );
++    assert_eq!(
++        post[0]["token_usage"]["total_tokens"],
++        usage["total_tokens"]
++    );
++    assert_eq!(post[1]["status"], "completed");
++    assert_eq!(post[1]["token_usage"]["total_tokens"], 42);
++    test.codex.shutdown_and_wait().await?;
++    server.shutdown().await;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn model_request_observer_reports_cancellation() -> Result<()> {
+     core_test_support::skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/memories/write/src/runtime.rs b/codex-rs/memories/write/src/runtime.rs
+--- a/codex-rs/memories/write/src/runtime.rs
++++ b/codex-rs/memories/write/src/runtime.rs
+@@ -386,6 +386,9 @@ impl MemoryStartupContext {
+                 }
+                 ResponseEvent::Completed {
+                     token_usage: usage, ..
++                }
++                | ResponseEvent::Interrupted {
++                    token_usage: usage, ..
+                 } => {
+                     token_usage = usage;
+                     break;
+diff --git a/codex-rs/otel/src/events/session_telemetry.rs b/codex-rs/otel/src/events/session_telemetry.rs
+--- a/codex-rs/otel/src/events/session_telemetry.rs
++++ b/codex-rs/otel/src/events/session_telemetry.rs
+@@ -653,6 +653,10 @@ impl SessionTelemetry {
+             ResponseEvent::Completed {
+                 token_usage: Some(token_usage),
+                 ..
++            }
++            | ResponseEvent::Interrupted {
++                token_usage: Some(token_usage),
++                ..
+             } => {
+                 handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
+                 handle_responses_span.record(
+@@ -1398,6 +1402,7 @@ impl SessionTelemetry {
+                 SessionTelemetry::responses_item_type(item)
+             }
+             ResponseEvent::Completed { .. } => "completed".into(),
++            ResponseEvent::Interrupted { .. } => "interrupted".into(),
+             ResponseEvent::OutputTextDelta(_) => "text_delta".into(),
+             ResponseEvent::ToolCallInputDelta { .. } => "tool_input_delta".into(),
+             ResponseEvent::ReasoningSummaryDelta { .. } => "reasoning_summary_delta".into(),

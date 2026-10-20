@@ -1,0 +1,285 @@
+configure-external-editor-for-tui
+
+Lane: frontend
+
+FlatPatch: configure-external-editor-for-tui
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Allow the TUI external editor command to be selected in local configuration ahead of environment variables.
+
+Requires: Unit:normalization/normalize-base-roots-for-processes
+
+Provides: Carry tui.external_editor through typed configuration, bootstrap and reloaded local preferences to editor launch; parse quoted Linux command arguments and use VISUAL then EDITOR only when no command is configured, with explicit errors for empty or malformed commands.
+
+Boundary: Protected harness buffer placement, write-policy checks and cleanup remain with normalize-base-roots-for-processes; terminal handoff, composer preservation and process failure reporting stay native, with no fallback after an invalid configured command and no user-config mutation.
+
+Verification: Core configuration and generated-schema tests verify the option; focused TUI resolver and editor process tests verify precedence, quoted arguments, missing and invalid values, protected buffers, content return and cleanup.
+
+
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -855,6 +855,9 @@ pub struct Tui {
+     #[serde(default, flatten)]
+     pub notification_settings: TuiNotificationSettings,
+ 
++    /// External editor command used by the TUI. Defaults to VISUAL, then EDITOR.
++    pub external_editor: Option<String>,
++
+     /// Enable animations (welcome screen, shimmer effects, spinners).
+     /// Defaults to `true`.
+     #[serde(default = "default_true")]
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4773,6 +4773,10 @@
+           },
+           "description": "Individual visual effects. Each also requires animations to be enabled."
+         },
++        "external_editor": {
++          "description": "External editor command used by the TUI. Defaults to VISUAL, then EDITOR.",
++          "type": "string"
++        },
+         "fullscreen_transcript": {
+           "default": true,
+           "description": "Own the fullscreen transcript, including scrolling, selection, and search. Defaults to `true`; alternate-screen restrictions take precedence.",
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1283,6 +1283,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             raw_output_mode: false,
+             fullscreen_transcript: true,
+             mouse_scroll_speed: None,
++            external_editor: None,
+             copy_on_select: Default::default(),
+             copy_on_select_clear_selection: false,
+             right_click_paste: Default::default(),
+@@ -4535,6 +4536,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             raw_output_mode: false,
+             fullscreen_transcript: true,
+             mouse_scroll_speed: None,
++            external_editor: None,
+             copy_on_select: Default::default(),
+             copy_on_select_clear_selection: false,
+             right_click_paste: Default::default(),
+@@ -4584,6 +4586,27 @@ async fn runtime_config_resolves_disable_paste_burst() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn runtime_config_resolves_external_editor() -> anyhow::Result<()> {
++    let codex_home = tempdir()?;
++    for (input, expected) in [
++        ("", None),
++        (
++            "[tui]\nexternal_editor = 'nano --nowrap'",
++            Some("nano --nowrap"),
++        ),
++    ] {
++        let config = Config::load_from_base_config_with_overrides(
++            toml::from_str(input)?,
++            ConfigOverrides::default(),
++            codex_home.path().abs(),
++        )
++        .await?;
++        assert_eq!(config.tui_external_editor.as_deref(), expected);
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn disable_paste_burst_preserves_layering_and_new_key_precedence() -> anyhow::Result<()> {
+     for (toml, key, value, expected) in [
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -827,6 +827,9 @@ pub struct Config {
+     /// Own the fullscreen transcript when the alternate screen is enabled.
+     pub tui_fullscreen_transcript: bool,
+ 
++    /// External editor command selected in the TUI config, if any.
++    pub tui_external_editor: Option<String>,
++
+     /// Mouse wheel speed multiplier for transcript scrolling; defaults to one row per event.
+     pub tui_mouse_scroll_speed: Option<f64>,
+ 
+@@ -4718,6 +4721,7 @@ impl Config {
+                 .as_ref()
+                 .is_none_or(|tui| tui.fullscreen_transcript),
+             tui_mouse_scroll_speed: cfg.tui.as_ref().and_then(|tui| tui.mouse_scroll_speed),
++            tui_external_editor: cfg.tui.as_ref().and_then(|tui| tui.external_editor.clone()),
+             tui_copy_on_select: cfg
+                 .tui
+                 .as_ref()
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -296,6 +296,7 @@ async fn new_config(
+         tui_auto_recap: true,
+         model_availability_nux: ModelAvailabilityNuxConfig::default(),
+         tui_fullscreen_transcript: false,
++        tui_external_editor: None,
+         tui_mouse_scroll_speed: None,
+         tui_copy_on_select: Default::default(),
+         tui_copy_on_select_clear_selection: false,
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -283,7 +283,9 @@ impl App {
+             .empty_state_animation
+             .borrow_mut()
+             .pause_clock();
+-        let editor_cmd = match external_editor::resolve_editor_command() {
++        let editor_cmd = match external_editor::resolve_editor_command(
++            self.local_settings.tui.external_editor.as_deref(),
++        ) {
+             Ok(cmd) => cmd,
+             Err(external_editor::EditorError::MissingEditor) => {
+                 self.chat_widget
+diff --git a/codex-rs/tui/src/external_editor.rs b/codex-rs/tui/src/external_editor.rs
+--- a/codex-rs/tui/src/external_editor.rs
++++ b/codex-rs/tui/src/external_editor.rs
+@@ -15,38 +15,27 @@ use tokio::process::Command;
+ pub(crate) enum EditorError {
+     #[error("neither VISUAL nor EDITOR is set")]
+     MissingEditor,
+-    #[cfg(not(windows))]
+     #[error("failed to parse editor command")]
+     ParseFailed,
+     #[error("editor command is empty")]
+     EmptyCommand,
+ }
+ 
+-/// Tries to resolve the full path to a Windows program, respecting PATH + PATHEXT.
+-/// Falls back to the original program name if resolution fails.
+-#[cfg(windows)]
+-fn resolve_windows_program(program: &str) -> std::path::PathBuf {
+-    // On Windows, `Command::new("code")` will not resolve `code.cmd` shims on PATH.
+-    // Use `which` so we respect PATH + PATHEXT (e.g., `code` -> `code.cmd`).
+-    which::which(program).unwrap_or_else(|_| std::path::PathBuf::from(program))
+-}
+-
+-/// Resolve the editor command from environment variables.
+-/// Prefers `VISUAL` over `EDITOR`.
+-pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, EditorError> {
+-    let raw = env::var("VISUAL")
+-        .or_else(|_| env::var("EDITOR"))
+-        .map_err(|_| EditorError::MissingEditor)?;
+-    let parts = {
+-        #[cfg(windows)]
+-        {
+-            winsplit::split(&raw)
+-        }
+-        #[cfg(not(windows))]
+-        {
+-            shlex::split(&raw).ok_or(EditorError::ParseFailed)?
++/// Resolve the configured editor command, falling back to `VISUAL` then `EDITOR`.
++pub(crate) fn resolve_editor_command(
++    configured: Option<&str>,
++) -> std::result::Result<Vec<String>, EditorError> {
++    let environment_command;
++    let raw = match configured {
++        Some(raw) => raw,
++        None => {
++            environment_command = env::var("VISUAL")
++                .or_else(|_| env::var("EDITOR"))
++                .map_err(|_| EditorError::MissingEditor)?;
++            environment_command.as_str()
+         }
+     };
++    let parts = shlex::split(raw).ok_or(EditorError::ParseFailed)?;
+     if parts.is_empty() {
+         return Err(EditorError::EmptyCommand);
+     }
+@@ -115,24 +104,14 @@ pub(crate) async fn run_editor(
+     }
+ 
+     let editor_directory = editor_directory(codex_harness, file_system_policy, cwd)?;
+-    // Convert to TempPath immediately so no file handle stays open on Windows.
++    // Retain cleanup ownership without holding a file handle during the editor process.
+     let temp_path = Builder::new()
+         .suffix(".md")
+         .tempfile_in(editor_directory)?
+         .into_temp_path();
+     fs::write(&temp_path, seed)?;
+ 
+-    let mut cmd = {
+-        #[cfg(windows)]
+-        {
+-            // handles .cmd/.bat shims
+-            Command::new(resolve_windows_program(&editor_cmd[0]))
+-        }
+-        #[cfg(not(windows))]
+-        {
+-            Command::new(&editor_cmd[0])
+-        }
+-    };
++    let mut cmd = Command::new(&editor_cmd[0]);
+     if editor_cmd.len() > 1 {
+         cmd.args(&editor_cmd[1..]);
+     }
+@@ -194,7 +173,7 @@ mod tests {
+             env::set_var("VISUAL", "vis");
+             env::set_var("EDITOR", "ed");
+         }
+-        let cmd = resolve_editor_command().unwrap();
++        let cmd = resolve_editor_command(/*configured*/ None).unwrap();
+         assert_eq!(cmd, vec!["vis".to_string()]);
+     }
+ 
+@@ -207,10 +186,40 @@ mod tests {
+             env::remove_var("EDITOR");
+         }
+         assert!(matches!(
+-            resolve_editor_command(),
++            resolve_editor_command(/*configured*/ None),
+             Err(EditorError::MissingEditor)
+         ));
+     }
++
++    #[test]
++    #[serial]
++    fn configured_editor_preserves_precedence_quotes_and_invalid_values() {
++        let _guard = EnvGuard::new();
++        unsafe { env::set_var("VISUAL", "fallback-editor") };
++        assert_eq!(
++            resolve_editor_command(Some("'/path with spaces/editor' --flag 'two words'")).unwrap(),
++            vec!["/path with spaces/editor", "--flag", "two words"]
++        );
++        assert!(matches!(
++            resolve_editor_command(Some(" ")),
++            Err(EditorError::EmptyCommand)
++        ));
++        assert!(matches!(
++            resolve_editor_command(Some("'unterminated")),
++            Err(EditorError::ParseFailed)
++        ));
++    }
++
++    #[test]
++    #[serial]
++    fn resolve_editor_uses_editor_when_visual_is_unset() {
++        let _guard = EnvGuard::new();
++        unsafe {
++            env::remove_var("VISUAL");
++            env::set_var("EDITOR", "ed --flag");
++        }
++        assert_eq!(resolve_editor_command(None).unwrap(), vec!["ed", "--flag"]);
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/tui/src/local_settings.rs b/codex-rs/tui/src/local_settings.rs
+--- a/codex-rs/tui/src/local_settings.rs
++++ b/codex-rs/tui/src/local_settings.rs
+@@ -57,6 +57,7 @@ impl LocalSettings {
+             ),
+             tui: Tui {
+                 notification_settings: config.tui_notifications.clone(),
++                external_editor: config.tui_external_editor.clone(),
+                 animations: config.animations,
+                 screen_reader_detection_done: None,
+                 effects: config.tui_effects,

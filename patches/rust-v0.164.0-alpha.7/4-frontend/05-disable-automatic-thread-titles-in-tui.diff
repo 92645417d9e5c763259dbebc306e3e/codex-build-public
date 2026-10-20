@@ -1,0 +1,134 @@
+disable-automatic-thread-titles-in-tui
+
+Lane: frontend
+
+FlatPatch: disable-automatic-thread-titles-in-tui
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Disable automatic conversation naming after ordinary user prompts while preserving explicit naming.
+
+Requires: none
+
+Provides: Disable the automatic title activation policy without changing the native generator, its model selection, or explicit naming entry points.
+
+Boundary: Preserve slash rename, new and fork naming, agent overview naming, generation and cancellation implementations, and independent resume-picker naming.
+
+Verification: Real user-message events start no automatic title request; native generator, slash rename, saved-name priority, progress, and cancellation tests retain their coverage.
+
+
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -2043,7 +2043,8 @@ impl App {
+             // thread, so unrelated shutdowns cannot consume this marker.
+             self.pending_shutdown_exit_thread_id = None;
+         }
+-        let automatic_title_user_message = if self.chat_widget.thread_name().is_none()
++        let automatic_title_user_message = if super::thread_title::AUTOMATIC_THREAD_TITLES_ENABLED
++            && self.chat_widget.thread_name().is_none()
+             && let ThreadBufferedEvent::Notification(notification) = &event
+             && let ServerNotification::ItemCompleted(notification) = notification.as_ref()
+             && let ThreadItem::UserMessage { content, .. } = &notification.item
+diff --git a/codex-rs/tui/src/app/thread_title.rs b/codex-rs/tui/src/app/thread_title.rs
+--- a/codex-rs/tui/src/app/thread_title.rs
++++ b/codex-rs/tui/src/app/thread_title.rs
+@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
+ use tokio_util::sync::CancellationToken;
+ 
+ pub(super) const THREAD_TITLE_MAX_CHARS: usize = 36;
++// Keep the upstream generator available to explicit native callers without automatic activation.
++pub(super) const AUTOMATIC_THREAD_TITLES_ENABLED: bool = false;
+ const THREAD_TITLE_MODEL: &str = "gpt-5.6-luna";
+ pub(super) const THREAD_TITLE_PROMPT_MAX_BYTES: usize = 960;
+ const THREAD_TITLE_RECENT_MESSAGES: usize = 8;
+diff --git a/codex-rs/tui/src/app/thread_title_tests.rs b/codex-rs/tui/src/app/thread_title_tests.rs
+--- a/codex-rs/tui/src/app/thread_title_tests.rs
++++ b/codex-rs/tui/src/app/thread_title_tests.rs
+@@ -183,6 +183,45 @@ async fn automatic_thread_title_generates_without_a_provisional_name() -> color_
+     check_thread_title_generation(TitleScenario::Automatic).await
+ }
+ 
++#[tokio::test]
++async fn user_messages_do_not_activate_automatic_thread_titles() -> color_eyre::Result<()> {
++    let mut app = make_test_app().await;
++    app.local_settings.tui.animations = false;
++    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let started = app_server.start_thread(&app.config).await?;
++    let thread_id = started.session.thread_id;
++    app.enqueue_primary_thread_session(started.session, started.turns)
++        .await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    for index in 0..2 {
++        app.handle_active_thread_event(
++            &mut tui,
++            &mut app_server,
++            ThreadBufferedEvent::Notification(Box::new(ServerNotification::ItemCompleted(
++                ItemCompletedNotification {
++                    thread_id: thread_id.to_string(),
++                    turn_id: format!("turn-{index}"),
++                    item: title_user_message("user-message", "Fix the login timeout"),
++                    completed_at_ms: 0,
++                },
++            ))),
++        )
++        .await?;
++        assert!(app.pending_thread_titles.is_empty());
++        assert!(app.temporary_structured_requests.is_empty());
++        assert_eq!(app.chat_widget.thread_name(), None);
++        assert_eq!(
++            app_server
++                .thread_read(thread_id, /*include_turns*/ false)
++                .await?
++                .name,
++            None
++        );
++    }
++    app_server.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn manual_rename_cancels_running_thread_title() -> color_eyre::Result<()> {
+     check_thread_title_generation(TitleScenario::ManualRename).await
+@@ -282,19 +321,13 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
+ 
+     if automatic {
+         for _ in 0..2 {
+-            app.handle_active_thread_event(
+-                &mut tui,
+-                &mut app_server,
+-                ThreadBufferedEvent::Notification(Box::new(ServerNotification::ItemCompleted(
+-                    ItemCompletedNotification {
+-                        thread_id: thread_id.to_string(),
+-                        turn_id: "existing-turn".to_string(),
+-                        item: title_user_message("user-message", "Fix the login timeout"),
+-                        completed_at_ms: 0,
+-                    },
+-                ))),
+-            )
+-            .await?;
++            // Exercise the retained generator independently of its disabled activation policy.
++            app.generate_thread_title(
++                &app_server,
++                thread_id,
++                ThreadTitleDestination::Automatic,
++                thread_title_prompt("Fix the login timeout"),
++            );
+         }
+         assert_eq!(app.chat_widget.thread_name(), None);
+         if matches!(scenario, TitleScenario::Automatic) {
+diff --git a/docs/resume-session-titles.md b/docs/resume-session-titles.md
+--- a/docs/resume-session-titles.md
++++ b/docs/resume-session-titles.md
+@@ -1,6 +1,8 @@
+ # Resume Session Titles
+ 
+ - Explicit title generation in `codex resume` is independent of ordinary automatic TUI titles and `/rename` suggestions.
++- Ordinary conversation prompts do not activate automatic TUI title generation.
++- Explicit naming, including `/rename`, retains its native behavior and model selection.
+ - Press Ctrl+G to generate and save a title for the selected active session.
+ - While generation runs, continue navigating and press Ctrl+G on other sessions to queue them in selection order.
+ - Pressing Ctrl+G again on the current or an already queued session does not add another request.

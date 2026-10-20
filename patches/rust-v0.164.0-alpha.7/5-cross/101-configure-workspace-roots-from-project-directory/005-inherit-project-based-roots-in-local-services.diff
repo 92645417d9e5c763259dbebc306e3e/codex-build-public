@@ -1,0 +1,666 @@
+inherit-project-based-roots-in-local-services
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: inherit-project-based-roots-in-local-services
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/src/request_processors/mcp_processor.rs b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+--- a/codex-rs/app-server/src/request_processors/mcp_processor.rs
++++ b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+@@ -424,13 +424,41 @@ impl McpRequestProcessor {
+             let auth = self.auth_manager.auth().await;
+             let (mcp_config, runtime_context) = match thread.as_ref() {
+                 Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
+-                None => (
+-                    mcp_manager.runtime_config(&config).await,
+-                    McpRuntimeContext::new(
++                None => {
++                    let mcp_config = mcp_manager.runtime_config(&config).await;
++                    let has_local_stdio = codex_mcp::configured_mcp_servers(&mcp_config)
++                        .iter()
++                        .filter(|(name, _)| {
++                            params
++                                .server_name
++                                .as_ref()
++                                .is_none_or(|selected| *name == selected)
++                        })
++                        .any(|(_, server)| {
++                            server.enabled
++                                && server.is_local_environment()
++                                && matches!(
++                                    server.transport,
++                                    codex_config::McpServerTransportConfig::Stdio { .. }
++                                )
++                        });
++                    let environment = if has_local_stdio {
++                        config.prepare_local_storage_environment()
++                    } else {
++                        config.local_storage_environment()
++                    }
++                    .map_err(|error| {
++                        internal_error(format!(
++                            "failed to prepare local MCP environment: {error:#}"
++                        ))
++                    })?;
++                    let runtime_context = McpRuntimeContext::new(
+                         self.thread_manager.environment_manager(),
+                         config.cwd.to_path_buf(),
+-                    ),
+-                ),
++                    )
++                    .with_local_process_environment(environment);
++                    (mcp_config, runtime_context)
++                }
+             };
+             let mut snapshot = collect_mcp_server_status_snapshot_with_detail(
+                 &mcp_config,
+@@ -679,8 +707,31 @@ impl McpRequestProcessor {
+         // This threadless resource-read path has no turn cwd or turn-selected
+         // environment. Use config cwd only as the local stdio fallback; named
+         // environment stdio MCPs must declare their own absolute cwd.
++        let has_local_stdio = mcp_config
++            .mcp_server_catalog
++            .server(&server)
++            .is_some_and(|server| {
++                let config = server.config();
++                config.enabled
++                    && config.is_local_environment()
++                    && matches!(
++                        config.transport,
++                        codex_config::McpServerTransportConfig::Stdio { .. }
++                    )
++            });
++        let environment = if has_local_stdio {
++            config.prepare_local_storage_environment()
++        } else {
++            config.local_storage_environment()
++        }
++        .map_err(|error| {
++            internal_error(format!(
++                "failed to prepare local MCP environment: {error:#}"
++            ))
++        })?;
+         let runtime_context =
+-            McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
++            McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf())
++                .with_local_process_environment(environment);
+         let request_id = request_id.clone();
+ 
+         let task = async move {
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -372,7 +372,9 @@ impl McpConnectionSet {
+             .into_iter()
+             .filter(|(_, server)| server.enabled())
+         {
+-            let server = server.with_read_only_mcp_tools(config.requires_read_only_mcp_tools);
++            let server = server
++                .with_read_only_mcp_tools(config.requires_read_only_mcp_tools)
++                .with_local_process_environment(runtime_context.local_process_environment());
+             let registration = config.mcp_server_catalog.server(&server_name);
+             let client_mcp_extensions = crate::client_capabilities::server_mcp_extensions(
+                 &client_mcp_extensions,
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -880,6 +880,7 @@ pub struct McpRuntimeContext {
+     ready_environments: HashMap<String, Arc<Environment>>,
+     local_process_cwd: PathBuf,
+     local_http_client: Arc<dyn HttpClient>,
++    local_process_environment: HashMap<String, String>,
+ }
+ 
+ /// Applies the local HTTP headers helper configured for an MCP server.
+@@ -925,6 +926,7 @@ impl McpRuntimeContext {
+             ready_environments: HashMap::new(),
+             local_process_cwd,
+             local_http_client,
++            local_process_environment: HashMap::new(),
+         }
+     }
+ 
+@@ -943,6 +945,16 @@ impl McpRuntimeContext {
+         self.local_process_cwd.clone()
+     }
+ 
++    /// Captures host-scoped values available to explicitly named local-source variables.
++    pub fn with_local_process_environment(mut self, environment: HashMap<String, String>) -> Self {
++        self.local_process_environment = environment;
++        self
++    }
++
++    pub(crate) fn local_process_environment(&self) -> &HashMap<String, String> {
++        &self.local_process_environment
++    }
++
+     pub(crate) fn local_http_client(&self) -> Arc<dyn HttpClient> {
+         Arc::clone(&self.local_http_client)
+     }
+diff --git a/codex-rs/codex-mcp/src/server.rs b/codex-rs/codex-mcp/src/server.rs
+--- a/codex-rs/codex-mcp/src/server.rs
++++ b/codex-rs/codex-mcp/src/server.rs
+@@ -74,6 +74,26 @@ impl EffectiveMcpServer {
+         self
+     }
+ 
++    /// Resolve named host variables before connection reuse, catalog caching, and launch.
++    pub(crate) fn with_local_process_environment(
++        mut self,
++        environment: &HashMap<String, String>,
++    ) -> Self {
++        if let McpServerTransportConfig::Stdio { env, env_vars, .. } = &mut self.config.transport {
++            for variable in env_vars
++                .iter()
++                .filter(|variable| !variable.is_remote_source())
++            {
++                if let Some(value) = environment.get(variable.name()) {
++                    env.get_or_insert_default()
++                        .entry(variable.name().to_owned())
++                        .or_insert_with(|| value.clone());
++                }
++            }
++        }
++        self
++    }
++
+     pub(crate) fn requires_read_only_mcp_tools(&self) -> bool {
+         self.requires_read_only_mcp_tools
+     }
+diff --git a/codex-rs/codex-mcp/src/server_tests.rs b/codex-rs/codex-mcp/src/server_tests.rs
+--- a/codex-rs/codex-mcp/src/server_tests.rs
++++ b/codex-rs/codex-mcp/src/server_tests.rs
+@@ -62,6 +62,47 @@ fn runtime_context() -> McpRuntimeContext {
+     )
+ }
+ 
++#[test]
++fn scoped_stdio_variables_preserve_explicit_and_remote_sources() {
++    let config: McpServerConfig = serde_json::from_value(serde_json::json!({
++        "command": "server",
++        "env": { "PROJECT_RUNTIME_ROOT": "/explicit/runtime" },
++        "env_vars": [
++            "PROJECT_SCRATCH_ROOT",
++            "PROJECT_RUNTIME_ROOT",
++            { "name": "PROJECT_PERSISTENT_ROOT", "source": "remote" }
++        ]
++    }))
++    .unwrap();
++    let roots = std::collections::HashMap::from([
++        ("PROJECT_SCRATCH_ROOT".into(), "/first/scratch".into()),
++        ("PROJECT_RUNTIME_ROOT".into(), "/first/runtime".into()),
++        ("PROJECT_PERSISTENT_ROOT".into(), "/first/persistent".into()),
++        ("SKILLS_ROOT".into(), "/unrequested/skills".into()),
++    ]);
++    let first =
++        EffectiveMcpServer::from_host_config(config.clone()).with_local_process_environment(&roots);
++    let codex_config::McpServerTransportConfig::Stdio { env, .. } = &first.config().transport
++    else {
++        panic!("stdio configuration");
++    };
++    assert_eq!(
++        env.as_ref().unwrap(),
++        &std::collections::HashMap::from([
++            ("PROJECT_SCRATCH_ROOT".into(), "/first/scratch".into()),
++            ("PROJECT_RUNTIME_ROOT".into(), "/explicit/runtime".into()),
++        ])
++    );
++    let next = EffectiveMcpServer::from_host_config(config).with_local_process_environment(
++        &std::collections::HashMap::from([("PROJECT_SCRATCH_ROOT".into(), "/next/scratch".into())]),
++    );
++    let runtime = runtime_context();
++    assert!(
++        !connection_identity(&first, &runtime)
++            .has_same_connection_config(&connection_identity(&next, &runtime))
++    );
++}
++
+ fn connection_identity(
+     server: &EffectiveMcpServer,
+     runtime_context: &McpRuntimeContext,
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -161,7 +161,7 @@ pub(crate) async fn run_pending_session_start_hooks(
+             permission_mode: hook_permission_mode(turn_context.approval_policy()),
+             target,
+         };
+-        let hooks = sess.hooks();
++        let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
+         let preview_runs = hooks.preview_session_start(&request);
+         if run_context_injecting_hook(
+             sess,
+@@ -206,7 +206,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
+         tool_use_id,
+         tool_input: tool_input.clone(),
+     };
+-    let hooks = sess.hooks();
++    let hooks = hooks_for_environments(sess, &step_context.environments);
+     let preview_runs = hooks.preview_pre_tool_use(&request);
+     emit_hook_started_events(sess, turn_context, preview_runs).await;
+ 
+@@ -252,6 +252,18 @@ fn tool_hook_cwd(environments: &TurnEnvironmentSnapshot, turn: &TurnContext) ->
+         .unwrap_or_else(|| turn.cwd.clone())
+ }
+ 
++fn hooks_for_environments(
++    sess: &Session,
++    environments: &TurnEnvironmentSnapshot,
++) -> codex_hooks::Hooks {
++    let hooks = sess.hooks();
++    match environments.local() {
++        Some(local) => hooks
++            .with_environment_overrides(&local.shell_environment_policy().inherited_environment),
++        None => hooks.as_ref().clone(),
++    }
++}
++
+ // PermissionRequest hooks share the same preview/start/completed event flow as
+ // other hook types, but they return an optional decision instead of mutating
+ // tool input or post-run state.
+@@ -275,7 +287,7 @@ pub(crate) async fn run_permission_request_hooks(
+         run_id_suffix: run_id_suffix.to_string(),
+         tool_input: payload.tool_input,
+     };
+-    let hooks = sess.hooks();
++    let hooks = hooks_for_environments(sess, review_context.environments());
+     let preview_runs = hooks.preview_permission_request(&request);
+     emit_hook_started_events(sess, turn_context, preview_runs).await;
+ 
+@@ -318,7 +330,7 @@ pub(crate) async fn run_post_tool_use_hooks(
+         tool_input,
+         tool_response,
+     };
+-    let hooks = sess.hooks();
++    let hooks = hooks_for_environments(sess, &step_context.environments);
+     let preview_runs = hooks.preview_post_tool_use(&request);
+     emit_hook_started_events(sess, turn_context, preview_runs).await;
+ 
+@@ -459,7 +471,8 @@ pub(crate) async fn run_turn_stop_hooks(
+         target,
+     };
+     let executor_hook_sources = executor_hook_sources_for_step(step_context);
+-    let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
++    let hooks = hooks_for_environments(sess, &step_context.environments)
++        .with_executor_hooks(executor_hook_sources);
+     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
+ 
+     let mut outcome = hooks.run_stop(request).await;
+@@ -476,6 +489,7 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+     }
+ 
+     let turn_context = sess.new_default_turn().await;
++    let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
+ 
+     // SessionEnd is root-only; ThreadSpawn uses SubagentStart/SubagentStop and other subagents
+     // are internal implementation details.
+@@ -515,7 +529,13 @@ pub(crate) async fn run_turn_interrupt_hooks(
+         .map(executor_hook_sources_for_step)
+         .unwrap_or_default();
+     let has_executor_hooks = !executor_hook_sources.is_empty();
+-    let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
++    let environments = last_known_step_context
++        .as_ref()
++        .map_or(&turn_context.initial_environments, |step| {
++            &step.environments
++        });
++    let hooks =
++        hooks_for_environments(sess, environments).with_executor_hooks(executor_hook_sources);
+     let preview_runs = hooks.preview_interrupt();
+     if preview_runs.is_empty() && !has_executor_hooks {
+         return;
+@@ -556,10 +576,11 @@ pub(crate) async fn run_pre_compact_hooks(
+         model: turn_context.model_info().slug.clone(),
+         trigger: compaction_trigger_label(trigger).to_string(),
+     };
+-    let preview_runs = sess.hooks().preview_pre_compact(&request);
++    let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
++    let preview_runs = hooks.preview_pre_compact(&request);
+     emit_hook_started_events(sess, turn_context, preview_runs).await;
+ 
+-    let outcome = sess.hooks().run_pre_compact(request).await;
++    let outcome = hooks.run_pre_compact(request).await;
+     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
+     if outcome.should_stop {
+         PreCompactHookOutcome::Stopped
+@@ -593,10 +614,11 @@ pub(crate) async fn run_post_compact_hooks(
+         model: turn_context.model_info().slug.clone(),
+         trigger: compaction_trigger_label(trigger).to_string(),
+     };
+-    let preview_runs = sess.hooks().preview_post_compact(&request);
++    let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
++    let preview_runs = hooks.preview_post_compact(&request);
+     emit_hook_started_events(sess, turn_context, preview_runs).await;
+ 
+-    let outcome = sess.hooks().run_post_compact(request).await;
++    let outcome = hooks.run_post_compact(request).await;
+     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
+     if outcome.should_stop {
+         PostCompactHookOutcome::Stopped
+@@ -620,7 +642,7 @@ pub(crate) async fn run_legacy_after_agent_hook(
+             _ => None,
+         })
+         .collect();
+-    let hooks = sess.hooks();
++    let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
+     for hook_outcome in hooks
+         .dispatch(codex_hooks::HookPayload {
+             session_id: sess.session_id().into(),
+@@ -692,7 +714,7 @@ pub(crate) async fn inspect_pending_input(
+                 permission_mode: hook_permission_mode(turn_context.approval_policy()),
+                 prompt: UserMessageItem::new(content).message(),
+             };
+-            let hooks = sess.hooks();
++            let hooks = hooks_for_environments(sess, &turn_context.initial_environments);
+             let preview_runs = hooks.preview_user_prompt_submit(&request);
+             run_context_injecting_hook(
+                 sess,
+@@ -1078,13 +1100,13 @@ pub(crate) fn hooks_for_model_request(
+     session: &Session,
+     step: &StepContext,
+ ) -> Arc<codex_hooks::Hooks> {
+-    let hooks = session.hooks();
++    let hooks = hooks_for_environments(session, &step.environments);
+     match step.turn.session_source {
+         SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+         | SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
+             Arc::new(hooks.for_memory_consolidation(executor_hook_sources_for_step(step)))
+         }
+-        _ => hooks,
++        _ => Arc::new(hooks),
+     }
+ }
+ 
+diff --git a/codex-rs/core/src/session/mcp.rs b/codex-rs/core/src/session/mcp.rs
+--- a/codex-rs/core/src/session/mcp.rs
++++ b/codex-rs/core/src/session/mcp.rs
+@@ -190,6 +190,12 @@ impl Session {
+             environments.all_selections().into(),
+             environments.ready_environment_handles(),
+         )
++        .with_local_process_environment(environments.local().map_or_else(HashMap::new, |local| {
++            local
++                .shell_environment_policy()
++                .inherited_environment
++                .clone()
++        }))
+     }
+ 
+     pub(crate) async fn runtime_mcp_servers(
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -365,7 +365,16 @@ impl Session {
+         .with_selected_environments(
+             desired.environments.all_selections().into(),
+             desired.environments.ready_environment_handles(),
+-        );
++        )
++        .with_local_process_environment(desired.environments.local().map_or_else(
++            HashMap::new,
++            |local| {
++                local
++                    .shell_environment_policy()
++                    .inherited_environment
++                    .clone()
++            },
++        ));
+         McpRuntimeInput {
+             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
+                 McpStartupPolicy::LazyWhenCached
+diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
+--- a/codex-rs/core/tests/suite/hooks.rs
++++ b/codex-rs/core/tests/suite/hooks.rs
+@@ -6018,6 +6018,66 @@ async fn wait_for_hook_inputs(home: &Path, event: &str, count: usize) -> Result<
+     .await?
+ }
+ 
++#[tokio::test]
++async fn model_request_hooks_inherit_the_captured_local_environment() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = start_mock_server().await;
++    mount_sse_once(&server, responses::sse_completed("complete")).await;
++    let test = test_codex()
++        .with_pre_build_hook(|home| {
++            let mut hooks = serde_json::Map::new();
++            for event in ["PreModelRequest", "PostModelRequest"] {
++                let output = home.join(format!("{event}.env"));
++                hooks.insert(
++                    event.into(),
++                    json!([{"hooks": [{
++                        "type": "command",
++                        "command": format!("env > '{}'", output.display()),
++                    }]}]),
++                );
++            }
++            fs::write(home.join("hooks.json"), json!({"hooks": hooks}).to_string())
++                .expect("write model request hooks");
++        })
++        .with_config(trust_discovered_hooks)
++        .build(&server)
++        .await?;
++    let mut local = core_test_support::test_codex::local(test.config.cwd.clone());
++    let mut config =
++        core_test_support::test_codex::environment_config_for_selection(&test.config, &local);
++    let expected = [
++        "PROJECT_SCRATCH_ROOT",
++        "PROJECT_RUNTIME_ROOT",
++        "PROJECT_PERSISTENT_ROOT",
++        "REPOS_ROOT",
++        "SKILLS_ROOT",
++        "SKILLS_SCRATCH_ROOT",
++    ]
++    .into_iter()
++    .map(|name| {
++        let root = test.codex_home_path().join("local-roots").join(name);
++        fs::create_dir_all(&root)?;
++        Ok((name.to_owned(), root.to_string_lossy().into_owned()))
++    })
++    .collect::<Result<HashMap<_, _>>>()?;
++    config.shell_environment_policy.inherited_environment = expected.clone();
++    local.config = codex_protocol::protocol::EnvironmentConfigState::Ready(config);
++    test.submit_turn_with_environments("respond", Some(vec![local]))
++        .await?;
++    for event in ["PreModelRequest", "PostModelRequest"] {
++        let environment = fs::read_to_string(test.codex_home_path().join(format!("{event}.env")))?;
++        for (name, value) in &expected {
++            assert!(
++                environment
++                    .lines()
++                    .any(|line| line == format!("{name}={value}")),
++                "{event} did not inherit {name}={value}"
++            );
++        }
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn model_request_hooks_report_failures_and_retries_but_cannot_veto() -> Result<()> {
+     core_test_support::skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/hooks/src/engine/command_runner.rs b/codex-rs/hooks/src/engine/command_runner.rs
+--- a/codex-rs/hooks/src/engine/command_runner.rs
++++ b/codex-rs/hooks/src/engine/command_runner.rs
+@@ -108,6 +108,13 @@ impl CommandHookRuntime {
+         }
+     }
+ 
++    pub(crate) fn with_environment(&self, environment: Arc<Vec<(OsString, OsString)>>) -> Self {
++        Self {
++            environment,
++            ..self.clone()
++        }
++    }
++
+     pub(crate) fn output_spiller(&self) -> &HookOutputSpiller {
+         &self.output_spiller
+     }
+diff --git a/codex-rs/hooks/src/engine/command_runner_tests.rs b/codex-rs/hooks/src/engine/command_runner_tests.rs
+--- a/codex-rs/hooks/src/engine/command_runner_tests.rs
++++ b/codex-rs/hooks/src/engine/command_runner_tests.rs
+@@ -605,6 +605,10 @@ print(os.environ["CODEX_HOOK_CAPTURED_ENV"])
+         &previous.environment,
+         &reconfigured.environment
+     ));
++    let mut next_environment = reconfigured.environment.as_ref().clone();
++    next_environment.retain(|(name, _)| name != "CODEX_HOOK_CAPTURED_ENV");
++    next_environment.push(("CODEX_HOOK_CAPTURED_ENV".into(), "selected".into()));
++    let reconfigured = reconfigured.with_environment(Arc::new(next_environment));
+     std::fs::write(release_path, "ready").expect("release async hook");
+ 
+     let hook_result = timeout(ASYNC_HOOK_TEST_TIMEOUT, results.recv())
+@@ -619,6 +623,23 @@ print(os.environ["CODEX_HOOK_CAPTURED_ENV"])
+         }]
+     );
+ 
++    let handler = write_handler(
++        &temp,
++        "import os\nprint(os.environ['CODEX_HOOK_CAPTURED_ENV'])\n",
++    );
++    schedule(&reconfigured, handler, temp.path()).await;
++    let hook_result = timeout(ASYNC_HOOK_TEST_TIMEOUT, results.recv())
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(
++        hook_result.run.entries,
++        vec![HookOutputEntry {
++            kind: HookOutputEntryKind::Context,
++            text: "selected".into(),
++        }]
++    );
++
+     reconfigured.shutdown().await;
+ }
+ 
+diff --git a/codex-rs/hooks/src/legacy_notify.rs b/codex-rs/hooks/src/legacy_notify.rs
+--- a/codex-rs/hooks/src/legacy_notify.rs
++++ b/codex-rs/hooks/src/legacy_notify.rs
+@@ -42,8 +42,10 @@ pub fn legacy_notify_json(payload: &HookPayload) -> Result<String, serde_json::E
+ }
+ 
+ // TODO: Remove this hook and its environment plumbing when legacy `notify` support is removed.
+-pub(crate) fn notify_hook(argv: Vec<String>, environment: Arc<Vec<(OsString, OsString)>>) -> Hook {
+-    let argv = Arc::new(argv);
++pub(crate) fn notify_hook(
++    argv: Arc<[String]>,
++    environment: Arc<Vec<(OsString, OsString)>>,
++) -> Hook {
+     Hook {
+         name: "legacy_notify".to_string(),
+         func: Arc::new(move |payload: &HookPayload| {
+diff --git a/codex-rs/hooks/src/registry.rs b/codex-rs/hooks/src/registry.rs
+--- a/codex-rs/hooks/src/registry.rs
++++ b/codex-rs/hooks/src/registry.rs
+@@ -24,8 +24,6 @@ use crate::events::stop::StopRequest;
+ use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
+ use crate::events::user_prompt_submit::UserPromptSubmitRequest;
+ use crate::mcp::HookMcpExecutor;
+-use crate::types::Hook;
+-use crate::types::HookEvent;
+ use crate::types::HookPayload;
+ use crate::types::HookResponse;
+ use async_channel::Receiver;
+@@ -65,7 +63,7 @@ pub struct Hooks {
+     // TODO: Once legacy `notify` is removed, capture this snapshot in `CommandHookRuntime::new`
+     // and remove the environment plumbing from `Hooks` and `from_config`.
+     environment: Arc<Vec<(OsString, OsString)>>,
+-    after_agent: Arc<[Hook]>,
++    legacy_notify_argv: Option<Arc<[String]>>,
+     engine: ClaudeHooksEngine,
+     plugin_hook_sources: Arc<[PluginHookSource]>,
+     plugin_hook_load_warnings: Arc<[String]>,
+@@ -126,18 +124,41 @@ impl Hooks {
+         hooks
+     }
+ 
++    /// Capture the selected host environment without changing already running hooks.
++    pub fn with_environment_overrides(
++        &self,
++        overrides: &std::collections::HashMap<String, String>,
++    ) -> Self {
++        let mut environment = self.environment.as_ref().clone();
++        environment.retain(|(name, _)| {
++            !name
++                .to_str()
++                .is_some_and(|name| overrides.contains_key(name))
++        });
++        environment.extend(
++            overrides
++                .iter()
++                .map(|(name, value)| (name.into(), value.into())),
++        );
++        let mut hooks = self.clone();
++        hooks.environment = Arc::new(environment);
++        hooks.engine.command_runtime = self
++            .engine
++            .command_runtime
++            .with_environment(Arc::clone(&hooks.environment));
++        hooks
++    }
++
+     fn from_config(
+         config: HooksConfig,
+         mcp_executor: Arc<dyn HookMcpExecutor>,
+         environment: Arc<Vec<(OsString, OsString)>>,
+         build_runtime: impl FnOnce(CommandShell) -> CommandHookRuntime,
+     ) -> Self {
+-        let after_agent = config
++        let legacy_notify_argv = config
+             .legacy_notify_argv
+             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
+-            .map(|argv| crate::legacy_notify::notify_hook(argv, Arc::clone(&environment)))
+-            .into_iter()
+-            .collect();
++            .map(Arc::from);
+         let command_runtime = build_runtime(CommandShell {
+             program: config.shell_program.unwrap_or_default(),
+             args: config.shell_args,
+@@ -153,7 +174,7 @@ impl Hooks {
+         );
+         Self {
+             environment,
+-            after_agent,
++            legacy_notify_argv,
+             engine,
+             plugin_hook_sources: config.plugin_hook_sources.into(),
+             plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
+@@ -169,25 +190,13 @@ impl Hooks {
+         self.engine.warnings()
+     }
+ 
+-    fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
+-        match hook_event {
+-            HookEvent::AfterAgent { .. } => &self.after_agent,
+-        }
+-    }
+-
+     pub async fn dispatch(&self, hook_payload: HookPayload) -> Vec<HookResponse> {
+-        let hooks = self.hooks_for_event(&hook_payload.hook_event);
+-        let mut outcomes = Vec::with_capacity(hooks.len());
+-        for hook in hooks {
+-            let outcome = hook.execute(&hook_payload).await;
+-            let should_abort_operation = outcome.result.should_abort_operation();
+-            outcomes.push(outcome);
+-            if should_abort_operation {
+-                break;
+-            }
+-        }
+-
+-        outcomes
++        let Some(argv) = &self.legacy_notify_argv else {
++            return Vec::new();
++        };
++        let hook =
++            crate::legacy_notify::notify_hook(Arc::clone(argv), Arc::clone(&self.environment));
++        vec![hook.execute(&hook_payload).await]
+     }
+ 
+     pub fn preview_session_start(

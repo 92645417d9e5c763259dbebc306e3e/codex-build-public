@@ -1,0 +1,532 @@
+monitor-github-releases-in-app-server
+
+Lane: cross
+
+Unit: monitor-codex-releases-through-github
+
+ChildPatch: monitor-github-releases-in-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -35,6 +35,7 @@ use crate::request_processors::EnvironmentRequestProcessor;
+ use crate::request_processors::FeedbackRequestProcessor;
+ use crate::request_processors::FsRequestProcessor;
+ use crate::request_processors::GitRequestProcessor;
++use crate::request_processors::GithubProcessor;
+ use crate::request_processors::InitializeRequestProcessor;
+ use crate::request_processors::MarketplaceRequestProcessor;
+ use crate::request_processors::McpEventStreamReady;
+@@ -161,6 +162,7 @@ pub(crate) struct MessageProcessor {
+     feedback_processor: FeedbackRequestProcessor,
+     fs_processor: FsRequestProcessor,
+     git_processor: GitRequestProcessor,
++    github_processor: GithubProcessor,
+     initialize_processor: InitializeRequestProcessor,
+     marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+@@ -499,6 +501,8 @@ impl MessageProcessor {
+             config_manager.clone(),
+             account_processor.clone(),
+         );
++        let github_processor =
++            GithubProcessor::new(integrations.github(), config.http_client_factory());
+         let proxy_processor = ProxyProcessor::new(integrations, outgoing.clone());
+         let plugin_processor = PluginRequestProcessor::new(
+             auth_manager.clone(),
+@@ -627,6 +631,7 @@ impl MessageProcessor {
+             feedback_processor,
+             fs_processor,
+             git_processor,
++            github_processor,
+             initialize_processor,
+             marketplace_processor,
+             mcp_processor,
+@@ -647,6 +652,7 @@ impl MessageProcessor {
+     pub(crate) fn clear_runtime_references(&self) {
+         self.account_processor.clear_external_auth();
+         self.apps_processor.shutdown();
++        self.github_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         self.skills_watcher.shutdown();
+     }
+@@ -871,6 +877,7 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) async fn drain_background_tasks(&self) {
++        self.github_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         if let Some(worker) = &self.turn_cost_worker {
+             worker.shutdown();
+@@ -1227,6 +1234,12 @@ impl MessageProcessor {
+                 .write(params)
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::GithubRead { .. } => Ok(Some(self.github_processor.read().into())),
++            ClientRequest::GithubCheck { .. } => self
++                .github_processor
++                .check()
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ExperimentalFeatureEnablementSet { params, .. } => {
+                 self.config_processor
+                     .experimental_feature_enablement_set(request_id.clone(), params)
+@@ -2007,6 +2020,10 @@ mod message_processor_tracing_tests;
+ #[path = "message_processor_gateway_oauth_tests.rs"]
+ mod gateway_oauth_tests;
+ 
++#[cfg(test)]
++#[path = "message_processor_github_tests.rs"]
++mod github_tests;
++
+ #[cfg(test)]
+ #[path = "message_processor_thread_lifecycle_tests.rs"]
+ mod thread_lifecycle_tests;
+diff --git a/codex-rs/app-server/src/message_processor_github_tests.rs b/codex-rs/app-server/src/message_processor_github_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/message_processor_github_tests.rs
+@@ -0,0 +1,101 @@
++use super::ConnectionSessionState;
++use super::message_processor_tracing_tests::TEST_CONNECTION_ID;
++use super::message_processor_tracing_tests::build_test_processor;
++use super::message_processor_tracing_tests::read_response;
++use crate::request_serialization::RequestSerializationQueueKey;
++use crate::transport::AppServerTransport;
++use crate::transport::ConnectionOrigin;
++use anyhow::Result;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::GithubReadResponse;
++use codex_app_server_protocol::InitializeResponse;
++use codex_app_server_protocol::RequestId;
++use codex_config::LoaderOverrides;
++use codex_core::config::ConfigBuilder;
++use codex_login::AuthManager;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::time::Duration;
++use tokio::sync::oneshot;
++use tokio::time::timeout;
++use tokio_util::sync::CancellationToken;
++
++#[tokio::test]
++async fn cached_reads_bypass_busy_github_rpc_queue() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    let config = Arc::new(
++        ConfigBuilder::default()
++            .codex_home(home.path().to_path_buf())
++            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
++            .build()
++            .await?,
++    );
++    let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
++    let (processor, mut outgoing) = build_test_processor(config, auth).await;
++    let session = Arc::new(ConnectionSessionState::new(ConnectionOrigin::Stdio));
++    processor
++        .process_request(
++            TEST_CONNECTION_ID,
++            serde_json::from_value(json!({
++                "id": 1, "method": "initialize", "params": {
++                    "clientInfo": {"name": "github-status-test", "version": "1"}
++                }
++            }))?,
++            &AppServerTransport::Stdio,
++            Arc::clone(&session),
++        )
++        .await;
++    let _: InitializeResponse = read_response(&mut outgoing, 1).await;
++
++    let check = ClientRequest::GithubCheck {
++        request_id: RequestId::Integer(10),
++        params: None,
++    };
++    let (key, access) = RequestSerializationQueueKey::from_scope(
++        TEST_CONNECTION_ID,
++        check.serialization_scope().expect("serialized checks"),
++    );
++    let (started_tx, started_rx) = oneshot::channel();
++    let (release_tx, release_rx) = oneshot::channel();
++    processor
++        .request_serialization_queues
++        .enqueue_background(key, access, async move {
++            started_tx.send(()).unwrap();
++            release_rx.await.unwrap();
++        })
++        .await;
++    timeout(Duration::from_secs(1), started_rx).await??;
++
++    processor
++        .process_request(
++            TEST_CONNECTION_ID,
++            serde_json::from_value(json!({"id": 2, "method": "github/read"}))?,
++            &AppServerTransport::Stdio,
++            Arc::clone(&session),
++        )
++        .await;
++    let read: GithubReadResponse =
++        timeout(Duration::from_secs(1), read_response(&mut outgoing, 2)).await?;
++    assert_eq!(read, GithubReadResponse::default());
++    processor
++        .process_client_request(
++            TEST_CONNECTION_ID,
++            ClientRequest::GithubRead {
++                request_id: RequestId::Integer(3),
++                params: None,
++            },
++            session,
++            &AtomicBool::new(true),
++            CancellationToken::new(),
++        )
++        .await;
++    let read: GithubReadResponse =
++        timeout(Duration::from_secs(1), read_response(&mut outgoing, 3)).await?;
++    assert_eq!(read, GithubReadResponse::default());
++    release_tx.send(()).unwrap();
++    processor.shutdown_threads().await;
++    processor.drain_background_tasks().await;
++    Ok(())
++}
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -554,6 +554,7 @@ mod feedback_rollout_history;
+ mod feedback_thread_index;
+ mod fs_processor;
+ mod git_processor;
++mod github_processor;
+ mod initialize_processor;
+ mod marketplace_processor;
+ mod mcp_event_stream;
+@@ -589,6 +590,7 @@ pub(crate) use environment_processor::EnvironmentRequestProcessor;
+ pub(crate) use feedback_processor::FeedbackRequestProcessor;
+ pub(crate) use fs_processor::FsRequestProcessor;
+ pub(crate) use git_processor::GitRequestProcessor;
++pub(crate) use github_processor::GithubProcessor;
+ pub(crate) use initialize_processor::InitializeRequestProcessor;
+ pub(crate) use initialize_processor::is_originating_client_name;
+ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+diff --git a/codex-rs/app-server/src/request_processors/github_processor.rs b/codex-rs/app-server/src/request_processors/github_processor.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/github_processor.rs
+@@ -0,0 +1,145 @@
++use codex_app_server_protocol::GithubCheckResponse;
++use codex_app_server_protocol::GithubReadResponse;
++use codex_app_server_protocol::GithubStatus;
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_http_client::HttpClientFactory;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::sync::Mutex;
++use tokio::sync::watch;
++use tokio::task::JoinHandle;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++
++use crate::error_code::internal_error;
++use crate::error_code::invalid_params;
++use crate::github_http::GithubHttp;
++use crate::integrations::GithubConfig;
++
++const MANUAL_CHECK_MIN_INTERVAL: Duration = Duration::from_secs(30);
++
++pub(crate) struct GithubProcessor {
++    inner: Arc<Inner>,
++    cancel: CancellationToken,
++    _task: Option<JoinHandle<()>>,
++}
++
++struct Inner {
++    config: Option<GithubConfig>,
++    http: GithubHttp,
++    last_attempt: Mutex<Option<Instant>>,
++    status: watch::Sender<Option<GithubStatus>>,
++}
++
++impl GithubProcessor {
++    pub(crate) fn new(config: Option<GithubConfig>, factory: HttpClientFactory) -> Self {
++        Self::with_http(config, GithubHttp::new(factory))
++    }
++
++    fn with_http(config: Option<GithubConfig>, http: GithubHttp) -> Self {
++        let inner = Arc::new(Inner {
++            config,
++            http,
++            last_attempt: Mutex::new(None),
++            status: watch::channel(None).0,
++        });
++        let cancel = CancellationToken::new();
++        let task = inner.config.as_ref().map(|config| {
++            let interval = Duration::from_secs(u64::from(config.check_interval_hours) * 60 * 60);
++            let inner = Arc::clone(&inner);
++            let cancel = cancel.clone();
++            tokio::spawn(async move {
++                loop {
++                    let delay = tokio::select! {
++                        _ = cancel.cancelled() => break,
++                        last = inner.last_attempt.lock() => last.map_or(Duration::ZERO, |last| {
++                            interval.saturating_sub(last.elapsed())
++                        }),
++                    };
++                    tokio::select! {
++                        _ = cancel.cancelled() => break,
++                        _ = tokio::time::sleep(delay) => {},
++                    }
++                    tokio::select! {
++                        _ = cancel.cancelled() => break,
++                        result = inner.check(interval) => {
++                            if result.is_err() {
++                                tracing::warn!("GitHub release check failed");
++                            }
++                        },
++                    }
++                }
++            })
++        });
++        Self {
++            inner,
++            cancel,
++            _task: task,
++        }
++    }
++
++    pub(crate) fn read(&self) -> GithubReadResponse {
++        GithubReadResponse {
++            configured: self.inner.config.is_some(),
++            status: self.inner.status.borrow().clone(),
++        }
++    }
++
++    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<GithubStatus>> {
++        self.inner.status.subscribe()
++    }
++
++    pub(crate) async fn check(&self) -> Result<GithubCheckResponse, JSONRPCErrorError> {
++        self.inner.check(MANUAL_CHECK_MIN_INTERVAL).await
++    }
++
++    pub(crate) fn shutdown(&self) {
++        self.cancel.cancel();
++    }
++}
++
++impl Drop for GithubProcessor {
++    fn drop(&mut self) {
++        self.shutdown();
++    }
++}
++
++impl Inner {
++    async fn check(
++        &self,
++        minimum_interval: Duration,
++    ) -> Result<GithubCheckResponse, JSONRPCErrorError> {
++        let config = self
++            .config
++            .as_ref()
++            .ok_or_else(|| invalid_params("GitHub is not configured"))?;
++        // Serialize scheduled and manual requests without blocking cached reads.
++        let mut last_attempt = self.last_attempt.lock().await;
++        if last_attempt.is_some_and(|last| last.elapsed() < minimum_interval) {
++            return Ok(GithubCheckResponse {
++                performed: false,
++                status: self.status.borrow().clone(),
++            });
++        }
++        *last_attempt = Some(Instant::now());
++        match self.http.releases(&config.token).await {
++            Ok(status) => {
++                // Publish each successful check, including unchanged versions, so
++                // subscribers can retry delivery without owning another GitHub poller.
++                self.status.send_replace(Some(status.clone()));
++                Ok(GithubCheckResponse {
++                    performed: true,
++                    status: Some(status),
++                })
++            }
++            Err(()) => {
++                self.status.send_replace(None);
++                Err(internal_error("GitHub release check failed"))
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "github_processor_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/request_processors/github_processor_tests.rs b/codex-rs/app-server/src/request_processors/github_processor_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/github_processor_tests.rs
+@@ -0,0 +1,163 @@
++use super::*;
++use codex_http_client::OutboundProxyPolicy;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++use url::Url;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::Respond;
++use wiremock::ResponseTemplate;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++
++fn config() -> GithubConfig {
++    GithubConfig {
++        token: "github-token".into(),
++        check_interval_hours: 20,
++    }
++}
++
++fn http(server: &MockServer) -> GithubHttp {
++    GithubHttp::with_url(
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++        Url::parse(&server.uri()).expect("mock URL"),
++    )
++}
++
++fn release_response() -> ResponseTemplate {
++    ResponseTemplate::new(200)
++        .insert_header("x-ratelimit-remaining", "4999")
++        .set_body_json(json!({
++            "data": { "repository": { "releases": { "nodes": [
++                {"tagName": "rust-v1.0.0", "url": "https://example.invalid/stable", "isDraft": false},
++                {"tagName": "rust-v1.1.0-alpha.1", "url": "https://example.invalid/alpha", "isDraft": false}
++            ] } } }
++        }))
++}
++
++struct FailureSequence(AtomicUsize);
++
++impl Respond for FailureSequence {
++    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
++        if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
++            ResponseTemplate::new(503)
++        } else {
++            release_response()
++        }
++    }
++}
++
++#[tokio::test]
++async fn checks_publish_observations_clear_failures_and_throttle_every_attempt() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .respond_with(FailureSequence(AtomicUsize::new(0)))
++        .expect(3)
++        .mount(&server)
++        .await;
++    let inner = Inner {
++        config: Some(config()),
++        http: http(&server),
++        last_attempt: Mutex::new(None),
++        status: watch::channel(None).0,
++    };
++    let mut observations = inner.status.subscribe();
++    let first = inner.check(MANUAL_CHECK_MIN_INTERVAL).await.unwrap();
++    assert!(first.performed);
++    let status = first.status.unwrap();
++    assert_eq!(status.latest_release.unwrap().version, "1.0.0");
++    assert_eq!(status.latest_prerelease.unwrap().version, "1.1.0-alpha.1");
++    assert_eq!(status.remaining, Some(4999));
++    assert!(status.checked_at > 0);
++    assert!(observations.has_changed().unwrap());
++    let cached = observations.borrow_and_update().clone();
++    assert_eq!(
++        inner.check(MANUAL_CHECK_MIN_INTERVAL).await.unwrap(),
++        GithubCheckResponse {
++            performed: false,
++            status: cached,
++        }
++    );
++    assert!(!observations.has_changed().unwrap());
++
++    *inner.last_attempt.lock().await = Some(Instant::now() - Duration::from_secs(31));
++    assert!(inner.check(MANUAL_CHECK_MIN_INTERVAL).await.is_err());
++    assert!(observations.has_changed().unwrap());
++    assert_eq!(*observations.borrow_and_update(), None);
++    assert_eq!(
++        inner.check(MANUAL_CHECK_MIN_INTERVAL).await.unwrap(),
++        GithubCheckResponse {
++            performed: false,
++            status: None,
++        }
++    );
++
++    *inner.last_attempt.lock().await = Some(Instant::now() - Duration::from_secs(31));
++    let recovered = inner.check(MANUAL_CHECK_MIN_INTERVAL).await.unwrap();
++    assert!(recovered.performed);
++    assert!(observations.has_changed().unwrap());
++    assert_eq!(*observations.borrow_and_update(), recovered.status);
++}
++
++#[tokio::test]
++async fn unconfigured_github_has_no_background_worker_or_network_check() {
++    let server = MockServer::start().await;
++    let processor = GithubProcessor::with_http(None, http(&server));
++    assert_eq!(processor.read(), GithubReadResponse::default());
++    assert!(processor._task.is_none());
++    assert_eq!(
++        processor.check().await.unwrap_err().message,
++        "GitHub is not configured"
++    );
++    assert!(server.received_requests().await.unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn shutdown_cancels_inflight_checks_without_blocking_cached_reads() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .respond_with(release_response().set_delay(Duration::from_secs(60)))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let mut processor = GithubProcessor::with_http(Some(config()), http(&server));
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while server.received_requests().await.unwrap().is_empty() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("scheduled check started without a Telegram configuration");
++    assert_eq!(
++        processor.read(),
++        GithubReadResponse {
++            configured: true,
++            status: None,
++        }
++    );
++    assert_eq!(*processor.subscribe().borrow(), None);
++    processor.shutdown();
++    tokio::time::timeout(Duration::from_secs(5), processor._task.as_mut().unwrap())
++        .await
++        .expect("worker stopped before HTTP timeout")
++        .expect("worker joined");
++}
++
++#[tokio::test]
++async fn dropping_github_processor_releases_its_background_owner() {
++    let server = MockServer::start().await;
++    let processor = GithubProcessor::with_http(Some(config()), http(&server));
++    let inner = Arc::downgrade(&processor.inner);
++    drop(processor);
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while inner.upgrade().is_some() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("worker released its owner");
++}

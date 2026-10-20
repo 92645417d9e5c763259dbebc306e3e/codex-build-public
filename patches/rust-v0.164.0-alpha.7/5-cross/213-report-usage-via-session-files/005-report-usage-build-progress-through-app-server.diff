@@ -1,0 +1,789 @@
+report-usage-build-progress-through-app-server
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: report-usage-build-progress-through-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -2092,6 +2092,7 @@ server_notification_definitions! {
+     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
+     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
+     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
++    UsageBuildProgress => "usage/buildProgress" (v2::UsageBuildProgressNotification),
+     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
+     ProxyUpdated => "proxy/updated" (v2::ProxyUpdatedNotification),
+@@ -3318,6 +3319,32 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn serialize_usage_build_progress() -> Result<()> {
++        let notification =
++            ServerNotification::UsageBuildProgress(v2::UsageBuildProgressNotification {
++                request_id: RequestId::String("usage-request".into()),
++                progress: v2::UsageBuildProgress {
++                    phase: v2::UsageBuildPhase::Reading,
++                    files_processed: 12,
++                    files_total: Some(20),
++                },
++            });
++        let wire = json!({
++            "method": "usage/buildProgress",
++            "params": {
++                "requestId": "usage-request",
++                "progress": {"phase": "reading", "filesProcessed": 12, "filesTotal": 20}
++            }
++        });
++        assert_eq!(serde_json::to_value(&notification)?, wire);
++        assert_eq!(
++            serde_json::to_value(serde_json::from_value::<ServerNotification>(wire.clone())?)?,
++            wire
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn serialize_get_account_token_usage() -> Result<()> {
+         let request = ClientRequest::GetAccountTokenUsage {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/usage.rs b/codex-rs/app-server-protocol/src/protocol/v2/usage.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/usage.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/usage.rs
+@@ -1,4 +1,5 @@
+ use crate::JsonSchema;
++use crate::RequestId;
+ use crate::TS;
+ pub use codex_protocol::usage::*;
+ use serde::Deserialize;
+@@ -24,3 +25,37 @@ pub struct UsageReadResponse {
+     #[serde(default)]
+     pub refreshed: bool,
+ }
++
++#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum UsageBuildPhase {
++    #[default]
++    Waiting,
++    Discovering,
++    Reading,
++    Reconciling,
++    Deduplicating,
++    Aggregating,
++    Publishing,
++}
++
++#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageBuildProgress {
++    pub phase: UsageBuildPhase,
++    /// Completed candidate files, including skipped non-paginated files.
++    pub files_processed: u64,
++    /// Known after discovery. File completion is not whole-report completion.
++    pub files_total: Option<u64>,
++}
++
++#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageBuildProgressNotification {
++    /// The usage/read request on this connection, never a global build identifier.
++    pub request_id: RequestId,
++    pub progress: UsageBuildProgress,
++}
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1936,7 +1936,7 @@ impl MessageProcessor {
+             }
+             ClientRequest::UsageRead { params, .. } => self
+                 .usage
+-                .read(params)
++                .read(params, &request_id, &self.outgoing)
+                 .await
+                 .map(|response| Some(response.into()))
+                 .map_err(crate::error_code::internal_error),
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -102,6 +102,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::McpServerStatusUpdated(_)
+         | ServerNotification::McpServerEventStream(_)
+         | ServerNotification::AccountUpdated(_)
++        | ServerNotification::UsageBuildProgress(_)
+         | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::AppListUpdated(_)
+         | ServerNotification::RemoteControlStatusChanged(_)
+diff --git a/codex-rs/app-server/src/usage/aggregate.rs b/codex-rs/app-server/src/usage/aggregate.rs
+--- a/codex-rs/app-server/src/usage/aggregate.rs
++++ b/codex-rs/app-server/src/usage/aggregate.rs
+@@ -12,11 +12,14 @@ use chrono::Duration;
+ use chrono::FixedOffset;
+ use chrono::NaiveDate;
+ use chrono::Utc;
++use codex_app_server_protocol::UsageBuildPhase;
++use codex_app_server_protocol::UsageBuildProgress;
+ use codex_app_server_protocol::UsagePriceRates;
+ use codex_models_manager::model_pricing::Prices;
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+ use std::path::Path;
++use tokio::sync::watch;
+ 
+ #[derive(Clone, Copy)]
+ enum Period {
+@@ -48,6 +51,7 @@ pub(super) fn load(
+     prices: Prices,
+     timezone: FixedOffset,
+     now: i64,
++    progress: &watch::Sender<UsageBuildProgress>,
+ ) -> Result<UsageReport, Error> {
+     let refreshed_at = DateTime::<Utc>::from_timestamp_millis(now)
+         .ok_or("invalid report time")?
+@@ -58,7 +62,8 @@ pub(super) fn load(
+         mut observations,
+         mut credits,
+         mut diagnostics,
+-    } = reader::load(home)?;
++    } = reader::load(home, progress)?;
++    progress.send_modify(|value| value.phase = UsageBuildPhase::Deduplicating);
+     // Native records are immutable response observations. Preserve the first
+     // owner observation, including file order when copied timestamps are equal.
+     events.sort_by(|left, right| {
+@@ -108,6 +113,7 @@ pub(super) fn load(
+     });
+     diagnostics.duplicate_events = before - events.len();
+     diagnostics.unique_events = events.len();
++    progress.send_modify(|value| value.phase = UsageBuildPhase::Aggregating);
+     let latest_usage_at = events
+         .iter()
+         .map(|event| event.millis)
+diff --git a/codex-rs/app-server/src/usage/aggregate_tests.rs b/codex-rs/app-server/src/usage/aggregate_tests.rs
+--- a/codex-rs/app-server/src/usage/aggregate_tests.rs
++++ b/codex-rs/app-server/src/usage/aggregate_tests.rs
+@@ -44,6 +44,7 @@ fn report(root: &Path) -> UsageReport {
+         prices(),
+         FixedOffset::east_opt(8 * 3600).unwrap(),
+         now,
++        &watch::channel(UsageBuildProgress::default()).0,
+     )
+     .unwrap()
+ }
+@@ -127,6 +128,7 @@ fn applied_settings_price_standalone_compaction_without_turn_context() {
+             prices_with_applied_model(),
+             FixedOffset::east_opt(8 * 3600).unwrap(),
+             now,
++            &watch::channel(UsageBuildProgress::default()).0,
+         )
+         .unwrap();
+         for (rows, period) in [
+@@ -205,6 +207,7 @@ fn applied_model_changes_wait_for_task_start_and_preserve_response_context() {
+         prices_with_applied_model(),
+         FixedOffset::east_opt(8 * 3600).unwrap(),
+         now,
++        &watch::channel(UsageBuildProgress::default()).0,
+     )
+     .unwrap();
+     let rows = &report.rows["2026-02-01"];
+@@ -535,6 +538,7 @@ fn weekly_quota_uses_priced_canonical_snapshots_without_counting_repeated_delive
+         Prices::new(),
+         *report.refreshed_at.offset(),
+         now,
++        &watch::channel(UsageBuildProgress::default()).0,
+     )
+     .unwrap();
+     assert!(unpriced.quota.is_empty());
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+--- a/codex-rs/app-server/src/usage/mod.rs
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -1,12 +1,15 @@
+ //! Local paginated-rollout accounting, with no external process or network dependency.
+ mod aggregate;
+ mod credits;
++mod progress;
+ mod quota;
+ mod reader;
+ mod types;
+ mod wire;
+ 
+ use chrono::Local;
++use codex_app_server_protocol::UsageBuildPhase;
++use codex_app_server_protocol::UsageBuildProgress;
+ use codex_app_server_protocol::UsageReadParams;
+ use codex_app_server_protocol::UsageReadResponse;
+ use codex_app_server_protocol::UsageReport;
+@@ -18,6 +21,7 @@ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::time::Instant;
+ use tokio::sync::Mutex;
++use tokio::sync::watch;
+ 
+ type Error = Box<dyn std::error::Error + Send + Sync>;
+ 
+@@ -35,7 +39,11 @@ impl Service {
+         }
+     }
+ 
+-    pub(crate) async fn read(&self, params: UsageReadParams) -> Result<UsageReadResponse, String> {
++    async fn read_report(
++        &self,
++        params: UsageReadParams,
++        progress: watch::Sender<UsageBuildProgress>,
++    ) -> Result<UsageReadResponse, String> {
+         // Keep the lock through loading so concurrent clients reuse the same scan.
+         let mut cached = self.cached.lock().await;
+         if !params.refresh
+@@ -47,7 +55,7 @@ impl Service {
+             });
+         }
+         let codex_home = self.codex_home.clone();
+-        let report = tokio::task::spawn_blocking(move || load(&codex_home))
++        let report = tokio::task::spawn_blocking(move || load(&codex_home, &progress))
+             .await
+             .map_err(|error| format!("usage task failed: {error}"))??;
+         let report = Arc::new(report);
+@@ -59,12 +67,23 @@ impl Service {
+     }
+ }
+ 
+-fn load(codex_home: &Path) -> Result<UsageReport, String> {
++fn load(
++    codex_home: &Path,
++    progress: &watch::Sender<UsageBuildProgress>,
++) -> Result<UsageReport, String> {
+     let started = Instant::now();
++    progress.send_modify(|value| value.phase = UsageBuildPhase::Discovering);
+     let now = Local::now();
+     let prices = model_pricing::read_prices(codex_home).map_err(|error| error.to_string())?;
+-    let mut report = aggregate::load(codex_home, prices, *now.offset(), now.timestamp_millis())
+-        .map_err(|error| format!("could not load Codex usage: {error}"))?;
++    let mut report = aggregate::load(
++        codex_home,
++        prices,
++        *now.offset(),
++        now.timestamp_millis(),
++        progress,
++    )
++    .map_err(|error| format!("could not load Codex usage: {error}"))?;
++    progress.send_modify(|value| value.phase = UsageBuildPhase::Publishing);
+     model_pricing::ensure_models(
+         codex_home,
+         report
+diff --git a/codex-rs/app-server/src/usage/progress.rs b/codex-rs/app-server/src/usage/progress.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/progress.rs
+@@ -0,0 +1,48 @@
++use super::Service;
++use super::UsageBuildProgress;
++use super::UsageReadParams;
++use super::UsageReadResponse;
++use crate::outgoing_message::ConnectionRequestId;
++use crate::outgoing_message::OutgoingMessageSender;
++use codex_app_server_protocol::ServerNotification;
++use codex_app_server_protocol::UsageBuildProgressNotification;
++use std::time::Duration;
++use tokio::sync::watch;
++
++impl Service {
++    pub(crate) async fn read(
++        &self,
++        params: UsageReadParams,
++        request: &ConnectionRequestId,
++        outgoing: &OutgoingMessageSender,
++    ) -> Result<UsageReadResponse, String> {
++        let (progress, mut updates) = watch::channel(UsageBuildProgress::default());
++        updates.mark_changed();
++        let report = self.read_report(params, progress);
++        tokio::pin!(report);
++        let period = Duration::from_millis(250);
++        loop {
++            tokio::select! {
++                biased;
++                result = &mut report => return result,
++                () = async {
++                    tokio::time::sleep(period).await;
++                    if updates.has_changed().unwrap_or(false) {
++                        let progress = updates.borrow_and_update().clone();
++                        outgoing.send_server_notification_to_connections(
++                            &[request.connection_id],
++                            ServerNotification::UsageBuildProgress(UsageBuildProgressNotification {
++                                request_id: request.request_id.clone(),
++                                progress,
++                            }),
++                        ).await;
++                    }
++                } => {}
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "progress_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/progress_tests.rs b/codex-rs/app-server/src/usage/progress_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/progress_tests.rs
+@@ -0,0 +1,152 @@
++use super::*;
++use crate::outgoing_message::ConnectionId;
++use crate::outgoing_message::OutgoingEnvelope;
++use crate::outgoing_message::OutgoingMessage;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::UsageBuildPhase;
++use pretty_assertions::assert_eq;
++use std::fs;
++use std::sync::Arc;
++use tokio::sync::mpsc;
++
++#[test]
++fn completed_file_progress_includes_skipped_files_and_keeps_accounting_separate() {
++    let home = tempfile::tempdir().unwrap();
++    let sessions = home.path().join("sessions");
++    fs::create_dir(&sessions).unwrap();
++    for index in 0..128 {
++        fs::write(
++            sessions.join(format!("{index}.jsonl")),
++            "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\"}}\n",
++        )
++        .unwrap();
++    }
++    fs::write(
++        sessions.join("linear.jsonl"),
++        "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"linear\"}}\n",
++    )
++    .unwrap();
++    fs::write(sessions.join("malformed.jsonl"), "{\n").unwrap();
++    let (progress, observed) = watch::channel(UsageBuildProgress::default());
++    let report = crate::usage::load(home.path(), &progress).unwrap();
++    assert_eq!(
++        *observed.borrow(),
++        UsageBuildProgress {
++            phase: UsageBuildPhase::Publishing,
++            files_processed: 130,
++            files_total: Some(130),
++        }
++    );
++    assert_eq!(report.diagnostics.files, 128);
++    assert_eq!(report.diagnostics.skipped_non_paginated, 1);
++    assert_eq!(report.diagnostics.malformed_records, 1);
++}
++
++#[tokio::test(start_paused = true)]
++async fn progress_is_request_scoped_rate_bounded_and_absent_for_cached_reads() {
++    let home = tempfile::tempdir().unwrap();
++    let service = Arc::new(Service::new(home.path().to_path_buf()));
++    let lock = service.cached.lock().await;
++    let (tx, mut rx) = mpsc::channel(16);
++    let outgoing = Arc::new(OutgoingMessageSender::new(
++        tx,
++        codex_analytics::AnalyticsEventsClient::disabled(),
++    ));
++    let mut readers = Vec::new();
++    for connection in [7, 8] {
++        let service = Arc::clone(&service);
++        let outgoing = Arc::clone(&outgoing);
++        readers.push(tokio::spawn(async move {
++            service
++                .read(
++                    UsageReadParams::default(),
++                    &ConnectionRequestId {
++                        connection_id: ConnectionId(connection),
++                        request_id: RequestId::String(connection.to_string()),
++                    },
++                    &outgoing,
++                )
++                .await
++                .unwrap()
++        }));
++    }
++    tokio::task::yield_now().await;
++    tokio::time::advance(Duration::from_millis(249)).await;
++    assert!(rx.try_recv().is_err());
++    tokio::time::advance(Duration::from_millis(1)).await;
++    let mut connections = Vec::new();
++    for _ in 0..2 {
++        let OutgoingEnvelope::ToConnection {
++            connection_id,
++            message: OutgoingMessage::AppServerNotification(envelope),
++            ..
++        } = rx.recv().await.unwrap()
++        else {
++            panic!("expected targeted progress")
++        };
++        let ServerNotification::UsageBuildProgress(update) = envelope.notification else {
++            panic!("expected usage progress")
++        };
++        assert_eq!(
++            update.request_id,
++            RequestId::String(connection_id.0.to_string())
++        );
++        assert_eq!(update.progress, UsageBuildProgress::default());
++        connections.push(connection_id.0);
++    }
++    connections.sort_unstable();
++    assert_eq!(connections, vec![7, 8]);
++    tokio::time::advance(Duration::from_secs(2)).await;
++    tokio::task::yield_now().await;
++    assert!(rx.try_recv().is_err());
++    drop(lock);
++    let first = readers.remove(0).await.unwrap();
++    let second = readers.remove(0).await.unwrap();
++    assert!(Arc::ptr_eq(&first.report, &second.report));
++    while rx.try_recv().is_ok() {}
++    let cached = service
++        .read(
++            UsageReadParams::default(),
++            &ConnectionRequestId {
++                connection_id: ConnectionId(9),
++                request_id: RequestId::String("cached".into()),
++            },
++            &outgoing,
++        )
++        .await
++        .unwrap();
++    assert!(!cached.refreshed);
++    assert!(rx.try_recv().is_err());
++}
++
++#[tokio::test(start_paused = true)]
++async fn a_full_progress_queue_does_not_hold_the_completed_report() {
++    let home = tempfile::tempdir().unwrap();
++    let service = Arc::new(Service::new(home.path().to_path_buf()));
++    let lock = service.cached.lock().await;
++    let (tx, _rx) = mpsc::channel(1);
++    let reservation = tx.clone().reserve_owned().await.unwrap();
++    let outgoing =
++        OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
++    let reader = {
++        let service = Arc::clone(&service);
++        tokio::spawn(async move {
++            service
++                .read(
++                    UsageReadParams::default(),
++                    &ConnectionRequestId {
++                        connection_id: ConnectionId(7),
++                        request_id: RequestId::Integer(1),
++                    },
++                    &outgoing,
++                )
++                .await
++        })
++    };
++    tokio::task::yield_now().await;
++    tokio::time::advance(Duration::from_millis(250)).await;
++    tokio::task::yield_now().await;
++    drop(lock);
++    assert!(reader.await.unwrap().unwrap().refreshed);
++    drop(reservation);
++}
+diff --git a/codex-rs/app-server/src/usage/reader.rs b/codex-rs/app-server/src/usage/reader.rs
+--- a/codex-rs/app-server/src/usage/reader.rs
++++ b/codex-rs/app-server/src/usage/reader.rs
+@@ -6,6 +6,8 @@ use super::wire::ParsedFile;
+ use super::wire::intern_model;
+ use super::wire::read_lines;
+ use super::wire::timestamp;
++use codex_app_server_protocol::UsageBuildPhase;
++use codex_app_server_protocol::UsageBuildProgress;
+ use serde_json::Value;
+ use std::collections::BTreeMap;
+ use std::fs;
+@@ -15,6 +17,7 @@ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Mutex;
+ use std::thread;
++use tokio::sync::watch;
+ 
+ pub(super) struct Events {
+     pub(super) events: Vec<Event>,
+@@ -101,7 +104,10 @@ fn read_rollout(
+ 
+ /// Read each file once for all report dimensions, bounded to its observed byte length.
+ /// Compact records keep copied-prefix comparison off the filesystem and UI thread.
+-pub(super) fn load(home: &Path) -> Result<Events, super::Error> {
++pub(super) fn load(
++    home: &Path,
++    progress: &watch::Sender<UsageBuildProgress>,
++) -> Result<Events, super::Error> {
+     // A relative-path collision prefers active over archived records.
+     let mut paths = BTreeMap::new();
+     for name in [
+@@ -115,6 +121,10 @@ pub(super) fn load(home: &Path) -> Result<Events, super::Error> {
+             Err(error) => return Err(error.into()),
+         }
+     }
++    progress.send_modify(|value| {
++        value.phase = UsageBuildPhase::Reading;
++        value.files_total = Some(paths.len() as u64);
++    });
+     let mut diagnostics = Diagnostics::default();
+     let workers = thread::available_parallelism()
+         .map_or(1, usize::from)
+@@ -141,6 +151,7 @@ pub(super) fn load(home: &Path) -> Result<Events, super::Error> {
+                     if let Some(rollout) = read_rollout(reader, &mut diagnostics)? {
+                         files.push((relative, rollout));
+                     }
++                    progress.send_modify(|value| value.files_processed += 1);
+                 }
+                 Ok((files, diagnostics))
+             }));
+@@ -156,6 +167,7 @@ pub(super) fn load(home: &Path) -> Result<Events, super::Error> {
+         }
+         Ok(files.into_values().collect::<Vec<_>>())
+     })?;
++    progress.send_modify(|value| value.phase = UsageBuildPhase::Reconciling);
+     diagnostics.files = files.len();
+     let mut by_id = BTreeMap::new();
+     for (index, file) in files.iter().enumerate() {
+diff --git a/codex-rs/app-server/src/usage/reader_tests.rs b/codex-rs/app-server/src/usage/reader_tests.rs
+--- a/codex-rs/app-server/src/usage/reader_tests.rs
++++ b/codex-rs/app-server/src/usage/reader_tests.rs
+@@ -10,7 +10,11 @@ fn a_header_without_its_line_ending_remains_an_incomplete_tail() {
+     let header = json!({"type":"session_meta","payload":{
+         "id":"thread","history_mode":"paginated"}});
+     fs::write(sessions.join("header.jsonl"), header.to_string()).unwrap();
+-    let events = load(directory.path()).unwrap();
++    let events = load(
++        directory.path(),
++        &watch::channel(UsageBuildProgress::default()).0,
++    )
++    .unwrap();
+     assert_eq!(events.diagnostics.files, 1);
+     assert_eq!(events.diagnostics.incomplete_tails, 1);
+     assert_eq!(events.diagnostics.malformed_records, 0);
+@@ -40,7 +44,11 @@ fn native_billing_preserves_historical_subagent_usage_and_referenced_suffixes()
+             text.push_str(&format!("{event}\n"));
+         }
+         fs::write(root.join("child.jsonl"), text).unwrap();
+-        let events = load(directory.path()).unwrap();
++        let events = load(
++            directory.path(),
++            &watch::channel(UsageBuildProgress::default()).0,
++        )
++        .unwrap();
+         assert_eq!(
+             events
+                 .events
+@@ -64,9 +72,23 @@ fn native_billing_preserves_historical_subagent_usage_and_referenced_suffixes()
+ #[test]
+ fn missing_roots_are_empty_but_a_file_in_place_of_a_root_is_an_error() {
+     let directory = tempfile::tempdir().unwrap();
+-    assert!(load(directory.path()).unwrap().events.is_empty());
++    assert!(
++        load(
++            directory.path(),
++            &watch::channel(UsageBuildProgress::default()).0
++        )
++        .unwrap()
++        .events
++        .is_empty()
++    );
+     fs::write(directory.path().join("sessions"), "").unwrap();
+-    assert!(load(directory.path()).is_err());
++    assert!(
++        load(
++            directory.path(),
++            &watch::channel(UsageBuildProgress::default()).0
++        )
++        .is_err()
++    );
+ }
+ 
+ #[test]
+@@ -100,7 +122,11 @@ fn response_records_use_native_ownership_without_recounting_inherited_totals() {
+             text.push_str(&format!("{record}\n{snapshot}\n"));
+         }
+         fs::write(root.join("child.jsonl"), text).unwrap();
+-        let events = load(directory.path()).unwrap();
++        let events = load(
++            directory.path(),
++            &watch::channel(UsageBuildProgress::default()).0,
++        )
++        .unwrap();
+         assert_eq!(events.events.len(), 1);
+         assert_eq!(events.events[0].tokens.input, 20);
+         assert_eq!(events.diagnostics.replayed_events, usize::from(copied));
+@@ -127,7 +153,11 @@ fn old_session_header_does_not_hide_new_incomplete_spending_after_the_baseline()
+     }});
+     let path = root.join("resumed.jsonl");
+     fs::write(&path, format!("{header}\n{initial}\n")).unwrap();
+-    let events = load(directory.path()).unwrap();
++    let events = load(
++        directory.path(),
++        &watch::channel(UsageBuildProgress::default()).0,
++    )
++    .unwrap();
+     assert!(events.events.is_empty());
+     assert!(events.credits.is_empty());
+ 
+@@ -145,7 +175,11 @@ fn old_session_header_does_not_hide_new_incomplete_spending_after_the_baseline()
+         format!("{header}\n{initial}\n{context}\n{incomplete}\n{incomplete}\n"),
+     )
+     .unwrap();
+-    let events = load(directory.path()).unwrap();
++    let events = load(
++        directory.path(),
++        &watch::channel(UsageBuildProgress::default()).0,
++    )
++    .unwrap();
+     assert_eq!(events.events.len(), 1);
+     assert_eq!(events.events[0].tokens.input, 20);
+     assert_eq!(events.events[0].tokens.output, 5);
+diff --git a/codex-rs/app-server/src/usage/service_tests.rs b/codex-rs/app-server/src/usage/service_tests.rs
+--- a/codex-rs/app-server/src/usage/service_tests.rs
++++ b/codex-rs/app-server/src/usage/service_tests.rs
+@@ -8,8 +8,14 @@ async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
+     let home = tempfile::tempdir().unwrap();
+     let service = Service::new(home.path().to_path_buf());
+     let (first, second) = tokio::join!(
+-        service.read(UsageReadParams::default()),
+-        service.read(UsageReadParams::default()),
++        service.read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0
++        ),
++        service.read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0
++        ),
+     );
+     let first = first.unwrap();
+     let second = second.unwrap();
+@@ -27,7 +33,13 @@ async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
+         "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"linear\"}}\n",
+     )
+     .unwrap();
+-    let cached = service.read(UsageReadParams::default()).await.unwrap();
++    let cached = service
++        .read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0,
++        )
++        .await
++        .unwrap();
+     assert!(!cached.refreshed);
+     let cached = cached.report;
+     assert!(Arc::ptr_eq(&first, &cached));
+@@ -35,14 +47,23 @@ async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
+     assert_eq!(cached.build_duration_ms, first.build_duration_ms);
+ 
+     let refreshed = service
+-        .read(UsageReadParams { refresh: true })
++        .read_report(
++            UsageReadParams { refresh: true },
++            watch::channel(UsageBuildProgress::default()).0,
++        )
+         .await
+         .unwrap();
+     assert!(refreshed.refreshed);
+     let refreshed = refreshed.report;
+     assert!(!Arc::ptr_eq(&first, &refreshed));
+     assert_eq!(refreshed.diagnostics.skipped_non_paginated, 1);
+-    let another_client = service.read(UsageReadParams::default()).await.unwrap();
++    let another_client = service
++        .read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0,
++        )
++        .await
++        .unwrap();
+     assert!(!another_client.refreshed);
+     let another_client = another_client.report;
+     assert!(Arc::ptr_eq(&refreshed, &another_client));
+@@ -54,7 +75,13 @@ async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
+ 
+     tokio::time::pause();
+     tokio::time::advance(Duration::from_secs(25 * 60 * 60)).await;
+-    let aged = service.read(UsageReadParams::default()).await.unwrap();
++    let aged = service
++        .read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0,
++        )
++        .await
++        .unwrap();
+     assert!(!aged.refreshed);
+     let aged = aged.report;
+     assert!(Arc::ptr_eq(&refreshed, &aged));
+@@ -65,15 +92,30 @@ async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
+ async fn explicit_refresh_reports_scan_errors_and_recovers_on_the_next_request() {
+     let home = tempfile::tempdir().unwrap();
+     let service = Service::new(home.path().to_path_buf());
+-    let initial = service.read(UsageReadParams::default()).await.unwrap();
++    let initial = service
++        .read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0,
++        )
++        .await
++        .unwrap();
+     fs::write(home.path().join("sessions"), "not a directory").unwrap();
+     assert!(
+         service
+-            .read(UsageReadParams { refresh: true })
++            .read_report(
++                UsageReadParams { refresh: true },
++                watch::channel(UsageBuildProgress::default()).0
++            )
+             .await
+             .is_err()
+     );
+-    let cached = service.read(UsageReadParams::default()).await.unwrap();
++    let cached = service
++        .read_report(
++            UsageReadParams::default(),
++            watch::channel(UsageBuildProgress::default()).0,
++        )
++        .await
++        .unwrap();
+     assert!(Arc::ptr_eq(&initial.report, &cached.report));
+     assert_eq!(
+         cached.report.build_duration_ms,
+@@ -81,7 +123,10 @@ async fn explicit_refresh_reports_scan_errors_and_recovers_on_the_next_request()
+     );
+     fs::remove_file(home.path().join("sessions")).unwrap();
+     let response = service
+-        .read(UsageReadParams { refresh: true })
++        .read_report(
++            UsageReadParams { refresh: true },
++            watch::channel(UsageBuildProgress::default()).0,
++        )
+         .await
+         .unwrap();
+     let wire = serde_json::to_value(&response).unwrap();
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -208,6 +208,7 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ProjectChanged(_)
+         | ServerNotification::SkillsChanged(_)
+         | ServerNotification::AccountUpdated(_)
++        | ServerNotification::UsageBuildProgress(_)
+         | ServerNotification::ThreadReadStateChanged(_)
+         | ServerNotification::GatewayOAuthChanged(_)
+         | ServerNotification::AccountRateLimitsUpdated(_)
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -374,6 +374,7 @@ impl ChatWidget {
+             }
+             ServerNotification::ServerRequestResolved(_)
+             | ServerNotification::AccountUpdated(_)
++            | ServerNotification::UsageBuildProgress(_)
+             | ServerNotification::GatewayOAuthChanged(_)
+             | ServerNotification::AccountRateLimitsUpdated(_)
+             | ServerNotification::ThreadStarted(_)

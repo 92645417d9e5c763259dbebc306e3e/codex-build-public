@@ -1,0 +1,1163 @@
+observe-response-ingress-over-websocket
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: observe-response-ingress-over-websocket
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Publish and retain attempt-scoped WebSocket response facts independently of model output delivery and native conversation history.
+
+Requires: Unit:cross/retain-model-diagnostics-for-thirty-six-hours, FlatPatch:backend/probe-models-after-weekly-quota-reset
+
+Provides: Record setup, dispatch, receipt and terminal facts for generation, compaction, memory, guardian and native ephemeral probes. Publish ordered modelResponse/updated snapshots, retain the latest 250 attempts in memory and serve modelResponse/list filters and cursors. Asynchronously persist and restore through the shared native StateRuntime logs pool, page older records, flush the ordered writer and drain every accepted write before that pool closes. Expire cached records, model membership and last-generation facts with the shared 36-hour retention. Expose last-generation TPS and TTFC plus rolling 24-hour per-model TPS P50/P05, TTFC P50/P95 and separate valid sample counts. Supply per-model and aggregate recent-24H generation counts with successful Completed attempts as numerator and all attempts, including unfinished ones, as denominator. Retry transient SQLite busy writes in place with bounded delays while preserving publication order, and clear the transient persistence error once the same record is saved.
+
+Boundary: HTTP, SSE and WebSocket warmup requests create no response-attempt records. Native transport, prewarming, fallback, incomplete-response errors and cancellation draining remain unchanged. Preserve reported incomplete usage and its original terminal outcome. Missing usage stays unknown, reported zero stays zero, observers never await storage, restored clocks remain inactive and storage errors remain visible. Preserve nonincremental-reason and item-type diagnostics without tool counters or legacy readers. Typed records, native logs database migration and physical expiry belong to retain-model-diagnostics-for-thirty-six-hours. Atomic output, pricing, full-history accounting, probe scheduling and TUI presentation remain separate. Restore compact generation samples once and maintain timing distributions and outcome counts in memory without database reads on refresh. Timing distributions and latest-generation metrics use ended attempts only. Do not open an independent SQLite file or connection pool; explicit unavailable native storage preserves live observations and reports persistence errors. Native runtime shutdown owns the shared pool closure. Exhausted retries and non-lock write failures remain actionable and cannot be cleared by an unrelated successful write.
+
+Verification: Observation and progress tests preserve receipt facts, failures, deadlines and unknown usage. History and backup tests cover publication ordering, live ownership, bounded recent retention, configured database placement, restart, 36-hour expiry and rolling summaries beyond recent-record eviction. Outcome tests cover ongoing-to-terminal transitions, successful and unsuccessful endings, duplicate or stale restore, per-model and total counts and 24-hour expiry without altering timing samples. Native WebSocket, guardian and probe tests preserve attribution, incomplete usage, cancellation draining and probe persistence while excluding warmup and HTTP; App Server tests cover listing, notifications and grouped summaries. Shutdown tests cover accepted queued writes, shared-pool closure and reopening the standalone logs main file. Concurrent-writer tests cover delayed recovery, error clearing, disk paging, ordered final revisions and bounded exhaustion without hiding terminal failures.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -2438,7 +2438,8 @@ fn websocket_error_detail(err: &ApiError) -> String {
+             format!("handshake API error: {status} {message}")
+         }
+         ApiError::Stream(message) => format!("handshake stream error: {message}"),
+-        ApiError::ContentFilter
++        ApiError::ResponseProgressTimeout
++        | ApiError::ContentFilter
+         | ApiError::ResponseIncomplete(_)
+         | ApiError::ContextWindowExceeded
+         | ApiError::QuotaExceeded
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -28,6 +28,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
+         ApiError::Transport(_)
+         | ApiError::Api { .. }
+         | ApiError::Stream(_)
++        | ApiError::ResponseProgressTimeout
+         | ApiError::ContentFilter
+         | ApiError::ResponseIncomplete(_)
+         | ApiError::ContextWindowExceeded
+@@ -58,6 +59,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
+             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
+         }
+         ApiError::Stream(msg) => CodexErr::Stream(msg),
++        ApiError::ResponseProgressTimeout => CodexErrorDetails::ResponseProgressTimeout.into(),
+         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
+         ApiError::ResponseIncomplete(incomplete) => {
+             CodexErr::new(CodexErrorDetails::ResponseIncomplete(incomplete))
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -8,6 +8,9 @@ use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
+ use crate::error::ApiError;
+ use crate::provider::Provider;
+ use crate::rate_limits::parse_rate_limit_event;
++use crate::response_observation::ResponseObservation;
++use crate::response_observation::ResponseObserver;
++use crate::response_progress::ResponseProgress;
+ use crate::responses_headers::json_headers_to_http_headers;
+ use crate::safety_buffering::treatment_from_headers;
+ use crate::sse::ResponsesStreamEvent;
+@@ -16,6 +19,7 @@ use crate::telemetry::WebsocketTelemetry;
+ use codex_client::TransportError;
+ use codex_http_client::HttpClientFactory;
+ use codex_http_client::RetryAfter;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_websocket_client::WebSocketConnection;
+ use codex_websocket_client::WebSocketConnector;
+ use futures::FutureExt;
+@@ -55,23 +59,30 @@ use url::Url;
+ 
+ struct WsStream {
+     tx_command: mpsc::Sender<WsCommand>,
+-    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
++    rx_message: mpsc::UnboundedReceiver<WsIncoming>,
+     pump_task: tokio::task::JoinHandle<()>,
+     status_telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     disconnected: Arc<AtomicBool>,
+ }
+ 
++enum WsIncoming {
++    Message(Result<Message, WsError>),
++    ResponseError(ApiError),
++}
++
+ enum WsCommand {
+     Send {
+         message: Message,
+-        tx_result: oneshot::Sender<Result<(), WsError>>,
++        begin_response: bool,
++        observer: Option<Arc<dyn ResponseObserver>>,
++        tx_result: oneshot::Sender<Result<(), ApiError>>,
+     },
+ }
+ 
+ impl WsStream {
+     fn new(inner: WebSocketConnection, telemetry: Option<Arc<dyn WebsocketTelemetry>>) -> Self {
+         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
+-        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
++        let (tx_message, rx_message) = mpsc::unbounded_channel();
+         let status_telemetry = telemetry;
+         let disconnected = Arc::new(AtomicBool::new(false));
+         let pump_telemetry = status_telemetry.clone();
+@@ -79,6 +90,7 @@ impl WsStream {
+ 
+         let pump_task = tokio::spawn(async move {
+             let mut inner = inner;
++            let mut response_progress: Option<ResponseProgress> = None;
+             let mut ping_interval = tokio::time::interval_at(
+                 Instant::now() + WEBSOCKET_PING_INTERVAL,
+                 WEBSOCKET_PING_INTERVAL,
+@@ -87,7 +99,18 @@ impl WsStream {
+             let mut next_ping_id = 0_u64;
+             let mut pending_ping: Option<([u8; 8], Instant)> = None;
+             loop {
++                let deadline = response_progress
++                    .as_ref()
++                    .and_then(|progress| progress.deadline);
+                 tokio::select! {
++                    biased;
++                    _ = wait_for_content_deadline(deadline) => {
++                        if let Some(progress) = &mut response_progress {
++                            progress.end(ResponseAttemptEnd::ProgressTimeout, Instant::now());
++                        }
++                        let _ = tx_message.send(WsIncoming::ResponseError(ApiError::ResponseProgressTimeout));
++                        break;
++                    }
+                     _ = ping_interval.tick(), if pump_telemetry.is_some() => {
+                         if !pump_telemetry.as_ref().is_some_and(|telemetry| telemetry.should_measure_ws_rtt()) {
+                             pending_ping = None;
+@@ -95,8 +118,15 @@ impl WsStream {
+                         }
+                         let payload = next_ping_id.to_be_bytes();
+                         next_ping_id = next_ping_id.wrapping_add(1);
+-                        if let Err(err) = inner.send(Message::Ping(payload.to_vec().into())).await {
+-                            let _ = tx_message.send(Err(err));
++                        if let Err(err) = send_frame(&mut inner, Message::Ping(payload.to_vec().into()), deadline).await {
++                            if let Some(progress) = &mut response_progress {
++                                progress.end(if matches!(err, ApiError::ResponseProgressTimeout) {
++                                    ResponseAttemptEnd::ProgressTimeout
++                                } else {
++                                    ResponseAttemptEnd::TransportClosed
++                                }, Instant::now());
++                            }
++                            let _ = tx_message.send(WsIncoming::ResponseError(err));
+                             break;
+                         }
+                         pending_ping = Some((payload, Instant::now()));
+@@ -106,9 +136,21 @@ impl WsStream {
+                             break;
+                         };
+                         match command {
+-                            WsCommand::Send { message, tx_result } => {
+-                                let result = inner.send(message).await;
++                            WsCommand::Send { message, begin_response, observer, tx_result } => {
++                                if begin_response || observer.is_some() {
++                                    response_progress = Some(ResponseProgress::sent(Instant::now(), observer, begin_response));
++                                }
++                                let result = send_frame(&mut inner, message, response_progress.as_ref().and_then(|progress| progress.deadline)).await;
+                                 let should_break = result.is_err();
++                                if let Err(error) = &result
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    progress.end(if matches!(error, ApiError::ResponseProgressTimeout) {
++                                        ResponseAttemptEnd::ProgressTimeout
++                                    } else {
++                                        ResponseAttemptEnd::SendFailed
++                                    }, Instant::now());
++                                }
+                                 let _ = tx_result.send(result);
+                                 if should_break {
+                                     break;
+@@ -117,13 +159,24 @@ impl WsStream {
+                         }
+                     }
+                     message = inner.next() => {
++                        let received_at = Instant::now();
+                         let Some(message) = message else {
++                            if let Some(progress) = &mut response_progress {
++                                progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                            }
+                             break;
+                         };
+                         match message {
+                             Ok(Message::Ping(payload)) => {
+-                                if let Err(err) = inner.send(Message::Pong(payload)).await {
+-                                    let _ = tx_message.send(Err(err));
++                                if let Err(err) = send_frame(&mut inner, Message::Pong(payload), deadline).await {
++                                    if let Some(progress) = &mut response_progress {
++                                        progress.end(if matches!(err, ApiError::ResponseProgressTimeout) {
++                                            ResponseAttemptEnd::ProgressTimeout
++                                        } else {
++                                            ResponseAttemptEnd::TransportClosed
++                                        }, Instant::now());
++                                    }
++                                    let _ = tx_message.send(WsIncoming::ResponseError(err));
+                                     break;
+                                 }
+                             }
+@@ -142,8 +195,39 @@ impl WsStream {
+                             | Message::Binary(_)
+                             | Message::Close(_)
+                             | Message::Frame(_))) => {
++                                if let Message::Text(text) = &message
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    match progress.receive(text, received_at) {
++                                        Ok(true) => response_progress = None,
++                                        Ok(false) => {
++                                            // A mapped protocol error ends receipt before a later EOF
++                                            // can replace its outcome while the consumer is busy.
++                                            if let Some(wrapped) = parse_wrapped_websocket_error_event(text)
++                                                && let Some(error) = map_wrapped_websocket_error_event(wrapped, text.to_string())
++                                            {
++                                                let watch_content = progress.deadline.is_some();
++                                                progress.end(ResponseAttemptEnd::Failed, received_at);
++                                                if watch_content {
++                                                    let _ = tx_message.send(WsIncoming::ResponseError(error));
++                                                    break;
++                                                }
++                                                response_progress = None;
++                                            }
++                                        },
++                                        Err(error) => {
++                                            let _ = tx_message.send(WsIncoming::ResponseError(error));
++                                            break;
++                                        }
++                                    }
++                                }
+                                 let is_close = matches!(message, Message::Close(_));
+-                                if tx_message.send(Ok(message)).is_err() {
++                                if is_close
++                                    && let Some(progress) = &mut response_progress
++                                {
++                                    progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                                }
++                                if tx_message.send(WsIncoming::Message(Ok(message))).is_err() {
+                                     break;
+                                 }
+                                 if is_close {
+@@ -151,7 +235,10 @@ impl WsStream {
+                                 }
+                             }
+                             Err(err) => {
+-                                let _ = tx_message.send(Err(err));
++                                if let Some(progress) = &mut response_progress {
++                                    progress.end(ResponseAttemptEnd::TransportClosed, received_at);
++                                }
++                                let _ = tx_message.send(WsIncoming::Message(Err(err)));
+                                 break;
+                             }
+                         }
+@@ -172,8 +259,8 @@ impl WsStream {
+ 
+     async fn request(
+         &mut self,
+-        make_command: impl FnOnce(oneshot::Sender<Result<(), WsError>>) -> WsCommand,
+-    ) -> Result<(), WsError> {
++        make_command: impl FnOnce(oneshot::Sender<Result<(), ApiError>>) -> WsCommand,
++    ) -> Result<(), ApiError> {
+         let (tx_result, rx_result) = oneshot::channel();
+         if self.tx_command.send(make_command(tx_result)).await.is_ok()
+             && let Ok(result) = rx_result.await
+@@ -181,18 +268,56 @@ impl WsStream {
+             return result;
+         }
+         while let Some(message) = self.rx_message.recv().await {
+-            message?;
++            match message {
++                WsIncoming::Message(message) => {
++                    message.map_err(map_ws_stream_error)?;
++                }
++                WsIncoming::ResponseError(error) => return Err(error),
++            }
+         }
+-        Err(WsError::ConnectionClosed)
++        Err(map_ws_stream_error(WsError::ConnectionClosed))
+     }
+ 
+-    async fn send(&mut self, message: Message) -> Result<(), WsError> {
+-        self.request(|tx_result| WsCommand::Send { message, tx_result })
+-            .await
++    async fn send(
++        &mut self,
++        message: Message,
++        begin_response: bool,
++        observer: Option<Arc<dyn ResponseObserver>>,
++    ) -> Result<(), ApiError> {
++        self.request(|tx_result| WsCommand::Send {
++            message,
++            begin_response,
++            observer,
++            tx_result,
++        })
++        .await
++    }
++
++    async fn next(&mut self) -> Result<Option<Result<Message, WsError>>, ApiError> {
++        match self.rx_message.recv().await {
++            Some(WsIncoming::Message(message)) => Ok(Some(message)),
++            Some(WsIncoming::ResponseError(error)) => Err(error),
++            None => Ok(None),
++        }
++    }
++}
++
++async fn wait_for_content_deadline(deadline: Option<Instant>) {
++    match deadline {
++        Some(deadline) => tokio::time::sleep_until(deadline).await,
++        None => std::future::pending::<()>().await,
+     }
++}
+ 
+-    async fn next(&mut self) -> Option<Result<Message, WsError>> {
+-        self.rx_message.recv().await
++async fn send_frame(
++    inner: &mut WebSocketConnection,
++    message: Message,
++    deadline: Option<Instant>,
++) -> Result<(), ApiError> {
++    tokio::select! {
++        biased;
++        _ = wait_for_content_deadline(deadline) => Err(ApiError::ResponseProgressTimeout),
++        result = inner.send(message) => result.map_err(map_ws_stream_error),
+     }
+ }
+ 
+@@ -314,6 +439,7 @@ impl ResponsesWebsocketConnection {
+         request: ResponsesWsRequest<'_>,
+         connection_reused: bool,
+         turn_state: Option<Arc<OnceLock<String>>>,
++        observer: Option<Arc<dyn ResponseObserver>>,
+     ) -> Result<ResponseStream, ApiError> {
+         let (tx_event, rx_event) =
+             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
+@@ -349,6 +475,9 @@ impl ResponsesWebsocketConnection {
+             connection_reused,
+         };
+         let request_text = serialize_websocket_request(&request)?;
++        if let Some(observer) = &observer {
++            observer.prepared(request_text.len() as u64);
++        }
+ 
+         let current_span = Span::current();
+         tokio::spawn(
+@@ -358,6 +487,15 @@ impl ResponsesWebsocketConnection {
+             )]
+             async move {
+                 if let Some(model) = server_model {
++                    if let Some(observer) = &observer {
++                        observer.received(
++                            ResponseObservation {
++                                served_model: Some(model.clone()),
++                                ..Default::default()
++                            },
++                            Instant::now(),
++                        );
++                    }
+                     let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+                 }
+                 if server_reasoning_included {
+@@ -417,6 +555,7 @@ impl ResponsesWebsocketConnection {
+                             telemetry,
+                             turn_state.as_deref(),
+                             &timing_log_context,
++                            observer.clone(),
+                             interrupt.clone(),
+                             &mut completion,
+                         ) => result,
+@@ -430,6 +569,18 @@ impl ResponsesWebsocketConnection {
+                 };
+ 
+                 if let Err(err) = result {
++                    if let Some(observer) = &observer {
++                        observer.ended(
++                            if tx_event.is_closed() {
++                                ResponseAttemptEnd::Canceled
++                            } else if matches!(err, ApiError::ResponseProgressTimeout) {
++                                ResponseAttemptEnd::ProgressTimeout
++                            } else {
++                                ResponseAttemptEnd::Failed
++                            },
++                            Instant::now(),
++                        );
++                    }
+                     // A terminal stream error should reach the caller immediately. Waiting for a
+                     // graceful close handshake here can stall indefinitely and mask the error.
+                     let failed_stream = guard.take();
+@@ -551,6 +702,7 @@ impl ResponsesWebsocketClient {
+         let immediate_close = tokio::time::timeout(immediate_close_timeout, stream.next())
+             .await
+             .ok()
++            .transpose()?
+             .flatten()
+             .transpose()
+             .map_err(map_ws_stream_error)?
+@@ -786,6 +938,7 @@ async fn run_websocket_response_stream(
+     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     turn_state: Option<&OnceLock<String>>,
+     timing_log_context: &ResponsesWebsocketTimingLogContext,
++    observer: Option<Arc<dyn ResponseObserver>>,
+     interrupt: impl Future<Output = ResponseInterrupt> + Clone + Unpin,
+     completion: &mut Option<ResponseEvent>,
+ ) -> Result<(), ApiError> {
+@@ -804,6 +957,8 @@ async fn run_websocket_response_stream(
+         idle_timeout,
+         telemetry.as_ref(),
+         timing_log_context.connection_reused,
++        false,
++        observer.clone(),
+     )
+     .await?;
+ 
+@@ -815,9 +970,10 @@ async fn run_websocket_response_stream(
+     loop {
+         let poll_start = Instant::now();
+         let response = tokio::select! {
+-            response = tokio::time::timeout(idle_timeout, ws_stream.next()) => {
+-                response.map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))
+-            }
++            response = async {
++                tokio::time::timeout(idle_timeout, ws_stream.next()).await
++                    .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()))?
++            } => response,
+             request = &mut interrupt_request, if response_id.is_some() => {
+                 interruption = Some(request);
+                 send_websocket_request(
+@@ -830,6 +986,8 @@ async fn run_websocket_response_stream(
+                     idle_timeout,
+                     /*telemetry*/ None,
+                     timing_log_context.connection_reused,
++                    false,
++                    None,
+                 )
+                 .await?;
+                 awaiting_interrupt_ack = matches!(request, ResponseInterrupt::Cancel { .. });
+@@ -935,9 +1093,13 @@ async fn run_websocket_response_stream(
+                     continue;
+                 }
+                 let model = event.response_model();
++                let original_completed = event.kind() == "response.completed";
+                 // Preserve terminal usage before any accompanying notification can block.
+                 let event = match process_responses_event(event) {
+                     Ok(Some(event @ ResponseEvent::Completed { .. })) => {
++                        if original_completed && let Some(observer) = &observer {
++                            observer.ended(ResponseAttemptEnd::Completed, Instant::now());
++                        }
+                         *completion = Some(event);
+                         Ok(None)
+                     }
+@@ -1074,17 +1236,25 @@ async fn send_websocket_request(
+     idle_timeout: Duration,
+     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+     connection_reused: bool,
++    begin_response: bool,
++    observer: Option<Arc<dyn ResponseObserver>>,
+ ) -> Result<(), ApiError> {
+     trace!("websocket request: {request_text}");
+ 
+     let request_start = Instant::now();
+-    let result = tokio::time::timeout(
+-        idle_timeout,
+-        ws_stream.send(Message::Text(request_text.into())),
+-    )
+-    .await
+-    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+-    .and_then(|result| result.map_err(map_ws_stream_error));
++    let send = ws_stream.send(
++        Message::Text(request_text.into()),
++        begin_response,
++        observer.clone(),
++    );
++    let result = if begin_response {
++        send.await
++    } else {
++        tokio::time::timeout(idle_timeout, send)
++            .await
++            .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
++            .and_then(|result| result)
++    };
+ 
+     if let Some(t) = telemetry.as_ref() {
+         t.on_ws_request(
+@@ -1094,9 +1264,12 @@ async fn send_websocket_request(
+         );
+     }
+ 
+-    result?;
+-
+-    Ok(())
++    if result.is_err()
++        && let Some(observer) = &observer
++    {
++        observer.ended(ResponseAttemptEnd::SendFailed, Instant::now());
++    }
++    result
+ }
+ 
+ fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {
+diff --git a/codex-rs/codex-api/src/error.rs b/codex-rs/codex-api/src/error.rs
+--- a/codex-rs/codex-api/src/error.rs
++++ b/codex-rs/codex-api/src/error.rs
+@@ -15,6 +15,8 @@ pub enum ApiError {
+     Api { status: StatusCode, message: String },
+     #[error("stream error: {0}")]
+     Stream(String),
++    #[error("response made no content progress for 300 seconds")]
++    ResponseProgressTimeout,
+     #[error("stream error: Incomplete response returned, reason: content_filter")]
+     ContentFilter,
+     #[error(transparent)]
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -8,6 +8,8 @@ pub(crate) mod images;
+ pub(crate) mod provider;
+ pub(crate) mod rate_limits;
+ pub(crate) mod requests;
++mod response_observation;
++mod response_progress;
+ mod responses_headers;
+ pub(crate) mod safety_buffering;
+ pub(crate) mod search;
+@@ -89,6 +91,8 @@ pub use crate::provider::Provider;
+ pub use crate::provider::RetryConfig;
+ pub use crate::provider::is_azure_responses_provider;
+ pub use crate::requests::Compression;
++pub use crate::response_observation::ResponseObservation;
++pub use crate::response_observation::ResponseObserver;
+ pub use crate::search::AllowedCaller;
+ pub use crate::search::ApproximateLocation;
+ pub use crate::search::ClickOperation;
+diff --git a/codex-rs/codex-api/src/response_observation.rs b/codex-rs/codex-api/src/response_observation.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_observation.rs
+@@ -0,0 +1,174 @@
++//! Request-scoped observations taken at wire receipt, before output publication.
++
++use crate::sse::ResponsesStreamEvent;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use serde_json::Value;
++use tokio::time::Instant;
++
++/// Records facts synchronously without waiting on storage or UI consumers.
++/// Implementations do not control buffering or content-progress deadlines.
++pub trait ResponseObserver: Send + Sync {
++    /// Counts serialized model-protocol UTF-8 bytes without retaining the request.
++    fn prepared(&self, payload_bytes: u64);
++    /// Marks the transport's request-dispatch origin.
++    fn sent(&self, at: Instant);
++    /// The served model may precede `sent` without timing or byte observations.
++    fn received(&self, observation: ResponseObservation, at: Instant);
++    /// Ends the attempt without replacing an already observed protocol ending.
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant);
++}
++
++#[derive(Debug, Default)]
++pub struct ResponseObservation {
++    pub payload_bytes: u64,
++    pub has_content: bool,
++    pub response_id: Option<String>,
++    pub served_model: Option<String>,
++    pub usage: Option<Value>,
++    pub terminal: Option<ResponseAttemptEnd>,
++}
++
++impl ResponseObservation {
++    pub(crate) fn from_payload(payload: &str) -> Self {
++        serde_json::from_str::<ResponsesStreamEvent>(payload)
++            .map(|event| Self::from_event(&event, payload))
++            .unwrap_or_else(|_| Self {
++                payload_bytes: payload.len() as u64,
++                ..Default::default()
++            })
++    }
++
++    pub(crate) fn from_event(event: &ResponsesStreamEvent, payload: &str) -> Self {
++        // Interruption acknowledgements are control replies, not model facts.
++        // The transport validates their referenced response ID after wire observation.
++        if matches!(
++            event.kind(),
++            "response.interrupt.accepted" | "response.interrupt.failed"
++        ) {
++            return Self {
++                payload_bytes: payload.len() as u64,
++                ..Default::default()
++            };
++        }
++        let response = event.response.as_ref();
++        let text_field = |field: &str| {
++            response
++                .and_then(|response| response.get(field))
++                .and_then(Value::as_str)
++                .map(str::to_owned)
++        };
++        let terminal = match event.kind() {
++            "response.completed" => Some(ResponseAttemptEnd::Completed),
++            "response.failed" => Some(ResponseAttemptEnd::Failed),
++            "response.incomplete" => Some(
++                if response
++                    .and_then(|response| response.pointer("/incomplete_details/reason"))
++                    .and_then(Value::as_str)
++                    == Some("interrupted")
++                {
++                    ResponseAttemptEnd::Interrupted
++                } else {
++                    ResponseAttemptEnd::Incomplete
++                },
++            ),
++            _ => None,
++        };
++        Self {
++            payload_bytes: payload.len() as u64,
++            has_content: has_content(event),
++            response_id: text_field("id").or_else(|| {
++                event
++                    .response_id
++                    .as_ref()
++                    .and_then(Value::as_str)
++                    .map(str::to_owned)
++            }),
++            served_model: event.response_model().or_else(|| text_field("model")),
++            usage: response
++                .and_then(|response| response.get("usage"))
++                .filter(|value| value.is_object())
++                .cloned(),
++            terminal,
++        }
++    }
++}
++
++/// Detects actual model fields without retaining or counting their contents.
++fn has_content(event: &ResponsesStreamEvent) -> bool {
++    match event.kind() {
++        "response.completed" | "response.incomplete" | "response.failed" => event
++            .response
++            .as_ref()
++            .and_then(|response| response.get("output"))
++            .and_then(Value::as_array)
++            .is_some_and(|items| items.iter().any(item_has_content)),
++        "response.output_item.added" | "response.output_item.done" => {
++            event.item.as_ref().is_some_and(item_has_content)
++        }
++        "response.output_text.delta"
++        | "response.refusal.delta"
++        | "response.reasoning_text.delta"
++        | "response.reasoning_summary_text.delta"
++        | "response.function_call_arguments.delta"
++        | "response.custom_tool_call_input.delta" => {
++            event.delta.as_ref().is_some_and(|text| !text.is_empty())
++        }
++        "response.output_text.done"
++        | "response.reasoning_text.done"
++        | "response.reasoning_summary_text.done" => {
++            event.text.as_ref().is_some_and(|text| !text.is_empty())
++        }
++        "response.refusal.done" => nonempty(event.refusal.as_ref()),
++        "response.function_call_arguments.done" => nonempty(event.arguments.as_ref()),
++        "response.custom_tool_call_input.done" => nonempty(event.input.as_ref()),
++        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
++            nonempty(event.part.as_ref().and_then(|part| part.get("text")))
++        }
++        "response.content_part.added" | "response.content_part.done" => {
++            event.part.as_ref().is_some_and(part_has_content)
++        }
++        _ => false,
++    }
++}
++
++fn nonempty(value: Option<&Value>) -> bool {
++    value
++        .and_then(Value::as_str)
++        .is_some_and(|text| !text.is_empty())
++}
++
++fn part_has_content(part: &Value) -> bool {
++    matches!(
++        part.get("type").and_then(Value::as_str),
++        Some("output_text" | "refusal" | "summary_text" | "reasoning_text" | "text")
++    ) && (nonempty(part.get("text")) || nonempty(part.get("refusal")))
++}
++
++fn item_has_content(item: &Value) -> bool {
++    let kind = item.get("type").and_then(Value::as_str);
++    let content = match kind {
++        Some("message" | "reasoning") => ["content", "summary"].iter().any(|field| {
++            item.get(field)
++                .and_then(Value::as_array)
++                .is_some_and(|parts| parts.iter().any(part_has_content))
++        }),
++        Some("function_call") => {
++            nonempty(item.get("arguments"))
++                || item
++                    .get("encrypted_function_args")
++                    .and_then(Value::as_array)
++                    .is_some_and(|args| args.iter().any(|value| nonempty(Some(value))))
++        }
++        Some("custom_tool_call") => nonempty(item.get("input")),
++        _ => false,
++    };
++    content
++        || (matches!(
++            kind,
++            Some("reasoning" | "compaction" | "compaction_summary" | "context_compaction")
++        ) && nonempty(item.get("encrypted_content")))
++}
++
++#[cfg(test)]
++#[path = "response_observation_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/response_observation_tests.rs b/codex-rs/codex-api/src/response_observation_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_observation_tests.rs
+@@ -0,0 +1,62 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++fn observe(payload: Value) -> ResponseObservation {
++    let payload = payload.to_string();
++    ResponseObservation::from_event(&serde_json::from_str(&payload).unwrap(), &payload)
++}
++
++#[test]
++fn failed_response_retains_usage_without_treating_error_text_as_content() {
++    let usage = json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80},
++        "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 5}});
++    let observation = observe(json!({"type": "response.failed", "response": {
++        "id": "r1", "status": "failed", "model": "served-model", "usage": usage,
++        "error": {"code": "failure", "message": "not model output"}
++    }}));
++    assert_eq!(observation.terminal, Some(ResponseAttemptEnd::Failed));
++    assert!(!observation.has_content);
++    assert_eq!(observation.usage, Some(usage));
++    assert_eq!(observation.served_model.as_deref(), Some("served-model"));
++}
++
++#[test]
++fn model_progress_recognizes_native_content_without_counting_control_fields() {
++    for item in [
++        json!({"type": "message", "content": [{"type": "output_text", "text": "answer"}]}),
++        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "reason"}]}),
++        json!({"type": "reasoning", "encrypted_content": "opaque"}),
++        json!({"type": "function_call", "arguments": "{}"}),
++        json!({"type": "function_call", "encrypted_function_args": ["opaque"]}),
++        json!({"type": "custom_tool_call", "input": "command"}),
++        json!({"type": "compaction", "encrypted_content": "opaque"}),
++    ] {
++        assert!(observe(json!({"type": "response.output_item.done", "item": item})).has_content);
++        assert!(
++            observe(json!({"type": "response.completed", "response": {"output": [item]}}))
++                .has_content
++        );
++    }
++    for payload in [
++        json!({"type": "response.created", "response": {"id": "r1"}}),
++        json!({"type": "codex.response.metadata", "headers": {"openai-model": "model"}}),
++        json!({"type": "codex.rate_limits", "rate_limits": {"secondary": {
++            "used_percent": 12.5, "window_minutes": 10080, "reset_at": 1704074400
++        }}}),
++        json!({"type": "response.output_item.added", "item": {"type": "function_call", "name": "tool", "arguments": ""}}),
++        json!({"type": "response.output_text.delta", "delta": ""}),
++        json!({"type": "error", "error": {"message": "failure"}}),
++    ] {
++        assert!(!observe(payload).has_content);
++    }
++    for payload in [
++        json!({"type": "response.output_text.delta", "delta": "a"}),
++        json!({"type": "response.reasoning_summary_text.delta", "delta": "b"}),
++        json!({"type": "response.function_call_arguments.delta", "delta": "{"}),
++        json!({"type": "response.custom_tool_call_input.done", "input": "command"}),
++        json!({"type": "response.content_part.done", "part": {"type": "refusal", "refusal": "declined"}}),
++    ] {
++        assert!(observe(payload).has_content);
++    }
++}
+diff --git a/codex-rs/codex-api/src/response_progress.rs b/codex-rs/codex-api/src/response_progress.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_progress.rs
+@@ -0,0 +1,85 @@
++//! Wire receipt is observed independently of the complete-output content deadline.
++
++use crate::ApiError;
++use crate::response_observation::ResponseObservation;
++use crate::response_observation::ResponseObserver;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::time::Instant;
++
++const CONTENT_TIMEOUT: Duration = Duration::from_secs(300);
++
++pub(crate) struct ResponseProgress {
++    pub(crate) deadline: Option<Instant>,
++    response_id: Option<String>,
++    observer: Option<Arc<dyn ResponseObserver>>,
++}
++
++impl ResponseProgress {
++    pub(crate) fn sent(
++        at: Instant,
++        observer: Option<Arc<dyn ResponseObserver>>,
++        watch_content: bool,
++    ) -> Self {
++        if let Some(observer) = &observer {
++            observer.sent(at);
++        }
++        Self {
++            deadline: watch_content.then_some(at + CONTENT_TIMEOUT),
++            response_id: None,
++            observer,
++        }
++    }
++
++    /// A terminal receipt stops the watchdog before downstream publication.
++    pub(crate) fn receive(&mut self, payload: &str, at: Instant) -> Result<bool, ApiError> {
++        if self.deadline.is_some_and(|deadline| at > deadline) {
++            self.end(ResponseAttemptEnd::ProgressTimeout, at);
++            return Err(ApiError::ResponseProgressTimeout);
++        }
++        let observation = ResponseObservation::from_payload(payload);
++        if self.deadline.is_some()
++            && let Some(id) = &observation.response_id
++        {
++            if self
++                .response_id
++                .as_ref()
++                .is_some_and(|current| current != id)
++            {
++                self.end(ResponseAttemptEnd::ProtocolError, at);
++                return Err(ApiError::Stream(
++                    "response ID differs from the active response".into(),
++                ));
++            }
++            self.response_id.clone_from(&observation.response_id);
++        }
++        if observation.has_content && self.deadline.is_some() {
++            self.deadline = Some(at + CONTENT_TIMEOUT);
++        }
++        let terminal = observation.terminal.is_some();
++        if let Some(observer) = &self.observer {
++            observer.received(observation, at);
++        }
++        if terminal {
++            self.observer = None;
++        }
++        Ok(terminal)
++    }
++
++    pub(crate) fn end(&mut self, reason: ResponseAttemptEnd, at: Instant) {
++        if let Some(observer) = self.observer.take() {
++            observer.ended(reason, at);
++        }
++    }
++}
++
++impl Drop for ResponseProgress {
++    fn drop(&mut self) {
++        self.end(ResponseAttemptEnd::Canceled, Instant::now());
++    }
++}
++
++#[cfg(test)]
++#[path = "response_progress_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-api/src/response_progress_tests.rs b/codex-rs/codex-api/src/response_progress_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/codex-api/src/response_progress_tests.rs
+@@ -0,0 +1,178 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::sync::Mutex;
++
++#[derive(Default)]
++struct Observations(Mutex<Vec<ResponseObservation>>);
++
++impl ResponseObserver for Observations {
++    fn prepared(&self, _: u64) {}
++    fn sent(&self, _: Instant) {}
++    fn received(&self, observation: ResponseObservation, _: Instant) {
++        self.0.lock().unwrap().push(observation);
++    }
++    fn ended(&self, reason: ResponseAttemptEnd, at: Instant) {
++        self.received(
++            ResponseObservation {
++                terminal: Some(reason),
++                ..Default::default()
++            },
++            at,
++        );
++    }
++}
++
++#[test]
++fn transport_close_ends_observation_once() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()), true);
++    progress
++        .receive(
++            r#"{"type":"response.output_text.delta","delta":"partial answer"}"#,
++            now,
++        )
++        .unwrap();
++    progress.end(ResponseAttemptEnd::TransportClosed, now);
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(records.len(), 2);
++    assert!(records[0].has_content);
++    assert_eq!(
++        records[1].terminal,
++        Some(ResponseAttemptEnd::TransportClosed)
++    );
++}
++
++#[test]
++fn controls_do_not_extend_the_content_deadline_without_an_observer() {
++    let now = Instant::now();
++    let mut progress = ResponseProgress::sent(now, None, true);
++    for payload in [
++        r#"{"type":"response.created","response":{"id":"r1"}}"#,
++        r#"{"type":"codex.response.metadata"}"#,
++        r#"{"type":"response.output_text.delta","delta":""}"#,
++    ] {
++        assert!(
++            !progress
++                .receive(payload, now + Duration::from_secs(299))
++                .unwrap()
++        );
++        assert_eq!(progress.deadline, Some(now + CONTENT_TIMEOUT));
++    }
++    assert!(matches!(
++        progress.receive(
++            r#"{"type":"response.completed","response":{"id":"r1"}}"#,
++            now + Duration::from_secs(301),
++        ),
++        Err(ApiError::ResponseProgressTimeout)
++    ));
++}
++
++#[test]
++fn content_extends_progress_until_a_matching_terminal() {
++    let now = Instant::now();
++    let mut progress = ResponseProgress::sent(now, None, true);
++    assert!(
++        !progress
++            .receive(r#"{"type":"response.created","response":{"id":"r1"}}"#, now)
++            .unwrap()
++    );
++    assert!(!progress.receive(
++        r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque"}}"#,
++        now + Duration::from_secs(299),
++    ).unwrap());
++    assert_eq!(progress.deadline, Some(now + Duration::from_secs(599)));
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.completed","response":{"id":"r1"}}"#,
++                now + Duration::from_secs(598)
++            )
++            .unwrap()
++    );
++}
++
++#[test]
++fn a_foreign_terminal_cannot_end_the_active_response() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()), true);
++    progress
++        .receive(r#"{"type":"response.created","response":{"id":"r1"}}"#, now)
++        .unwrap();
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.completed","response":{"id":"r2"}}"#,
++                now
++            )
++            .is_err()
++    );
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(
++        records.last().unwrap().terminal,
++        Some(ResponseAttemptEnd::ProtocolError)
++    );
++    assert!(
++        !records
++            .iter()
++            .any(|row| row.terminal == Some(ResponseAttemptEnd::Completed))
++    );
++}
++
++#[test]
++fn terminal_usage_is_observed_before_cancellation_can_overwrite_it() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()), true);
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.failed","response":{"id":"r1","usage":{"output_tokens":0}}}"#,
++                now
++            )
++            .unwrap()
++    );
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(records.len(), 1);
++    assert_eq!(records[0].terminal, Some(ResponseAttemptEnd::Failed));
++    assert_eq!(
++        records[0].usage,
++        Some(serde_json::json!({"output_tokens": 0}))
++    );
++}
++
++#[test]
++fn streaming_observation_does_not_enable_the_complete_output_deadline() {
++    let now = Instant::now();
++    let observations = Arc::new(Observations::default());
++    let mut progress = ResponseProgress::sent(now, Some(observations.clone()), false);
++    assert_eq!(progress.deadline, None);
++    assert!(
++        !progress
++            .receive(
++                r#"{"type":"response.created","response":{"id":"r1"}}"#,
++                now + Duration::from_secs(301),
++            )
++            .unwrap()
++    );
++    assert!(
++        progress
++            .receive(
++                r#"{"type":"response.completed","response":{"id":"r1","usage":{"output_tokens":0}}}"#,
++                now + Duration::from_secs(600),
++            )
++            .unwrap()
++    );
++    drop(progress);
++    let records = observations.0.lock().unwrap();
++    assert_eq!(records.len(), 2);
++    assert_eq!(records[1].terminal, Some(ResponseAttemptEnd::Completed));
++    assert_eq!(
++        records[1].usage,
++        Some(serde_json::json!({"output_tokens": 0}))
++    );
++}
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -162,13 +162,18 @@ pub struct ResponsesStreamEvent {
+     pub(crate) kind: String,
+     pub(crate) headers: Option<Value>,
+     metadata: Option<Value>,
+-    response: Option<Value>,
+-    error: Option<Value>,
+-    item: Option<Value>,
++    pub(crate) response: Option<Value>,
++    pub(crate) response_id: Option<Value>,
++    pub(crate) error: Option<Value>,
++    pub(crate) item: Option<Value>,
+     item_id: Option<String>,
+     call_id: Option<String>,
+-    delta: Option<String>,
+-    text: Option<String>,
++    pub(crate) delta: Option<String>,
++    pub(crate) text: Option<String>,
++    pub(crate) part: Option<Value>,
++    pub(crate) arguments: Option<Value>,
++    pub(crate) input: Option<Value>,
++    pub(crate) refusal: Option<Value>,
+     summary_index: Option<i64>,
+     content_index: Option<i64>,
+     #[serde(default, deserialize_with = "deserialize_present_value")]
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -2274,6 +2274,7 @@ impl ModelClientSession {
+                     ws_request,
+                     self.websocket_session.connection_reused(),
+                     Some(Arc::clone(&self.turn_state)),
++                    None,
+                 )
+                 .await;
+             if let Some(original_item_ids) = original_item_ids {
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
+@@ -47,6 +47,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
+             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
+             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
+             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
++            ApiError::ResponseProgressTimeout => "response_progress_timeout",
+             ApiError::ResponseIncomplete(_) => "incomplete_response",
+             ApiError::ContextWindowExceeded => "context_window_exceeded",
+             ApiError::QuotaExceeded => "quota_exceeded",
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/connection_pool.rs
+@@ -550,6 +550,7 @@ impl ConnectionLease {
+                         ResponsesWsRequest::ResponseCreate(request.into()),
+                         /*connection_reused*/ true,
+                         /*turn_state*/ None,
++                        /*observer*/ None,
+                     )
+                     .await
+             }
+diff --git a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+@@ -142,6 +142,7 @@ impl SamplingExecution {
+                 ApiError::Retryable { .. }
+                 | ApiError::RateLimitExceeded { .. }
+                 | ApiError::Stream(_)
++                | ApiError::ResponseProgressTimeout
+                 | ApiError::ContentFilter
+                 | ApiError::ServerOverloaded { .. }
+                 | ApiError::FlexUnavailable,
+diff --git a/codex-rs/protocol/src/error.rs b/codex-rs/protocol/src/error.rs
+--- a/codex-rs/protocol/src/error.rs
++++ b/codex-rs/protocol/src/error.rs
+@@ -111,6 +111,9 @@ pub enum CodexErrorDetails {
+     /// The Session loop treats this as a transient error and will automatically retry the turn.
+     #[error("stream disconnected before completion: {0}")]
+     Stream(String),
++    /// A connected generation stopped delivering content; use the bounded response retry budget.
++    #[error("response made no content progress for 300 seconds")]
++    ResponseProgressTimeout,
+     /// A response stopped by the content filter. Sampling retries need developer guidance.
+     #[error(
+         "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+@@ -439,6 +442,7 @@ impl CodexErr {
+                 self.server_retry_delay()
+             }
+             CodexErrorDetails::Stream(..)
++            | CodexErrorDetails::ResponseProgressTimeout
+             | CodexErrorDetails::ContentFilter
+             | CodexErrorDetails::RateLimitExceeded(_)
+             | CodexErrorDetails::Timeout
+diff --git a/codex-rs/response-debug-context/src/lib.rs b/codex-rs/response-debug-context/src/lib.rs
+--- a/codex-rs/response-debug-context/src/lib.rs
++++ b/codex-rs/response-debug-context/src/lib.rs
+@@ -75,6 +75,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
+         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
+         ApiError::Stream(err) => err.to_string(),
++        ApiError::ResponseProgressTimeout => "response progress timeout".to_string(),
+         ApiError::ContentFilter => {
+             "Incomplete response returned, reason: content_filter".to_string()
+         }

@@ -1,0 +1,169 @@
+apply-launch-arguments-by-symlink
+
+Lane: backend
+
+Unit: select-launch-arguments-by-symlink
+
+ChildPatch: apply-launch-arguments-by-symlink
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -1,5 +1,6 @@
+ use clap::Args;
+ use clap::CommandFactory;
++use clap::FromArgMatches;
+ use clap::Parser;
+ use clap_complete::Shell;
+ use clap_complete::generate;
+@@ -1048,13 +1049,24 @@ async fn cli_main(
+     arg0_paths: Arg0DispatchPaths,
+     remote_control_disabled: bool,
+ ) -> anyhow::Result<()> {
++    let codex_home = find_codex_home()?;
++    let launch_args = symlink_launch::arguments(std::env::args_os(), &codex_home)?;
++    let cli = match launch_args {
++        Some(args) => {
++            let matches = MultitoolCli::command()
++                .args_override_self(true)
++                .get_matches_from(args);
++            MultitoolCli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
++        }
++        None => MultitoolCli::parse(),
++    };
+     let MultitoolCli {
+         config_overrides: mut root_config_overrides,
+         feature_toggles,
+         remote,
+         mut interactive,
+         subcommand,
+-    } = MultitoolCli::parse();
++    } = cli;
+     // Retain the launch target through TUI exit, even if a launcher changes selection.
+     let daemon_cli_executable = arg0_paths
+         .codex_self_exe
+diff --git a/codex-rs/cli/src/symlink_launch.rs b/codex-rs/cli/src/symlink_launch.rs
+--- a/codex-rs/cli/src/symlink_launch.rs
++++ b/codex-rs/cli/src/symlink_launch.rs
+@@ -48,3 +48,33 @@ pub(crate) fn load_profile(codex_home: &Path, name: &str) -> anyhow::Result<Vec<
+ #[cfg(test)]
+ #[path = "symlink_launch_tests.rs"]
+ mod tests;
++
++pub(crate) fn arguments(
++    args: impl IntoIterator<Item = OsString>,
++    codex_home: &Path,
++) -> anyhow::Result<Option<Vec<OsString>>> {
++    let mut args = args.into_iter();
++    let executable = args.next().context("missing executable argument")?;
++    let invoked = Path::new(&executable);
++    let resolved = if invoked.components().count() > 1 {
++        invoked.to_path_buf()
++    } else {
++        which::which(&executable).context("failed to locate invoked executable")?
++    };
++    if !std::fs::symlink_metadata(&resolved)
++        .with_context(|| format!("failed to inspect {}", resolved.display()))?
++        .file_type()
++        .is_symlink()
++    {
++        return Ok(None);
++    }
++    let name = invoked
++        .file_name()
++        .and_then(|name| name.to_str())
++        .context("symlink launch name is not valid UTF-8")?;
++    let profile = load_profile(codex_home, name)?;
++    let mut expanded = vec![executable];
++    expanded.extend(profile);
++    expanded.extend(args);
++    Ok(Some(expanded))
++}
+diff --git a/codex-rs/cli/src/symlink_launch_tests.rs b/codex-rs/cli/src/symlink_launch_tests.rs
+--- a/codex-rs/cli/src/symlink_launch_tests.rs
++++ b/codex-rs/cli/src/symlink_launch_tests.rs
+@@ -1,4 +1,7 @@
++use super::arguments;
+ use super::load_profile;
++use clap::CommandFactory;
++use clap::FromArgMatches;
+ use pretty_assertions::assert_eq;
+ use std::ffi::OsString;
+ 
+@@ -72,3 +75,71 @@ fn missing_table_preserves_unrelated_configuration() {
+     assert_eq!(config.model.as_deref(), Some("custom"));
+     assert_eq!(config.symlinks.unwrap()["codex-embedded"], ["--no-daemon"]);
+ }
++
++#[test]
++fn direct_executable_does_not_read_or_create_profiles() {
++    let home = tempfile::tempdir().unwrap();
++    let executable = home.path().join("real-codex");
++    std::fs::write(&executable, "binary").unwrap();
++    assert_eq!(
++        arguments([executable.into_os_string()], home.path()).unwrap(),
++        None
++    );
++    assert!(!home.path().join("config.toml").exists());
++}
++
++#[test]
++fn symlink_invocation_uses_only_its_named_arguments() {
++    let home = tempfile::tempdir().unwrap();
++    let executable = home.path().join("real-codex");
++    std::fs::write(&executable, "binary").unwrap();
++    let symlink = home.path().join("codex-embedded");
++    std::os::unix::fs::symlink(&executable, &symlink).unwrap();
++    let expanded = arguments([symlink.into_os_string()], home.path())
++        .unwrap()
++        .unwrap();
++    assert_eq!(expanded[1..], [OsString::from("--no-daemon")]);
++    assert_eq!(
++        std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
++        "[symlinks]\ncodex = []\ncodex-embedded = [\"--no-daemon\"]\n"
++    );
++}
++
++#[test]
++fn explicit_arguments_override_named_arguments() {
++    let home = tempfile::tempdir().unwrap();
++    let executable = home.path().join("real-codex");
++    std::fs::write(&executable, "binary").unwrap();
++    let symlink = home.path().join("codex");
++    std::os::unix::fs::symlink(&executable, &symlink).unwrap();
++    std::fs::write(
++        home.path().join("config.toml"),
++        "[symlinks]\ncodex = [\"--sandbox\", \"workspace-write\", \"--ask-for-approval\", \"never\"]\n",
++    )
++    .unwrap();
++    let expanded = arguments(
++        [
++            symlink.into_os_string(),
++            "--sandbox".into(),
++            "read-only".into(),
++            "--ask-for-approval".into(),
++            "on-request".into(),
++        ],
++        home.path(),
++    )
++    .unwrap()
++    .unwrap();
++    let matches = crate::MultitoolCli::command()
++        .args_override_self(true)
++        .try_get_matches_from(expanded)
++        .unwrap();
++    let cli = crate::MultitoolCli::from_arg_matches(&matches).unwrap();
++    assert!(matches!(
++        cli.interactive.shared.sandbox_mode,
++        Some(codex_utils_cli::SandboxModeCliArg::ReadOnly)
++    ));
++    assert!(matches!(
++        cli.interactive.approval_policy,
++        Some(codex_utils_cli::ApprovalModeCliArg::OnRequest)
++    ));
++}

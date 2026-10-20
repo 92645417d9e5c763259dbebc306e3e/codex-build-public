@@ -1,0 +1,1081 @@
+confine-copy-feedback-to-footer
+
+Lane: frontend
+
+FlatPatch: confine-copy-feedback-to-footer
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Keep copy outcomes in the existing footer and mute selection hints above the composer without changing transcript or composer height.
+
+Requires: none
+
+Provides: Render native pending, busy, confirmed, unconfirmed and failed copy feedback in spare footer columns; preserve copy lifecycle and expiry, footer controls and warning hit targets, and gap navigation and links. Rendered-surface selection does not insert a Selecting text hint above the composer.
+
+Boundary: Do not change clipboard delivery, selection and follow semantics, persistent status content, modal ownership, ordinary composer hints or bottom-pane row allocation. Keep complete copy outcome variants and omit them when no fitting space remains.
+
+Verification: Focused owned-transcript mouse-copy and idle/running geometry tests, copy lifecycle and narrow rendering tests, footer content/cursor/warning-hit tests, and existing input and status footer coverage. Footer selection tests verify unchanged transcript cells and composer geometry through press, drag and release while preserving selected text, Escape and stationary warning clicks.
+
+
+diff --git a/codex-rs/tui/src/app/owned_transcript.rs b/codex-rs/tui/src/app/owned_transcript.rs
+--- a/codex-rs/tui/src/app/owned_transcript.rs
++++ b/codex-rs/tui/src/app/owned_transcript.rs
+@@ -135,22 +135,12 @@ impl App {
+         };
+         self.sync_owned_transcript(screen_size.width);
+         let transcript_width = self.chat_widget.history_wrap_width(screen_size.width);
+-        let composer_hint = if self
+-            .chat_widget
+-            .rendered_selection
+-            .borrow()
+-            .view
+-            .has_active_interaction()
+-        {
+-            Some(
+-                ratatui::text::Line::from("Selecting text · esc cancel")
+-                    .dim()
+-                    .into(),
+-            )
+-        } else {
+-            self.composer_hint(transcript_width)
+-        };
++        let composer_hint = self.composer_hint(transcript_width);
+         let now = Instant::now();
++        let copy_feedback = self
++            .transcript_view
++            .copy_feedback(now)
++            .filter(|_| self.chat_widget.no_modal_or_popup_active());
+         let turn_tip = self.turn_tip(transcript_width, now, &tui.frame_requester());
+         let working_tip = turn_tip
+             .as_ref()
+@@ -195,6 +185,7 @@ impl App {
+                     crate::bottom_pane::CommandPopupPlacement::Overlay
+                 },
+                 composer_gap: composer_gap.as_ref(),
++                copy_feedback,
+                 working_tip,
+                 ..Default::default()
+             });
+@@ -218,7 +209,6 @@ impl App {
+         );
+         let mut rendered_cursor = None;
+         let mut footer_height_changed = false;
+-        let mut feedback_tick = None;
+         let mut blossom_tick = None;
+         let mut transcript_bottom = available.saturating_sub(u16::from(composer_gap.is_none()));
+         tui.draw(screen_size.height, |frame| {
+@@ -240,10 +230,10 @@ impl App {
+             );
+             if let Some(gap) = composer_gap.as_mut() {
+                 gap.needs_separator = available > 1
+-                    // Keep the tip under the pointer when selection hints or copy feedback appear.
++                    // Keep a visible turn tip under the pointer.
+                     && turn_tip.is_none()
+                     && chat_widget.no_modal_or_popup_active()
+-                    && view.composer_gap_has_content(transcript_width, composer_hint.as_ref(), now);
++                    && view.composer_gap_has_content(transcript_width, composer_hint.as_ref());
+             }
+             // Rendering resolves whether new activity is still hidden. Paint that result in
+             // this frame so a revision change cannot flash a stale activity hint.
+@@ -270,6 +260,7 @@ impl App {
+                         crate::bottom_pane::CommandPopupPlacement::Overlay
+                     },
+                     composer_gap: composer_gap.as_ref(),
++                    copy_feedback,
+                     working_tip,
+                     ..Default::default()
+                 });
+@@ -333,8 +324,7 @@ impl App {
+                 })
+             }
+             .filter(|_| chat_widget.no_modal_or_popup_active());
+-            feedback_tick =
+-                view.render_composer_gap(follow_area, composer_hint.as_ref(), frame.buffer, now);
++            view.render_composer_gap(follow_area, composer_hint.as_ref(), frame.buffer);
+             if let Some((_, tip)) = &turn_tip
+                 && let Some(area) = tip.rendered.get()
+             {
+@@ -379,7 +369,7 @@ impl App {
+         if footer_height_changed {
+             tui.frame_requester().schedule_frame();
+         }
+-        if let Some(delay) = feedback_tick {
++        if let Some(delay) = copy_feedback.and_then(|feedback| feedback.expiry_delay(now)) {
+             tui.frame_requester().schedule_frame_in(delay);
+         }
+         if let Some(delay) = blossom_tick {
+diff --git a/codex-rs/tui/src/app/owned_transcript_follow_tests.rs b/codex-rs/tui/src/app/owned_transcript_follow_tests.rs
+--- a/codex-rs/tui/src/app/owned_transcript_follow_tests.rs
++++ b/codex-rs/tui/src/app/owned_transcript_follow_tests.rs
+@@ -142,27 +142,67 @@ async fn follow_control_click_preserves_draft_caret_and_composer_geometry() -> R
+             ("draft stays here".to_string(), cursor)
+         );
+         assert!(app.chat_widget.queued_user_message_texts().is_empty());
+-        if running {
+-            app.transcript_view.show_copy_feedback(
+-                &Ok(crate::clipboard_copy::CopyStatus::Confirmed),
+-                /*characters*/ 24,
+-            );
++        {
+             let mut snapshots = Vec::new();
+             for (width, height) in [(80, 12), (18, 14), (6, 18), (80, 6)] {
+                 let size = Size::new(width, height);
+                 tui.screen_size_for_event(&TuiEvent::Resize(size))?;
+                 app.render_owned_transcript(&mut tui, size)?;
+-                let buffer =
+-                    crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+-                snapshots.push(format!(
+-                    "{width} columns, {height} rows\n{}",
+-                    super::tests::buffer_text(buffer)
+-                ));
++                let before_bottom = app.render_owned_transcript(&mut tui, size)?;
++                let before_cursor = tui.terminal.last_known_cursor_pos;
++                let before =
++                    crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal)
++                        .clone();
++                for result in [
++                    crate::clipboard_copy::CopyStatus::Pending(7),
++                    crate::clipboard_copy::CopyStatus::Confirmed,
++                ] {
++                    app.transcript_view.show_copy_feedback(&Ok(result), 24);
++                    assert_eq!(app.render_owned_transcript(&mut tui, size)?, before_bottom);
++                    assert_eq!(tui.terminal.last_known_cursor_pos, before_cursor);
++                    let buffer =
++                        crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
++                    for y in 0..before_bottom.y {
++                        for x in 0..width {
++                            assert_eq!(buffer[(x, y)], before[(x, y)]);
++                        }
++                    }
++                    if width == 80 {
++                        let footer = (0..width)
++                            .map(|x| buffer[(x, height - 1)].symbol())
++                            .collect::<String>();
++                        assert!(
++                            footer.contains("Copying") || footer.contains("Copied"),
++                            "{footer}"
++                        );
++                    }
++                    if result == crate::clipboard_copy::CopyStatus::Confirmed {
++                        snapshots.push(format!(
++                            "{width} columns, {height} rows\n{}",
++                            super::tests::buffer_text(buffer)
++                        ));
++                    }
++                }
++                assert!(
++                    app.transcript_view
++                        .copy_feedback(Instant::now() + Duration::from_secs(10),)
++                        .is_none()
++                );
++                assert_eq!(app.render_owned_transcript(&mut tui, size)?, before_bottom);
++                assert_eq!(tui.terminal.last_known_cursor_pos, before_cursor);
++                assert_eq!(
++                    crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal),
++                    &before,
++                );
++            }
++            if running {
++                insta::assert_snapshot!(
++                    "running_copy_feedback_spacing",
++                    crate::chatwidget::tests::helpers::normalize_snapshot_paths(
++                        snapshots.join("\n\n")
++                    ),
++                );
+             }
+-            insta::assert_snapshot!(
+-                "running_copy_feedback_spacing",
+-                crate::chatwidget::tests::helpers::normalize_snapshot_paths(snapshots.join("\n\n")),
+-            );
+         }
+     }
+     tui.set_owned_screen(/*owned*/ false)?;
+diff --git a/codex-rs/tui/src/app/owned_transcript_tests.rs b/codex-rs/tui/src/app/owned_transcript_tests.rs
+--- a/codex-rs/tui/src/app/owned_transcript_tests.rs
++++ b/codex-rs/tui/src/app/owned_transcript_tests.rs
+@@ -1767,7 +1767,10 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
+     }
+     assert_eq!(app.chat_widget.capture_thread_input_state(), draft);
+     app.render_owned_transcript(&mut tui, size)?;
+-    assert!(row_containing(&tui, "Copied 5 chars to host clipboard") < y);
++    assert_eq!(
++        row_containing(&tui, "Copied 5 chars to host clipboard"),
++        size.height - 1
++    );
+     insta::assert_snapshot!(
+         "fullscreen_composer_right_click_copy",
+         format!(
+@@ -2016,10 +2019,11 @@ async fn footer_selection_defers_warning_clicks_and_preserves_the_draft() -> Res
+         &mut tui,
+         Box::new(history_cell::new_warning_event("Example warning".into())),
+     );
+-    app.render_owned_transcript(&mut tui, size)?;
++    let bottom = app.render_owned_transcript(&mut tui, size)?;
+     let draft = app.chat_widget.capture_thread_input_state();
+     let cursor = tui.terminal.last_known_cursor_pos;
+-    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
++    let before = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal).clone();
++    let buffer = &before;
+     let rendered = buffer_text(buffer);
+     assert!(rendered.contains("! Example warning"));
+     let badge_row = rendered
+@@ -2039,6 +2043,15 @@ async fn footer_selection_defers_warning_clicks_and_preserves_the_draft() -> Res
+     ] {
+         assert!(app.handle_rendered_selection_event(&mut tui, &event)?);
+         assert!(!app.chat_widget.keymap_contexts().is_warnings());
++        assert_eq!(app.render_owned_transcript(&mut tui, size)?, bottom);
++        assert_eq!(tui.terminal.last_known_cursor_pos, cursor);
++        let after = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
++        assert!(!buffer_text(after).contains("Selecting text"));
++        for y in 0..bottom.y {
++            for x in 0..size.width {
++                assert_eq!(after[(x, y)], before[(x, y)]);
++            }
++        }
+     }
+     app.render_owned_transcript(&mut tui, size)?;
+     assert_eq!(
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -4596,12 +4596,45 @@ impl ChatComposer {
+                 }
+             }
+         }
++        let footer_props = self.hint_footer_props(options);
++        let show_cycle_hint = self.status_surface_height(options) == 0
++            && !footer_props.is_task_running
++            && self.footer.collaboration_mode_indicator.is_some();
++        let show_shortcuts_hint =
++            footer_props.mode == FooterMode::ComposerEmpty && !self.is_in_paste_burst();
++        let show_queue_hint =
++            footer_props.mode == FooterMode::ComposerHasDraft && footer_props.is_task_running;
++        let status_line_active = uses_passive_footer_status_layout(&footer_props);
++        let left_mode_indicator = if status_line_active || self.status_surface_height(options) > 0 {
++            None
++        } else {
++            self.footer.collaboration_mode_indicator
++        };
+         let transcript_hint_area = inset_footer_hint_area(footer_rect);
+-        let warning_notice = self.warning_notice_layout(transcript_hint_area, options);
++        let mut warning_notice = self.warning_notice_layout(transcript_hint_area, options);
++        let mut copy_notice = None;
+         let warning_area = warning_notice.as_ref().map(|(area, _)| *area);
+         match options.footer {
+             Some(footer) => {
+-                self.render_transcript_footer(transcript_hint_area, buf, footer, warning_area);
++                let mut hint_area = transcript_hint_area;
++                if let Some(warning_area) = warning_area {
++                    hint_area.width = warning_area.x.saturating_sub(hint_area.x + 2);
++                }
++                let text = self.transcript_footer_text(hint_area.width, footer);
++                copy_notice = footer_state::copy_feedback_layout(
++                    options.copy_feedback,
++                    transcript_hint_area,
++                    text.width(),
++                    warning_area.map_or(0, |area| usize::from(area.width) + 2),
++                );
++                if let Some((area, _)) = &copy_notice {
++                    let reserve = area.width + 2;
++                    hint_area.width = hint_area.width.saturating_sub(reserve);
++                    if let Some((warning_area, _)) = &mut warning_notice {
++                        warning_area.x -= reserve;
++                    }
++                }
++                Paragraph::new(text).render(hint_area, buf);
+             }
+             None if self.shortcuts_above_composer(options) => {
+                 let props = self.hint_footer_props(options);
+@@ -4610,27 +4643,7 @@ impl ChatComposer {
+                     .render(transcript_hint_area, buf);
+             }
+             None => {
+-                let footer_props = self.hint_footer_props(options);
+-                let show_cycle_hint = self.status_surface_height(options) == 0
+-                    && !footer_props.is_task_running
+-                    && self.footer.collaboration_mode_indicator.is_some();
+-                let show_shortcuts_hint = match footer_props.mode {
+-                    FooterMode::ComposerEmpty => !self.is_in_paste_burst(),
+-                    FooterMode::ComposerHasDraft => false,
+-                    FooterMode::HistorySearch
+-                    | FooterMode::QuitShortcutReminder
+-                    | FooterMode::ShortcutOverlay
+-                    | FooterMode::EscHint => false,
+-                };
+-                let show_queue_hint = match footer_props.mode {
+-                    FooterMode::ComposerHasDraft => footer_props.is_task_running,
+-                    FooterMode::HistorySearch
+-                    | FooterMode::QuitShortcutReminder
+-                    | FooterMode::ComposerEmpty
+-                    | FooterMode::ShortcutOverlay
+-                    | FooterMode::EscHint => false,
+-                };
+-                let hint_rect = if let Some(warning_area) = warning_area {
++                let mut hint_rect = if let Some(warning_area) = warning_area {
+                     Rect {
+                         width: warning_area
+                             .x
+@@ -4648,7 +4661,6 @@ impl ChatComposer {
+                 } else {
+                     let available_width =
+                         hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+-                    let status_line_active = uses_passive_footer_status_layout(&footer_props);
+                     let combined_status_line = if status_line_active {
+                         passive_footer_status_line(&footer_props)
+                     } else {
+@@ -4680,12 +4692,6 @@ impl ChatComposer {
+                     } else {
+                         None
+                     };
+-                    let left_mode_indicator =
+-                        if status_line_active || self.status_surface_height(options) > 0 {
+-                            None
+-                        } else {
+-                            self.footer.collaboration_mode_indicator
+-                        };
+                     let active_footer_hint_override = self.footer.hint_override.as_ref();
+                     let mut left_width = if self.footer.flash_visible() {
+                         self.footer
+@@ -4783,6 +4789,31 @@ impl ChatComposer {
+                             .unwrap_or(can_show_left_and_context)
+                     };
+ 
++                    let rendered_left_width = match &single_line_layout {
++                        Some((SummaryLeft::Custom(line), _)) => line.width(),
++                        Some((SummaryLeft::None, _)) => 0,
++                        _ => usize::from(left_width),
++                    };
++                    let occupied_right_width = if show_right && right_width > 0 {
++                        usize::from(right_width) + 2
++                    } else {
++                        0
++                    } + warning_area
++                        .map_or(0, |area| usize::from(area.width) + 2);
++                    copy_notice = footer_state::copy_feedback_layout(
++                        options.copy_feedback,
++                        transcript_hint_area,
++                        rendered_left_width,
++                        occupied_right_width,
++                    );
++                    if let Some((area, _)) = &copy_notice {
++                        let reserve = area.width + 2;
++                        hint_rect.width = hint_rect.width.saturating_sub(reserve);
++                        if let Some((warning_area, _)) = &mut warning_notice {
++                            warning_area.x -= reserve;
++                        }
++                    }
++
+                     if let Some((summary_left, _)) = single_line_layout {
+                         match summary_left {
+                             SummaryLeft::Default => {
+@@ -4856,10 +4887,15 @@ impl ChatComposer {
+                 }
+             }
+         }
+-        self.footer.warning_notice_area.set(warning_area);
++        self.footer
++            .warning_notice_area
++            .set(warning_notice.as_ref().map(|(area, _)| *area));
+         if let Some((warning_area, line)) = warning_notice {
+             line.render(warning_area, buf);
+         }
++        if let Some((copy_area, line)) = copy_notice {
++            line.render(copy_area, buf);
++        }
+         if let Some(selection) = options.rendered_selection
+             && !self.popup_active()
+             && options.footer.is_none_or(|footer| !footer.is_interactive)
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -22,13 +22,10 @@ use crate::bottom_pane::footer::FooterKeyHints;
+ use crate::bottom_pane::footer::FooterProps;
+ use crate::key_hint;
+ use crossterm::event::KeyCode;
+-use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
+ use ratatui::style::Styled;
+ use ratatui::text::Line;
+ use ratatui::text::Text;
+-use ratatui::widgets::Paragraph;
+-use ratatui::widgets::Widget;
+ 
+ use crate::bottom_pane::footer::CollaborationModeIndicator;
+ use crate::bottom_pane::footer::FooterMode;
+@@ -83,6 +80,8 @@ pub(crate) struct ComposerRenderOptions<'a> {
+     pub(crate) separate_status_line: bool,
+     pub(crate) command_popup_placement: CommandPopupPlacement,
+     pub(crate) footer: Option<&'a TranscriptFooter>,
++    /// Per-frame copy outcome; it never participates in composer height measurement.
++    pub(crate) copy_feedback: Option<crate::transcript_view::CopyFeedback>,
+ }
+ 
+ impl super::ChatComposer {
+@@ -293,13 +292,11 @@ impl super::ChatComposer {
+             .max(u16::from(options.separate_status_line))
+     }
+ 
+-    pub(super) fn render_transcript_footer(
++    pub(super) fn transcript_footer_text(
+         &self,
+-        mut hint_area: Rect,
+-        buf: &mut Buffer,
++        width: u16,
+         footer: &TranscriptFooter,
+-        warning_area: Option<Rect>,
+-    ) {
++    ) -> Text<'static> {
+         let mut text = footer.text.clone();
+         if footer.cursor_column.is_none()
+             && self.footer.flash_visible()
+@@ -308,12 +305,6 @@ impl super::ChatComposer {
+         {
+             *line = flash.line.clone();
+         }
+-        if let Some(warning_area) = warning_area {
+-            hint_area.width = warning_area
+-                .x
+-                .saturating_sub(hint_area.x)
+-                .saturating_sub(/*rhs*/ 2);
+-        }
+         if !footer.is_interactive
+             && !self.footer.flash_visible()
+             && self.footer_mode() == FooterMode::ComposerEmpty
+@@ -331,13 +322,13 @@ impl super::ChatComposer {
+                     }
+                     hint.extend(key.spans());
+                     hint.push_span(label.set_style(secondary_text_style()));
+-                    if line.width() + hint.width() <= usize::from(hint_area.width) {
++                    if line.width() + hint.width() <= usize::from(width) {
+                         line.extend(hint.spans);
+                     }
+                 }
+             }
+         }
+-        Paragraph::new(text).render(hint_area, buf);
++        text
+     }
+ 
+     pub(crate) fn footer_flash_delay(&self) -> Option<Duration> {
+@@ -352,6 +343,30 @@ impl super::ChatComposer {
+     }
+ }
+ 
++pub(super) fn copy_feedback_layout(
++    feedback: Option<crate::transcript_view::CopyFeedback>,
++    area: Rect,
++    left_width: usize,
++    occupied_right_width: usize,
++) -> Option<(Rect, Line<'static>)> {
++    let feedback = feedback?;
++    if area.is_empty() {
++        return None;
++    }
++    // Measure the already-selected footer content before spending spare columns on feedback.
++    let reserved =
++        left_width.saturating_add(usize::from(left_width > 0) * 2) + occupied_right_width;
++    let budget = usize::from(area.width.saturating_sub(1)).saturating_sub(reserved) as u16;
++    let line = feedback.line(budget);
++    let width = line.width() as u16;
++    (width > 0).then(|| {
++        (
++            Rect::new(area.right() - width - 1, area.bottom() - 1, width, 1),
++            line,
++        )
++    })
++}
++
+ pub(super) struct FooterState {
+     pub(super) quit_shortcut_expires_at: Option<Instant>,
+     pub(super) quit_shortcut_key: KeyBinding,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state_tests.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state_tests.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state_tests.rs
+@@ -6,6 +6,9 @@ use crate::app_event_sender::AppEventSender;
+ use crate::bottom_pane::ChatComposer;
+ use crate::bottom_pane::footer::inset_footer_hint_area;
+ use pretty_assertions::assert_eq;
++use ratatui::buffer::Buffer;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
+ use tokio::sync::mpsc::unbounded_channel;
+ 
+ fn composer() -> ChatComposer {
+@@ -57,6 +60,150 @@ fn text(buffer: &Buffer) -> String {
+         .join("\n")
+ }
+ 
++#[test]
++fn copy_feedback_preserves_footer_content_cursor_and_warning_hits() {
++    let mut composer = composer();
++    composer.footer.show_warnings_key = Some(key_hint::plain(KeyCode::F(2)).into());
++    let mut view = crate::transcript_view::TranscriptView::default();
++    view.show_copy_feedback(&Ok(crate::clipboard_copy::CopyStatus::Confirmed), 24);
++    let feedback = view.copy_feedback(Instant::now());
++    for interactive in [false, true] {
++        let label = if interactive {
++            "Find: needle"
++        } else {
++            "Tool calls hidden"
++        };
++        let footer = TranscriptFooter {
++            text: label.into(),
++            cursor_column: interactive.then_some(6),
++            is_interactive: interactive,
++        };
++        for width in [6, 18, 32, 80, 120] {
++            let options = composer.resolve_render_options(ComposerRenderOptions {
++                separate_status_line: true,
++                footer: Some(&footer),
++                warning_count: 4,
++                ..Default::default()
++            });
++            let area = Rect::new(
++                0,
++                0,
++                width,
++                composer.desired_height_with_options(width, options),
++            );
++            let mut before = Buffer::empty(area);
++            composer.render_with_options(area, &mut before, None, options);
++            let cursor = composer.cursor_pos_with_options(area, options);
++            let warning_text = composer.footer.warning_notice_area.get().map(|warning| {
++                (warning.x..warning.right())
++                    .map(|x| before[(x, warning.y)].symbol())
++                    .collect::<String>()
++            });
++            let left_end = composer
++                .footer
++                .warning_notice_area
++                .get()
++                .map_or(width, |warning| warning.x);
++            let left_text = (0..left_end)
++                .map(|x| before[(x, area.bottom() - 1)].symbol())
++                .collect::<String>();
++            let with_copy = ComposerRenderOptions {
++                copy_feedback: feedback,
++                ..options
++            };
++            assert_eq!(
++                composer.desired_height_with_options(width, with_copy),
++                area.height
++            );
++            assert_eq!(composer.cursor_pos_with_options(area, with_copy), cursor);
++            let mut after = Buffer::empty(area);
++            composer.render_with_options(area, &mut after, None, with_copy);
++            for y in 0..area.bottom() - 1 {
++                for x in 0..width {
++                    assert_eq!(after[(x, y)], before[(x, y)]);
++                }
++            }
++            let row = (0..width)
++                .map(|x| after[(x, area.bottom() - 1)].symbol())
++                .collect::<String>();
++            assert!(row.starts_with(left_text.trim_end()), "{row}");
++            if width >= 32 {
++                assert!(row.contains(label), "{row}");
++            }
++            if width == 120 || (width == 80 && interactive) {
++                assert!(
++                    row.trim_end()
++                        .ends_with("Copied 24 chars to host clipboard"),
++                    "{row}"
++                );
++            } else if width == 80 {
++                assert!(row.trim_end().ends_with("Copied 24 chars"), "{row}");
++            }
++            if let Some(warning_text) = warning_text {
++                let warning = composer.footer.warning_notice_area.get().unwrap();
++                assert_eq!(
++                    (warning.x..warning.right())
++                        .map(|x| after[(x, warning.y)].symbol())
++                        .collect::<String>(),
++                    warning_text,
++                );
++                assert!(
++                    composer.warning_notice_contains(ratatui::layout::Position::new(
++                        warning.x, warning.y
++                    ))
++                );
++                if row.contains("Copied") {
++                    assert!(
++                        !composer.warning_notice_contains(ratatui::layout::Position::new(
++                            width - 2,
++                            warning.y
++                        ))
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn copy_feedback_preserves_existing_side_context() {
++    let mut composer = composer();
++    composer.set_text_content("draft".into(), Vec::new(), Vec::new());
++    composer.footer.side_conversation_context_label = Some("Branch model".into());
++    let mut view = crate::transcript_view::TranscriptView::default();
++    view.show_copy_feedback(&Ok(crate::clipboard_copy::CopyStatus::Confirmed), 24);
++    for width in [40, 80, 120] {
++        let options = ComposerRenderOptions {
++            separate_status_line: true,
++            ..Default::default()
++        };
++        let area = Rect::new(
++            0,
++            0,
++            width,
++            composer.desired_height_with_options(width, options),
++        );
++        let mut before = Buffer::empty(area);
++        composer.render_with_options(area, &mut before, None, options);
++        assert!(text(&before).contains("Branch model"));
++        let options = ComposerRenderOptions {
++            copy_feedback: view.copy_feedback(Instant::now()),
++            ..options
++        };
++        assert_eq!(
++            composer.desired_height_with_options(width, options),
++            area.height
++        );
++        let mut after = Buffer::empty(area);
++        composer.render_with_options(area, &mut after, None, options);
++        assert!(text(&after).contains("Branch model"));
++        assert!(text(&after).contains("MODEL STATUS"));
++        if width >= 80 {
++            assert!(text(&after).contains("Copied 24 chars to host clipboard"));
++        }
++    }
++}
++
+ #[test]
+ fn passive_transcript_footer_preserves_applicable_agents_hint() {
+     let mut composer = composer();
+@@ -66,37 +213,37 @@ fn passive_transcript_footer_preserves_applicable_agents_hint() {
+         cursor_column: None,
+         is_interactive: false,
+     };
+-    let draw = |composer: &ChatComposer, footer: &TranscriptFooter, width, warning_area| {
++    let draw = |composer: &ChatComposer, footer: &TranscriptFooter, width| {
+         let area = Rect::new(0, 0, width, 1);
+         let mut buffer = Buffer::empty(area);
+-        composer.render_transcript_footer(area, &mut buffer, footer, warning_area);
++        Paragraph::new(composer.transcript_footer_text(width, footer)).render(area, &mut buffer);
+         text(&buffer)
+     };
+-    let wide = draw(&composer, &footer, 80, None);
++    let wide = draw(&composer, &footer, 80);
+     assert!(wide.starts_with("Tool calls hidden"), "{wide}");
+     assert!(wide.contains("for agents"), "{wide}");
+     assert!(wide.contains("shortcuts"), "{wide}");
+     for width in 17..=32 {
+-        let narrow = draw(&composer, &footer, width, None);
++        let narrow = draw(&composer, &footer, width);
+         assert!(narrow.starts_with("Tool calls hidden"), "{narrow}");
+         assert!(
+             !narrow.contains("for") || narrow.contains("for agents"),
+             "{narrow}"
+         );
+     }
+-    let reserved = draw(&composer, &footer, 80, Some(Rect::new(20, 0, 60, 1)));
++    let reserved = draw(&composer, &footer, 18);
+     assert_eq!(reserved, "Tool calls hidden");
+     composer.set_text_content("draft".into(), Vec::new(), Vec::new());
+-    assert_eq!(draw(&composer, &footer, 80, None), "Tool calls hidden");
++    assert_eq!(draw(&composer, &footer, 80), "Tool calls hidden");
+     composer.set_text_content(String::new(), Vec::new(), Vec::new());
+     composer.set_agents_navigation_enabled(false);
+-    assert!(!draw(&composer, &footer, 80, None).contains("for agents"));
++    assert!(!draw(&composer, &footer, 80).contains("for agents"));
+     composer.set_agents_navigation_enabled(true);
+     footer.is_interactive = true;
+-    assert_eq!(draw(&composer, &footer, 80, None), "Tool calls hidden");
++    assert_eq!(draw(&composer, &footer, 80), "Tool calls hidden");
+     footer.is_interactive = false;
+     composer.show_footer_flash("Copied selection".into(), Duration::from_secs(3));
+-    assert_eq!(draw(&composer, &footer, 80, None), "Copied selection");
++    assert_eq!(draw(&composer, &footer, 80), "Copied selection");
+ }
+ 
+ #[test]
+diff --git a/codex-rs/tui/src/transcript_view.rs b/codex-rs/tui/src/transcript_view.rs
+--- a/codex-rs/tui/src/transcript_view.rs
++++ b/codex-rs/tui/src/transcript_view.rs
+@@ -46,6 +46,7 @@ use snapshot::ViewSnapshot;
+ use text::TextLayout;
+ 
+ pub(crate) use bookmark::TranscriptBookmark;
++pub(crate) use composer_gap::CopyFeedback;
+ pub(crate) use input::JumpTarget;
+ pub(crate) use input::ViewAction;
+ pub(crate) use layout::ActivityTranscriptLines;
+diff --git a/codex-rs/tui/src/transcript_view/composer_gap.rs b/codex-rs/tui/src/transcript_view/composer_gap.rs
+--- a/codex-rs/tui/src/transcript_view/composer_gap.rs
++++ b/codex-rs/tui/src/transcript_view/composer_gap.rs
+@@ -1,5 +1,5 @@
+-//! Share the composer gap between copy feedback, reading controls, and linked tips.
+-//! Feedback wins while visible; controls and tips release their pointer targets when replaced.
++//! Keep reading controls and linked tips in the composer gap.
++//! Copy feedback retains its lifecycle here but is presented by the existing footer layout.
+ 
+ use super::*;
+ use crate::clipboard_copy::CopyStatus;
+@@ -9,7 +9,8 @@ use ratatui::style::Style;
+ use std::time::Duration;
+ use std::time::Instant;
+ 
+-pub(super) struct CopyFeedback {
++#[derive(Clone, Copy)]
++pub(crate) struct CopyFeedback {
+     pub(super) result: Result<CopyStatus, ()>,
+     pub(super) characters: usize,
+     expires_at: Option<Instant>,
+@@ -20,15 +21,7 @@ impl TranscriptView {
+         &self,
+         width: u16,
+         hint: Option<&HyperlinkLine>,
+-        now: Instant,
+     ) -> bool {
+-        if let Some(feedback) = self
+-            .copy_feedback
+-            .as_ref()
+-            .filter(|feedback| feedback.expires_at.is_none_or(|expiry| expiry > now))
+-        {
+-            return feedback.line(width.saturating_sub(/*rhs*/ 1)).width() > 0;
+-        }
+         self.follow_control_label(width).is_some()
+             || self.fitting_composer_hint(width, hint).is_some()
+     }
+@@ -67,14 +60,7 @@ impl TranscriptView {
+         });
+     }
+ 
+-    pub(crate) fn render_composer_gap(
+-        &mut self,
+-        area: Option<Rect>,
+-        hint: Option<&HyperlinkLine>,
+-        buffer: &mut Buffer,
+-        now: Instant,
+-    ) -> Option<Duration> {
+-        self.composer_tip = None;
++    pub(crate) fn copy_feedback(&mut self, now: Instant) -> Option<CopyFeedback> {
+         if self
+             .copy_feedback
+             .as_ref()
+@@ -82,26 +68,20 @@ impl TranscriptView {
+         {
+             self.copy_feedback = None;
+         }
++        self.copy_feedback
++    }
++
++    pub(crate) fn render_composer_gap(
++        &mut self,
++        area: Option<Rect>,
++        hint: Option<&HyperlinkLine>,
++        buffer: &mut Buffer,
++    ) {
++        self.composer_tip = None;
+         let Some(area) = area.filter(|area| !area.is_empty()) else {
+             self.render_follow_control(/*area*/ None, buffer);
+-            return None;
++            return;
+         };
+-        if let Some(feedback) = &self.copy_feedback {
+-            let line = feedback.line(area.width.saturating_sub(/*rhs*/ 1));
+-            let delay = feedback
+-                .expires_at
+-                .map(|expiry| expiry.saturating_duration_since(now));
+-            let width = line.width().min(usize::from(area.width)) as u16;
+-            let target = Rect::new(
+-                area.right().saturating_sub(width + 1).max(area.x),
+-                area.y,
+-                width,
+-                /*height*/ 1,
+-            );
+-            line.render(target, buffer);
+-            self.render_follow_control(/*area*/ None, buffer);
+-            return delay;
+-        }
+         self.render_follow_control(Some(area), buffer);
+         if let Some(hint) = self.fitting_composer_hint(area.width, hint) {
+             let width = hint.width() as u16;
+@@ -110,12 +90,16 @@ impl TranscriptView {
+                 .render(target, buffer);
+             self.composer_tip = Some((target, hint.clone()));
+         }
+-        None
+     }
+ }
+ 
+ impl CopyFeedback {
+-    fn line(&self, width: u16) -> Line<'static> {
++    pub(crate) fn expiry_delay(&self, now: Instant) -> Option<Duration> {
++        self.expires_at
++            .map(|expiry| expiry.saturating_duration_since(now))
++    }
++
++    pub(crate) fn line(&self, width: u16) -> Line<'static> {
+         let characters = self.characters;
+         let labels = match self.result {
+             Ok(CopyStatus::Confirmed) => [
+diff --git a/codex-rs/tui/src/transcript_view/composer_gap_tests.rs b/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
+--- a/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
++++ b/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
+@@ -1,4 +1,4 @@
+-//! Copy outcomes remain truthful at narrow widths and release stale navigation hit targets.
++//! Copy outcomes use the footer without replacing gap controls or linked tips.
+ 
+ use super::*;
+ use crate::transcript_view::tests::cell;
+@@ -10,6 +10,32 @@ use crossterm::event::MouseEvent;
+ use crossterm::event::MouseEventKind;
+ use pretty_assertions::assert_eq;
+ 
++fn render_feedback(feedback: Option<CopyFeedback>, width: u16) -> Buffer {
++    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
++    let mut composer = crate::bottom_pane::ChatComposer::new(
++        true,
++        crate::app_event_sender::AppEventSender::new(tx),
++        false,
++        "Ask Codex".into(),
++        true,
++    );
++    composer.set_text_content("draft".into(), Vec::new(), Vec::new());
++    let options = crate::bottom_pane::ComposerRenderOptions {
++        separate_status_line: true,
++        copy_feedback: feedback,
++        ..Default::default()
++    };
++    let area = Rect::new(
++        0,
++        0,
++        width,
++        composer.desired_height_with_options(width, options),
++    );
++    let mut buffer = Buffer::empty(area);
++    composer.render_with_options(area, &mut buffer, None, options);
++    buffer
++}
++
+ #[test]
+ fn pending_copy_feedback_survives_expiry_and_selection_replacement() {
+     let cells = vec![cell("selected text")];
+@@ -25,17 +51,11 @@ fn pending_copy_feedback_survives_expiry_and_selection_replacement() {
+     );
+     view.show_copy_feedback(&pending, selected.chars().count());
+     view.show_copy_feedback(&Ok(CopyStatus::Busy), /*characters*/ 0);
+-    let area = Rect::new(
+-        /*x*/ 0, /*y*/ 0, /*width*/ 60, /*height*/ 1,
+-    );
+-    let mut buffer = Buffer::empty(area);
+     let later = Instant::now() + Duration::from_secs(/*secs*/ 10);
+-    assert!(view.composer_gap_has_content(area.width, /*hint*/ None, later));
+-    assert_eq!(
+-        view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer, later),
+-        None
+-    );
+-    let pending_frame = text(&buffer);
++    assert!(!view.composer_gap_has_content(60, /*hint*/ None));
++    let feedback = view.copy_feedback(later).unwrap();
++    assert_eq!(feedback.expiry_delay(later), None);
++    let pending_frame = text(&render_feedback(Some(feedback), 60));
+     assert_eq!(
+         view.finish_copy(
+             &cells,
+@@ -45,8 +65,7 @@ fn pending_copy_feedback_survives_expiry_and_selection_replacement() {
+         Some(false)
+     );
+     assert_eq!(view.selected_text(&cells), Some(selected));
+-    buffer.reset();
+-    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer, Instant::now());
++    let buffer = render_feedback(view.copy_feedback(Instant::now()), 60);
+     insta::assert_snapshot!(format!(
+         "Pending after ten seconds\n{pending_frame}\nSetup failed\n{}",
+         text(&buffer)
+@@ -91,23 +110,36 @@ fn copy_feedback_is_right_aligned_and_does_not_claim_terminal_delivery() {
+         Ok(CopyStatus::Unconfirmed),
+         Err("unavailable".to_owned()),
+     ] {
+-        for width in [80, 32, 18] {
++        for width in [80, 32, 18, 9, 6] {
+             let mut view = TranscriptView::default();
+             view.show_copy_feedback(&result, /*characters*/ 24);
+-            assert!(view.composer_gap_has_content(width, /*hint*/ None, Instant::now()));
+-            let area = Rect::new(/*x*/ 0, /*y*/ 0, width, /*height*/ 1);
+-            let mut buffer = Buffer::empty(area);
++            assert!(!view.composer_gap_has_content(width, /*hint*/ None));
++            let feedback = view.copy_feedback(Instant::now()).unwrap();
+             assert_eq!(
+-                view.render_composer_gap(
+-                    Some(area),
+-                    /*hint*/ None,
+-                    &mut buffer,
+-                    Instant::now()
+-                )
+-                .is_some(),
++                feedback.expiry_delay(Instant::now()).is_some(),
+                 !matches!(result, Ok(CopyStatus::Pending(_)))
+             );
+-            assert_eq!(buffer[(width - 1, 0)].symbol(), " ");
++            let before = render_feedback(None, width);
++            let buffer = render_feedback(Some(feedback), width);
++            assert_eq!(buffer.area, before.area);
++            let row = buffer.area.bottom() - 1;
++            if width <= 9 {
++                assert_eq!(buffer, before);
++            }
++            if width == 80 {
++                let expected = match &result {
++                    Ok(CopyStatus::Pending(_)) => "Copying 24 chars…",
++                    Ok(CopyStatus::Busy) => "Copy already in progress",
++                    Ok(CopyStatus::Confirmed) => "Copied 24 chars to host clipboard",
++                    Ok(CopyStatus::Unconfirmed) => "Copy sent to terminal · paste to verify",
++                    Err(_) => "Copy failed · try again",
++                };
++                assert!(text(&buffer).contains(expected));
++            }
++            if buffer != before {
++                assert_eq!(buffer[(width - 1, row)].symbol(), " ");
++                assert_ne!(buffer[(width - 2, row)].symbol(), " ");
++            }
+             snapshots.push(format!("{result:?}, {width} columns\n{}", text(&buffer)));
+         }
+     }
+@@ -115,7 +147,7 @@ fn copy_feedback_is_right_aligned_and_does_not_claim_terminal_delivery() {
+ }
+ 
+ #[test]
+-fn feedback_releases_navigation_targets_and_expiry_restores_them() {
++fn feedback_and_expiry_preserve_navigation_targets() {
+     let cells = vec![cell("one\ntwo\nthree\nfour\nfive")];
+     let mut view = TranscriptView::default();
+     render(&mut view, &cells, /*width*/ 60, /*height*/ 3);
+@@ -125,24 +157,24 @@ fn feedback_releases_navigation_targets_and_expiry_restores_them() {
+         /*x*/ 0, /*y*/ 3, /*width*/ 60, /*height*/ 1,
+     );
+     let mut buffer = Buffer::empty(area);
+-    assert!(view.composer_gap_has_content(area.width, /*hint*/ None, Instant::now()));
+-    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer, Instant::now());
++    assert!(view.composer_gap_has_content(area.width, /*hint*/ None));
++    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer);
+     assert!(text(&buffer).contains("Back to bottom"));
++    let before = buffer.clone();
+     view.show_copy_feedback(&Ok(CopyStatus::Unconfirmed), /*characters*/ 3);
+     buffer.reset();
+-    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer, Instant::now());
+-    assert!(!text(&buffer).contains("Back to bottom"));
++    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer);
++    assert_eq!(buffer, before);
+     assert!(!view.is_following());
+     view.copy_feedback.as_mut().unwrap().expires_at = Some(Instant::now());
+     buffer.reset();
+-    assert_eq!(
+-        view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer, Instant::now()),
+-        None
+-    );
++    assert!(view.copy_feedback(Instant::now()).is_none());
++    view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer);
++    assert_eq!(buffer, before);
+     assert!(text(&buffer).contains("Back to bottom"));
+     view.jump_to_latest();
+     render(&mut view, &cells, /*width*/ 60, /*height*/ 3);
+-    assert!(!view.composer_gap_has_content(area.width, /*hint*/ None, Instant::now()));
++    assert!(!view.composer_gap_has_content(area.width, /*hint*/ None));
+ }
+ 
+ #[test]
+@@ -161,7 +193,7 @@ fn tip_links_follow_alignment_and_release_stale_targets() {
+         row: area.y,
+         modifiers: KeyModifiers::CONTROL,
+     };
+-    view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
++    view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
+     assert!(
+         buffer[(click.column, click.row)]
+             .symbol()
+@@ -204,13 +236,8 @@ fn tip_links_follow_alignment_and_release_stale_targets() {
+     }
+ 
+     for replacement in [None, Some(HyperlinkLine::from("Other tip"))] {
+-        view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
+-        view.render_composer_gap(
+-            Some(area),
+-            replacement.as_ref(),
+-            &mut buffer,
+-            Instant::now(),
+-        );
++        view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
++        view.render_composer_gap(Some(area), replacement.as_ref(), &mut buffer);
+         assert!(view.handle_mouse(click, &[]).is_none());
+     }
+     for next_area in [
+@@ -225,16 +252,20 @@ fn tip_links_follow_alignment_and_release_stale_targets() {
+             /*x*/ 4, /*y*/ 3, /*width*/ 20, /*height*/ 1,
+         )),
+     ] {
+-        view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
+-        view.render_composer_gap(next_area, Some(&tip), &mut buffer, Instant::now());
++        view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
++        view.render_composer_gap(next_area, Some(&tip), &mut buffer);
+         assert!(view.handle_mouse(click, &[]).is_none());
+     }
+-    view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
++    view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
+     view.show_copy_feedback(&Ok(CopyStatus::Confirmed), /*characters*/ 3);
+-    view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
+-    assert!(view.handle_mouse(click, &[]).is_none());
++    view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
++    assert!(matches!(
++        view.handle_mouse(click, &[]),
++        Some(ViewAction::OpenLink(_))
++    ));
+     view.copy_feedback.as_mut().unwrap().expires_at = Some(Instant::now());
+-    view.render_composer_gap(Some(area), Some(&tip), &mut buffer, Instant::now());
++    assert!(view.copy_feedback(Instant::now()).is_none());
++    view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
+     assert!(matches!(
+         view.handle_mouse(click, &[]),
+         Some(ViewAction::OpenLink(_))
+diff --git a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs b/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
+--- a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
++++ b/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
+@@ -339,12 +339,10 @@ fn copy_completion_keeps_payload_count_and_follow_intent() {
+             /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 1,
+         );
+         let mut buffer = ratatui::buffer::Buffer::empty(area);
+-        view.render_composer_gap(
+-            Some(area),
+-            /*hint*/ None,
+-            &mut buffer,
+-            std::time::Instant::now(),
+-        );
++        view.copy_feedback(std::time::Instant::now())
++            .unwrap()
++            .line(area.width)
++            .render(area, &mut buffer);
+         insta::allow_duplicates! {
+             insta::assert_snapshot!(text(&buffer).trim(), @"Copied 8 chars to host clipboard");
+         }
+diff --git a/codex-rs/tui/src/transcript_view/right_click_copy_tests.rs b/codex-rs/tui/src/transcript_view/right_click_copy_tests.rs
+--- a/codex-rs/tui/src/transcript_view/right_click_copy_tests.rs
++++ b/codex-rs/tui/src/transcript_view/right_click_copy_tests.rs
+@@ -52,6 +52,7 @@ fn right_click_retains_selection_until_confirmed_and_preserves_reading_position(
+             )
+         );
+         view.show_copy_feedback(&copied, selected.chars().count());
++        assert!(view.copy_feedback(Instant::now()).is_some());
+         let mut buffer = Buffer::empty(Rect::new(
+             /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 4,
+         ));
+@@ -68,7 +69,6 @@ fn right_click_retains_selection_until_confirmed_and_preserves_reading_position(
+             )),
+             /*hint*/ None,
+             &mut buffer,
+-            Instant::now(),
+         );
+         frames.push(format!("{result:?}\n{}", text(&buffer)));
+     }

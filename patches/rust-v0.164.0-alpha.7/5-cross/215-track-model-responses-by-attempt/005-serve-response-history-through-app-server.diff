@@ -1,0 +1,1064 @@
+serve-response-history-through-app-server
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: serve-response-history-through-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -903,6 +903,11 @@ client_request_definitions! {
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadReadStateUpdateResponse,
+     },
++    ResponseAttemptsRead => "modelResponse/list" {
++        params: v2::ResponseAttemptsReadParams,
++        serialization: None,
++        response: v2::ResponseAttemptsReadResponse,
++    },
+     ThreadTurnsList => "thread/turns/list" {
+         params: v2::ThreadTurnsListParams,
+         // Explicitly concurrent: this primarily reads append-only rollout storage.
+@@ -2107,6 +2112,7 @@ server_notification_definitions! {
+     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
+     ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
+     ModelVerification => "model/verification" (v2::ModelVerificationNotification),
++    ResponseAttemptUpdated => "modelResponse/updated" (v2::ResponseAttemptUpdatedNotification),
+     ResponsesStreamConnectionStatus => "model/websocketStatus" (v2::ResponsesStreamConnectionStatusNotification),
+     ModelChanged => "model/changed" (v2::ModelChangedNotification),
+     AuthRecoveryStarted => "modelProvider/authRecoveryStarted" (v2::AuthRecoveryNotification),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/model.rs b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/model.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+@@ -227,6 +227,53 @@ pub struct ResponsesStreamConnectionStatusNotification {
+     pub rtt_ms: Option<u64>,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ResponseAttemptsReadResponse {
++    pub data: Vec<codex_protocol::response_metrics::ResponseAttempt>,
++    pub next_cursor: Option<String>,
++    /// Requested-model choices from the full history, independent of the selected page.
++    pub models: Vec<String>,
++    /// Only this app-server's active attempts may advance display clocks.
++    #[schemars(with = "Vec<String>")]
++    pub active_attempt_ids: Vec<uuid::Uuid>,
++    /// Latest ended generation in the session scope, independent of pagination.
++    pub last_generation: Option<codex_protocol::response_metrics::ResponsePerformance>,
++    /// A backup failure does not discard authoritative in-memory records.
++    pub persistence_error: Option<String>,
++}
++
++/// Browse model response attempts across loaded and unloaded sessions.
++#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ResponseAttemptsReadParams {
++    /// Omit to include all sessions.
++    #[ts(optional = nullable)]
++    pub thread_id: Option<String>,
++    /// Match the requested model, independently of the model that served it.
++    #[ts(optional = nullable)]
++    pub model: Option<String>,
++    /// Omit to include every status. Working includes only live attempts.
++    #[ts(optional = nullable)]
++    pub status: Option<codex_protocol::response_metrics::ResponseAttemptStatus>,
++    /// Opaque exclusive cursor returned by the preceding page.
++    #[ts(optional = nullable)]
++    pub cursor: Option<String>,
++    /// Defaults to 100 records, with a maximum of 1000.
++    #[ts(optional = nullable)]
++    pub limit: Option<u32>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ResponseAttemptUpdatedNotification {
++    pub thread_id: Option<String>,
++    pub attempt: codex_protocol::response_metrics::ResponseAttempt,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -528,6 +528,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
+                 plugin_startup_tasks: Some(PluginStartupConfig::Current),
+             }));
+             let mut thread_created_rx = processor.thread_created_receiver();
++            let mut response_attempt_rx = processor.response_attempt_receiver();
+             let session = Arc::new(ConnectionSessionState::new(
+                 crate::transport::ConnectionOrigin::InProcess,
+             ));
+@@ -577,6 +578,9 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
+                             }
+                         }
+                     }
++                    update = response_attempt_rx.recv() => {
++                        processor.send_response_attempt_update(update).await;
++                    }
+                     created = thread_created_rx.recv(), if listen_for_threads => {
+                         match created {
+                             Ok(thread_id) => {
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -1093,6 +1093,7 @@ pub async fn run_main_with_transport_options(
+         processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
+         let processor = Arc::new(processor);
+         let mut thread_created_rx = processor.thread_created_receiver();
++        let mut response_attempt_rx = processor.response_attempt_receiver();
+         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
+         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
+         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+@@ -1446,6 +1447,9 @@ pub async fn run_main_with_transport_options(
+                             .send_server_notification(notification)
+                             .await;
+                     }
++                    update = response_attempt_rx.recv(), if !ready_to_exit => {
++                        processor.send_response_attempt_update(update).await;
++                    }
+                     created = thread_created_rx.recv(), if listen_for_threads && !ready_to_exit => {
+                         match created {
+                             Ok(thread_id) => {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -76,6 +76,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
+ use codex_app_server_protocol::JSONRPCNotification;
+ use codex_app_server_protocol::JSONRPCRequest;
+ use codex_app_server_protocol::JSONRPCResponse;
++use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ThreadSampleCancelResponse;
+ use codex_app_server_protocol::UserVerificationCancelResponse;
+ use codex_app_server_protocol::experimental_required_message;
+@@ -812,6 +813,39 @@ impl MessageProcessor {
+         self.thread_processor.thread_created_receiver()
+     }
+ 
++    pub(crate) fn response_attempt_receiver(
++        &self,
++    ) -> broadcast::Receiver<codex_protocol::response_metrics::ResponseAttempt> {
++        self.thread_processor.response_attempt_receiver()
++    }
++
++    pub(crate) async fn send_response_attempt_update(
++        &self,
++        update: Result<
++            codex_protocol::response_metrics::ResponseAttempt,
++            broadcast::error::RecvError,
++        >,
++    ) {
++        let attempts = match update {
++            Ok(attempt) => vec![attempt],
++            Err(broadcast::error::RecvError::Lagged(_)) => self
++                .thread_processor
++                .response_history()
++                .notification_snapshot(),
++            // The processor owns the sender for the lifetime of these receivers.
++            Err(broadcast::error::RecvError::Closed) => return,
++        };
++        for attempt in attempts {
++            let notification = codex_app_server_protocol::ResponseAttemptUpdatedNotification {
++                thread_id: attempt.thread_id.map(|thread_id| thread_id.to_string()),
++                attempt,
++            };
++            self.outgoing
++                .send_server_notification(ServerNotification::ResponseAttemptUpdated(notification))
++                .await;
++        }
++    }
++
+     pub(crate) async fn daemon_recovery_snapshot(
+         &self,
+     ) -> codex_app_server_transport::daemon_recovery::RecoverySnapshot {
+@@ -1642,6 +1676,11 @@ impl MessageProcessor {
+             ClientRequest::ThreadReadStateUpdate { params, .. } => {
+                 self.thread_processor.thread_read_state_update(params).await
+             }
++            ClientRequest::ResponseAttemptsRead { params, .. } => self
++                .thread_processor
++                .response_attempts_read(params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ThreadTurnsList { params, .. } => {
+                 self.thread_processor.thread_turns_list(params).await
+             }
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -117,6 +117,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::ContextCompacted(_)
+         | ServerNotification::ModelRerouted(_)
+         | ServerNotification::ModelVerification(_)
++        | ServerNotification::ResponseAttemptUpdated(_)
+         | ServerNotification::ResponsesStreamConnectionStatus(_)
+         | ServerNotification::ModelChanged(_)
+         | ServerNotification::AuthRecoveryStarted(_)
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -873,6 +873,45 @@ impl ThreadRequestProcessor {
+             .map(|response| Some(response.into()))
+     }
+ 
++    pub(crate) async fn response_attempts_read(
++        &self,
++        params: codex_app_server_protocol::ResponseAttemptsReadParams,
++    ) -> Result<codex_app_server_protocol::ResponseAttemptsReadResponse, JSONRPCErrorError> {
++        let thread_id = params
++            .thread_id
++            .as_deref()
++            .map(ThreadId::from_string)
++            .transpose()
++            .map_err(|error| invalid_request(format!("invalid thread ID: {error}")))?;
++        let before = params
++            .cursor
++            .as_deref()
++            .map(uuid::Uuid::parse_str)
++            .transpose()
++            .map_err(|error| invalid_request(format!("invalid response cursor: {error}")))?;
++        let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
++        Ok(self
++            .response_history()
++            .page(
++                thread_id,
++                params.model.as_deref(),
++                params.status,
++                before,
++                limit,
++            )
++            .await)
++    }
++
++    pub(crate) fn response_history(&self) -> Arc<codex_core::ResponseHistory> {
++        self.thread_manager.response_history()
++    }
++
++    pub(crate) fn response_attempt_receiver(
++        &self,
++    ) -> broadcast::Receiver<codex_protocol::response_metrics::ResponseAttempt> {
++        self.thread_manager.response_attempt_receiver()
++    }
++
+     async fn send_deprecation_notice(&self, connection_id: ConnectionId, summary: &str) {
+         self.outgoing
+             .send_server_notification_to_connections(
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -120,6 +120,7 @@ mod request_permissions;
+ mod request_user_input;
+ mod request_validation;
+ mod residency;
++mod response_metrics;
+ mod review;
+ #[path = "rollout_compress_tests.rs"]
+ mod rollout_compress;
+diff --git a/codex-rs/app-server/tests/suite/v2/response_metrics.rs b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+@@ -0,0 +1,271 @@
++use anyhow::Result;
++use app_test_support::ChatGptAuthFixture;
++use app_test_support::MockResponsesConfig;
++use app_test_support::TestAppServer;
++use app_test_support::write_chatgpt_auth;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
++use codex_app_server_protocol::ResponseAttemptsReadParams;
++use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadUnsubscribeParams;
++use codex_app_server_protocol::ThreadUnsubscribeResponse;
++use codex_app_server_protocol::TurnStartParams;
++use codex_app_server_protocol::UserInput;
++use codex_config::types::AuthCredentialsStoreMode;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseAttemptStatus;
++use codex_protocol::response_metrics::ResponseTokenCounts;
++use core_test_support::responses::WebSocketConnectionConfig;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::start_websocket_server_with_headers;
++use core_test_support::skip_if_no_network;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::time::Duration;
++use tempfile::TempDir;
++use tokio::time::timeout;
++
++const READ_TIMEOUT: Duration = Duration::from_secs(30);
++
++#[tokio::test]
++async fn response_pages_and_notifications_share_records_across_sessions() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let usage = json!({
++        "input_tokens": 100, "input_tokens_details": {"cached_tokens": 10},
++        "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 12}, "total_tokens": 120,
++    });
++    let mut completed = ev_completed("answer");
++    completed["response"]["usage"] = usage.clone();
++    let connection = WebSocketConnectionConfig {
++        requests: vec![
++            vec![ev_response_created("prewarm"), ev_completed("prewarm")],
++            vec![
++                ev_response_created("answer"),
++                json!({"type": "codex.rate_limits", "rate_limits": {"secondary": {
++                    "used_percent": 12, "window_minutes": 10080, "reset_at": 1900000000
++                }}}),
++                ev_assistant_message("message", "Complete answer"),
++                completed,
++            ],
++        ],
++        response_headers: vec![("openai-model".into(), "served-model".into())],
++        accept_delay: None,
++        close_after_requests: true,
++    };
++    let server = start_websocket_server_with_headers(vec![connection.clone(), connection]).await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(server.uri())
++        .with_provider_config("supports_websockets = true\nrequires_openai_auth = true")
++        .with_root_config("thread_unload_delay_secs = 0")
++        .write(home.path())?;
++    write_chatgpt_auth(
++        home.path(),
++        ChatGptAuthFixture::new("fake-access-token")
++            .account_id("metrics-account")
++            .plan_type("plus"),
++        AuthCredentialsStoreMode::File,
++    )?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .with_env_overrides(&[("OPENAI_API_KEY", None), ("CODEX_API_KEY", None)])
++        .build_initialized_with_timeout(READ_TIMEOUT)
++        .await?;
++    let mut records = Vec::new();
++    for text in ["first session", "second session"] {
++        let thread = app.start_thread(ThreadStartParams::default()).await?.thread;
++        let completed = timeout(
++            READ_TIMEOUT,
++            app.start_turn_and_wait_for_completion(TurnStartParams {
++                thread_id: thread.id.clone(),
++                input: vec![UserInput::Text {
++                    text: text.into(),
++                    text_elements: Vec::new(),
++                }],
++                ..Default::default()
++            }),
++        )
++        .await??;
++        let notification = timeout(
++            READ_TIMEOUT,
++            app.read_stream_until_matching_notification(
++                "completed response record",
++                |notification| {
++                    notification.method == "modelResponse/updated"
++                        && notification.params.as_ref().is_some_and(|params| {
++                            params["threadId"] == thread.id
++                                && params["attempt"]["requestKind"] == "generation"
++                                && params["attempt"]["endReason"] == "completed"
++                        })
++                },
++            ),
++        )
++        .await??;
++        let params = notification.params.unwrap();
++        assert!(params.get("quota").is_none());
++        for field in [
++            "provider",
++            "accountId",
++            "rateLimits",
++            "usageObservedSequence",
++        ] {
++            assert!(params["attempt"].get(field).is_none(), "unexpected {field}");
++        }
++        let update: ResponseAttemptUpdatedNotification = serde_json::from_value(params)?;
++        assert_eq!(update.thread_id.as_deref(), Some(thread.id.as_str()));
++        assert_eq!(
++            update.attempt.turn_id.as_deref(),
++            Some(completed.turn.id.as_str())
++        );
++        assert_eq!(
++            update.attempt.end_reason,
++            Some(ResponseAttemptEnd::Completed)
++        );
++        assert_eq!(
++            update.attempt.tokens,
++            ResponseTokenCounts {
++                input: Some(100),
++                cache_read: Some(10),
++                cache_write: Some(0),
++                output: Some(20),
++                reasoning: Some(12),
++            }
++        );
++        assert_eq!(update.attempt.served_model.as_deref(), Some("served-model"));
++        assert!(update.attempt.ttfb_ms.is_some());
++        assert!(update.attempt.ttfc_ms.is_some());
++        assert!(update.attempt.tps.is_some());
++        assert!(update.attempt.sent_payload_bytes.is_some());
++        records.insert(0, update.attempt);
++
++        let _: ThreadUnsubscribeResponse = app
++            .request(|request_id| ClientRequest::ThreadUnsubscribe {
++                request_id,
++                params: ThreadUnsubscribeParams {
++                    thread_id: thread.id,
++                },
++            })
++            .await?;
++        timeout(
++            READ_TIMEOUT,
++            app.read_stream_until_notification_message("thread/closed"),
++        )
++        .await??;
++    }
++    let request_count = server.connections().iter().map(Vec::len).sum::<usize>();
++    for _ in 0..2 {
++        let snapshot: ResponseAttemptsReadResponse = app
++            .request(|request_id| ClientRequest::ResponseAttemptsRead {
++                request_id,
++                params: ResponseAttemptsReadParams::default(),
++            })
++            .await?;
++        assert_eq!(snapshot.data, records);
++        assert!(snapshot.active_attempt_ids.is_empty());
++        assert_eq!(
++            snapshot.last_generation.unwrap().attempt_id,
++            records[0].attempt_id
++        );
++        assert_eq!(snapshot.models, vec![records[0].requested_model.clone()]);
++    }
++    let first: ResponseAttemptsReadResponse = app
++        .request(|request_id| ClientRequest::ResponseAttemptsRead {
++            request_id,
++            params: ResponseAttemptsReadParams {
++                limit: Some(1),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(first.data, records[..1]);
++    let second: ResponseAttemptsReadResponse = app
++        .request(|request_id| ClientRequest::ResponseAttemptsRead {
++            request_id,
++            params: ResponseAttemptsReadParams {
++                cursor: first.next_cursor,
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(second.data, records[1..]);
++    let filtered: ResponseAttemptsReadResponse = app
++        .request(|request_id| ClientRequest::ResponseAttemptsRead {
++            request_id,
++            params: ResponseAttemptsReadParams {
++                thread_id: Some(records[1].thread_id.expect("session response").to_string()),
++                model: Some(records[1].requested_model.clone()),
++                status: Some(ResponseAttemptStatus::Completed),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(filtered.data, records[1..]);
++    let working: ResponseAttemptsReadResponse = app
++        .request(|request_id| ClientRequest::ResponseAttemptsRead {
++            request_id,
++            params: ResponseAttemptsReadParams {
++                status: Some(ResponseAttemptStatus::Working),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert!(working.data.is_empty());
++    assert_eq!(
++        filtered.last_generation.unwrap().attempt_id,
++        records[1].attempt_id
++    );
++    assert_eq!(
++        server.connections().iter().map(Vec::len).sum::<usize>(),
++        request_count
++    );
++    assert!(
++        timeout(READ_TIMEOUT, app.shutdown_gracefully())
++            .await??
++            .success()
++    );
++    server.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn response_page_rejects_invalid_session_and_cursor() -> Result<()> {
++    let mut app = TestAppServer::builder()
++        .build_initialized_with_timeout(READ_TIMEOUT)
++        .await?;
++    for (params, expected) in [
++        (
++            ResponseAttemptsReadParams {
++                thread_id: Some("invalid-thread".into()),
++                ..Default::default()
++            },
++            "invalid thread ID",
++        ),
++        (
++            ResponseAttemptsReadParams {
++                cursor: Some("invalid-cursor".into()),
++                ..Default::default()
++            },
++            "invalid response cursor",
++        ),
++    ] {
++        let id = app
++            .send_request("modelResponse/list", Some(serde_json::to_value(params)?))
++            .await?;
++        let error = timeout(
++            READ_TIMEOUT,
++            app.read_stream_until_error_message(RequestId::Integer(id)),
++        )
++        .await??;
++        assert_eq!(error.error.code, -32600);
++        assert!(error.error.message.contains(expected), "{error:?}");
++    }
++    assert!(
++        timeout(READ_TIMEOUT, app.shutdown_gracefully())
++            .await??
++            .success()
++    );
++    Ok(())
++}
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -14,6 +14,8 @@ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_history;
+ mod realtime_prompt;
++mod response_history;
++pub use response_history::ResponseHistory;
+ mod response_metrics;
+ pub use response_metrics::ResponseMetrics;
+ mod responses_headers;
+diff --git a/codex-rs/core/src/response_history.rs b/codex-rs/core/src/response_history.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history.rs
+@@ -0,0 +1,152 @@
++//! Retained response observations, independent of transport and live trackers.
++
++use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptStatus;
++use codex_protocol::response_metrics::ResponsePerformance;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::sync::Mutex;
++use tokio::time::Instant;
++use uuid::Uuid;
++
++const RECENT_RESPONSE_LIMIT: usize = 250;
++
++#[derive(Debug, Default)]
++pub struct ResponseHistory {
++    state: Mutex<HistoryState>,
++}
++
++#[derive(Debug, Default)]
++struct HistoryState {
++    recent: BTreeMap<Uuid, RetainedAttempt>,
++    has_older: bool,
++    models: BTreeSet<String>,
++    last_generations: HashMap<Option<ThreadId>, ResponsePerformance>,
++}
++
++#[derive(Debug)]
++struct RetainedAttempt {
++    record: ResponseAttempt,
++    observed_at: Option<Instant>,
++}
++
++impl RetainedAttempt {
++    fn snapshot(&self) -> ResponseAttempt {
++        let mut record = self.record.clone();
++        if let Some(at) = self.observed_at {
++            record.elapsed_ms += u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
++        }
++        record
++    }
++}
++
++impl ResponseHistory {
++    /// Consume a published snapshot without retaining or controlling its tracker.
++    pub fn record(self: &Arc<Self>, record: ResponseAttempt) {
++        let mut history = self.state.lock().expect("response history lock");
++        history.models.insert(record.requested_model.clone());
++        if record.end_reason.is_some() && record.request_kind == "generation" {
++            history.record_generation(ResponsePerformance::from(&record));
++        }
++        let observed_at = (record.end_reason.is_none()
++            && record.terminal_observed_offset_ms.is_none())
++        .then(Instant::now);
++        history.recent.insert(
++            record.attempt_id,
++            RetainedAttempt {
++                record,
++                observed_at,
++            },
++        );
++        history.trim();
++    }
++
++    pub async fn page(
++        self: &Arc<Self>,
++        thread_id: Option<ThreadId>,
++        model: Option<&str>,
++        status: Option<ResponseAttemptStatus>,
++        before: Option<Uuid>,
++        limit: usize,
++    ) -> ResponseAttemptsReadResponse {
++        let history = self.state.lock().expect("response history lock");
++        let mut data: Vec<_> = history
++            .recent
++            .values()
++            .rev()
++            .filter(|row| {
++                let record = &row.record;
++                before.is_none_or(|cursor| record.attempt_id < cursor)
++                    && thread_id.is_none_or(|id| record.thread_id == Some(id))
++                    && model.is_none_or(|model| record.requested_model == model)
++                    && status
++                        .is_none_or(|status| record.status(row.observed_at.is_some()) == status)
++            })
++            .take(limit + 1)
++            .map(RetainedAttempt::snapshot)
++            .collect();
++        let next_cursor = if data.len() > limit {
++            data.truncate(limit);
++            data.last().map(|row| row.attempt_id.to_string())
++        } else {
++            None
++        };
++        ResponseAttemptsReadResponse {
++            data,
++            next_cursor,
++            models: history.models.iter().cloned().collect(),
++            active_attempt_ids: history
++                .recent
++                .values()
++                .filter(|row| row.observed_at.is_some())
++                .map(|row| row.record.attempt_id)
++                .collect(),
++            last_generation: history
++                .last_generations
++                .values()
++                .filter(|last| thread_id.is_none_or(|id| Some(id) == last.thread_id))
++                .max_by_key(|last| last.attempt_id)
++                .cloned(),
++            persistence_error: None,
++        }
++    }
++
++    /// Resynchronize live subscribers without reviving unfinished stored records.
++    pub fn notification_snapshot(&self) -> Vec<ResponseAttempt> {
++        self.state
++            .lock()
++            .expect("response history lock")
++            .recent
++            .values()
++            .rev()
++            .filter(|row| row.observed_at.is_some() || row.record.end_reason.is_some())
++            .map(RetainedAttempt::snapshot)
++            .collect()
++    }
++}
++
++impl HistoryState {
++    fn record_generation(&mut self, performance: ResponsePerformance) {
++        let current = self
++            .last_generations
++            .entry(performance.thread_id)
++            .or_insert_with(|| performance.clone());
++        if current.attempt_id < performance.attempt_id {
++            *current = performance;
++        }
++    }
++
++    fn trim(&mut self) {
++        while self.recent.len() > RECENT_RESPONSE_LIMIT {
++            self.recent.pop_first();
++            self.has_older = true;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/codex-rs/core/src/response_history/tests.rs b/codex-rs/core/src/response_history/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history/tests.rs
+@@ -0,0 +1,230 @@
++use super::*;
++use crate::ResponseMetrics;
++use crate::response_metrics::ResponseAttemptContext;
++use codex_api::ResponseObservation;
++use codex_api::ResponseObserver;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseTokenCounts;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::time::Duration;
++
++pub(super) fn recording() -> (Arc<ResponseMetrics>, Arc<ResponseHistory>) {
++    let history = Arc::new(ResponseHistory::default());
++    let retained = Arc::clone(&history);
++    let metrics = Arc::new(ResponseMetrics::new(move |record| retained.record(record)));
++    (metrics, history)
++}
++
++pub(super) fn context() -> ResponseAttemptContext {
++    ResponseAttemptContext {
++        thread_id: Some(ThreadId::new()),
++        turn_id: Some("turn-1".into()),
++        request_kind: "generation".into(),
++        requested_model: "model".into(),
++        reasoning_effort: None,
++    }
++}
++
++#[tokio::test(start_paused = true)]
++async fn pages_keep_live_identities_and_last_generation_outside_filters() {
++    let (metrics, history) = recording();
++    let first_context = context();
++    let thread_id = first_context.thread_id;
++    let first = metrics.start(first_context, Instant::now(), 1000);
++    first.sent(Instant::now());
++    first.received(
++        ResponseObservation {
++            served_model: Some("served".into()),
++            usage: Some(json!({"output_tokens": 0})),
++            terminal: Some(ResponseAttemptEnd::Failed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    let first_row = history.page(None, None, None, None, 1).await.data.remove(0);
++    let second = metrics.start(context(), Instant::now(), 1000);
++    let second_id = history.page(None, None, None, None, 1).await.data[0].attempt_id;
++    tokio::time::advance(Duration::from_secs(2)).await;
++    let page = history.page(None, None, None, None, 1).await;
++    assert_eq!(page.data.len(), 1);
++    assert_eq!(page.data[0].attempt_id, second_id);
++    assert_eq!(page.data[0].elapsed_ms, 2000);
++    assert_eq!(page.active_attempt_ids, vec![second_id]);
++    assert_eq!(
++        page.last_generation.unwrap().attempt_id,
++        first_row.attempt_id
++    );
++    let older = history.page(None, None, None, Some(second_id), 1).await;
++    assert_eq!(older.data, vec![first_row.clone()]);
++    assert_eq!(older.next_cursor, None);
++    let filtered = history.page(thread_id, Some("model"), None, None, 1).await;
++    assert_eq!(filtered.data, vec![first_row]);
++    assert_eq!(filtered.active_attempt_ids, vec![second_id]);
++    assert_eq!(filtered.models, vec!["model"]);
++    assert!(
++        history
++            .page(None, Some("served"), None, None, 1)
++            .await
++            .data
++            .is_empty()
++    );
++    drop(second);
++    assert!(
++        history
++            .page(None, None, None, None, 1)
++            .await
++            .active_attempt_ids
++            .is_empty()
++    );
++}
++
++#[tokio::test]
++async fn evicted_snapshots_do_not_keep_trackers_alive_or_displace_newer_history() {
++    let (metrics, history) = recording();
++    let oldest = metrics.start(context(), Instant::now(), 1000);
++    let oldest_id = history.page(None, None, None, None, 1).await.data[0].attempt_id;
++    for _ in 0..RECENT_RESPONSE_LIMIT {
++        drop(metrics.start(context(), Instant::now(), 1000));
++    }
++    let rows = history
++        .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
++        .await
++        .data;
++    assert_eq!(rows.len(), RECENT_RESPONSE_LIMIT);
++    assert!(rows.iter().all(|row| row.attempt_id != oldest_id));
++    assert!(
++        rows.iter()
++            .all(|row| row.end_reason == Some(ResponseAttemptEnd::Canceled))
++    );
++    assert!(
++        rows.windows(2)
++            .all(|rows| rows[0].attempt_id > rows[1].attempt_id)
++    );
++    drop(oldest);
++    assert_eq!(
++        history
++            .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
++            .await
++            .data,
++        rows
++    );
++}
++
++#[tokio::test(start_paused = true)]
++async fn terminal_receipt_stops_retained_clocks_before_output_validation() {
++    let (metrics, history) = recording();
++    let attempt = metrics.start(context(), Instant::now(), 1000);
++    attempt.sent(Instant::now());
++    tokio::time::advance(Duration::from_secs(1)).await;
++    attempt.received(
++        ResponseObservation {
++            usage: Some(json!({"output_tokens": 10})),
++            terminal: Some(ResponseAttemptEnd::Completed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    tokio::time::advance(Duration::from_secs(30)).await;
++    let pending = history.page(None, None, None, None, 1).await;
++    assert!(pending.active_attempt_ids.is_empty());
++    assert_eq!(pending.data[0].elapsed_ms, 1000);
++    assert_eq!(pending.data[0].end_reason, None);
++    assert_eq!(pending.data[0].tokens, ResponseTokenCounts::default());
++    assert!(history.notification_snapshot().is_empty());
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let completed = history.page(None, None, None, None, 1).await;
++    assert_eq!(completed.data[0].elapsed_ms, 1000);
++    assert_eq!(completed.data[0].tokens.output, Some(10));
++    assert_eq!(completed.data[0].attempt_id, pending.data[0].attempt_id);
++    assert!(completed.data[0].revision > pending.data[0].revision);
++    assert_eq!(history.notification_snapshot(), completed.data);
++}
++
++#[tokio::test(start_paused = true)]
++async fn status_and_model_filters_page_live_transitions_before_limiting() {
++    let (metrics, history) = recording();
++    let older = metrics.start(context(), Instant::now(), 1000);
++    let newer = metrics.start(context(), Instant::now(), 1000);
++    let mut other_context = context();
++    other_context.requested_model = "other".into();
++    let other = metrics.start(other_context, Instant::now(), 1000);
++    let first = history
++        .page(
++            None,
++            Some("model"),
++            Some(ResponseAttemptStatus::Working),
++            None,
++            1,
++        )
++        .await;
++    assert_eq!(first.data.len(), 1);
++    assert_eq!(first.active_attempt_ids.len(), 3);
++    assert_eq!(first.models, vec!["model", "other"]);
++    let cursor = first.data[0].attempt_id;
++    assert_eq!(first.next_cursor, Some(cursor.to_string()));
++    let second = history
++        .page(
++            None,
++            Some("model"),
++            Some(ResponseAttemptStatus::Working),
++            Some(cursor),
++            1,
++        )
++        .await;
++    assert_eq!(second.data.len(), 1);
++    assert!(second.data[0].attempt_id < cursor);
++    assert_eq!(second.next_cursor, None);
++
++    newer.sent(Instant::now());
++    newer.received(
++        ResponseObservation {
++            terminal: Some(ResponseAttemptEnd::Completed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    let working = history
++        .page(
++            None,
++            Some("model"),
++            Some(ResponseAttemptStatus::Working),
++            None,
++            1,
++        )
++        .await;
++    assert_eq!(working.data, second.data);
++    assert_eq!(working.next_cursor, None);
++    let received = history
++        .page(None, None, Some(ResponseAttemptStatus::Received), None, 1)
++        .await;
++    assert_eq!(received.data[0].attempt_id, cursor);
++    assert!(!received.active_attempt_ids.contains(&cursor));
++    assert!(
++        history
++            .page(None, None, Some(ResponseAttemptStatus::Unfinished), None, 1)
++            .await
++            .data
++            .is_empty()
++    );
++    newer.ended(ResponseAttemptEnd::Completed, Instant::now());
++    assert!(
++        history
++            .page(None, None, Some(ResponseAttemptStatus::Received), None, 1)
++            .await
++            .data
++            .is_empty()
++    );
++    let completed = history
++        .page(
++            None,
++            Some("model"),
++            Some(ResponseAttemptStatus::Completed),
++            None,
++            1,
++        )
++        .await;
++    assert_eq!(completed.data[0].attempt_id, cursor);
++    assert_eq!(completed.last_generation.unwrap().attempt_id, cursor);
++    drop((older, other));
++}
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -427,6 +427,7 @@ pub(crate) struct ThreadManagerState {
+     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
+     thread_created_tx: broadcast::Sender<ThreadId>,
+     response_metrics: Arc<crate::ResponseMetrics>,
++    response_history: Arc<crate::ResponseHistory>,
+     response_updates: broadcast::Sender<codex_protocol::response_metrics::ResponseAttempt>,
+     thread_id_generator: ThreadIdGenerator,
+     agent_control_factory: Option<AgentControlFactory>,
+@@ -567,7 +568,10 @@ impl ThreadManager {
+         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+         let (response_updates, _) = broadcast::channel(1024);
+         let response_tx = response_updates.clone();
++        let response_history = Arc::new(crate::ResponseHistory::default());
++        let history = Arc::clone(&response_history);
+         let response_metrics = Arc::new(crate::ResponseMetrics::new(move |record| {
++            history.record(record.clone());
+             // Notifications need no receiver while the manager runs without a UI.
+             let _ = response_tx.send(record);
+         }));
+@@ -605,6 +609,7 @@ impl ThreadManager {
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+                 response_metrics,
++                response_history,
+                 response_updates,
+                 thread_id_generator: default_thread_id_generator(),
+                 agent_control_factory: None,
+@@ -767,7 +772,10 @@ impl ThreadManager {
+         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+         let (response_updates, _) = broadcast::channel(1024);
+         let response_tx = response_updates.clone();
++        let response_history = Arc::new(crate::ResponseHistory::default());
++        let history = Arc::clone(&response_history);
+         let response_metrics = Arc::new(crate::ResponseMetrics::new(move |record| {
++            history.record(record.clone());
+             let _ = response_tx.send(record);
+         }));
+         let restriction_product = SessionSource::Exec.restriction_product();
+@@ -802,6 +810,7 @@ impl ThreadManager {
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+                 response_metrics,
++                response_history,
+                 response_updates,
+                 thread_id_generator: default_thread_id_generator(),
+                 agent_control_factory: None,
+@@ -843,6 +852,10 @@ impl ThreadManager {
+         Arc::clone(&self.state.response_metrics)
+     }
+ 
++    pub fn response_history(&self) -> Arc<crate::ResponseHistory> {
++        Arc::clone(&self.state.response_history)
++    }
++
+     pub fn response_attempt_receiver(
+         &self,
+     ) -> broadcast::Receiver<codex_protocol::response_metrics::ResponseAttempt> {
+diff --git a/codex-rs/exec/src/event_processor_with_human_output.rs b/codex-rs/exec/src/event_processor_with_human_output.rs
+--- a/codex-rs/exec/src/event_processor_with_human_output.rs
++++ b/codex-rs/exec/src/event_processor_with_human_output.rs
+@@ -304,6 +304,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
+                 CodexStatus::Running
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
++            ServerNotification::ResponseAttemptUpdated(_) => CodexStatus::Running,
+             ServerNotification::ResponsesStreamConnectionStatus(_) => CodexStatus::Running,
+             ServerNotification::ModelChanged(_) => CodexStatus::Running,
+             ServerNotification::ConnectedClientCountChanged(_) => CodexStatus::Running,
+diff --git a/codex-rs/exec/src/event_processor_with_jsonl_output.rs b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+--- a/codex-rs/exec/src/event_processor_with_jsonl_output.rs
++++ b/codex-rs/exec/src/event_processor_with_jsonl_output.rs
+@@ -506,6 +506,7 @@ impl EventProcessorWithJsonOutput {
+                 CodexStatus::Running
+             }
+             ServerNotification::ModelVerification(_) => CodexStatus::Running,
++            ServerNotification::ResponseAttemptUpdated(_) => CodexStatus::Running,
+             ServerNotification::ResponsesStreamConnectionStatus(_) => CodexStatus::Running,
+             ServerNotification::ModelChanged(_) => CodexStatus::Running,
+             ServerNotification::ConnectedClientCountChanged(_) => CodexStatus::Running,
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -1715,6 +1715,7 @@ fn should_process_notification(
+         ServerNotification::ModelVerification(notification) => {
+             notification.thread_id == thread_id && notification.turn_id == turn_id
+         }
++        ServerNotification::ResponseAttemptUpdated(_) => false,
+         ServerNotification::ResponsesStreamConnectionStatus(_) => false,
+         ServerNotification::ModelChanged(_) => false,
+         ServerNotification::ConnectedClientCountChanged(_) => false,
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -206,6 +206,7 @@ pub(super) fn server_notification_thread_target(
+             }
+         }
+         ServerNotification::ProjectChanged(_)
++        | ServerNotification::ResponseAttemptUpdated(_)
+         | ServerNotification::SkillsChanged(_)
+         | ServerNotification::AccountUpdated(_)
+         | ServerNotification::UsageBuildProgress(_)
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -236,6 +236,7 @@ impl ChatWidget {
+                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+             }
+             ServerNotification::ModelRerouted(_) => {}
++            ServerNotification::ResponseAttemptUpdated(_) => {}
+             ServerNotification::ModelVerification(notification) => {
+                 self.on_app_server_model_verification(&notification.verifications)
+             }

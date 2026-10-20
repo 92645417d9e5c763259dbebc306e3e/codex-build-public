@@ -1,0 +1,562 @@
+present-usage-progress-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-usage-progress-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app/control_center_data.rs b/codex-rs/tui/src/app/control_center_data.rs
+--- a/codex-rs/tui/src/app/control_center_data.rs
++++ b/codex-rs/tui/src/app/control_center_data.rs
+@@ -1,8 +1,10 @@
+ //! Request shared accounting snapshots and retain request-scoped build observations.
+ use super::App;
+ use crate::app_event::AppEvent;
++use crate::motion::MotionMode;
+ use crate::pager_overlay::Overlay;
+ use crate::tui;
++use crate::usage::UsageBuildView;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::UsageBuildProgress;
+ use codex_app_server_protocol::UsageBuildProgressNotification;
+@@ -54,6 +56,15 @@ impl App {
+             self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
+             Arc::clone(&self.model_catalog),
+         ));
++        if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
++            view.dialogs.push(Box::new(UsageBuildView::new(
++                request.started_at,
++                request.progress.subscribe(),
++                MotionMode::from_animations_enabled(
++                    self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
++                ),
++            )));
++        }
+         if start_load {
+             self.app_event_tx.send(AppEvent::LoadUsage {
+                 request_id,
+@@ -72,8 +83,15 @@ impl App {
+         }
+         let request = UsageRequest::new();
+         let request_id = request.id;
+-        self.usage_request = Some(request);
+         view.begin_usage_refresh(request_id);
++        view.dialogs.push(Box::new(UsageBuildView::new(
++            request.started_at,
++            request.progress.subscribe(),
++            MotionMode::from_animations_enabled(
++                self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
++            ),
++        )));
++        self.usage_request = Some(request);
+         self.app_event_tx.send(AppEvent::LoadUsage {
+             request_id,
+             refresh: true,
+@@ -103,6 +121,8 @@ impl App {
+         }
+         if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
+             view.set_report(result.map(|response| response.report));
++            // Retire the completed dialog before another key can target it.
++            view.dialogs.pre_draw_tick(Instant::now());
+         }
+         tui.frame_requester().schedule_frame();
+     }
+diff --git a/codex-rs/tui/src/app/control_center_data_tests.rs b/codex-rs/tui/src/app/control_center_data_tests.rs
+--- a/codex-rs/tui/src/app/control_center_data_tests.rs
++++ b/codex-rs/tui/src/app/control_center_data_tests.rs
+@@ -60,6 +60,13 @@ async fn loading_and_failed_usage_reports_close_with_escape() -> anyhow::Result<
+             app.finish_usage(&mut tui, request_id, Err("fixture error".into()));
+         } else {
+             app.open_control_center(&mut tui);
++            let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++                panic!("center")
++            };
++            assert!(center.has_dialog());
++            center.dialogs.handle_key_event(KeyCode::Esc.into(), None);
++            assert!(!center.has_dialog() && !center.is_done());
++            assert!(app.usage_request.is_some());
+         }
+         for key in [
+             KeyCode::Char('q').into(),
+diff --git a/codex-rs/tui/src/app/control_center_input_tests.rs b/codex-rs/tui/src/app/control_center_input_tests.rs
+--- a/codex-rs/tui/src/app/control_center_input_tests.rs
++++ b/codex-rs/tui/src/app/control_center_input_tests.rs
+@@ -83,6 +83,9 @@ impl Fixture {
+         self.app.chat_widget.insert_str("Preserved draft");
+         self.app.open_control_center(&mut self.tui);
+         while self.events.try_recv().is_ok() {}
++        self.key(KeyCode::Esc).await?;
++        assert!(!self.center().has_dialog());
++        assert!(self.app.usage_request.is_some());
+         self.key(KeyCode::Char(key)).await?;
+         tokio::time::timeout(Duration::from_secs(10), async {
+             while !self.text().contains(title) {
+@@ -588,6 +591,100 @@ async fn proxy_settings_own_editor_input_cursor_and_return_to_the_same_center()
+     fixture.finish().await
+ }
+ 
++#[tokio::test]
++async fn usage_progress_owns_input_and_hiding_keeps_the_request_and_settings_intact()
++-> crate::app::Result<()> {
++    let mut fixture = Fixture::new().await?;
++    fixture.app.open_control_center(&mut fixture.tui);
++    let request = fixture.app.usage_request.as_ref().unwrap();
++    let request_id = request.id;
++    let started_at = request.started_at;
++    assert!(fixture.text().contains("Building usage"));
++    let rpc_id = codex_app_server_protocol::RequestId::String("usage-build".into());
++    fixture.app.usage_request.as_mut().unwrap().rpc_id = Some(rpc_id.clone());
++    fixture
++        .app
++        .handle_backend_event(
++            &fixture.server,
++            crate::app_server_session::AppServerSessionEvent {
++                backend_id: fixture.server.backend_id(),
++                event: codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
++                    codex_app_server_protocol::ServerNotification::UsageBuildProgress(
++                        codex_app_server_protocol::UsageBuildProgressNotification {
++                            request_id: rpc_id,
++                            progress: codex_app_server_protocol::UsageBuildProgress {
++                                phase: codex_app_server_protocol::UsageBuildPhase::Reading,
++                                files_processed: 2,
++                                files_total: Some(4),
++                            },
++                        },
++                    ),
++                )),
++            },
++        )
++        .await;
++    assert!(fixture.text().contains("Files: 2 / 4") && fixture.text().contains("50%"));
++    for key in [
++        KeyCode::Char('q').into(),
++        KeyCode::Char('r').into(),
++        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
++    ] {
++        fixture.key(key).await?;
++    }
++    assert_eq!(fixture.center().screen, CenterScreen::Summary);
++    assert!(fixture.center().has_dialog());
++    assert_eq!(
++        std::iter::from_fn(|| fixture.events.try_recv().ok())
++            .filter(|event| matches!(event, AppEvent::LoadUsage { .. }))
++            .count(),
++        1
++    );
++    fixture.key(KeyCode::Esc).await?;
++    assert!(!fixture.center().has_dialog());
++    let request = fixture.app.usage_request.as_ref().unwrap();
++    assert_eq!(request.id, request_id);
++    assert_eq!(request.started_at, started_at);
++    fixture
++        .app
++        .open_proxy_menu(&fixture.tui, Default::default());
++    fixture
++        .dispatch(AppEvent::UsageLoaded {
++            request_id,
++            result: Ok(UsageReadResponse {
++                report: Arc::new(crate::usage::test_report()),
++                refreshed: true,
++            }),
++        })
++        .await?;
++    assert!(fixture.app.usage_request.is_none());
++    assert!(fixture.center().has_dialog() && fixture.text().contains("Proxy"));
++    assert!(fixture.center().report().is_some());
++    fixture.key(KeyCode::Esc).await?;
++    fixture.key(KeyCode::Char('r')).await?;
++    assert!(fixture.center().has_dialog());
++    let refresh_id = fixture.app.usage_request.as_ref().unwrap().id;
++    fixture
++        .dispatch(AppEvent::UsageLoaded {
++            request_id: refresh_id,
++            result: Err("fixture scan failed".into()),
++        })
++        .await?;
++    assert!(!fixture.center().has_dialog());
++    assert!(
++        fixture
++            .text()
++            .contains("Usage unavailable: fixture scan failed")
++    );
++    fixture
++        .key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT))
++        .await?;
++    assert_eq!(
++        fixture.center().screen,
++        CenterScreen::Usage(UsageRange::Daily)
++    );
++    fixture.finish().await
++}
++
+ #[tokio::test]
+ async fn telegram_settings_keep_masked_input_nested_views_and_covered_updates()
+ -> crate::app::Result<()> {
+@@ -811,6 +908,7 @@ async fn response_filters_keep_arrow_ownership_over_global_bindings() -> crate::
+ 
+     let mut fixture = Fixture::new().await?;
+     fixture.app.open_control_center(&mut fixture.tui);
++    fixture.key(KeyCode::Esc).await?;
+     let Some(Overlay::ControlCenter(center)) = &mut fixture.app.overlay else {
+         unreachable!()
+     };
+@@ -859,6 +957,7 @@ async fn quit_dialog_cancels_by_default_and_rechecks_before_exiting() -> crate::
+     fixture.app.open_control_center(&mut fixture.tui);
+     while fixture.events.try_recv().is_ok() {}
+     while fixture.commands.try_recv().is_ok() {}
++    fixture.key(KeyCode::Esc).await?;
+     fixture.app.reconnect.offline = true;
+     fixture.key(KeyCode::Char('q')).await?;
+     assert!(fixture.text().contains("Cannot quit"));
+diff --git a/codex-rs/tui/src/app/control_center_responses_tests.rs b/codex-rs/tui/src/app/control_center_responses_tests.rs
+--- a/codex-rs/tui/src/app/control_center_responses_tests.rs
++++ b/codex-rs/tui/src/app/control_center_responses_tests.rs
+@@ -197,6 +197,7 @@ async fn response_filters_are_transient_and_never_write_configuration() -> anyho
+     let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
+         panic!("center")
+     };
++    center.dialogs.handle_key_event(KeyCode::Esc.into(), None);
+     center.responses.history.models.insert("gpt-5.4".into());
+     app.overlay
+         .as_mut()
+diff --git a/codex-rs/tui/src/app/control_center_statistics_tests.rs b/codex-rs/tui/src/app/control_center_statistics_tests.rs
+--- a/codex-rs/tui/src/app/control_center_statistics_tests.rs
++++ b/codex-rs/tui/src/app/control_center_statistics_tests.rs
+@@ -350,10 +350,18 @@ async fn statistics_and_summary_preserve_unknowns_zero_and_independent_sources()
+     preset.model = "Alpha/Case".into();
+     preset.display_name = "Friendly Alpha".into();
+     app.model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(vec![preset]));
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
+     let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
+         unreachable!()
+     };
+-    view.set_report(Ok(Arc::new(crate::usage::test_report())));
+     view.timing = Some(Ok(ResponseTimingReadResponse {
+         models: vec![
+             ResponseModelTiming {
+@@ -678,6 +686,8 @@ async fn timing_refreshes_on_new_generation_and_expiry_without_reloading_usage_o
+     let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
+         unreachable!()
+     };
++    view.dialogs.handle_key_event(KeyCode::Esc.into(), None);
++    assert!(app.usage_request.is_some());
+     view.screen = CenterScreen::Responses;
+     view.show_statistics(1.0, tui.frame_requester());
+     app.refresh_control_center_timing(&session, false);
+@@ -747,10 +757,15 @@ async fn quota_statistics_omit_page_estimates_and_preserve_averages() {
+     assert!(page.contains("$123.00"), "{page}");
+     let zero_row = page.lines().find(|row| row.contains("80.0%")).unwrap();
+     assert_eq!(zero_row.split('│').nth(7).unwrap().trim(), "--");
+-    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
+-        unreachable!()
+-    };
+-    view.set_report(Ok(Arc::new(report.clone())));
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(report.clone()),
++            refreshed: true,
++        }),
++    );
+     let statistics = app.control_center_quota_statistics().iter().join("\n");
+     assert!(!statistics.contains("Latest estimated"), "{statistics}");
+     assert!(statistics.contains("Credits / $1 API: "), "{statistics}");
+diff --git a/codex-rs/tui/src/usage/mod.rs b/codex-rs/tui/src/usage/mod.rs
+--- a/codex-rs/tui/src/usage/mod.rs
++++ b/codex-rs/tui/src/usage/mod.rs
+@@ -1,10 +1,12 @@
+ //! Presentation of the app-server's shared local accounting snapshot.
+ mod heatmap;
++mod progress;
+ mod render;
+ 
+ pub(crate) use heatmap::day_has_usage;
+ pub(crate) use heatmap::heatmap_bounds;
+ pub(crate) use heatmap::latest_usage_day;
++pub(crate) use progress::UsageBuildView;
+ 
+ pub(crate) use render::render;
+ pub(crate) use render::render_quotas;
+diff --git a/codex-rs/tui/src/usage/progress.rs b/codex-rs/tui/src/usage/progress.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/progress.rs
+@@ -0,0 +1,114 @@
++use crate::bottom_pane::BottomPaneView;
++use crate::bottom_pane::CancellationEvent;
++use crate::dialog::DialogFrame;
++use crate::motion::MotionMode;
++use crate::motion::ReducedMotionIndicator;
++use crate::motion::activity_indicator;
++use crate::render::renderable::Renderable;
++use codex_app_server_protocol::UsageBuildPhase;
++use codex_app_server_protocol::UsageBuildProgress;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Constraint;
++use ratatui::layout::Layout;
++use ratatui::layout::Rect;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::widgets::Widget;
++use std::time::Duration;
++use std::time::Instant;
++use tokio::sync::watch;
++
++pub(crate) struct UsageBuildView {
++    started_at: Instant,
++    progress: watch::Receiver<Option<UsageBuildProgress>>,
++    motion: MotionMode,
++    hidden: bool,
++}
++
++impl UsageBuildView {
++    pub(crate) fn new(
++        started_at: Instant,
++        progress: watch::Receiver<Option<UsageBuildProgress>>,
++        motion: MotionMode,
++    ) -> Self {
++        Self {
++            started_at,
++            progress,
++            motion,
++            hidden: false,
++        }
++    }
++}
++
++impl Renderable for UsageBuildView {
++    fn desired_height(&self, _width: u16) -> u16 {
++        8
++    }
++
++    fn render(&self, area: Rect, buf: &mut Buffer) {
++        let frame = DialogFrame::new(area, 1);
++        frame.render(buf);
++        let [title, _, phase_area, files, elapsed] =
++            Layout::vertical([Constraint::Length(1); 5]).areas(frame.body_content());
++        let mut heading = Vec::new();
++        if let Some(indicator) = activity_indicator(
++            Some(self.started_at),
++            self.motion,
++            ReducedMotionIndicator::Hidden,
++        ) {
++            heading.extend([indicator, " ".into()]);
++        }
++        heading.push("Building usage".bold());
++        Line::from(heading).render(title, buf);
++        let progress = self.progress.borrow();
++        let phase = match progress.as_ref().map(|value| value.phase) {
++            None => "Waiting for server",
++            Some(UsageBuildPhase::Waiting) => "Waiting for shared build",
++            Some(UsageBuildPhase::Discovering) => "Discovering session files",
++            Some(UsageBuildPhase::Reading) => "Reading session files",
++            Some(UsageBuildPhase::Reconciling) => "Reconciling session history",
++            Some(UsageBuildPhase::Deduplicating) => "Deduplicating responses",
++            Some(UsageBuildPhase::Aggregating) => "Aggregating usage",
++            Some(UsageBuildPhase::Publishing) => "Publishing report",
++        };
++        Line::from(phase).render(phase_area, buf);
++        if let Some(progress) = progress.as_ref()
++            && let Some(total) = progress.files_total
++        {
++            let label = if progress.phase == UsageBuildPhase::Reading && total > 0 {
++                // Do not round unfinished files up to 100%.
++                let percent =
++                    (u128::from(progress.files_processed) * 100 / u128::from(total)).min(100);
++                format!("Files: {} / {total} ({percent}%)", progress.files_processed)
++            } else {
++                format!("Files: {} / {total}", progress.files_processed)
++            };
++            Line::from(label).render(files, buf);
++        }
++        Line::from(format!(
++            "Elapsed: {:.1}s",
++            self.started_at.elapsed().as_secs_f64()
++        ))
++        .render(elapsed, buf);
++        crate::footer_hint::shortcut("esc", "hide").render(frame.footer(), buf);
++    }
++}
++
++impl BottomPaneView for UsageBuildView {
++    fn is_complete(&self) -> bool {
++        self.hidden || self.progress.has_changed().is_err()
++    }
++
++    fn on_ctrl_c(&mut self) -> CancellationEvent {
++        self.hidden = true;
++        CancellationEvent::Handled
++    }
++
++    fn next_frame_delay(&self) -> Option<Duration> {
++        Some(Duration::from_millis(250))
++    }
++}
++
++#[cfg(test)]
++#[path = "progress_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/usage/progress_tests.rs b/codex-rs/tui/src/usage/progress_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/progress_tests.rs
+@@ -0,0 +1,143 @@
++use super::*;
++use crate::bottom_pane::CenteredView;
++use crate::dialog::DialogStack;
++use crate::tui::FrameRequester;
++use crossterm::event::KeyCode;
++use pretty_assertions::assert_eq;
++
++fn text(view: &dyn Renderable) -> String {
++    let area = Rect::new(0, 0, 72, 14);
++    let mut buffer = Buffer::empty(area);
++    view.render(area, &mut buffer);
++    buffer.content.iter().map(|cell| cell.symbol()).collect()
++}
++
++#[test]
++fn file_progress_is_reading_only_and_unknown_totals_do_not_invent_a_percentage() {
++    let (updates, progress) = watch::channel(None);
++    let view = UsageBuildView::new(Instant::now(), progress, MotionMode::Reduced);
++    let waiting = text(&CenteredView(&view));
++    assert!(waiting.contains("Waiting for server"));
++    assert!(waiting.contains("Elapsed:") && waiting.contains("hide"));
++    assert!(!waiting.contains("Files:") && !waiting.contains('%'));
++    for (phase, processed, total, expected) in [
++        (UsageBuildPhase::Reading, 5, None, None),
++        (UsageBuildPhase::Reading, 0, Some(0), None),
++        (UsageBuildPhase::Reading, 0, Some(3), Some("0%")),
++        (UsageBuildPhase::Reading, 1, Some(3), Some("33%")),
++        (UsageBuildPhase::Reading, 26935, Some(26936), Some("99%")),
++        (UsageBuildPhase::Reading, 3, Some(3), Some("100%")),
++        (UsageBuildPhase::Aggregating, 3, Some(3), None),
++    ] {
++        updates.send_modify(|progress| {
++            *progress = Some(UsageBuildProgress {
++                phase,
++                files_processed: processed,
++                files_total: total,
++            })
++        });
++        let rendered = text(&CenteredView(&view));
++        if let Some(total) = total {
++            assert!(rendered.contains(&format!("Files: {processed} / {total}")));
++        } else {
++            assert!(!rendered.contains("Files:"));
++        }
++        if let Some(percent) = expected {
++            assert!(rendered.contains(percent), "{rendered}");
++        } else {
++            assert!(!rendered.contains('%'), "{rendered}");
++        }
++        assert!(!view.is_complete());
++    }
++    assert!(text(&CenteredView(&view)).contains("Aggregating usage"));
++    drop(updates);
++    assert!(view.is_complete());
++}
++
++#[test]
++fn progress_uses_plain_text_in_the_shared_body_and_a_separate_footer() {
++    for bg in [(0, 0, 0), (245, 245, 245)] {
++        crate::terminal_palette::with_test_default_colors(
++            crate::terminal_probe::DefaultColors {
++                fg: (128, 128, 128),
++                bg,
++            },
++            || {
++                let (_updates, progress) = watch::channel(Some(UsageBuildProgress {
++                    phase: UsageBuildPhase::Reading,
++                    files_processed: 26935,
++                    files_total: Some(26936),
++                }));
++                let view = UsageBuildView::new(Instant::now(), progress, MotionMode::Reduced);
++                for width in [40, 72] {
++                    let area = Rect::new(3, 2, width, view.desired_height(width));
++                    let mut buffer = Buffer::empty(Rect::new(0, 0, width + 6, area.bottom() + 2));
++                    for cell in &mut buffer.content {
++                        cell.set_bg(ratatui::style::Color::Blue);
++                    }
++                    view.render(area, &mut buffer);
++                    let panel = crate::style::user_message_style().bg.unwrap();
++                    let mut rows = Vec::new();
++                    for y in area.top()..area.bottom() {
++                        let expected = if y == area.bottom() - 1 {
++                            ratatui::style::Color::Reset
++                        } else {
++                            panel
++                        };
++                        let mut row = String::new();
++                        for x in area.left()..area.right() {
++                            let cell = &buffer[(x, y)];
++                            assert_eq!(cell.bg, expected);
++                            assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED));
++                            row.push_str(cell.symbol());
++                        }
++                        rows.push(row);
++                    }
++                    assert!(
++                        rows.iter()
++                            .any(|row| row.trim() == "Files: 26935 / 26936 (99%)")
++                    );
++                    assert_eq!(rows.last().unwrap().trim(), "esc hide");
++                    assert!(rows.last().unwrap().starts_with("  esc"));
++                    assert!(rows[rows.len() - 2].trim().is_empty());
++                    assert_eq!(buffer[(0, 0)].bg, ratatui::style::Color::Blue);
++                }
++            },
++        );
++    }
++}
++
++#[test]
++fn hiding_keeps_observations_available_and_completion_uses_the_native_dialog_stack() {
++    let (updates, progress) = watch::channel(None);
++    let started_at = Instant::now();
++    let mut dialogs = DialogStack::new(FrameRequester::test_dummy());
++    dialogs.push(Box::new(UsageBuildView::new(
++        started_at,
++        progress,
++        MotionMode::Reduced,
++    )));
++    dialogs.handle_key_event(KeyCode::Esc.into(), None);
++    assert!(dialogs.is_empty());
++    updates.send_modify(|progress| {
++        *progress = Some(UsageBuildProgress {
++            phase: UsageBuildPhase::Reading,
++            files_processed: 2,
++            files_total: Some(4),
++        })
++    });
++    let view = UsageBuildView::new(started_at, updates.subscribe(), MotionMode::Reduced);
++    assert!(text(&CenteredView(&view)).contains("50%"));
++    for width in [0, 1, 7, 20, 72] {
++        for height in [0, 1, 4, 9] {
++            let area = Rect::new(0, 0, width, height);
++            let mut buffer = Buffer::empty(area);
++            CenteredView(&view).render(area, &mut buffer);
++            assert_eq!(buffer.area, area);
++        }
++    }
++    dialogs.push(Box::new(view));
++    drop(updates);
++    assert!(dialogs.pre_draw_tick(Instant::now()));
++    assert!(dialogs.is_empty());
++}

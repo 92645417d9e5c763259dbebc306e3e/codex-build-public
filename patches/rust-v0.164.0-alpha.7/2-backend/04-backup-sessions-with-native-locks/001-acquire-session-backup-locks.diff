@@ -1,0 +1,372 @@
+acquire-session-backup-locks
+
+Lane: backend
+
+Unit: backup-sessions-with-native-locks
+
+ChildPatch: acquire-session-backup-locks
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Provide a separate local session backup command that refuses every busy native session-data lock and archives a consistent zstd session snapshot.
+
+Requires: Unit:normalization/normalize-base-roots-for-processes, Unit:normalization/route-thread-writer-locks-to-harness, Unit:backend/rebuild-sqlite-history-from-paginated-rollouts
+
+Provides: Nonblocking acquisition and recheck of maintenance, writer coordination, all per-thread files and the home-directory index lock; exact session archive publication with no overwrite and cancellation-safe cleanup.
+
+Boundary: Rollout production, migration, compression and index semantics remain with their native owners; the command never backs up SQLite or waits for active sessions.
+
+Verification: rollout writer_lock tests cover every busy lock, partial release, name updates and fork-reference publication; CLI backup fixtures cover exact members, roundtrip bytes, no-clobber, missing sources and cancellation.
+
+
+diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
+--- a/codex-rs/rollout/src/lib.rs
++++ b/codex-rs/rollout/src/lib.rs
+@@ -107,10 +107,20 @@ pub use seekable_reader::read_rollout_prefix;
+ pub use seekable_reader::rollout_contains_prefix;
+ 
+ /// Materializes a compressed rollout as plain JSONL before another rollout references it.
++/// Holds native publication coordination through the blocking work, including caller cancellation.
+ pub async fn materialize_rollout_for_reference(
+     path: &std::path::Path,
++    codex_harness: &std::path::Path,
+ ) -> std::io::Result<std::path::PathBuf> {
+-    compression::materialize_rollout_for_append(path, /*writer_lock*/ None).await
++    let path = path.to_path_buf();
++    let codex_harness = codex_harness.to_path_buf();
++    tokio::task::spawn_blocking(move || {
++        let coordinator = WriterLockCoordinator::new(&codex_harness);
++        let _coordination = coordinator.lock_coordination()?;
++        compression::materialize_rollout_for_append_blocking(&path)
++    })
++    .await
++    .map_err(std::io::Error::other)?
+ }
+ pub use config::Config;
+ pub use config::RolloutConfig;
+@@ -171,8 +181,10 @@ pub use session_index::prune_thread_names_without_rollouts;
+ pub use session_index::remove_thread_name_entries;
+ pub use state_db::StateDbHandle;
+ pub use state_db::sqlite_telemetry_recorder;
++pub use writer_lock::SessionBackupGuard;
+ pub use writer_lock::WriterLockCoordinator;
+ pub use writer_lock::WriterLockGuard;
++pub use writer_lock::try_acquire_session_backup_lock;
+ 
+ #[cfg(test)]
+ mod tests;
+diff --git a/codex-rs/rollout/src/writer_lock.rs b/codex-rs/rollout/src/writer_lock.rs
+--- a/codex-rs/rollout/src/writer_lock.rs
++++ b/codex-rs/rollout/src/writer_lock.rs
+@@ -30,6 +30,77 @@ pub struct WriterLockGuard {
+     file: Option<File>,
+ }
+ 
++/// Excludes live writers, publication, maintenance and session-name updates together.
++/// Raw writer files must close before coordination; WriterLockGuard's cleanup would relock it.
++pub struct SessionBackupGuard {
++    _writers: Vec<File>,
++    _session_index: File,
++    _coordination: File,
++    _maintenance: crate::RolloutMaintenanceGuard,
++}
++
++/// Acquires the native session-data locks without waiting or removing lock files.
++/// Returns `WouldBlock` when any owner is active and releases every partial acquisition.
++/// The harness must be the namespace used by the selected home's writers and maintenance.
++pub fn try_acquire_session_backup_lock(
++    codex_home: &Path,
++    codex_harness: &Path,
++) -> io::Result<SessionBackupGuard> {
++    let maintenance =
++        crate::try_acquire_rollout_maintenance_lock(codex_harness)?.ok_or_else(|| {
++            io::Error::new(io::ErrorKind::WouldBlock, "rollout maintenance is active")
++        })?;
++    let coordinator = WriterLockCoordinator::new(codex_harness);
++    let coordination = coordinator.open_coordination()?;
++    try_backup_lock(&coordination, "thread writer coordination is active")?;
++    let paths = thread_lock_paths(&coordinator.directory)?;
++    let mut writers = Vec::with_capacity(paths.len());
++    for path in &paths {
++        let file = OpenOptions::new().read(true).write(true).open(path)?;
++        try_backup_lock(&file, &format!("active thread writer: {}", path.display()))?;
++        writers.push(file);
++    }
++    // Index updates lock the home directory, so atomic index replacement keeps one lock inode.
++    let session_index = File::open(codex_home)?;
++    try_backup_lock(&session_index, "session index update is active")?;
++    if paths != thread_lock_paths(&coordinator.directory)? {
++        return Err(io::Error::new(
++            io::ErrorKind::WouldBlock,
++            "thread writer lock set changed during backup acquisition",
++        ));
++    }
++    Ok(SessionBackupGuard {
++        _writers: writers,
++        _session_index: session_index,
++        _coordination: coordination,
++        _maintenance: maintenance,
++    })
++}
++
++fn try_backup_lock(file: &File, busy: &str) -> io::Result<()> {
++    file.try_lock().map_err(|error| match error {
++        fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock, busy),
++        fs::TryLockError::Error(error) => error,
++    })
++}
++
++fn thread_lock_paths(directory: &Path) -> io::Result<Vec<PathBuf>> {
++    let mut paths = Vec::new();
++    for entry in fs::read_dir(directory)? {
++        let entry = entry?;
++        if entry
++            .file_name()
++            .to_str()
++            .and_then(|name| name.strip_suffix(".lock"))
++            .is_some_and(|id| ThreadId::from_string(id).is_ok())
++        {
++            paths.push(entry.path());
++        }
++    }
++    paths.sort();
++    Ok(paths)
++}
++
+ impl WriterLockCoordinator {
+     /// Uses the same lock namespace as existing local thread-store writers.
+     pub fn new(codex_harness: &Path) -> Self {
+@@ -111,13 +182,7 @@ impl WriterLockCoordinator {
+     }
+ 
+     pub(crate) fn lock_coordination(&self) -> io::Result<File> {
+-        fs::create_dir_all(&self.directory)?;
+-        let file = OpenOptions::new()
+-            .read(true)
+-            .write(true)
+-            .create(true)
+-            .truncate(false)
+-            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
++        let file = self.open_coordination()?;
+         file.lock().map_err(|err| {
+             io::Error::other(format!(
+                 "failed to acquire thread writer coordination lock: {err}"
+@@ -126,6 +191,16 @@ impl WriterLockCoordinator {
+         Ok(file)
+     }
+ 
++    fn open_coordination(&self) -> io::Result<File> {
++        fs::create_dir_all(&self.directory)?;
++        OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(false)
++            .open(self.directory.join(COORDINATION_LOCK_FILE))
++    }
++
+     fn remove_stale_thread_locks(&self) -> io::Result<()> {
+         for entry in fs::read_dir(&self.directory)? {
+             let entry = entry?;
+diff --git a/codex-rs/rollout/src/writer_lock_tests.rs b/codex-rs/rollout/src/writer_lock_tests.rs
+--- a/codex-rs/rollout/src/writer_lock_tests.rs
++++ b/codex-rs/rollout/src/writer_lock_tests.rs
+@@ -10,6 +10,100 @@ use super::WriterLockCoordinator;
+ use pretty_assertions::assert_eq;
+ use std::io::ErrorKind;
+ 
++#[test]
++fn backup_requires_every_native_lock_and_releases_partial_acquisitions() {
++    let home = TempDir::new().unwrap();
++    let harness = TempDir::new().unwrap();
++    let coordinator = Arc::new(WriterLockCoordinator::new(harness.path()));
++    let thread_id = ThreadId::default();
++    let writer = coordinator.acquire(thread_id).unwrap();
++    let attempt = || {
++        super::try_acquire_session_backup_lock(home.path(), harness.path())
++            .err()
++            .expect("backup must refuse a busy native lock")
++    };
++    assert_eq!(attempt().kind(), ErrorKind::WouldBlock);
++    drop(writer);
++
++    let maintenance = crate::try_acquire_rollout_maintenance_lock(harness.path())
++        .unwrap()
++        .unwrap();
++    assert_eq!(attempt().kind(), ErrorKind::WouldBlock);
++    drop(maintenance);
++
++    let coordination = coordinator.lock_coordination().unwrap();
++    assert_eq!(attempt().kind(), ErrorKind::WouldBlock);
++    drop(coordination);
++
++    let index = fs::File::open(home.path()).unwrap();
++    index.lock().unwrap();
++    assert_eq!(attempt().kind(), ErrorKind::WouldBlock);
++    drop(index);
++
++    let stale = harness
++        .path()
++        .join(WRITER_LOCK_DIR)
++        .join(format!("{thread_id}.lock"));
++    fs::File::create(&stale).unwrap();
++    let backup = super::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap();
++    assert!(
++        crate::try_acquire_rollout_maintenance_lock(harness.path())
++            .unwrap()
++            .is_none()
++    );
++    let coordination = coordinator.open_coordination().unwrap();
++    assert!(matches!(
++        coordination.try_lock(),
++        Err(fs::TryLockError::WouldBlock)
++    ));
++    let index = fs::File::open(home.path()).unwrap();
++    assert!(matches!(
++        index.try_lock(),
++        Err(fs::TryLockError::WouldBlock)
++    ));
++    let thread = fs::File::open(&stale).unwrap();
++    assert!(matches!(
++        thread.try_lock(),
++        Err(fs::TryLockError::WouldBlock)
++    ));
++    drop(thread);
++    drop(index);
++    drop(coordination);
++    drop(backup);
++    assert!(
++        stale.exists(),
++        "backup must not take over or remove native locks"
++    );
++    drop(coordinator.acquire(thread_id).unwrap());
++    drop(super::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++}
++
++#[tokio::test]
++async fn backup_excludes_actual_name_updates_until_release() {
++    let home = TempDir::new().unwrap();
++    let harness = TempDir::new().unwrap();
++    let backup = super::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap();
++    let update_home = home.path().to_path_buf();
++    let thread_id = ThreadId::default();
++    let mut update = tokio::spawn(async move {
++        crate::append_thread_name(&update_home, thread_id, "after backup").await
++    });
++    assert!(
++        tokio::time::timeout(std::time::Duration::from_millis(30), &mut update)
++            .await
++            .is_err()
++    );
++    assert!(!home.path().join("session_index.jsonl").exists());
++    drop(backup);
++    update.await.unwrap().unwrap();
++    assert_eq!(
++        crate::find_thread_name_by_id(home.path(), &thread_id)
++            .await
++            .unwrap(),
++        Some("after backup".to_string())
++    );
++}
++
+ #[test]
+ fn writer_locks_reject_competing_owners_and_release_their_files() {
+     let home = TempDir::new().expect("temp dir");
+@@ -49,6 +143,36 @@ fn writer_locks_reject_competing_owners_and_release_their_files() {
+     assert_eq!(entries, vec![COORDINATION_LOCK_FILE]);
+ }
+ 
++#[tokio::test]
++async fn backup_excludes_reference_materialization_until_release() {
++    let home = TempDir::new().unwrap();
++    let harness = TempDir::new().unwrap();
++    let plain = home.path().join("source.jsonl");
++    let compressed = plain.with_extension("jsonl.zst");
++    fs::write(
++        &compressed,
++        zstd::stream::encode_all(&b"source bytes\n"[..], 0).unwrap(),
++    )
++    .unwrap();
++    let backup = super::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap();
++    let materialize_harness = harness.path().to_path_buf();
++    let source = compressed.clone();
++    let mut materialize = tokio::spawn(async move {
++        crate::materialize_rollout_for_reference(&source, &materialize_harness).await
++    });
++    assert!(
++        tokio::time::timeout(std::time::Duration::from_millis(30), &mut materialize)
++            .await
++            .is_err()
++    );
++    assert!(!plain.exists());
++    assert!(compressed.exists());
++    drop(backup);
++    assert_eq!(materialize.await.unwrap().unwrap(), plain);
++    assert_eq!(fs::read(&plain).unwrap(), b"source bytes\n");
++    assert!(!compressed.exists());
++}
++
+ #[test]
+ fn first_acquisition_removes_stale_locks_without_removing_active_locks() {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/thread-store/src/local/revert_thread.rs b/codex-rs/thread-store/src/local/revert_thread.rs
+--- a/codex-rs/thread-store/src/local/revert_thread.rs
++++ b/codex-rs/thread-store/src/local/revert_thread.rs
+@@ -85,15 +85,17 @@ pub(super) async fn revert(
+     for segment in &mut lineage.segments {
+         if segment.rollout_id() == current_rollout.rollout_id && source_meta.history_base.is_none()
+         {
+-            segment.rollout_path =
+-                codex_rollout::materialize_rollout_for_reference(segment.rollout_path.as_path())
+-                    .await
+-                    .map_err(|err| ThreadStoreError::Internal {
+-                        message: format!(
+-                            "failed to materialize rollout {} for revert: {err}",
+-                            segment.rollout_path.display()
+-                        ),
+-                    })?;
++            segment.rollout_path = codex_rollout::materialize_rollout_for_reference(
++                segment.rollout_path.as_path(),
++                &store.config.codex_harness,
++            )
++            .await
++            .map_err(|err| ThreadStoreError::Internal {
++                message: format!(
++                    "failed to materialize rollout {} for revert: {err}",
++                    segment.rollout_path.display()
++                ),
++            })?;
+         }
+         super::thread_history_materialization::materialize_to_sqlite(
+             store,
+diff --git a/codex-rs/thread-store/src/local/rollout_lineage.rs b/codex-rs/thread-store/src/local/rollout_lineage.rs
+--- a/codex-rs/thread-store/src/local/rollout_lineage.rs
++++ b/codex-rs/thread-store/src/local/rollout_lineage.rs
+@@ -182,14 +182,17 @@ impl LocalThreadStore {
+                     if next_rollout_id.is_none() && meta.meta.history_base.is_none() =>
+                 {
+                     // A newly shared standalone source must remain readable by older binaries.
+-                    codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
+-                        .await
+-                        .map_err(|err| ThreadStoreError::Internal {
+-                            message: format!(
+-                                "failed to materialize referenced rollout {}: {err}",
+-                                rollout_path.display()
+-                            ),
+-                        })?
++                    codex_rollout::materialize_rollout_for_reference(
++                        rollout_path.as_path(),
++                        &self.config.codex_harness,
++                    )
++                    .await
++                    .map_err(|err| ThreadStoreError::Internal {
++                        message: format!(
++                            "failed to materialize referenced rollout {}: {err}",
++                            rollout_path.display()
++                        ),
++                    })?
+                 }
+                 // Already-shared compressed history requires a compatible reader regardless of
+                 // new forks. Read it without publishing decoded copies into ancestors' folders;
