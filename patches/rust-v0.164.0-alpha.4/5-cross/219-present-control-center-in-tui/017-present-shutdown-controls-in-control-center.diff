@@ -1,0 +1,421 @@
+present-shutdown-controls-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-shutdown-controls-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -223,6 +223,7 @@ mod connector_mentions;
+ mod control_center_data;
+ mod control_center_observations;
+ mod control_center_responses;
++mod control_center_shutdown;
+ mod control_center_statistics;
+ mod daemon_control;
+ mod daemon_menu;
+diff --git a/codex-rs/tui/src/app/control_center_data.rs b/codex-rs/tui/src/app/control_center_data.rs
+--- a/codex-rs/tui/src/app/control_center_data.rs
++++ b/codex-rs/tui/src/app/control_center_data.rs
+@@ -43,12 +43,15 @@ impl App {
+         let request = self.usage_request.get_or_insert_with(UsageRequest::new);
+         let request_id = request.id;
+         self.overlay = Some(Overlay::new_control_center_loading(
+-            &self.keymap,
++            crate::dialog::DialogResources {
++                app_event_tx: &self.app_event_tx,
++                keymap: &self.keymap,
++                frame_requester: &tui.frame_requester(),
++                vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++            },
+             request_id,
+             tui.terminal.last_known_screen_size.width,
+             self.local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
+-            tui.frame_requester(),
+-            self.app_event_tx.clone(),
+             Arc::clone(&self.model_catalog),
+         ));
+         if start_load {
+diff --git a/codex-rs/tui/src/app/control_center_shutdown.rs b/codex-rs/tui/src/app/control_center_shutdown.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_shutdown.rs
+@@ -0,0 +1,46 @@
++//! Confirm control-center shutdown through the existing daemon eligibility checks.
++
++use super::App;
++use super::AppRunControl;
++use crate::app_server_session::AppServerSession;
++use crate::pager_overlay::Overlay;
++use crate::tui;
++
++impl App {
++    pub(super) async fn confirm_control_center_quit(
++        &mut self,
++        tui: &mut tui::Tui,
++        app_server: &mut AppServerSession,
++    ) -> AppRunControl {
++        if !matches!(&self.overlay, Some(Overlay::ControlCenter(center)) if !center.is_done()) {
++            return AppRunControl::Continue;
++        }
++        // The daemon checks current eligibility again when confirmation is consumed.
++        match self.request_idle_daemon_shutdown(app_server).await {
++            Ok(reason) => AppRunControl::Exit(reason),
++            Err(error) => {
++                self.show_control_center_quit_dialog(tui, Err(error));
++                AppRunControl::Continue
++            }
++        }
++    }
++
++    pub(super) fn show_control_center_quit_dialog(
++        &mut self,
++        tui: &mut tui::Tui,
++        eligibility: Result<(), String>,
++    ) {
++        if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++            center.show_quit_dialog(
++                eligibility,
++                crate::dialog::DialogResources {
++                    app_event_tx: &self.app_event_tx,
++                    keymap: &self.keymap,
++                    frame_requester: &tui.frame_requester(),
++                    vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++                },
++            );
++            tui.frame_requester().schedule_frame();
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -53,6 +53,7 @@ impl App {
+             && !matches!(
+                 &event,
+                 AppEvent::OpenDaemonMenu
++                    | AppEvent::ConfirmControlCenterQuit
+                     | AppEvent::OpenWarnings
+                     | AppEvent::StatusLineSetup { .. }
+                     | AppEvent::StatusLineSetupCancelled
+@@ -2139,6 +2140,7 @@ impl App {
+             }
+             AppEvent::ReadResponseAttempts { request_id, params } => self.read_response_attempts(app_server, request_id, params),
+             AppEvent::ResponseAttemptsLoaded { request_id, result, prices } => self.finish_response_attempts(request_id, result, prices),
++            AppEvent::ConfirmControlCenterQuit => return Ok(self.confirm_control_center_quit(tui, app_server).await),
+             AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
+             AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
+                 if self.current_displayed_thread_id() == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -884,6 +884,8 @@ pub(crate) enum AppEvent {
+         result: Result<codex_app_server_protocol::ResponseAttemptsReadResponse, String>,
+         prices: Result<codex_models_manager::model_pricing::Prices, String>,
+     },
++    ConfirmControlCenterQuit,
++
+     /// Restore response timing when the displayed thread changes.
+     RefreshResponseTiming {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -84,23 +84,13 @@ impl Overlay {
+     }
+ 
+     pub(crate) fn new_control_center_loading(
+-        keymap: &crate::keymap::RuntimeKeymap,
++        resources: crate::dialog::DialogResources<'_>,
+         request_id: Uuid,
+         width: u16,
+         mouse_scroll_speed: f64,
+-        frames: crate::tui::FrameRequester,
+-        events: crate::app_event_sender::AppEventSender,
+         catalog: Arc<crate::model_catalog::ModelCatalog>,
+     ) -> Self {
+-        let mut overlay = ControlCenter::new(
+-            None,
+-            keymap,
+-            width,
+-            mouse_scroll_speed,
+-            frames,
+-            events,
+-            catalog,
+-        );
++        let mut overlay = ControlCenter::new(None, resources, width, mouse_scroll_speed, catalog);
+         overlay.request_id = Some(request_id);
+         Self::ControlCenter(Box::new(overlay))
+     }
+@@ -763,12 +753,15 @@ mod tests {
+             let request_id = Uuid::new_v4();
+             let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+             let mut overlay = Overlay::new_control_center_loading(
+-                &crate::keymap::RuntimeKeymap::defaults(),
++                crate::dialog::DialogResources {
++                    app_event_tx: &crate::app_event_sender::AppEventSender::new(events),
++                    keymap: &crate::keymap::RuntimeKeymap::defaults(),
++                    frame_requester: &crate::tui::FrameRequester::test_dummy(),
++                    vim_enabled: false,
++                },
+                 request_id,
+                 120,
+                 1.0,
+-                crate::tui::FrameRequester::test_dummy(),
+-                crate::app_event_sender::AppEventSender::new(events),
+                 Arc::new(crate::model_catalog::ModelCatalog::new(Vec::new())),
+             );
+             assert!(overlay.accepts_usage_request(request_id));
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -3,18 +3,22 @@
+ use super::PagerView;
+ use super::response_tab::ResponseTab;
+ use super::statistics::StatisticsView;
+-use crate::app_event_sender::AppEventSender;
++use crate::app_event::AppEvent;
++use crate::bottom_pane::SelectionItem;
++use crate::bottom_pane::SelectionViewParams;
+ use crate::bottom_pane::render_filled_tab_bar;
+ use crate::control_center_table::Cell;
+ use crate::control_center_table::Palette;
+ use crate::control_center_table::interaction::TableInteraction;
+ use crate::control_center_table::interaction::TableMouseAction;
++use crate::dialog::DialogResources;
++use crate::dialog::DialogStack;
+ use crate::footer_hint;
+ use crate::key_hint;
+-use crate::keymap::RuntimeKeymap;
+ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+ use crate::model_catalog::ModelCatalog;
+ use crate::render::highlight::syntax_theme_revision;
++use crate::render::renderable::Renderable;
+ use crate::style::table_separator_style;
+ use crate::tui;
+ use crate::tui::FrameRequester;
+@@ -40,6 +44,7 @@ use ratatui::widgets::Clear;
+ use ratatui::widgets::Widget;
+ use std::cell::RefCell;
+ use std::io::Result;
++use std::rc::Rc;
+ use std::rc::Weak;
+ use std::sync::Arc;
+ use std::time::Instant;
+@@ -74,9 +79,9 @@ pub(crate) struct ControlCenter {
+     is_done: bool,
+     report: std::result::Result<Option<Arc<UsageReport>>, String>,
+     pub(crate) request_id: Option<Uuid>,
+-    pub(crate) usage_refresh_elapsed: Option<std::time::Duration>,
+     pub(crate) screen: CenterScreen,
+     pub(crate) responses: ResponseTab,
++    pub(crate) dialogs: DialogStack,
+     selected_day: Option<NaiveDate>,
+     viewport_width: u16,
+     content_width: u16,
+@@ -99,27 +104,34 @@ pub(crate) struct ControlCenter {
+ impl ControlCenter {
+     pub(crate) fn new(
+         report: Option<Arc<UsageReport>>,
+-        keymap: &RuntimeKeymap,
++        resources: DialogResources<'_>,
+         width: u16,
+         mouse_scroll_speed: f64,
+-        frames: FrameRequester,
+-        events: AppEventSender,
+         catalog: Arc<ModelCatalog>,
+     ) -> Self {
+         let selected_day = report.as_deref().and_then(crate::usage::latest_usage_day);
+         let mut overlay = Self {
+-            view: PagerView::new(Vec::new(), String::new(), 0, keymap.pager.clone()),
++            view: PagerView::new(Vec::new(), String::new(), 0, resources.keymap.pager.clone()),
+             is_done: false,
+             report: Ok(report),
+             request_id: None,
+-            usage_refresh_elapsed: None,
+             screen: CenterScreen::Summary,
+-            responses: ResponseTab::new(keymap.list.clone(), frames.clone(), events, catalog),
++            responses: ResponseTab::new(
++                resources.keymap.list.clone(),
++                resources.frame_requester.clone(),
++                resources.app_event_tx.clone(),
++                catalog,
++            ),
++            dialogs: DialogStack::new(resources.frame_requester.clone()),
+             selected_day,
+             viewport_width: width,
+             content_width: width.saturating_sub(4),
++            selected_quota: 0,
+             theme_revision: syntax_theme_revision(),
+-            table_interaction: TableInteraction::new(mouse_scroll_speed, frames),
++            table_interaction: TableInteraction::new(
++                mouse_scroll_speed,
++                resources.frame_requester.clone(),
++            ),
+             details: Vec::new(),
+             response_statistics: watch::channel(Vec::new()).0,
+             quota_statistics: watch::channel(Vec::new()).0,
+@@ -156,7 +168,6 @@ impl ControlCenter {
+             .report()
+             .and_then(|report| crate::usage::latest_usage_day(report));
+         self.refresh();
+-        self.usage_refresh_elapsed = None;
+     }
+ 
+     pub(crate) fn is_done(&self) -> bool {
+@@ -167,6 +178,73 @@ impl ControlCenter {
+         self.statistics.strong_count() > 0
+     }
+ 
++    pub(crate) fn has_dialog(&self) -> bool {
++        !self.dialogs.is_empty()
++    }
++
++    pub(crate) fn show_statistics(
++        &mut self,
++        mouse_scroll_speed: f64,
++        frames: FrameRequester,
++    ) -> bool {
++        if self.has_dialog() {
++            return false;
++        }
++        let lines = match self.screen {
++            CenterScreen::Responses => self.response_statistics.subscribe(),
++            CenterScreen::Quotas => self.quota_statistics.subscribe(),
++            _ => return false,
++        };
++        let view = Rc::new(RefCell::new(StatisticsView::new(
++            lines,
++            self.view.keymap.clone(),
++            mouse_scroll_speed,
++            frames,
++        )));
++        self.statistics = Rc::downgrade(&view);
++        self.table_interaction.cells.clear();
++        self.dialogs.push(Box::new(view));
++        true
++    }
++
++    pub(crate) fn show_quit_dialog(
++        &mut self,
++        eligibility: std::result::Result<(), String>,
++        resources: DialogResources<'_>,
++    ) {
++        self.table_interaction.cells.clear();
++        let (title, subtitle, items, selected) = match eligibility {
++            Ok(()) => (
++                "Quit Codex?",
++                "All sessions are idle and this is the last connected client. Stop the local background server and quit Codex?".to_owned(),
++                vec![
++                    SelectionItem {
++                        name: "Quit".into(),
++                        actions: vec![Box::new(|events| events.send(AppEvent::ConfirmControlCenterQuit))],
++                        dismiss_on_select: true,
++                        ..Default::default()
++                    },
++                    SelectionItem { name: "Go back".into(), dismiss_on_select: true, ..Default::default() },
++                ],
++                1,
++            ),
++            Err(error) => (
++                "Cannot quit",
++                error,
++                vec![SelectionItem { name: "Back".into(), dismiss_on_select: true, ..Default::default() }],
++                0,
++            ),
++        };
++        self.dialogs
++            .push(Box::new(resources.selection_view(SelectionViewParams {
++                title: Some(title.into()),
++                subtitle: Some(subtitle),
++                items,
++                initial_selected_idx: Some(selected),
++                ..SelectionViewParams::confirmation()
++            })));
++    }
++
+     fn content_width(&self) -> u16 {
+         self.content_width
+     }
+@@ -473,6 +551,10 @@ impl ControlCenter {
+             buf,
+             Instant::now(),
+         );
++        if let Some(dialog) = self.dialogs.centered_view() {
++            self.table_interaction.cells.clear();
++            dialog.render(area, buf);
++        }
+     }
+ 
+     fn render_usage(&mut self, mut body: Rect, buf: &mut Buffer) -> Vec<(Rect, Arc<str>)> {
+@@ -663,7 +745,7 @@ impl ControlCenter {
+                 tui.frame_requester().schedule_frame();
+                 Ok(())
+             }
+-            TuiEvent::Mouse(mouse) => {
++            TuiEvent::Mouse(mouse) if !self.has_dialog() => {
+                 if let Some(action) = self.table_interaction.handle_mouse(mouse, tui) {
+                     if let TableMouseAction::Scroll(rows) = action {
+                         self.scroll(rows);
+@@ -673,7 +755,16 @@ impl ControlCenter {
+                 Ok(())
+             }
+             TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
+-                tui.draw(u16::MAX, |frame| self.render(frame.area(), frame.buffer))?;
++                self.dialogs.pre_draw_tick(Instant::now());
++                tui.draw(u16::MAX, |frame| {
++                    self.render(frame.area(), frame.buffer);
++                    if let Some(dialog) = self.dialogs.centered_view()
++                        && let Some(position) = dialog.cursor_pos(frame.area())
++                    {
++                        frame.set_cursor_style(dialog.cursor_style(frame.area()));
++                        frame.set_cursor_position(position);
++                    }
++                })?;
+                 let millis = if self.screen == CenterScreen::Responses
+                     && self.responses.history.rows().any(|row| row.is_running())
+                 {
+@@ -729,11 +820,14 @@ pub(super) fn test_center(
+     let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+     let mut center = ControlCenter::new(
+         report,
+-        &RuntimeKeymap::defaults(),
++        DialogResources {
++            app_event_tx: &crate::app_event_sender::AppEventSender::new(events),
++            keymap: &crate::keymap::RuntimeKeymap::defaults(),
++            frame_requester: &crate::tui::FrameRequester::test_dummy(),
++            vim_enabled: false,
++        },
+         width,
+         speed,
+-        FrameRequester::test_dummy(),
+-        AppEventSender::new(events),
+         Arc::new(ModelCatalog::new(Vec::new())),
+     );
+     center.screen = screen;
+@@ -804,11 +898,14 @@ mod tests {
+         let report = Arc::new(crate::usage::test_report());
+         let mut center = ControlCenter::new(
+             Some(Arc::clone(&report)),
+-            &RuntimeKeymap::defaults(),
++            DialogResources {
++                app_event_tx: &crate::app_event_sender::AppEventSender::new(events),
++                keymap: &crate::keymap::RuntimeKeymap::defaults(),
++                frame_requester: &crate::tui::FrameRequester::test_dummy(),
++                vim_enabled: false,
++            },
+             120,
+             1.0,
+-            FrameRequester::test_dummy(),
+-            AppEventSender::new(events),
+             Arc::new(ModelCatalog::new(Vec::new())),
+         );
+         let AppEvent::ReadResponseAttempts { request_id, .. } = received.try_recv().unwrap() else {

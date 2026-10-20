@@ -1,0 +1,116 @@
+analyze-model-membership-after-synchronization
+
+Lane: cross
+
+Unit: analyze-model-changes-after-synchronization
+
+ChildPatch: analyze-model-membership-after-synchronization
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Analyze official model changes after synchronization and publish typed app-server notifications for independent subscribers.
+
+Requires: Unit:cross/synchronize-model-catalog-with-official-membership
+
+Provides: Define added and removed model changes, compare successive successful same-identity online observations for personal ChatGPT accounts, and publish nonempty changes through the app-server and an internal subscription for Telegram; initial and changed-identity baselines remain silent.
+
+Boundary: Model synchronization owns discovery, online observation, cache and provider boundaries; existing refresh cadence and shutdown remain intact; local edits are not observations, TUI warnings are retired, and exec output remains silent.
+
+Verification: model_changes tests cover baseline, identity and membership deltas; models_refresh_worker tests cover account scope, requirements and lifecycle; transport tests cover typed global broadcasts and internal subscriptions.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/model.rs b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/model.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+@@ -181,6 +181,15 @@ pub struct ModelListResponse {
+     pub next_cursor: Option<String>,
+ }
+ 
++/// An observed change in the official online catalog.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(tag = "type", rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ModelChange {
++    Added { slug: String },
++    Removed { slug: String },
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -130,6 +130,7 @@ mod managed_daemon;
+ mod mcp_refresh;
+ mod message_processor;
+ mod model_catalog;
++mod model_changes;
+ mod models;
+ mod models_refresh_worker;
+ mod notification_media;
+diff --git a/codex-rs/app-server/src/model_changes.rs b/codex-rs/app-server/src/model_changes.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/model_changes.rs
+@@ -0,0 +1,56 @@
++use codex_app_server_protocol::ModelChange;
++use codex_models_manager::manager::OfficialModelsObservation;
++
++/// A new account or provider establishes a silent baseline.
++pub(crate) fn analyze(
++    previous: Option<&OfficialModelsObservation>,
++    current: &OfficialModelsObservation,
++) -> Vec<ModelChange> {
++    let Some(previous) = previous.filter(|previous| previous.identity == current.identity) else {
++        return Vec::new();
++    };
++    current
++        .slugs
++        .difference(&previous.slugs)
++        .map(|slug| ModelChange::Added { slug: slug.clone() })
++        .chain(
++            previous
++                .slugs
++                .difference(&current.slugs)
++                .map(|slug| ModelChange::Removed { slug: slug.clone() }),
++        )
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeSet;
++
++    use super::*;
++
++    #[test]
++    fn reports_only_changes_between_same_identity_observations() {
++        let first = OfficialModelsObservation {
++            identity: "account-a".into(),
++            slugs: BTreeSet::from(["old".into(), "retained".into()]),
++        };
++        let second = OfficialModelsObservation {
++            identity: "account-a".into(),
++            slugs: BTreeSet::from(["new".into(), "retained".into()]),
++        };
++        assert!(analyze(None, &first).is_empty());
++        assert!(analyze(Some(&first), &first).is_empty());
++        assert_eq!(
++            analyze(Some(&first), &second),
++            vec![
++                ModelChange::Added { slug: "new".into() },
++                ModelChange::Removed { slug: "old".into() },
++            ]
++        );
++        let different_account = OfficialModelsObservation {
++            identity: "account-b".into(),
++            slugs: second.slugs,
++        };
++        assert!(analyze(Some(&first), &different_account).is_empty());
++    }
++}

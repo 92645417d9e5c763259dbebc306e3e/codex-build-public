@@ -1,0 +1,799 @@
+store-response-history-in-native-logs
+
+Lane: cross
+
+Unit: retain-model-diagnostics-for-thirty-six-hours
+
+ChildPatch: store-response-history-in-native-logs
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/state/logs_migrations/0003_response_attempts.sql b/codex-rs/state/logs_migrations/0003_response_attempts.sql
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/state/logs_migrations/0003_response_attempts.sql
+@@ -0,0 +1,31 @@
++CREATE TABLE responses (
++    id TEXT PRIMARY KEY NOT NULL,
++    revision INTEGER NOT NULL,
++    thread_id TEXT,
++    turn_id TEXT,
++    response_id TEXT,
++    request_kind TEXT NOT NULL,
++    requested_model TEXT NOT NULL,
++    served_model TEXT,
++    reasoning_effort TEXT,
++    started_at INTEGER NOT NULL,
++    ttfb_ms INTEGER,
++    ttfc_ms INTEGER,
++    terminal_offset_ms INTEGER,
++    elapsed_ms INTEGER NOT NULL,
++    sent_bytes INTEGER,
++    received_bytes INTEGER NOT NULL,
++    end_reason TEXT,
++    input_tokens INTEGER,
++    cache_read_tokens INTEGER,
++    cache_write_tokens INTEGER,
++    output_tokens INTEGER,
++    reasoning_tokens INTEGER,
++    tps REAL
++);
++
++CREATE INDEX responses_thread_page ON responses (thread_id, id DESC);
++CREATE INDEX responses_model_page ON responses (requested_model, id DESC);
++CREATE INDEX responses_thread_model_page ON responses (thread_id, requested_model, id DESC);
++
++CREATE INDEX responses_retention ON responses (started_at);
+diff --git a/codex-rs/state/src/lib.rs b/codex-rs/state/src/lib.rs
+--- a/codex-rs/state/src/lib.rs
++++ b/codex-rs/state/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod log_db;
+ mod migrations;
+ mod model;
+ mod paths;
++mod response_history;
+ mod runtime;
+ mod sqlite;
+ mod telemetry;
+@@ -34,6 +35,9 @@ pub use model::QueuedUserSubmissionRecord;
+ pub use model::RolloutMigrationCursor;
+ pub use model::RolloutMigrationSkippedRollout;
+ pub use model::RolloutMigrationState;
++pub use response_history::ResponseHistoryPage;
++pub use response_history::ResponseHistoryStore;
++pub use response_history::ResponseTimingSample;
+ pub use runtime::GuardianReviewRecord;
+ pub use runtime::MAX_GUARDIAN_REVIEW_BYTES;
+ pub use runtime::MAX_GUARDIAN_REVIEW_RECORDS;
+@@ -114,6 +118,9 @@ pub use telemetry::install_process_db_telemetry;
+ pub use telemetry::record_backfill_gate;
+ pub use telemetry::record_fallback;
+ 
++/// Retention window shared by diagnostic logs and response-attempt history.
++pub const DIAGNOSTIC_RETENTION_SECONDS: i64 = 36 * 60 * 60;
++
+ /// Maximum number of pending user submissions permitted for one thread.
+ pub const MAX_QUEUE_ITEMS: usize = 100;
+ 
+diff --git a/codex-rs/state/src/response_history.rs b/codex-rs/state/src/response_history.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/state/src/response_history.rs
+@@ -0,0 +1,690 @@
++//! Typed response history in the native diagnostic logs database.
++
++use crate::DIAGNOSTIC_RETENTION_SECONDS;
++use chrono::Utc;
++use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseAttemptStatus;
++use codex_protocol::response_metrics::ResponsePerformance;
++use codex_protocol::response_metrics::ResponseTokenCounts;
++use sqlx::QueryBuilder;
++use sqlx::Row;
++use sqlx::Sqlite;
++use sqlx::SqlitePool;
++use sqlx::sqlite::SqliteRow;
++use std::num::TryFromIntError;
++use uuid::Uuid;
++
++#[derive(Clone, Debug)]
++pub struct ResponseHistoryStore {
++    pool: SqlitePool,
++}
++
++pub struct ResponseHistoryPage {
++    pub data: Vec<ResponseAttempt>,
++    pub next_cursor: Option<Uuid>,
++}
++
++#[derive(Debug)]
++pub struct ResponseTimingSample {
++    pub attempt_id: Uuid,
++    pub revision: u64,
++    pub requested_model: String,
++    pub started_at: i64,
++    pub end_reason: Option<ResponseAttemptEnd>,
++    pub tps: Option<f64>,
++    pub ttfc_ms: Option<u64>,
++}
++
++impl ResponseHistoryStore {
++    pub(crate) fn new(pool: SqlitePool) -> Self {
++        Self { pool }
++    }
++
++    /// The response service's single writer supplies snapshots in publication order.
++    pub async fn write(&self, record: &ResponseAttempt) -> anyhow::Result<()> {
++        sqlx::query(
++            "INSERT INTO responses (id, revision, thread_id, turn_id, response_id, request_kind, \
++                requested_model, served_model, reasoning_effort, \
++                started_at, ttfb_ms, ttfc_ms, terminal_offset_ms, elapsed_ms, \
++                sent_bytes, received_bytes, end_reason, input_tokens, cache_read_tokens, \
++                cache_write_tokens, output_tokens, reasoning_tokens, tps) \
++             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
++             ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, \
++                response_id = excluded.response_id, requested_model = excluded.requested_model, \
++                served_model = excluded.served_model, reasoning_effort = excluded.reasoning_effort, \
++                ttfb_ms = excluded.ttfb_ms, ttfc_ms = excluded.ttfc_ms, \
++                terminal_offset_ms = excluded.terminal_offset_ms, \
++                elapsed_ms = excluded.elapsed_ms, sent_bytes = excluded.sent_bytes, \
++                received_bytes = excluded.received_bytes, end_reason = excluded.end_reason, \
++                input_tokens = excluded.input_tokens, cache_read_tokens = excluded.cache_read_tokens, \
++                cache_write_tokens = excluded.cache_write_tokens, output_tokens = excluded.output_tokens, \
++                reasoning_tokens = excluded.reasoning_tokens, tps = excluded.tps",
++        )
++        .bind(record.attempt_id.to_string())
++        .bind(i64::try_from(record.revision)?)
++        .bind(record.thread_id.map(|thread_id| thread_id.to_string()))
++        .bind(&record.turn_id)
++        .bind(&record.response_id)
++        .bind(&record.request_kind)
++        .bind(&record.requested_model)
++        .bind(&record.served_model)
++        .bind(&record.reasoning_effort)
++        .bind(record.started_at)
++        .bind(sql_count(record.ttfb_ms)?)
++        .bind(sql_count(record.ttfc_ms)?)
++        .bind(sql_count(record.terminal_observed_offset_ms)?)
++        .bind(i64::try_from(record.elapsed_ms)?)
++        .bind(sql_count(record.sent_payload_bytes)?)
++        .bind(i64::try_from(record.received_payload_bytes)?)
++        .bind(record.end_reason.as_ref().map(AsRef::<str>::as_ref))
++        .bind(sql_count(record.tokens.input)?)
++        .bind(sql_count(record.tokens.cache_read)?)
++        .bind(sql_count(record.tokens.cache_write)?)
++        .bind(sql_count(record.tokens.output)?)
++        .bind(sql_count(record.tokens.reasoning)?)
++        .bind(record.tps)
++        .execute(&self.pool)
++        .await?;
++        Ok(())
++    }
++
++    /// Filters precede the exclusive cursor and page limit.
++    pub async fn page(
++        &self,
++        thread_id: Option<ThreadId>,
++        model: Option<&str>,
++        status: Option<ResponseAttemptStatus>,
++        before: Option<Uuid>,
++        limit: usize,
++    ) -> anyhow::Result<ResponseHistoryPage> {
++        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM responses WHERE started_at >= ");
++        query.push_bind(Utc::now().timestamp() - DIAGNOSTIC_RETENTION_SECONDS);
++        if let Some(thread_id) = thread_id {
++            query
++                .push(" AND thread_id = ")
++                .push_bind(thread_id.to_string());
++        }
++        if let Some(model) = model {
++            query.push(" AND requested_model = ").push_bind(model);
++        }
++        if let Some(status) = &status {
++            match status {
++                ResponseAttemptStatus::Working => {
++                    query.push(" AND 0");
++                }
++                ResponseAttemptStatus::Received => {
++                    query.push(" AND end_reason IS NULL AND terminal_offset_ms IS NOT NULL");
++                }
++                ResponseAttemptStatus::Unfinished => {
++                    query.push(" AND end_reason IS NULL AND terminal_offset_ms IS NULL");
++                }
++                ResponseAttemptStatus::Completed
++                | ResponseAttemptStatus::Incomplete
++                | ResponseAttemptStatus::Failed
++                | ResponseAttemptStatus::Interrupted
++                | ResponseAttemptStatus::Canceled
++                | ResponseAttemptStatus::SetupFailed
++                | ResponseAttemptStatus::SendFailed
++                | ResponseAttemptStatus::TransportClosed
++                | ResponseAttemptStatus::ProgressTimeout
++                | ResponseAttemptStatus::ProtocolError => {
++                    query.push(" AND end_reason = ").push_bind(status.as_ref());
++                }
++            }
++        }
++        if let Some(before) = before {
++            query.push(" AND id < ").push_bind(before.to_string());
++        }
++        query
++            .push(" ORDER BY id DESC LIMIT ")
++            .push_bind((limit + 1) as i64);
++        let rows = query.build().fetch_all(&self.pool).await?;
++        let mut data = rows
++            .iter()
++            .map(read_response)
++            .collect::<anyhow::Result<Vec<_>>>()?;
++        let has_more = data.len() > limit;
++        data.truncate(limit);
++        let next_cursor = has_more.then(|| data.last().expect("nonempty response page").attempt_id);
++        Ok(ResponseHistoryPage { data, next_cursor })
++    }
++
++    /// Requested models paired with their latest retained start time in Unix seconds.
++    pub async fn models(&self) -> anyhow::Result<Vec<(String, i64)>> {
++        Ok(sqlx::query_as(
++            "SELECT requested_model, MAX(started_at) FROM responses WHERE started_at >= ? \
++             GROUP BY requested_model ORDER BY requested_model",
++        )
++        .bind(Utc::now().timestamp() - DIAGNOSTIC_RETENTION_SECONDS)
++        .fetch_all(&self.pool)
++        .await?)
++    }
++
++    /// Restore generations in the requested window, including unfinished attempts,
++    /// and each model's latest ended generation within diagnostic retention.
++    pub async fn timing_samples(&self, since: i64) -> anyhow::Result<Vec<ResponseTimingSample>> {
++        let cutoff = Utc::now().timestamp() - DIAGNOSTIC_RETENTION_SECONDS;
++        let rows = sqlx::query(
++            "SELECT id, revision, requested_model, started_at, end_reason, tps, ttfc_ms FROM responses \
++             WHERE request_kind = 'generation' \
++                AND started_at >= ? \
++                AND (started_at >= ? OR (end_reason IS NOT NULL AND id IN (SELECT MAX(id) FROM responses \
++                    WHERE request_kind = 'generation' AND end_reason IS NOT NULL AND started_at >= ? \
++                    GROUP BY requested_model)))",
++        )
++        .bind(cutoff)
++        .bind(since)
++        .bind(cutoff)
++        .fetch_all(&self.pool)
++        .await?;
++        rows.into_iter()
++            .map(|row| {
++                Ok(ResponseTimingSample {
++                    attempt_id: Uuid::parse_str(row.try_get("id")?)?,
++                    revision: row.try_get::<i64, _>("revision")?.try_into()?,
++                    requested_model: row.try_get("requested_model")?,
++                    started_at: row.try_get("started_at")?,
++                    end_reason: row
++                        .try_get::<Option<&str>, _>("end_reason")?
++                        .map(str::parse)
++                        .transpose()?,
++                    tps: row.try_get("tps")?,
++                    ttfc_ms: read_count(&row, "ttfc_ms")?,
++                })
++            })
++            .collect()
++    }
++
++    /// Latest ended generation per session, paired with its start time for cache expiry.
++    pub async fn last_generations(&self) -> anyhow::Result<Vec<(i64, ResponsePerformance)>> {
++        let rows = sqlx::query(
++            "SELECT id, thread_id, started_at, ttfb_ms, ttfc_ms, tps FROM responses \
++             WHERE id IN (SELECT MAX(id) FROM responses \
++                WHERE request_kind = 'generation' AND end_reason IS NOT NULL \
++                    AND started_at >= ? GROUP BY thread_id)",
++        )
++        .bind(Utc::now().timestamp() - DIAGNOSTIC_RETENTION_SECONDS)
++        .fetch_all(&self.pool)
++        .await?;
++        rows.into_iter()
++            .map(|row| {
++                Ok((
++                    row.try_get("started_at")?,
++                    ResponsePerformance {
++                        attempt_id: Uuid::parse_str(row.try_get("id")?)?,
++                        thread_id: row
++                            .try_get::<Option<&str>, _>("thread_id")?
++                            .map(ThreadId::from_string)
++                            .transpose()?,
++                        ttfb_ms: read_count(&row, "ttfb_ms")?,
++                        ttfc_ms: read_count(&row, "ttfc_ms")?,
++                        tps: row.try_get("tps")?,
++                    },
++                ))
++            })
++            .collect()
++    }
++}
++
++fn sql_count(value: Option<u64>) -> Result<Option<i64>, TryFromIntError> {
++    value.map(i64::try_from).transpose()
++}
++
++fn read_count(row: &SqliteRow, column: &str) -> anyhow::Result<Option<u64>> {
++    Ok(row
++        .try_get::<Option<i64>, _>(column)?
++        .map(u64::try_from)
++        .transpose()?)
++}
++
++fn read_tokens(row: &SqliteRow) -> anyhow::Result<ResponseTokenCounts> {
++    Ok(ResponseTokenCounts {
++        input: read_count(row, "input_tokens")?,
++        cache_read: read_count(row, "cache_read_tokens")?,
++        cache_write: read_count(row, "cache_write_tokens")?,
++        output: read_count(row, "output_tokens")?,
++        reasoning: read_count(row, "reasoning_tokens")?,
++    })
++}
++
++fn read_response(row: &SqliteRow) -> anyhow::Result<ResponseAttempt> {
++    Ok(ResponseAttempt {
++        attempt_id: Uuid::parse_str(row.try_get("id")?)?,
++        revision: row.try_get::<i64, _>("revision")?.try_into()?,
++        thread_id: row
++            .try_get::<Option<&str>, _>("thread_id")?
++            .map(ThreadId::from_string)
++            .transpose()?,
++        turn_id: row.try_get("turn_id")?,
++        response_id: row.try_get("response_id")?,
++        request_kind: row.try_get("request_kind")?,
++        requested_model: row.try_get("requested_model")?,
++        served_model: row.try_get("served_model")?,
++        reasoning_effort: row.try_get("reasoning_effort")?,
++        started_at: row.try_get("started_at")?,
++        ttfb_ms: read_count(row, "ttfb_ms")?,
++        ttfc_ms: read_count(row, "ttfc_ms")?,
++        terminal_observed_offset_ms: read_count(row, "terminal_offset_ms")?,
++        elapsed_ms: row.try_get::<i64, _>("elapsed_ms")?.try_into()?,
++        sent_payload_bytes: read_count(row, "sent_bytes")?,
++        received_payload_bytes: row.try_get::<i64, _>("received_bytes")?.try_into()?,
++        end_reason: row
++            .try_get::<Option<&str>, _>("end_reason")?
++            .map(str::parse)
++            .transpose()?,
++        tokens: read_tokens(row)?,
++        tps: row.try_get("tps")?,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::SqliteConfig;
++    use crate::StateRuntime;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++    use codex_utils_absolute_path::test_support::PathExt;
++    use pretty_assertions::assert_eq;
++    use serde_json::json;
++
++    pub(super) fn record(thread_id: ThreadId, model: &str) -> ResponseAttempt {
++        serde_json::from_value(json!({
++            "attemptId": Uuid::now_v7(), "revision": 1, "threadId": thread_id,
++            "requestKind": "generation",
++            "requestedModel": model, "startedAt": Utc::now().timestamp(), "elapsedMs": 10,
++            "receivedPayloadBytes": 100, "tokens": {"input": 0, "cacheRead": 0},
++            "endReason": "failed"
++        }))
++        .unwrap()
++    }
++
++    #[tokio::test]
++    async fn typed_statistics_round_trip_without_serialized_records() -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        tokio::fs::create_dir_all(&home).await?;
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let runtime = StateRuntime::init(sqlite.clone(), "test".into()).await?;
++        let store = runtime.response_history();
++        assert!(sqlite.logs_db_path().is_file());
++        let mut record = record(ThreadId::new(), "requested");
++        record.turn_id = Some("turn-1".into());
++        record.response_id = Some("resp-official".into());
++        record.reasoning_effort = Some("high".into());
++        record.sent_payload_bytes = Some(2048);
++        record.ttfb_ms = Some(150);
++        record.ttfc_ms = Some(300);
++        record.terminal_observed_offset_ms = Some(500);
++        store.write(&record).await?;
++        record.revision += 1;
++        record.served_model = Some("served".into());
++        record.end_reason = Some(ResponseAttemptEnd::SetupFailed);
++        store.write(&record).await?;
++        let reader = store.clone();
++        assert_eq!(
++            reader.page(None, None, None, None, 1).await?.data,
++            vec![record.clone()]
++        );
++        assert_eq!(
++            reader.models().await?,
++            vec![("requested".into(), record.started_at)]
++        );
++        assert_eq!(
++            reader
++                .page(
++                    None,
++                    Some("requested"),
++                    Some(ResponseAttemptStatus::SetupFailed),
++                    None,
++                    100
++                )
++                .await?
++                .data,
++            vec![record.clone()]
++        );
++        assert!(
++            reader
++                .page(None, Some("served"), None, None, 100)
++                .await?
++                .data
++                .is_empty()
++        );
++        assert_eq!(record.tokens.input, Some(0));
++        assert_eq!(record.tokens.output, None);
++        assert_eq!(
++            reader.last_generations().await?,
++            vec![(record.started_at, ResponsePerformance::from(&record))]
++        );
++        let columns: Vec<String> =
++            sqlx::query_scalar("SELECT name FROM pragma_table_info('responses')")
++                .fetch_all(&store.pool)
++                .await?;
++        assert!(!columns.iter().any(|name| matches!(
++            name.as_str(),
++            "record" | "usage_json" | "diagnostics" | "provider" | "account_id" | "usage_sequence"
++        )));
++        let stored: (Option<String>, Option<i64>, Option<i64>) =
++            sqlx::query_as("SELECT response_id, input_tokens, output_tokens FROM responses")
++                .fetch_one(&store.pool)
++                .await?;
++        assert_eq!(stored, (Some("resp-official".into()), Some(0), None));
++        let mut probe = record.clone();
++        probe.attempt_id = Uuid::now_v7();
++        probe.thread_id = None;
++        probe.turn_id = None;
++        probe.request_kind = "probe".into();
++        probe.end_reason = Some(ResponseAttemptEnd::Completed);
++        store.write(&probe).await?;
++        runtime.close().await;
++        let runtime = StateRuntime::init(sqlite, "test".into()).await?;
++        let reopened = runtime.response_history();
++        assert_eq!(
++            reopened.page(None, None, None, None, 1).await?.data,
++            vec![probe]
++        );
++        assert_eq!(
++            reopened
++                .page(record.thread_id, None, None, None, 10)
++                .await?
++                .data,
++            vec![record.clone()]
++        );
++        assert_eq!(
++            reopened.last_generations().await?,
++            vec![(record.started_at, ResponsePerformance::from(&record))]
++        );
++        let timings = reopened.timing_samples(record.started_at).await?;
++        assert_eq!(timings.len(), 1);
++        assert_eq!(timings[0].attempt_id, record.attempt_id);
++        assert_eq!(timings[0].requested_model, "requested");
++        assert_eq!(timings[0].started_at, record.started_at);
++        assert_eq!(timings[0].tps, None);
++        assert_eq!(timings[0].ttfc_ms, Some(300));
++        let older_latest = reopened.timing_samples(record.started_at + 1).await?;
++        assert_eq!(older_latest.len(), 1);
++        assert_eq!(older_latest[0].attempt_id, record.attempt_id);
++        runtime.close().await;
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn filters_precede_limits_and_cursors_exclude_newer_insertions() -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        tokio::fs::create_dir_all(&home).await?;
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let runtime = StateRuntime::init(sqlite, "test".into()).await?;
++        let store = runtime.response_history();
++        let selected = ThreadId::new();
++        let other = ThreadId::new();
++        let first = record(selected, "selected-model");
++        let second = record(selected, "selected-model");
++        let mut completed = record(selected, "selected-model");
++        completed.end_reason = Some(ResponseAttemptEnd::Completed);
++        for row in [
++            &first,
++            &record(other, "selected-model"),
++            &second,
++            &record(selected, "other-model"),
++            &completed,
++        ] {
++            store.write(row).await?;
++        }
++        let page = store
++            .page(
++                Some(selected),
++                Some("selected-model"),
++                Some(ResponseAttemptStatus::Failed),
++                None,
++                1,
++            )
++            .await?;
++        assert_eq!(page.data, vec![second.clone()]);
++        assert_eq!(page.next_cursor, Some(second.attempt_id));
++        store.write(&record(selected, "selected-model")).await?;
++        let older = store
++            .page(
++                Some(selected),
++                Some("selected-model"),
++                Some(ResponseAttemptStatus::Failed),
++                page.next_cursor,
++                1,
++            )
++            .await?;
++        assert_eq!(older.data, vec![first]);
++        assert_eq!(older.next_cursor, None);
++        runtime.close().await;
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn persisted_receipt_and_unfinished_statuses_never_imply_live_ownership()
++    -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let runtime = StateRuntime::init(sqlite.clone(), "test".into()).await?;
++        let store = runtime.response_history();
++        let mut unfinished = record(ThreadId::new(), "model");
++        unfinished.end_reason = None;
++        store.write(&unfinished).await?;
++        let mut received = record(ThreadId::new(), "model");
++        received.end_reason = None;
++        received.terminal_observed_offset_ms = Some(10);
++        store.write(&received).await?;
++        runtime.close().await;
++        let runtime = StateRuntime::init(sqlite, "test".into()).await?;
++        let reopened = runtime.response_history();
++        assert_eq!(
++            reopened
++                .page(None, None, Some(ResponseAttemptStatus::Unfinished), None, 1)
++                .await?
++                .data,
++            vec![unfinished]
++        );
++        assert_eq!(
++            reopened
++                .page(None, None, Some(ResponseAttemptStatus::Received), None, 1)
++                .await?
++                .data,
++            vec![received.clone()]
++        );
++        let working = reopened
++            .page(None, None, Some(ResponseAttemptStatus::Working), None, 1)
++            .await?;
++        assert!(working.data.is_empty());
++        assert_eq!(working.next_cursor, None);
++        received.end_reason = Some(ResponseAttemptEnd::Completed);
++        received.revision += 1;
++        reopened.write(&received).await?;
++        assert!(
++            reopened
++                .page(None, None, Some(ResponseAttemptStatus::Received), None, 1)
++                .await?
++                .data
++                .is_empty()
++        );
++        assert_eq!(
++            reopened
++                .page(None, None, Some(ResponseAttemptStatus::Completed), None, 1)
++                .await?
++                .data,
++            vec![received]
++        );
++        runtime.close().await;
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn native_logs_migration_preserves_ordinary_events() -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        tokio::fs::create_dir_all(&home).await?;
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let pool = sqlite.open_read_write_pool(&sqlite.logs_db_path()).await?;
++        let preceding = sqlx::migrate::Migrator::with_migrations(
++            crate::migrations::LOGS_MIGRATOR
++                .migrations
++                .iter()
++                .take(2)
++                .cloned()
++                .collect(),
++        );
++        preceding.run(&pool).await?;
++        sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, 0, 'INFO', 'test', 'retained event')")
++            .bind(Utc::now().timestamp())
++            .execute(&pool)
++            .await?;
++        pool.close().await;
++        let runtime = StateRuntime::init(sqlite.clone(), "test".into()).await?;
++        let store = runtime.response_history();
++        let current = record(ThreadId::new(), "model");
++        store.write(&current).await?;
++        let body: String = sqlx::query_scalar("SELECT feedback_log_body FROM logs")
++            .fetch_one(&store.pool)
++            .await?;
++        assert_eq!(body, "retained event");
++        assert_eq!(
++            store.page(None, None, None, None, 10).await?.data,
++            vec![current.clone()]
++        );
++        let reader = store.clone();
++        runtime.close().await;
++        let error = reader.write(&current).await.unwrap_err();
++        assert!(matches!(
++            error.downcast_ref::<sqlx::Error>(),
++            Some(sqlx::Error::PoolClosed)
++        ));
++        for suffix in ["-wal", "-shm"] {
++            assert!(
++                !std::path::PathBuf::from(format!("{}{suffix}", sqlite.logs_db_path().display()))
++                    .exists()
++            );
++        }
++        let copy = home.join("standalone.sqlite");
++        tokio::fs::copy(sqlite.logs_db_path(), &copy).await?;
++        let reader = sqlite.open_read_only_pool(&copy, None).await?;
++        let body: String = sqlx::query_scalar("SELECT feedback_log_body FROM logs")
++            .fetch_one(&reader)
++            .await?;
++        assert_eq!(body, "retained event");
++        let attempt_id: String = sqlx::query_scalar("SELECT id FROM responses")
++            .fetch_one(&reader)
++            .await?;
++        assert_eq!(attempt_id, current.attempt_id.to_string());
++        reader.close().await;
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn every_query_excludes_expired_attempts_before_maintenance() -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let runtime = StateRuntime::init(sqlite, "test".into()).await?;
++        let store = runtime.response_history();
++        let current = record(ThreadId::new(), "current");
++        let mut expired = record(ThreadId::new(), "expired");
++        expired.started_at -= DIAGNOSTIC_RETENTION_SECONDS + 60;
++        store.write(&current).await?;
++        store.write(&expired).await?;
++        assert_eq!(
++            store.page(None, None, None, None, 1).await?.data,
++            vec![current.clone()]
++        );
++        assert_eq!(
++            store.models().await?,
++            vec![("current".into(), current.started_at)]
++        );
++        assert_eq!(
++            store.last_generations().await?,
++            vec![(current.started_at, ResponsePerformance::from(&current))]
++        );
++        let timings = store.timing_samples(0).await?;
++        assert_eq!(timings.len(), 1);
++        assert_eq!(timings[0].attempt_id, current.attempt_id);
++        runtime.close().await;
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn compact_restore_preserves_current_outcomes_and_latest_ended_generation()
++    -> anyhow::Result<()> {
++        let home = crate::runtime::test_support::unique_temp_dir();
++        let _cleanup = scopeguard::guard(home.clone(), |home| {
++            let _ = std::fs::remove_dir_all(home);
++        });
++        let sqlite = SqliteConfig::new_for_testing(home.as_path().abs());
++        let runtime = StateRuntime::init(sqlite.clone(), "test".into()).await?;
++        let store = runtime.response_history();
++        let now = Utc::now().timestamp();
++        let mut previous = record(ThreadId::new(), "older-model");
++        previous.started_at = now - 30 * 60 * 60;
++        previous.end_reason = Some(ResponseAttemptEnd::Completed);
++        previous.tps = Some(42.0);
++        let mut old_unfinished = record(ThreadId::new(), "older-model");
++        old_unfinished.started_at = previous.started_at + 1;
++        old_unfinished.end_reason = None;
++        let mut live = record(ThreadId::new(), "current-model");
++        live.end_reason = None;
++        live.revision = 3;
++        live.ttfc_ms = Some(120);
++        let mut incomplete = record(ThreadId::new(), "current-model");
++        incomplete.end_reason = Some(ResponseAttemptEnd::Incomplete);
++        let mut done = record(ThreadId::new(), "current-model");
++        done.end_reason = Some(ResponseAttemptEnd::Completed);
++        let mut probe = done.clone();
++        probe.attempt_id = Uuid::now_v7();
++        probe.request_kind = "probe".into();
++        for row in [
++            &previous,
++            &old_unfinished,
++            &live,
++            &incomplete,
++            &done,
++            &probe,
++        ] {
++            store.write(row).await?;
++        }
++        runtime.close().await;
++        let runtime = StateRuntime::init(sqlite, "test".into()).await?;
++        let store = runtime.response_history();
++        let restored = store.timing_samples(now - 24 * 60 * 60).await?;
++        assert_eq!(restored.len(), 4);
++        for expected in [&previous, &live, &incomplete, &done] {
++            let sample = restored
++                .iter()
++                .find(|sample| sample.attempt_id == expected.attempt_id)
++                .expect("retained generation");
++            assert_eq!(sample.revision, expected.revision);
++            assert_eq!(sample.end_reason, expected.end_reason);
++            assert_eq!(sample.tps, expected.tps);
++            assert_eq!(sample.ttfc_ms, expected.ttfc_ms);
++        }
++        live.revision += 1;
++        live.end_reason = Some(ResponseAttemptEnd::Canceled);
++        store.write(&live).await?;
++        let restored = store.timing_samples(now - 24 * 60 * 60).await?;
++        assert_eq!(restored.len(), 4);
++        let updated = restored
++            .iter()
++            .find(|sample| sample.attempt_id == live.attempt_id)
++            .expect("updated generation");
++        assert_eq!(updated.revision, live.revision);
++        assert_eq!(updated.end_reason, live.end_reason);
++        runtime.close().await;
++        Ok(())
++    }
++}
+diff --git a/codex-rs/state/src/runtime.rs b/codex-rs/state/src/runtime.rs
+--- a/codex-rs/state/src/runtime.rs
++++ b/codex-rs/state/src/runtime.rs
+@@ -1,6 +1,7 @@
+ use crate::LogEntry;
+ use crate::LogQuery;
+ use crate::LogRow;
++use crate::ResponseHistoryStore;
+ use crate::SortKey;
+ use crate::SqliteConfig;
+ use crate::ThreadMetadata;
+@@ -296,6 +297,12 @@ impl StateRuntime {
+         &self.sqlite
+     }
+ 
++    /// Access response facts through this runtime's existing diagnostic logs pool.
++    /// Stop response writers before closing the runtime; closure affects all store clones.
++    pub fn response_history(&self) -> ResponseHistoryStore {
++        ResponseHistoryStore::new(self.logs_pool.as_ref().clone())
++    }
++
+     pub fn thread_goals(&self) -> &GoalStore {
+         &self.thread_goals
+     }

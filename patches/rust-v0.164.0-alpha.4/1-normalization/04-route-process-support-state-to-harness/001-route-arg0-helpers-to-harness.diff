@@ -1,0 +1,434 @@
+route-arg0-helpers-to-harness
+
+Lane: normalization
+
+Unit: route-process-support-state-to-harness
+
+ChildPatch: route-arg0-helpers-to-harness
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Keep process helper, clipboard staging and Linux sandbox bookkeeping under the selected harness while preserving their independent native behavior and isolation.
+
+Requires: Unit:normalization/normalize-base-roots-for-processes, Unit:normalization/route-app-server-runtime-to-harness
+
+Provides: Stage guarded per-process arg0 aliases and expose only the active alias directory to permissions; persist unique clipboard PNG files under harness/clipboard with native acquisition and intermediate-file cleanup; place the one-shot prefix-rule marker and synthetic mount registry under harness while preserving symlink rejection, masking and registry cleanup.
+
+Boundary: Base-root resolution and executor harness propagation remain with their normalization owners. Alias dispatch, clipboard acquisition and attachment lifetime, policy contents, migration rules, durable home data and unrelated filesystem permissions retain native ownership.
+
+Verification: arg0 alias placement and active-directory tests, exact configured permission-policy projections including the active alias read grant, clipboard_png_uses_harness_staging_root, execpolicy sandbox_migration_tests, core exec_policy tests, linux-sandbox registry and sandbox tests, and daemon_sockets tests cover separated roots, bytes, one-shot behavior and isolation.
+
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -319,38 +319,32 @@ where
+ fn prepare_path_entry_for_codex_aliases(
+     existing_path: Option<OsString>,
+ ) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+-    let codex_home = find_codex_home()?;
++    let codex_harness = ensure_codex_harness()?;
+     #[cfg(not(debug_assertions))]
+     {
+         // Guard against placing helpers in system temp directories outside debug builds.
+         let temp_root = std::env::temp_dir();
+-        if codex_home.starts_with(&temp_root) {
++        if codex_harness.starts_with(&temp_root) {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::InvalidInput,
+                 format!(
+-                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_home: {codex_home:?})"
++                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_harness: {codex_harness:?})"
+                 ),
+             ));
+         }
+     }
+ 
+-    prepare_aliases_in_home(&codex_home, existing_path)
++    prepare_path_entry_for_codex_aliases_in(&codex_harness, existing_path)
+ }
+ 
+-// The production entry point validates the home before reaching this filesystem seam.
+-fn prepare_aliases_in_home(
+-    codex_home: &Path,
++// The production entry point validates the harness before reaching this filesystem seam.
++fn prepare_path_entry_for_codex_aliases_in(
++    codex_harness: &Path,
+     existing_path: Option<OsString>,
+ ) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+-    std::fs::create_dir_all(codex_home)?;
+-    // Windows and WSL can share CODEX_HOME without sharing a lock namespace.
+-    // Keep each OS outside the legacy `tmp/arg0` root so older clients cannot
+-    // delete these helpers while their owning process is still running.
+-    let temp_root = codex_home
+-        .join("tmp")
+-        .join(format!("arg0-{}", std::env::consts::OS));
++    // Keep process helpers separate from home-owned data and older clients' cleanup roots.
++    let temp_root = codex_harness.join("arg0");
+     std::fs::create_dir_all(&temp_root)?;
+-    #[cfg(unix)]
+     {
+         use std::os::unix::fs::PermissionsExt;
+ 
+@@ -599,6 +593,22 @@ mod tests {
+         })
+     }
+ 
++    #[test]
++    fn arg0_aliases_are_staged_under_harness() -> anyhow::Result<()> {
++        let root = TempDir::new()?;
++        let codex_harness = root.path().join("harness");
++
++        let (guard, _path) = super::prepare_path_entry_for_codex_aliases_in(&codex_harness, None)?;
++
++        assert!(
++            guard
++                ._temp_dir
++                .path()
++                .starts_with(codex_harness.join("arg0"))
++        );
++        Ok(())
++    }
++
+     #[cfg(windows)]
+     #[test]
+     fn windows_batch_alias_preserves_unicode_executable_paths() -> anyhow::Result<()> {
+@@ -764,15 +774,14 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn helper_cleanup_is_isolated_from_other_platforms_and_legacy_clients() -> std::io::Result<()> {
++    fn helper_cleanup_is_isolated_from_home_and_legacy_clients() -> std::io::Result<()> {
+         let home = tempfile::tempdir()?;
++        let harness = tempfile::tempdir()?;
+         let temporary = home.path().join("tmp");
+-        let own_root = temporary.join(format!("arg0-{}", std::env::consts::OS));
+-        let foreign_os = if cfg!(windows) { "linux" } else { "windows" };
+-        let foreign_root = temporary.join(format!("arg0-{foreign_os}"));
++        let own_root = harness.path().join("arg0");
++        let foreign_root = temporary.join("arg0-linux");
+         let legacy_root = temporary.join("arg0");
+-        // Unlocked foreign directories model a live peer whose lock is invisible
+-        // to this kernel. Only stale directories in our own namespace may go.
++        // Only stale helpers in the selected harness belong to this cleanup.
+         for root in [&own_root, &foreign_root, &legacy_root] {
+             let stale = root.join("codex-arg0-existing");
+             fs::create_dir_all(&stale)?;
+@@ -780,7 +789,10 @@ mod tests {
+             fs::write(stale.join("helper"), b"keep foreign helpers")?;
+         }
+ 
+-        let (guard, _) = super::prepare_aliases_in_home(home.path(), /*existing_path*/ None)?;
++        let (guard, _) = super::prepare_path_entry_for_codex_aliases_in(
++            harness.path(),
++            /*existing_path*/ None,
++        )?;
+         assert!(!own_root.join("codex-arg0-existing").exists());
+         assert_eq!(
+             [&foreign_root, &legacy_root]
+@@ -793,11 +805,7 @@ mod tests {
+         // Older versions clean only this root. Run that cleanup while a new
+         // helper is live, then confirm the advertised helper remains usable.
+         janitor_cleanup(&legacy_root)?;
+-        let helper = guard._temp_dir.path().join(if cfg!(windows) {
+-            "apply_patch.bat"
+-        } else {
+-            "apply_patch"
+-        });
++        let helper = guard._temp_dir.path().join("apply_patch");
+         assert!(helper.is_file());
+         assert_eq!(
+             fs::read(foreign_root.join("codex-arg0-existing/helper"))?,
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -125,6 +125,18 @@ use std::path::Path;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ 
++fn with_active_arg0_read_access(
++    config: &Config,
++    policy: FileSystemSandboxPolicy,
++) -> FileSystemSandboxPolicy {
++    let readable_roots = std::env::var_os("PATH")
++        .as_deref()
++        .and_then(|path| permissions::active_arg0_helper_dir(&config.codex_harness, path))
++        .into_iter()
++        .collect::<Vec<_>>();
++    policy.with_additional_readable_roots(config.cwd.as_path(), &readable_roots)
++}
++
+ fn stdio_mcp(command: &str) -> McpServerConfig {
+     stdio_mcp_with_args(command, &[])
+ }
+@@ -2502,29 +2514,32 @@ async fn default_permissions_profile_populates_runtime_sandbox_policy() -> std::
+     let cwd_root = cwd.path().abs();
+     assert_eq!(
+         config.permissions.file_system_sandbox_policy(),
+-        FileSystemSandboxPolicy::restricted(vec![
+-            FileSystemSandboxEntry {
+-                path: FileSystemPath::Special {
+-                    value: FileSystemSpecialPath::Minimal,
++        with_active_arg0_read_access(
++            &config,
++            FileSystemSandboxPolicy::restricted(vec![
++                FileSystemSandboxEntry {
++                    path: FileSystemPath::Special {
++                        value: FileSystemSpecialPath::Minimal,
++                    },
++                    access: FileSystemAccessMode::Read,
++                    missing_path_behavior: None,
+                 },
+-                access: FileSystemAccessMode::Read,
+-                missing_path_behavior: None,
+-            },
+-            FileSystemSandboxEntry {
+-                path: FileSystemPath::Path {
+-                    path: cwd_root.clone().into(),
++                FileSystemSandboxEntry {
++                    path: FileSystemPath::Path {
++                        path: cwd_root.clone().into(),
++                    },
++                    access: FileSystemAccessMode::Write,
++                    missing_path_behavior: None,
+                 },
+-                access: FileSystemAccessMode::Write,
+-                missing_path_behavior: None,
+-            },
+-            FileSystemSandboxEntry {
+-                path: FileSystemPath::Path {
+-                    path: cwd_root.join("docs").into(),
++                FileSystemSandboxEntry {
++                    path: FileSystemPath::Path {
++                        path: cwd_root.join("docs").into(),
++                    },
++                    access: FileSystemAccessMode::Read,
++                    missing_path_behavior: None,
+                 },
+-                access: FileSystemAccessMode::Read,
+-                missing_path_behavior: None,
+-            },
+-        ]),
++            ])
++        ),
+     );
+     assert_eq!(
+         &config.legacy_sandbox_policy(),
+@@ -4179,16 +4194,19 @@ async fn permissions_profiles_allow_unknown_special_paths() -> std::io::Result<(
+ 
+     assert_eq!(
+         config.permissions.file_system_sandbox_policy(),
+-        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+-            path: FileSystemPath::Special {
+-                value: FileSystemSpecialPath::unknown(
+-                    ":future_special_path",
+-                    /*subpath*/ None
+-                ),
+-            },
+-            access: FileSystemAccessMode::Read,
+-            missing_path_behavior: None,
+-        }]),
++        with_active_arg0_read_access(
++            &config,
++            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
++                path: FileSystemPath::Special {
++                    value: FileSystemSpecialPath::unknown(
++                        ":future_special_path",
++                        /*subpath*/ None
++                    ),
++                },
++                access: FileSystemAccessMode::Read,
++                missing_path_behavior: None,
++            }])
++        ),
+     );
+     assert_eq!(
+         &config.legacy_sandbox_policy(),
+@@ -4229,13 +4247,19 @@ async fn permissions_profiles_allow_unknown_special_paths_with_nested_entries()
+ 
+     assert_eq!(
+         config.permissions.file_system_sandbox_policy(),
+-        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+-            path: FileSystemPath::Special {
+-                value: FileSystemSpecialPath::unknown(":future_special_path", Some("docs".into())),
+-            },
+-            access: FileSystemAccessMode::Read,
+-            missing_path_behavior: None,
+-        }]),
++        with_active_arg0_read_access(
++            &config,
++            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
++                path: FileSystemPath::Special {
++                    value: FileSystemSpecialPath::unknown(
++                        ":future_special_path",
++                        Some("docs".into())
++                    ),
++                },
++                access: FileSystemAccessMode::Read,
++                missing_path_behavior: None,
++            }])
++        ),
+     );
+     assert!(
+         config.startup_warnings.iter().any(|warning| warning.contains(
+@@ -4260,7 +4284,7 @@ async fn permissions_profiles_allow_missing_filesystem_with_warning() -> std::io
+ 
+     assert_eq!(
+         config.permissions.file_system_sandbox_policy(),
+-        FileSystemSandboxPolicy::restricted(Vec::new())
++        with_active_arg0_read_access(&config, FileSystemSandboxPolicy::restricted(Vec::new()))
+     );
+     assert_eq!(
+         &config.legacy_sandbox_policy(),
+@@ -4294,7 +4318,7 @@ async fn permissions_profiles_allow_empty_filesystem_with_warning() -> std::io::
+ 
+     assert_eq!(
+         config.permissions.file_system_sandbox_policy(),
+-        FileSystemSandboxPolicy::restricted(Vec::new())
++        with_active_arg0_read_access(&config, FileSystemSandboxPolicy::restricted(Vec::new()))
+     );
+     assert!(
+         config.startup_warnings.iter().any(|warning| warning.contains(
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -4351,7 +4351,7 @@ impl Config {
+         )?;
+         let mut helper_readable_roots: Vec<_> = std::env::var_os("PATH")
+             .as_deref()
+-            .and_then(|path| permissions::active_arg0_helper_dir(&codex_home, path))
++            .and_then(|path| permissions::active_arg0_helper_dir(&codex_harness, path))
+             .into_iter()
+             .collect();
+         if features.enabled(Feature::MemoryTool) && memories_config.use_memories {
+diff --git a/codex-rs/core/src/config/permissions.rs b/codex-rs/core/src/config/permissions.rs
+--- a/codex-rs/core/src/config/permissions.rs
++++ b/codex-rs/core/src/config/permissions.rs
+@@ -49,19 +49,15 @@ pub(crate) const BUILT_IN_DANGER_FULL_ACCESS_PROFILE: &str =
+     BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ 
+ /// Keep the active apply_patch aliases readable without granting access to other
+-/// sessions or the rest of CODEX_HOME. Preserve the alias directory, not its target.
++/// sessions or the rest of CODEX_HARNESS. Preserve the alias directory, not its target.
+ pub(super) fn active_arg0_helper_dir(
+-    codex_home: &Path,
++    codex_harness: &Path,
+     path_env: &OsStr,
+ ) -> Option<AbsolutePathBuf> {
+-    let arg0_root = codex_home
+-        .join("tmp")
+-        .join(format!("arg0-{}", std::env::consts::OS));
+-    let legacy_root = codex_home.join("tmp").join("arg0");
++    let arg0_root = codex_harness.join("arg0");
+     std::env::split_paths(path_env)
+         .find(|path| {
+-            (path.parent() == Some(arg0_root.as_path())
+-                || path.parent() == Some(legacy_root.as_path()))
++            path.parent() == Some(arg0_root.as_path())
+                 && path
+                     .file_name()
+                     .is_some_and(|name| name.to_string_lossy().starts_with("codex-arg0"))
+diff --git a/codex-rs/core/src/config/permissions_tests.rs b/codex-rs/core/src/config/permissions_tests.rs
+--- a/codex-rs/core/src/config/permissions_tests.rs
++++ b/codex-rs/core/src/config/permissions_tests.rs
+@@ -22,32 +22,22 @@ use tempfile::TempDir;
+ #[test]
+ fn active_arg0_helper_dir_selects_only_the_first_session_alias_directory() -> anyhow::Result<()> {
+     let home = TempDir::new()?;
+-    let platform_root = home
+-        .path()
+-        .join("tmp")
+-        .join(format!("arg0-{}", std::env::consts::OS));
+-    let legacy_root = home.path().join("tmp/arg0");
+-    let foreign_os = if cfg!(windows) { "linux" } else { "windows" };
+-    let foreign_alias = home
+-        .path()
+-        .join("tmp")
+-        .join(format!("arg0-{foreign_os}"))
+-        .join("codex-arg0-foreign");
+-    for arg0_root in [&platform_root, &legacy_root] {
+-        let active = arg0_root.join("codex-arg0-active");
+-        let paths = std::env::join_paths([
+-            home.path().join("bin"),
+-            foreign_alias.clone(),
+-            arg0_root.clone(),
+-            arg0_root.join("unrelated"),
+-            active.clone(),
+-            arg0_root.join("codex-arg0-parent"),
+-        ])?;
+-        assert_eq!(
+-            active_arg0_helper_dir(home.path(), &paths),
+-            Some(AbsolutePathBuf::from_absolute_path(active)?)
+-        );
+-    }
++    let harness = TempDir::new()?;
++    let arg0_root = harness.path().join("arg0");
++    let active = arg0_root.join("codex-arg0-active");
++    let paths = std::env::join_paths([
++        home.path().join("bin"),
++        home.path().join("tmp/arg0/codex-arg0-retired"),
++        home.path().join("tmp/arg0-linux/codex-arg0-retired"),
++        arg0_root.clone(),
++        arg0_root.join("unrelated"),
++        active.clone(),
++        arg0_root.join("codex-arg0-parent"),
++    ])?;
++    assert_eq!(
++        active_arg0_helper_dir(harness.path(), &paths),
++        Some(AbsolutePathBuf::from_absolute_path(active)?)
++    );
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/test-binary-support/lib.rs b/codex-rs/test-binary-support/lib.rs
+--- a/codex-rs/test-binary-support/lib.rs
++++ b/codex-rs/test-binary-support/lib.rs
+@@ -7,7 +7,9 @@ use tempfile::TempDir;
+ 
+ pub struct TestBinaryDispatchGuard {
+     _codex_home: TempDir,
++    // Drop active aliases before removing their parent harness directory.
+     arg0: Arg0PathEntryGuard,
++    _codex_harness: TempDir,
+     _previous_codex_home: Option<std::ffi::OsString>,
+ }
+ 
+@@ -48,10 +50,16 @@ where
+                 Ok(codex_home) => codex_home,
+                 Err(error) => panic!("failed to create test CODEX_HOME: {error}"),
+             };
++            let codex_harness = match tempfile::Builder::new().prefix("codex-harness").tempdir() {
++                Ok(codex_harness) => codex_harness,
++                Err(error) => panic!("failed to create test CODEX_HARNESS: {error}"),
++            };
+             let previous_codex_home = std::env::var_os("CODEX_HOME");
++            let previous_codex_harness = std::env::var_os("CODEX_HARNESS");
+             // Safety: this runs from a test ctor before test threads begin.
+             unsafe {
+                 std::env::set_var("CODEX_HOME", codex_home.path());
++                std::env::set_var("CODEX_HARNESS", codex_harness.path());
+             }
+ 
+             let arg0 = match arg0_dispatch() {
+@@ -66,10 +74,19 @@ where
+                     std::env::remove_var("CODEX_HOME");
+                 },
+             }
++            match previous_codex_harness.as_ref() {
++                Some(value) => unsafe {
++                    std::env::set_var("CODEX_HARNESS", value);
++                },
++                None => unsafe {
++                    std::env::remove_var("CODEX_HARNESS");
++                },
++            }
+ 
+             Some(TestBinaryDispatchGuard {
+                 _codex_home: codex_home,
+                 arg0,
++                _codex_harness: codex_harness,
+                 _previous_codex_home: previous_codex_home,
+             })
+         }

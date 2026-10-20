@@ -1,0 +1,1319 @@
+bind-host-mcp-to-prepared-local-roots
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: bind-host-mcp-to-prepared-local-roots
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/app-server/src/request_processors/account_processor/enterprise_login.rs b/codex-rs/app-server/src/request_processors/account_processor/enterprise_login.rs
+--- a/codex-rs/app-server/src/request_processors/account_processor/enterprise_login.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor/enterprise_login.rs
+@@ -141,7 +141,7 @@ impl EnterpriseLoginState {
+         else {
+             return false;
+         };
+-        let config = thread.runtime_mcp_config_and_context(&config).await.0;
++        let config = thread.runtime_mcp_config(&config).await;
+         let auth = self.auth_manager.auth_cached();
+         let servers = codex_mcp::effective_mcp_servers(&config, auth.as_ref());
+         config.xaa_enabled
+diff --git a/codex-rs/app-server/src/request_processors/mcp_processor.rs b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+--- a/codex-rs/app-server/src/request_processors/mcp_processor.rs
++++ b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+@@ -144,8 +144,12 @@ impl McpRequestProcessor {
+         let (mcp_config, runtime_context) = match thread_id.as_deref() {
+             Some(thread_id) => {
+                 let (_, thread) = self.load_thread(thread_id).await?;
+-                let (config, runtime_context) =
+-                    thread.current_mcp_config_and_runtime_context().await;
++                let (config, runtime_context) = thread
++                    .current_mcp_config_and_runtime_context()
++                    .await
++                    .map_err(|error| {
++                        internal_error(format!("failed to prepare MCP runtime: {error:#}"))
++                    })?;
+                 ((*config).clone(), runtime_context)
+             }
+             None => {
+@@ -423,7 +427,12 @@ impl McpRequestProcessor {
+             let mcp_manager = self.thread_manager.mcp_manager();
+             let auth = self.auth_manager.auth().await;
+             let (mcp_config, runtime_context) = match thread.as_ref() {
+-                Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
++                Some(thread) => thread
++                    .runtime_mcp_config_and_context(&config)
++                    .await
++                    .map_err(|error| {
++                        internal_error(format!("failed to prepare MCP runtime: {error:#}"))
++                    })?,
+                 None => {
+                     let mcp_config = mcp_manager.runtime_config(&config).await;
+                     let has_local_stdio = codex_mcp::configured_mcp_servers(&mcp_config)
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -1019,21 +1019,27 @@ impl CodexThread {
+             .await
+     }
+ 
++    /// Resolves the thread's MCP catalog without preparing host execution permissions.
++    pub async fn runtime_mcp_config(&self, config: &crate::config::Config) -> codex_mcp::McpConfig {
++        self.session.runtime_mcp_config(config).await
++    }
++
+     /// Resolves MCP configuration and environment bindings from the same config snapshot.
++    /// Returns an error if the host runtime's storage or permissions cannot be prepared.
+     pub async fn runtime_mcp_config_and_context(
+         &self,
+         config: &crate::config::Config,
+-    ) -> (codex_mcp::McpConfig, codex_mcp::McpRuntimeContext) {
++    ) -> anyhow::Result<(codex_mcp::McpConfig, codex_mcp::McpRuntimeContext)> {
+         self.session.runtime_mcp_config_and_context(config).await
+     }
+ 
+     /// Captures the exact MCP config and environment bindings for the current thread state.
+     pub async fn current_mcp_config_and_runtime_context(
+         &self,
+-    ) -> (Arc<codex_mcp::McpConfig>, codex_mcp::McpRuntimeContext) {
++    ) -> anyhow::Result<(Arc<codex_mcp::McpConfig>, codex_mcp::McpRuntimeContext)> {
+         let config = self.session.get_config().await;
+-        let (mcp_config, runtime_context) = self.runtime_mcp_config_and_context(&config).await;
+-        (Arc::new(mcp_config), runtime_context)
++        let (mcp_config, runtime_context) = self.runtime_mcp_config_and_context(&config).await?;
++        Ok((Arc::new(mcp_config), runtime_context))
+     }
+ 
+     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
+@@ -1149,7 +1155,7 @@ impl CodexThread {
+         server: &str,
+         params: ReadResourceRequestParams,
+     ) -> anyhow::Result<serde_json::Value> {
+-        self.session.refresh_mcp_if_dirty().await;
++        self.session.refresh_mcp_if_dirty().await?;
+         let result = self
+             .session
+             .services
+@@ -1169,8 +1175,8 @@ impl CodexThread {
+         Arc<codex_mcp::McpConfig>,
+         codex_mcp::McpServerStatusSnapshot,
+     )> {
+-        self.session.refresh_mcp_if_dirty().await;
+-        let runtime_context = self.session.current_mcp_runtime_context().await;
++        self.session.refresh_mcp_if_dirty().await?;
++        let runtime_context = self.session.current_mcp_runtime_context().await?;
+         self.session
+             .services
+             .mcp_runtime
+@@ -1184,7 +1190,7 @@ impl CodexThread {
+         call_id: &str,
+         uri: &str,
+     ) -> anyhow::Result<serde_json::Value> {
+-        self.session.refresh_mcp_if_dirty().await;
++        self.session.refresh_mcp_if_dirty().await?;
+         let result = self
+             .session
+             .services
+@@ -1209,7 +1215,7 @@ impl CodexThread {
+             None => None,
+         };
+         let _ = self.session.services.auth_manager.auth().await;
+-        self.session.refresh_mcp_if_dirty().await;
++        self.session.refresh_mcp_if_dirty().await?;
+         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
+             .open_event_stream(name, &arguments, meta)
+             .await
+@@ -1222,7 +1228,7 @@ impl CodexThread {
+         arguments: Option<serde_json::Value>,
+         meta: Option<serde_json::Value>,
+     ) -> anyhow::Result<CallToolResult> {
+-        self.session.refresh_mcp_if_dirty().await;
++        self.session.refresh_mcp_if_dirty().await?;
+         self.session
+             .services
+             .mcp_runtime
+diff --git a/codex-rs/core/src/mcp_skill_dependencies.rs b/codex-rs/core/src/mcp_skill_dependencies.rs
+--- a/codex-rs/core/src/mcp_skill_dependencies.rs
++++ b/codex-rs/core/src/mcp_skill_dependencies.rs
+@@ -154,7 +154,13 @@ async fn maybe_install_mcp_dependencies(
+         return;
+     }
+ 
+-    let (_, runtime_context) = sess.runtime_mcp_config_and_context(config).await;
++    let runtime_context = match sess.runtime_mcp_config_and_context(config).await {
++        Ok((_, runtime_context)) => runtime_context,
++        Err(error) => {
++            warn!(%error, "failed to prepare MCP dependencies for mentioned skills");
++            return;
++        }
++    };
+     for (name, server_config) in &added {
+         let http_client = match runtime_context.resolve_http_client(name, server_config) {
+             Ok(http_client) => http_client,
+@@ -238,8 +244,12 @@ async fn maybe_install_mcp_dependencies(
+         }
+     }
+ 
+-    sess.refresh_mcp_servers_now(added.into_iter().collect(), elicitation_reviewer)
+-        .await;
++    if let Err(error) = sess
++        .refresh_mcp_servers_now(added.into_iter().collect(), elicitation_reviewer)
++        .await
++    {
++        warn!(%error, "failed to refresh MCP dependencies for mentioned skills");
++    }
+ }
+ 
+ async fn should_install_mcp_dependencies(
+diff --git a/codex-rs/core/src/mcp_tool_call/conversation_history.rs b/codex-rs/core/src/mcp_tool_call/conversation_history.rs
+--- a/codex-rs/core/src/mcp_tool_call/conversation_history.rs
++++ b/codex-rs/core/src/mcp_tool_call/conversation_history.rs
+@@ -74,7 +74,7 @@ async fn history_binding(parent: &Arc<Session>) -> anyhow::Result<Arc<McpBinding
+                 .enabled(Feature::GuardianConversationHistoryTools),
+         "Conversation history is disabled on the parent"
+     );
+-    parent.refresh_mcp_if_dirty().await;
++    parent.refresh_mcp_if_dirty().await?;
+     parent
+         .services
+         .mcp_runtime
+diff --git a/codex-rs/core/src/session/mcp.rs b/codex-rs/core/src/session/mcp.rs
+--- a/codex-rs/core/src/session/mcp.rs
++++ b/codex-rs/core/src/session/mcp.rs
+@@ -102,37 +102,75 @@ impl ElicitationReviewer for GuardianMcpElicitationReviewer {
+ 
+ impl Session {
+     pub(crate) async fn runtime_mcp_config(&self, config: &Config) -> McpConfig {
+-        self.runtime_mcp_config_and_context(config).await.0
++        let environments = self.services.turn_environments.snapshot().await;
++        self.runtime_mcp_config_for_environments(config, &environments)
++            .await
+     }
+ 
+     pub(crate) async fn runtime_mcp_config_and_context(
+         &self,
+         config: &Config,
+-    ) -> (McpConfig, McpRuntimeContext) {
++    ) -> anyhow::Result<(McpConfig, McpRuntimeContext)> {
++        let host_fallback_cwd = self.state.lock().await.session_configuration.cwd().clone();
++        let environments = self.services.turn_environments.snapshot().await;
++        let mut mcp_config = self
++            .runtime_mcp_config_for_environments(config, &environments)
++            .await;
++        let auth = self.services.auth_manager.auth_cached();
++        let mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
++        let mut host_config = config.clone();
++        host_config.cwd = environments
++            .local_environment_cwd()
++            .unwrap_or_else(|| host_fallback_cwd.clone());
++        let local_permissions = Self::prepare_local_mcp_permissions(&host_config, &mcp_servers)?;
++        mcp_config.permission_profile = local_permissions
++            .as_ref()
++            .unwrap_or(&config.permissions)
++            .effective_permission_profile();
++        mcp_config.set_server_permission_profiles(
++            &mcp_servers,
++            environments.turn_environments().map(|environment| {
++                (
++                    environment.selection.environment_id.clone(),
++                    environment.permission_profile_with_workspace_roots(),
++                )
++            }),
++        );
++        let runtime_context = self.mcp_runtime_context(
++            &environments,
++            host_fallback_cwd.as_path(),
++            local_permissions.as_ref(),
++        );
++        Ok((mcp_config, runtime_context))
++    }
++
++    async fn runtime_mcp_config_for_environments(
++        &self,
++        config: &Config,
++        environments: &TurnEnvironmentSnapshot,
++    ) -> McpConfig {
+         let originator = self.originator().await;
+-        let (session_source, host_fallback_cwd, disabled_plugin_ids) = {
++        let (session_source, disabled_plugin_ids) = {
+             let state = self.state.lock().await;
+             (
+                 state.session_configuration.session_source.clone(),
+-                state.session_configuration.cwd().clone(),
+                 state.active_disabled_plugin_ids.clone(),
+             )
+         };
+-        let environments = self.services.turn_environments.snapshot().await;
+         let environment_selections = environments.all_selections();
+         let selected_capability_roots = self
+-            .resolve_selected_capability_roots_for_step(&environments)
++            .resolve_selected_capability_roots_for_step(environments)
+             .await;
+         let ready_selected_capability_roots =
+             Self::ready_selected_capability_roots(&selected_capability_roots);
+         let executor_capability_discovery_v2 = self
+-            .executor_capability_discovery_for_step_v2(config, &environments)
++            .executor_capability_discovery_for_step_v2(config, environments)
+             .await;
+         let executor_capability_discovery = self
+             .executor_capability_discovery_for_step(
+                 config,
+                 &ready_selected_capability_roots,
+-                &environments,
++                environments,
+             )
+             .await;
+         let mcp_projection =
+@@ -156,24 +194,34 @@ impl Session {
+                     executor_capability_discovery_v2.as_deref(),
+                 )
+                 .await;
+-        let mcp_config = self
+-            .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
++        self.project_selected_environment_mcp_servers(config, environments, mcp_projection)
+             .await
+-            .config;
+-        let runtime_context = self.mcp_runtime_context(&environments, &host_fallback_cwd);
+-        (mcp_config, runtime_context)
++            .config
+     }
+ 
+-    pub(crate) async fn current_mcp_runtime_context(&self) -> McpRuntimeContext {
+-        let host_fallback_cwd = self.state.lock().await.session_configuration.cwd().clone();
++    pub(crate) async fn current_mcp_runtime_context(&self) -> anyhow::Result<McpRuntimeContext> {
+         let environments = self.services.turn_environments.snapshot().await;
+-        self.mcp_runtime_context(&environments, &host_fallback_cwd)
++        let auth = self.services.auth_manager.auth_cached();
++        let desired = self.latest_mcp_desired_state(auth, environments).await;
++        let mcp_config = self
++            .services
++            .mcp_runtime
++            .current_config()
++            .ok_or_else(|| anyhow::anyhow!("MCP runtime is not initialized"))?;
++        let mcp_servers = effective_mcp_servers(&mcp_config, desired.auth.as_ref());
++        let local_permissions = Self::prepare_local_mcp_permissions(&desired.config, &mcp_servers)?;
++        Ok(self.mcp_runtime_context(
++            &desired.environments,
++            &desired.local_process_cwd,
++            local_permissions.as_ref(),
++        ))
+     }
+ 
+-    fn mcp_runtime_context(
++    pub(super) fn mcp_runtime_context(
+         &self,
+         environments: &TurnEnvironmentSnapshot,
+         host_fallback_cwd: &std::path::Path,
++        local_permissions: Option<&crate::config::Permissions>,
+     ) -> McpRuntimeContext {
+         let local_process_cwd = environments
+             .local_environment_cwd()
+@@ -187,12 +235,22 @@ impl Session {
+             environments.all_selections().into(),
+             environments.ready_environment_handles(),
+         )
+-        .with_local_process_environment(environments.local().map_or_else(HashMap::new, |local| {
+-            local
+-                .shell_environment_policy()
+-                .inherited_environment
+-                .clone()
+-        }))
++        .with_local_process_environment(environments.local().map_or_else(
++            || {
++                local_permissions.map_or_else(HashMap::new, |permissions| {
++                    permissions
++                        .shell_environment_policy
++                        .inherited_environment
++                        .clone()
++                })
++            },
++            |local| {
++                local
++                    .shell_environment_policy()
++                    .inherited_environment
++                    .clone()
++            },
++        ))
+     }
+ 
+     pub(crate) async fn runtime_mcp_servers(
+@@ -204,11 +262,12 @@ impl Session {
+ 
+     /// Publishes changed MCP state, waiting for any refresh already in progress.
+     #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
+-    pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
+-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
+-            error!("MCP runtime refresh semaphore closed");
+-            return;
+-        };
++    pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) -> CodexResult<()> {
++        let _refresh = self
++            .mcp_refresh
++            .acquire()
++            .await
++            .map_err(|_| CodexErr::Fatal("MCP runtime refresh semaphore closed".to_owned()))?;
+         loop {
+             // Compare and rebuild from current environments, not choices saved for a future turn.
+             let environments = self.services.turn_environments.snapshot().await;
+@@ -229,7 +288,7 @@ impl Session {
+             }
+ 
+             if !self.mcp_refresh.claim() {
+-                return;
++                return Ok(());
+             }
+             let mut refresh_invalidation = McpRefreshInvalidationGuard {
+                 refresh: &self.mcp_refresh,
+@@ -280,7 +339,10 @@ impl Session {
+                 &ready_selected_capability_roots,
+                 Some(self.mcp_elicitation_reviewer()),
+             )
+-            .await;
++            .await
++            .map_err(|error| {
++                CodexErr::Fatal(format!("failed to prepare MCP runtime: {error:#}"))
++            })?;
+             refresh_invalidation.published = true;
+         }
+     }
+@@ -291,7 +353,7 @@ impl Session {
+     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
+         // Reconcile unchanged config so failed or closed clients can be replaced.
+         self.mark_mcp_runtime_dirty();
+-        self.refresh_mcp_if_dirty().await;
++        self.refresh_mcp_if_dirty().await?;
+         let _refresh = self
+             .mcp_refresh
+             .acquire()
+@@ -304,7 +366,7 @@ impl Session {
+     pub(crate) async fn hard_refresh_latest_codex_apps_tools(
+         self: &Arc<Self>,
+     ) -> anyhow::Result<Vec<codex_mcp::ToolInfo>> {
+-        self.refresh_mcp_if_dirty().await;
++        self.refresh_mcp_if_dirty().await?;
+         let _refresh = self
+             .mcp_refresh
+             .acquire()
+@@ -364,7 +426,7 @@ impl Session {
+             mcp_projection,
+             &ready_selected_capability_roots,
+             Some(self.mcp_elicitation_reviewer()),
+-        );
++        )?;
+         anyhow::ensure!(
+             input.mcp_servers.contains_key(CODEX_APPS_MCP_SERVER_NAME),
+             "unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
+@@ -391,7 +453,7 @@ impl Session {
+         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
+         required_servers: &[String],
+         required_plugins: &HashSet<String>,
+-    ) -> Arc<codex_mcp::McpBinding> {
++    ) -> CodexResult<Arc<codex_mcp::McpBinding>> {
+         let ready_selected_capability_roots =
+             Self::ready_selected_capability_roots(selected_capability_roots);
+         if self
+@@ -421,7 +483,7 @@ impl Session {
+         {
+             self.mark_mcp_runtime_dirty();
+         }
+-        self.refresh_mcp_if_dirty().await;
++        self.refresh_mcp_if_dirty().await?;
+         let required_servers = required_servers
+             .iter()
+             .chain(&recovered_oauth_servers)
+@@ -433,10 +495,10 @@ impl Session {
+             .current_binding_with_requirements(&required_servers, required_plugins)
+             .await
+         {
+-            return binding;
++            return Ok(binding);
+         }
+         let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
+-        Arc::new(codex_mcp::McpBinding::empty(config))
++        Ok(Arc::new(codex_mcp::McpBinding::empty(config)))
+     }
+ 
+     #[tracing::instrument(
+@@ -770,11 +832,8 @@ impl Session {
+         &self,
+         added_servers: HashMap<String, McpServerConfig>,
+         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+-    ) {
+-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
+-            error!("MCP runtime refresh semaphore closed");
+-            return;
+-        };
++    ) -> anyhow::Result<()> {
++        let _refresh = self.mcp_refresh.acquire().await?;
+         let auth = self.services.auth_manager.auth().await;
+         {
+             let mut state = self.state.lock().await;
+@@ -783,12 +842,13 @@ impl Session {
+             for (name, server) in added_servers {
+                 servers.entry(name).or_insert(server);
+             }
+-            if let Err(err) = config.mcp_servers.set(servers) {
+-                warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
+-                return;
+-            }
++            config.mcp_servers.set(servers)?;
+             state.session_configuration.original_config_do_not_use = Arc::new(config);
+         }
++        let mut refresh_invalidation = McpRefreshInvalidationGuard {
++            refresh: &self.mcp_refresh,
++            published: false,
++        };
+         let ready_selected_capability_roots = self
+             .services
+             .mcp_runtime
+@@ -834,7 +894,9 @@ impl Session {
+             &ready_selected_capability_roots,
+             elicitation_reviewer,
+         )
+-        .await;
++        .await?;
++        refresh_invalidation.published = true;
++        Ok(())
+     }
+ 
+     pub(crate) fn ready_selected_capability_roots(
+diff --git a/codex-rs/core/src/session/mcp_prewarm.rs b/codex-rs/core/src/session/mcp_prewarm.rs
+--- a/codex-rs/core/src/session/mcp_prewarm.rs
++++ b/codex-rs/core/src/session/mcp_prewarm.rs
+@@ -52,7 +52,11 @@ impl Session {
+                 tokio::select! {
+                     biased;
+                     _ = shutdown.cancelled() => break,
+-                    _ = session.refresh_mcp_if_dirty() => {},
++                    result = session.refresh_mcp_if_dirty() => {
++                        if let Err(error) = result {
++                            warn!(%error, "MCP prewarm failed");
++                        }
++                    },
+                 }
+             }
+         });
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -49,7 +49,10 @@ impl Session {
+ 
+     /// Waits on this session's refreshed server before tool execution is admitted.
+     pub(crate) async fn wait_for_mcp_server(self: &Arc<Self>, server: &str) {
+-        self.refresh_mcp_if_dirty().await;
++        if let Err(error) = self.refresh_mcp_if_dirty().await {
++            warn!(%error, "MCP startup preparation failed");
++            return;
++        }
+         self.services
+             .mcp_runtime
+             .wait_for_server_startup(server)
+@@ -60,12 +63,13 @@ impl Session {
+     pub(crate) async fn prepare_mcp_call(
+         self: &Arc<Self>,
+         advertised_tool: &ToolInfo,
+-    ) -> Option<PreparedMcpCall> {
+-        self.refresh_mcp_if_dirty().await;
+-        self.services
++    ) -> anyhow::Result<Option<PreparedMcpCall>> {
++        self.refresh_mcp_if_dirty().await?;
++        Ok(self
++            .services
+             .mcp_runtime
+             .prepare_call(advertised_tool)
+-            .await
++            .await)
+     }
+ 
+     pub(super) async fn latest_mcp_desired_state(
+@@ -128,7 +132,7 @@ impl Session {
+             "session_init.mcp_manager_init",
+             otel.name = "session_init.mcp_manager_init",
+         ))
+-        .await;
++        .await?;
+ 
+         self.services.mcp_runtime.validate_required_servers().await
+     }
+@@ -271,7 +275,7 @@ impl Session {
+         mcp_projection: McpRuntimeProjection,
+         ready_selected_capability_roots: &[SelectedCapabilityRoot],
+         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+-    ) {
++    ) -> anyhow::Result<()> {
+         let mcp_projection = self
+             .project_selected_environment_mcp_servers(
+                 &desired.config,
+@@ -285,11 +289,28 @@ impl Session {
+             mcp_projection,
+             ready_selected_capability_roots,
+             elicitation_reviewer,
+-        );
++        )?;
+         AuthStorageOriginator::from_client_name(&desired.originator)
+             .scope(self.services.mcp_runtime.replace(input))
+             .await;
+         self.services.thread_extension_data.insert(selected_plugins);
++        Ok(())
++    }
++
++    pub(super) fn prepare_local_mcp_permissions(
++        config: &Config,
++        mcp_servers: &HashMap<String, codex_mcp::EffectiveMcpServer>,
++    ) -> anyhow::Result<Option<crate::config::Permissions>> {
++        if mcp_servers
++            .values()
++            .any(|server| server.config().enabled && server.config().is_local_environment())
++        {
++            // Host services still run locally when the thread has only remote attachments.
++            // Resolve their permissions and process environment from the same host roots.
++            config.prepare_local_permissions().map(Some)
++        } else {
++            Ok(None)
++        }
+     }
+ 
+     pub(super) fn build_mcp_runtime_input(
+@@ -298,7 +319,7 @@ impl Session {
+         mcp_projection: McpRuntimeProjection,
+         ready_selected_capability_roots: &[SelectedCapabilityRoot],
+         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+-    ) -> McpRuntimeInput {
++    ) -> anyhow::Result<McpRuntimeInput> {
+         let auth = desired.auth.clone();
+         let McpRuntimeProjection {
+             mut config,
+@@ -342,6 +363,10 @@ impl Session {
+                         == SandboxType::WindowsMxc,
+             );
+         let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
++        let local_permissions = Self::prepare_local_mcp_permissions(&desired.config, &mcp_servers)?;
++        if let Some(permissions) = &local_permissions {
++            config.permission_profile = permissions.effective_permission_profile();
++        }
+         config.set_server_permission_profiles(
+             &mcp_servers,
+             desired.environments.turn_environments().map(|environment| {
+@@ -352,24 +377,12 @@ impl Session {
+             }),
+         );
+         let mcp_config = Arc::new(config);
+-        let runtime_context = McpRuntimeContext::new(
+-            self.services.turn_environments.environment_manager(),
+-            desired.local_process_cwd.clone(),
+-        )
+-        .with_selected_environments(
+-            desired.environments.all_selections().into(),
+-            desired.environments.ready_environment_handles(),
+-        )
+-        .with_local_process_environment(desired.environments.local().map_or_else(
+-            HashMap::new,
+-            |local| {
+-                local
+-                    .shell_environment_policy()
+-                    .inherited_environment
+-                    .clone()
+-            },
+-        ));
+-        McpRuntimeInput {
++        let runtime_context = self.mcp_runtime_context(
++            &desired.environments,
++            &desired.local_process_cwd,
++            local_permissions.as_ref(),
++        );
++        Ok(McpRuntimeInput {
+             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
+                 McpStartupPolicy::LazyWhenCached
+             } else {
+@@ -391,6 +404,6 @@ impl Session {
+             auth_manager: Some(Arc::clone(&self.services.auth_manager)),
+             elicitation_reviewer,
+             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
+-        }
++        })
+     }
+ }
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -3962,6 +3962,7 @@ impl Session {
+                 )),
+                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
+             );
++            let mcp = mcp?;
+             // A step keeps the plugins from the environments it captured, even if shared MCP
+             // moves on to another environment. Its skill tools and the model use this same copy.
+             // Policy follows this step's MCP binding, which may have refreshed mid-turn.
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -6567,16 +6567,18 @@ async fn mcp_runtime_keeps_local_backend_without_a_selected_local_environment()
+         .await;
+     Arc::make_mut(&mut desired.config).prefer_mxc = true;
+     desired.environments.environments.clear();
+-    let runtime = session.build_mcp_runtime_input(
+-        &desired,
+-        crate::mcp::McpRuntimeProjection {
+-            config: (*mcp_config_for_test(&desired.config)).clone(),
+-            plugins_available: false,
+-            selected_plugins: Default::default(),
+-        },
+-        &[],
+-        /*elicitation_reviewer*/ None,
+-    );
++    let runtime = session
++        .build_mcp_runtime_input(
++            &desired,
++            crate::mcp::McpRuntimeProjection {
++                config: (*mcp_config_for_test(&desired.config)).clone(),
++                plugins_available: false,
++                selected_plugins: Default::default(),
++            },
++            &[],
++            /*elicitation_reviewer*/ None,
++        )
++        .expect("build local runtime input");
+     assert_eq!(
+         runtime.config.environment_use_mxc,
+         HashMap::from([(DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(), cfg!(windows))])
+@@ -9622,7 +9624,8 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
+             /*required_servers*/ &[],
+             /*required_plugins*/ &HashSet::new(),
+         )
+-        .await;
++        .await
++        .expect("prepare current MCP binding");
+ 
+     let configured_servers = codex_mcp::configured_mcp_servers(new_step.mcp.config());
+     assert_eq!(
+@@ -9677,7 +9680,10 @@ async fn refreshed_mcp_binding_captures_current_approval_authority() {
+         })
+         .await
+         .expect("approval settings should update");
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+ 
+     let binding = session
+         .services
+@@ -9767,7 +9773,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+         .await;
+ 
+     session.mark_mcp_runtime_dirty();
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     if live_update {
+         assert_eq!(
+             session
+@@ -9792,7 +9801,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+             })
+             .await
+             .expect("reviewer settings should update");
+-        session.refresh_mcp_if_dirty().await;
++        session
++            .refresh_mcp_if_dirty()
++            .await
++            .expect("refresh MCP runtime");
+     }
+ 
+     let request = codex_mcp::ElicitationReviewRequest {
+@@ -9838,7 +9850,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+         })
+         .await
+         .expect("approval policy should update");
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert_eq!(
+         session
+             .mcp_elicitation_reviewer()
+@@ -9859,7 +9874,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+         })
+         .await
+         .expect("permission profile should update");
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert_eq!(
+         session
+             .mcp_elicitation_reviewer()
+@@ -9891,7 +9909,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+     session
+         .spawn_task(Arc::clone(&next_turn), Vec::new(), task)
+         .await;
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert_eq!(
+         session
+             .mcp_elicitation_reviewer()
+@@ -9929,7 +9950,10 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
+         .new_turn_with_default_settings("owner-restricted".to_string(), Default::default())
+         .await;
+     session.spawn_task(restricted_turn, Vec::new(), task).await;
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert_eq!(
+         session
+             .mcp_elicitation_reviewer()
+@@ -9969,7 +9993,10 @@ async fn cancelled_mcp_refresh_remains_pending() {
+         "a cancelled refresh must leave the runtime dirty"
+     );
+ 
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert!(
+         !session.mcp_refresh.is_pending(),
+         "the next refresh should publish the pending runtime"
+@@ -9983,11 +10010,119 @@ async fn mcp_elicitation_reviewer_is_reused_across_runtime_refreshes() {
+     let previous = session.mcp_elicitation_reviewer();
+ 
+     session.mark_mcp_runtime_dirty();
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+ 
+     assert!(Arc::ptr_eq(&previous, &session.mcp_elicitation_reviewer()));
+ }
+ 
++#[tokio::test]
++async fn failed_host_mcp_preparation_blocks_stale_bindings_and_remains_pending() {
++    const CHILD_ROOT: &str = "CODEX_MCP_PREPARATION_TEST_ROOT";
++    let Some(root) = std::env::var_os(CHILD_ROOT) else {
++        // Root overrides belong to this child process, not concurrent tests.
++        let root = tempfile::tempdir().unwrap();
++        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
++        child.args([
++            "--exact",
++            "session::tests::failed_host_mcp_preparation_blocks_stale_bindings_and_remains_pending",
++            "--nocapture",
++        ]);
++        for name in [
++            "PROJECT_SCRATCH_ROOT",
++            "PROJECT_RUNTIME_ROOT",
++            "PROJECT_PERSISTENT_ROOT",
++            "REPOS_ROOT",
++            "SKILLS_ROOT",
++            "SKILLS_SCRATCH_ROOT",
++        ] {
++            child.env(name, root.path().join(name));
++        }
++        let output = child.env(CHILD_ROOT, root.path()).output().unwrap();
++        assert!(
++            output.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr),
++        );
++        return;
++    };
++    let root = PathBuf::from(root);
++    let (session, turn) = make_session_and_context().await;
++    let session = Arc::new(session);
++    let turn = Arc::new(turn);
++    let old_step = session
++        .capture_step_context(Arc::clone(&turn), &CancellationToken::new())
++        .await
++        .expect("publish initial runtime");
++    let mut config = session.get_config().await.as_ref().clone();
++    let mut server: McpServerConfig = serde_json::from_value(json!({
++        "command": "must-not-start-before-host-preparation",
++    }))
++    .unwrap();
++    config
++        .mcp_servers
++        .set(HashMap::from([("host".to_owned(), server.clone())]))
++        .unwrap();
++    session
++        .state
++        .lock()
++        .await
++        .session_configuration
++        .original_config_do_not_use = Arc::new(config.clone());
++    let scratch = root.join("PROJECT_SCRATCH_ROOT");
++    std::fs::rename(&scratch, root.join("saved-scratch")).unwrap();
++    std::fs::write(&scratch, "a file cannot be a storage directory").unwrap();
++    session.mark_mcp_runtime_dirty();
++
++    let Err(error) = session
++        .capture_step_context(Arc::clone(&turn), &CancellationToken::new())
++        .await
++    else {
++        panic!("a failed host preparation must not admit the previous MCP binding");
++    };
++    assert!(
++        error.to_string().contains("PROJECT_SCRATCH_ROOT"),
++        "{error}"
++    );
++    assert!(session.mcp_refresh.is_pending());
++    assert!(Arc::ptr_eq(
++        old_step.mcp.config(),
++        &session
++            .services
++            .mcp_runtime
++            .current_config()
++            .expect("retain previous publication"),
++    ));
++    assert!(
++        session
++            .runtime_mcp_config_and_context(&config)
++            .await
++            .is_err()
++    );
++
++    // A disabled host server must not make unused host storage a prerequisite.
++    server.enabled = false;
++    config
++        .mcp_servers
++        .set(HashMap::from([("host".to_owned(), server)]))
++        .unwrap();
++    session
++        .state
++        .lock()
++        .await
++        .session_configuration
++        .original_config_do_not_use = Arc::new(config);
++    let step = session
++        .capture_step_context(turn, &CancellationToken::new())
++        .await
++        .expect("disabled server needs no host preparation");
++    assert!(!session.mcp_refresh.is_pending());
++    assert!(!codex_mcp::configured_mcp_servers(step.mcp.config())["host"].enabled);
++}
++
+ #[tokio::test]
+ async fn mcp_policy_changes_schedule_runtime_refresh() {
+     let (session, _turn_context) = make_session_and_context().await;
+@@ -10020,7 +10155,10 @@ async fn mcp_refresh_detects_shared_auth_manager_changes() {
+         session.services.plugins_manager.auth_mode(),
+         Some(codex_protocol::auth::AuthMode::ApiKey)
+     );
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+     assert!(
+         session
+             .services
+@@ -10042,7 +10180,10 @@ async fn mcp_refresh_detects_shared_auth_manager_changes() {
+             .current_auth_matches(session.services.auth_manager.auth_cached().as_ref())
+     );
+ 
+-    session.refresh_mcp_if_dirty().await;
++    session
++        .refresh_mcp_if_dirty()
++        .await
++        .expect("refresh MCP runtime");
+ 
+     assert!(
+         session
+@@ -10308,7 +10449,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
+     expected_servers.insert("newer".to_string(), added_servers["newer"].clone());
+     session
+         .refresh_mcp_servers_now(added_servers, /*elicitation_reviewer*/ None)
+-        .await;
++        .await?;
+ 
+     let next_step = session
+         .capture_step_context(Arc::clone(&step_context.turn), &CancellationToken::new())
+@@ -10327,7 +10468,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
+     assert_ne!(step_context.mcp.config().plugins, current_config.plugins);
+ 
+     session.mark_mcp_runtime_dirty();
+-    session.refresh_mcp_if_dirty().await;
++    session.refresh_mcp_if_dirty().await?;
+     let current = session
+         .services
+         .mcp_runtime
+@@ -10371,7 +10512,8 @@ async fn mcp_dependency_refresh_preserves_current_server_constraints() -> anyhow
+             )]),
+             /*elicitation_reviewer*/ None,
+         )
+-        .await;
++        .await
++        .expect_err("constraints must reject the added server");
+ 
+     assert!(Arc::ptr_eq(&session.get_config().await, &config));
+     Ok(())
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -253,6 +253,8 @@ pub(crate) async fn run_turn(
+         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
+             .or_cancel(&cancellation_token)
+             .await
++            .map_err(CodexErr::from)
++            .flatten()
+         {
+             Ok(requirements) => requirements,
+             Err(err) => {
+@@ -264,7 +266,7 @@ pub(crate) async fn run_turn(
+                     PersistContext::Standard,
+                 )
+                 .await;
+-                return Err(err.into());
++                return Err(err);
+             }
+         };
+ 
+@@ -518,7 +520,7 @@ pub(crate) async fn run_turn(
+                     &pending_user_input,
+                 )
+                 .or_cancel(&cancellation_token)
+-                .await?;
++                .await??;
+                 required_servers.extend(pending_required_servers);
+                 required_servers.sort_unstable();
+                 required_servers.dedup();
+@@ -1005,14 +1007,14 @@ async fn required_mcp_servers_for_input(
+     sess: &Arc<Session>,
+     turn_context: &TurnContext,
+     user_input: &[UserInput],
+-) -> (Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>) {
++) -> CodexResult<(Vec<String>, Vec<crate::plugins::PluginCapabilitySummary>)> {
+     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
+-        return (Vec::new(), Vec::new());
++        return Ok((Vec::new(), Vec::new()));
+     }
+ 
+     // Plugin capabilities depend on authentication, so project them only after
+     // the runtime has aligned the plugin manager with its current account.
+-    sess.refresh_mcp_if_dirty().await;
++    sess.refresh_mcp_if_dirty().await?;
+     let loaded_plugins = sess
+         .services
+         .plugins_manager
+@@ -1099,7 +1101,7 @@ async fn required_mcp_servers_for_input(
+         }
+     }
+ 
+-    (required_servers.into_iter().collect(), mentioned_plugins)
++    Ok((required_servers.into_iter().collect(), mentioned_plugins))
+ }
+ 
+ #[instrument(level = "trace", skip_all)]
+diff --git a/codex-rs/core/src/session/turn_start_mcp_tests.rs b/codex-rs/core/src/session/turn_start_mcp_tests.rs
+--- a/codex-rs/core/src/session/turn_start_mcp_tests.rs
++++ b/codex-rs/core/src/session/turn_start_mcp_tests.rs
+@@ -88,7 +88,10 @@ async fn turn_start_refreshes_dirty_mcp_reuses_clean_runtime_and_cancels_discove
+             turn + 1
+         );
+         if turn > 0 {
+-            session.refresh_mcp_if_dirty().await;
++            session
++                .refresh_mcp_if_dirty()
++                .await
++                .expect("refresh MCP runtime");
+             assert!(
+                 recorder.client.cache_key()
+                     == recorder
+diff --git a/codex-rs/core/src/tasks/lifecycle.rs b/codex-rs/core/src/tasks/lifecycle.rs
+--- a/codex-rs/core/src/tasks/lifecycle.rs
++++ b/codex-rs/core/src/tasks/lifecycle.rs
+@@ -26,11 +26,6 @@ impl Session {
+             if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
+                 continue;
+             }
+-            if phase == TurnStartPhase::RegularTaskStart
+-                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
+-            {
+-                self.refresh_mcp_if_dirty().await;
+-            }
+             contributor
+                 .on_turn_start(codex_extension_api::TurnStartInput {
+                     turn_id: turn_context.sub_id.as_str(),
+diff --git a/codex-rs/core/src/tasks/regular.rs b/codex-rs/core/src/tasks/regular.rs
+--- a/codex-rs/core/src/tasks/regular.rs
++++ b/codex-rs/core/src/tasks/regular.rs
+@@ -2,6 +2,7 @@ use std::sync::Arc;
+ 
+ use codex_async_utils::OrCancelExt;
+ use codex_extension_api::TurnStartPhase;
++use codex_protocol::error::CodexErr;
+ use tokio_util::sync::CancellationToken;
+ 
+ use crate::session::TurnInput;
+@@ -60,6 +61,16 @@ impl SessionTask for RegularTask {
+                         == TurnStartPhase::RegularTaskStart
+                         && contributor.requires_mcp_runtime(&sess.services.thread_extension_data)
+                 });
++            if prepares_mcp {
++                match sess
++                    .refresh_mcp_if_dirty()
++                    .or_cancel(&cancellation_token)
++                    .await
++                {
++                    Ok(result) => result?,
++                    Err(_) => return Ok::<_, CodexErr>(SessionStartupPrewarmResolution::Cancelled),
++                }
++            }
+             let preparation = sess
+                 .emit_turn_start_lifecycle(
+                     &ctx,
+@@ -73,16 +84,17 @@ impl SessionTask for RegularTask {
+                 sess.request_mcp_runtime_reprojection();
+             }
+             if preparation.is_err() {
+-                return SessionStartupPrewarmResolution::Cancelled;
++                return Ok(SessionStartupPrewarmResolution::Cancelled);
+             }
+             sess.set_server_reasoning_included(/*included*/ false).await;
+-            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
+-                .await
++            Ok(sess
++                .consume_startup_prewarm_for_regular_turn(&cancellation_token)
++                .await)
+         }
+         .instrument(trace_span!("regular_task.prepare_run_turn"))
+         .await;
+         let prewarmed_client_session = match prewarmed_client_session {
+-            SessionStartupPrewarmResolution::Cancelled => {
++            Ok(SessionStartupPrewarmResolution::Cancelled) | Err(_) => {
+                 run_hooks_and_record_inputs(
+                     &sess,
+                     &ctx,
+@@ -91,10 +103,10 @@ impl SessionTask for RegularTask {
+                     PersistContext::Standard,
+                 )
+                 .await;
+-                return Ok(None);
++                return prewarmed_client_session.map(|_| None);
+             }
+-            SessionStartupPrewarmResolution::Unavailable { .. } => None,
+-            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
++            Ok(SessionStartupPrewarmResolution::Unavailable { .. }) => None,
++            Ok(SessionStartupPrewarmResolution::Ready(prewarmed_client_session)) => {
+                 Some(*prewarmed_client_session)
+             }
+         };
+diff --git a/codex-rs/core/src/tools/handlers/mcp.rs b/codex-rs/core/src/tools/handlers/mcp.rs
+--- a/codex-rs/core/src/tools/handlers/mcp.rs
++++ b/codex-rs/core/src/tools/handlers/mcp.rs
+@@ -188,7 +188,15 @@ impl McpHandler {
+         &self,
+         invocation: ToolInvocation,
+     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+-        let prepared_mcp_call = invocation.session.prepare_mcp_call(&self.tool_info).await;
++        let prepared_mcp_call = invocation
++            .session
++            .prepare_mcp_call(&self.tool_info)
++            .await
++            .map_err(|error| {
++                FunctionCallError::RespondToModel(format!(
++                    "failed to prepare MCP tool call: {error:#}"
++                ))
++            })?;
+         // Use the executed call's binding; a later catalog refresh must not change eligibility.
+         let result_metadata_capture_allowed = invocation
+             .session
+diff --git a/codex-rs/core/tests/suite/daybreak_access.rs b/codex-rs/core/tests/suite/daybreak_access.rs
+--- a/codex-rs/core/tests/suite/daybreak_access.rs
++++ b/codex-rs/core/tests/suite/daybreak_access.rs
+@@ -172,7 +172,7 @@ async fn daybreak_metadata_follows_the_actual_plugin_call(case: AccessCase) -> R
+                 .expect("remote executor")
+                 .is_remote()
+         );
+-        let (config, _) = test.codex.current_mcp_config_and_runtime_context().await;
++        let (config, _) = test.codex.current_mcp_config_and_runtime_context().await?;
+         assert_eq!(
+             config.mcp_server_catalog.configured_servers()["sample"].environment_id,
+             "remote"
+diff --git a/codex-rs/core/tests/suite/executor_discovery_v2.rs b/codex-rs/core/tests/suite/executor_discovery_v2.rs
+--- a/codex-rs/core/tests/suite/executor_discovery_v2.rs
++++ b/codex-rs/core/tests/suite/executor_discovery_v2.rs
+@@ -313,9 +313,9 @@ async fn check_acquisition(enabled: bool, supported: bool) -> Result<()> {
+     let acquires_v2 = enabled && supported;
+     if acquires_v2 {
+         observed.lock().await.clear();
+-        let _ = test.codex.current_mcp_config_and_runtime_context().await;
++        let _ = test.codex.current_mcp_config_and_runtime_context().await?;
+         let initial_calls = calls().await;
+-        let _ = test.codex.current_mcp_config_and_runtime_context().await;
++        let _ = test.codex.current_mcp_config_and_runtime_context().await?;
+         assert!(initial_calls > 0);
+         assert_eq!(
+             calls().await,
+diff --git a/codex-rs/core/tests/suite/mcp_ema_config.rs b/codex-rs/core/tests/suite/mcp_ema_config.rs
+--- a/codex-rs/core/tests/suite/mcp_ema_config.rs
++++ b/codex-rs/core/tests/suite/mcp_ema_config.rs
+@@ -44,7 +44,10 @@ async fn refresh_ema_denial_clears_authority_for_configured_servers() -> Result<
+         ))
+         .build_with_auto_env(&responses_server)
+         .await?;
+-    let (before, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (before, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let current_config = fixture.codex.config().await;
+     let refreshed = ConfigBuilder::default()
+         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+@@ -64,7 +67,10 @@ async fn refresh_ema_denial_clears_authority_for_configured_servers() -> Result<
+             .await,
+         ConfigRefreshOutcome::Published
+     );
+-    let (after, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (after, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let old_servers = codex_mcp::configured_mcp_servers(&before);
+     let new_servers = codex_mcp::configured_mcp_servers(&after);
+     let old = old_servers["enterprise"]
+@@ -120,7 +126,10 @@ async fn enterprise_activation_respects_configuration(scenario: ActivationScenar
+         ))
+         .build_with_auto_env(&responses_server)
+         .await?;
+-    let (runtime_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (runtime_config, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let expected_enabled = match scenario {
+         ActivationScenario::FeatureDisabled | ActivationScenario::MissingIdp => Some(false),
+         ActivationScenario::OperatorEnabled => Some(true),
+diff --git a/codex-rs/core/tests/suite/mcp_executor_context_tests.rs b/codex-rs/core/tests/suite/mcp_executor_context_tests.rs
+--- a/codex-rs/core/tests/suite/mcp_executor_context_tests.rs
++++ b/codex-rs/core/tests/suite/mcp_executor_context_tests.rs
+@@ -122,7 +122,10 @@ async fn thread_projection_preserves_executor_order_and_unavailable_selections()
+                     ..StartThreadOptions::new(test.config.clone())
+                 })
+                 .await?;
+-            thread.thread.current_mcp_config_and_runtime_context().await;
++            thread
++                .thread
++                .current_mcp_config_and_runtime_context()
++                .await?;
+             assert_eq!(thread.thread.environment_selections().await, selections);
+             {
+                 let observed = recorder
+diff --git a/codex-rs/core/tests/suite/mcp_tool_cache.rs b/codex-rs/core/tests/suite/mcp_tool_cache.rs
+--- a/codex-rs/core/tests/suite/mcp_tool_cache.rs
++++ b/codex-rs/core/tests/suite/mcp_tool_cache.rs
+@@ -771,7 +771,9 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
+         1,
+         "both model steps must share one binding while the cached server stays dormant"
+     );
+-    let (mcp_config, _) = second_thread.current_mcp_config_and_runtime_context().await;
++    let (mcp_config, _) = second_thread
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     assert_eq!(
+         second_thread
+             .mcp_connection_statuses(&mcp_config)
+diff --git a/codex-rs/core/tests/suite/remote_env.rs b/codex-rs/core/tests/suite/remote_env.rs
+--- a/codex-rs/core/tests/suite/remote_env.rs
++++ b/codex-rs/core/tests/suite/remote_env.rs
+@@ -666,7 +666,7 @@ async fn environment_permissions_follow_configuration_ownership() -> Result<()>
+     test.codex
+         .restore_thread_settings(test.codex.restorable_thread_settings().await)
+         .await?;
+-    let (mcp_config, _) = test.codex.current_mcp_config_and_runtime_context().await;
++    let (mcp_config, _) = test.codex.current_mcp_config_and_runtime_context().await?;
+     assert_eq!(
+         mcp_config.permission_profile,
+         PermissionProfile::workspace_write()
+diff --git a/codex-rs/core/tests/suite/rmcp_client.rs b/codex-rs/core/tests/suite/rmcp_client.rs
+--- a/codex-rs/core/tests/suite/rmcp_client.rs
++++ b/codex-rs/core/tests/suite/rmcp_client.rs
+@@ -832,7 +832,10 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
+     fixture
+         .submit_text_turn("start with pending environment configuration")
+         .await?;
+-    let (pending_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (pending_config, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let pending_servers = pending_config.mcp_server_catalog.configured_servers();
+     assert!(!pending_servers["allowed"].enabled);
+     assert!(!pending_servers["unselected"].enabled);
+@@ -884,7 +887,10 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
+         )
+         .await?;
+ 
+-    let (runtime_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (runtime_config, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let runtime_servers = runtime_config.mcp_server_catalog.configured_servers();
+     assert!(!runtime_servers["blocked"].enabled);
+     assert!(!runtime_servers["unselected"].enabled);
+@@ -918,7 +924,10 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
+         .codex
+         .environment_failed(&selection, "environment policy unavailable".to_string())
+         .await?;
+-    let (failed_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
++    let (failed_config, _) = fixture
++        .codex
++        .current_mcp_config_and_runtime_context()
++        .await?;
+     let failed_servers = failed_config.mcp_server_catalog.configured_servers();
+     assert!(!failed_servers["allowed"].enabled);
+     Ok(())
+@@ -2288,6 +2297,12 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
+ 
+     assert_cwd_tool_output(&structured, &expected_cwd);
+ 
++    let mut host_config = fixture.config.clone();
++    host_config
++        .permissions
++        .set_permission_profile(PermissionProfile::workspace_write())?;
++    let host_permissions = host_config.prepare_local_permissions()?;
++
+     // The relative MCP executable exists only in the host workspace. A remote
+     // primary must not change its command resolution at startup or refresh.
+     let executor = ExecServerProcess::start().await?;
+@@ -2355,14 +2370,9 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
+         let refreshed = call_cwd_tool(&server, &fixture, server_name, "after-refresh").await?;
+         assert_cwd_tool_output(&refreshed, &expected_cwd);
+ 
+-        // Host MCP policy follows explicit local roots, including an empty list,
+-        // and falls back to the saved host roots only when local is absent.
++        // Host MCP retains the local cwd and storage policy even when remote
++        // workspace selections or the thread's workspace metadata change.
+         for (phase, updated_roots) in [("initial", None), ("revoked", Some(Vec::new()))] {
+-            let expected_roots = local_roots
+-                .as_ref()
+-                .or(updated_roots.as_ref())
+-                .unwrap_or(&fixture.config.workspace_roots)
+-                .clone();
+             let call_id = format!("host-sandbox-{phase}");
+             mount_sse_once(
+                 &server,
+@@ -2411,8 +2421,7 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
+             assert_eq!(
+                 metadata.get(MCP_SANDBOX_STATE_CAPABILITY),
+                 Some(&serde_json::to_value(SandboxState {
+-                    permission_profile: PermissionProfile::workspace_write()
+-                        .materialize_project_roots_with_workspace_roots(&expected_roots),
++                    permission_profile: host_permissions.permission_profile().clone(),
+                     codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
+                     sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
+                     use_legacy_landlock: false,

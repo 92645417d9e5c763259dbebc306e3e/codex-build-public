@@ -1,0 +1,1081 @@
+persist-response-history-with-ordered-writes
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: persist-response-history-with-ordered-writes
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3067,6 +3067,7 @@ dependencies = [
+  "sha1 0.10.6",
+  "shlex",
+  "similar",
++ "sqlx",
+  "tempfile",
+  "test-case",
+  "test-log",
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -111,6 +111,7 @@ serde_json = { workspace = true }
+ sha1 = { workspace = true }
+ shlex = { workspace = true }
+ similar = { workspace = true }
++sqlx = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+ tokio = { workspace = true, features = [
+diff --git a/codex-rs/core/src/response_history.rs b/codex-rs/core/src/response_history.rs
+--- a/codex-rs/core/src/response_history.rs
++++ b/codex-rs/core/src/response_history.rs
+@@ -1,31 +1,39 @@
+ //! Retained response observations, independent of transport and live trackers.
+ 
++mod backup;
++
++use backup::Backup;
+ use codex_app_server_protocol::ResponseAttemptsReadResponse;
+ use codex_protocol::ThreadId;
+ use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_protocol::response_metrics::ResponseAttemptStatus;
+ use codex_protocol::response_metrics::ResponsePerformance;
++use codex_state::DIAGNOSTIC_RETENTION_SECONDS;
++use codex_state::ResponseHistoryPage;
++use codex_state::ResponseHistoryStore;
+ use std::collections::BTreeMap;
+-use std::collections::BTreeSet;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use std::sync::OnceLock;
+ use tokio::time::Instant;
+ use uuid::Uuid;
+ 
+ const RECENT_RESPONSE_LIMIT: usize = 250;
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ pub struct ResponseHistory {
++    store: Option<ResponseHistoryStore>,
+     state: Mutex<HistoryState>,
++    backup: OnceLock<Backup>,
+ }
+ 
+ #[derive(Debug, Default)]
+ struct HistoryState {
+     recent: BTreeMap<Uuid, RetainedAttempt>,
+     has_older: bool,
+-    models: BTreeSet<String>,
+-    last_generations: HashMap<Option<ThreadId>, ResponsePerformance>,
++    models: BTreeMap<String, i64>,
++    last_generations: HashMap<Option<ThreadId>, (i64, ResponsePerformance)>,
+ }
+ 
+ #[derive(Debug)]
+@@ -45,12 +53,21 @@ impl RetainedAttempt {
+ }
+ 
+ impl ResponseHistory {
++    pub fn new(store: Option<ResponseHistoryStore>) -> Self {
++        Self {
++            store,
++            state: Mutex::new(HistoryState::default()),
++            backup: OnceLock::new(),
++        }
++    }
++
+     /// Consume a published snapshot without retaining or controlling its tracker.
+     pub fn record(self: &Arc<Self>, record: ResponseAttempt) {
++        let backup = self.backup();
+         let mut history = self.state.lock().expect("response history lock");
+-        history.models.insert(record.requested_model.clone());
++        history.record_model(record.requested_model.clone(), record.started_at);
+         if record.end_reason.is_some() && record.request_kind == "generation" {
+-            history.record_generation(ResponsePerformance::from(&record));
++            history.record_generation(record.started_at, ResponsePerformance::from(&record));
+         }
+         let observed_at = (record.end_reason.is_none()
+             && record.terminal_observed_offset_ms.is_none())
+@@ -58,11 +75,14 @@ impl ResponseHistory {
+         history.recent.insert(
+             record.attempt_id,
+             RetainedAttempt {
+-                record,
++                record: record.clone(),
+                 observed_at,
+             },
+         );
+-        history.trim();
++        history.trim(chrono::Utc::now().timestamp());
++        // The cache and writer consume the same revision before the composition
++        // root sends live notifications. Disk work never runs under this lock.
++        backup.write(record);
+     }
+ 
+     pub async fn page(
+@@ -73,7 +93,56 @@ impl ResponseHistory {
+         before: Option<Uuid>,
+         limit: usize,
+     ) -> ResponseAttemptsReadResponse {
+-        let history = self.state.lock().expect("response history lock");
++        let backup = self.backup();
++        let (mut page, needs_restore) = self.recent_page(thread_id, model, status, before, limit);
++        // Populated recent pages do not wait for storage. Only disk-only startup
++        // and explicit older-page requests need the initialized database.
++        if needs_restore {
++            match backup.ready().await {
++                Ok(store) => {
++                    let (restored, needs_disk) =
++                        self.recent_page(thread_id, model, status, before, limit);
++                    page = restored;
++                    if needs_disk && before.is_some() {
++                        let stored_page = async {
++                            self.flush().await?;
++                            store
++                                .page(thread_id, model, status, before, limit)
++                                .await
++                                .map_err(|error| format!("{error:#}"))
++                        }
++                        .await;
++                        match stored_page {
++                            Ok(stored) => {
++                                page.data = stored.data;
++                                page.next_cursor =
++                                    stored.next_cursor.map(|cursor| cursor.to_string());
++                            }
++                            Err(error) => page.persistence_error = Some(error),
++                        }
++                    }
++                }
++                Err(error) => page.persistence_error = Some(error),
++            }
++        }
++        page.persistence_error = page.persistence_error.or_else(|| backup.error());
++        page
++    }
++
++    fn recent_page(
++        &self,
++        thread_id: Option<ThreadId>,
++        model: Option<&str>,
++        status: Option<ResponseAttemptStatus>,
++        before: Option<Uuid>,
++        limit: usize,
++    ) -> (ResponseAttemptsReadResponse, bool) {
++        let mut history = self.state.lock().expect("response history lock");
++        history.trim(chrono::Utc::now().timestamp());
++        let oldest = history.recent.first_key_value().map(|(id, _)| *id);
++        let needs_disk = status != Some(ResponseAttemptStatus::Working)
++            && (oldest.is_none()
++                || before.is_some_and(|cursor| oldest.is_some_and(|oldest| cursor <= oldest)));
+         let mut data: Vec<_> = history
+             .recent
+             .values()
+@@ -92,13 +161,25 @@ impl ResponseHistory {
+         let next_cursor = if data.len() > limit {
+             data.truncate(limit);
+             data.last().map(|row| row.attempt_id.to_string())
+-        } else {
++        } else if status == Some(ResponseAttemptStatus::Working) {
++            // Stored records cannot establish live ownership.
+             None
++        } else {
++            oldest
++                .filter(|_| {
++                    history.has_older
++                        || !self
++                            .backup
++                            .get()
++                            .expect("started response history")
++                            .is_ready()
++                })
++                .map(|cursor| cursor.to_string())
+         };
+-        ResponseAttemptsReadResponse {
++        let page = ResponseAttemptsReadResponse {
+             data,
+             next_cursor,
+-            models: history.models.iter().cloned().collect(),
++            models: history.models.keys().cloned().collect(),
+             active_attempt_ids: history
+                 .recent
+                 .values()
+@@ -108,18 +189,60 @@ impl ResponseHistory {
+             last_generation: history
+                 .last_generations
+                 .values()
++                .map(|(_, last)| last)
+                 .filter(|last| thread_id.is_none_or(|id| Some(id) == last.thread_id))
+                 .max_by_key(|last| last.attempt_id)
+                 .cloned(),
+             persistence_error: None,
++        };
++        (page, needs_disk)
++    }
++
++    fn backup(self: &Arc<Self>) -> &Backup {
++        self.backup
++            .get_or_init(|| Backup::start(self.store.clone(), Arc::downgrade(self)))
++    }
++
++    /// Drain the ordered writer without requesting another producer observation.
++    pub async fn flush(&self) -> Result<(), String> {
++        if let Some(backup) = self.backup.get() {
++            backup.flush().await?;
+         }
++        Ok(())
++    }
++
++    fn restore(
++        &self,
++        page: ResponseHistoryPage,
++        models: Vec<(String, i64)>,
++        last_generations: Vec<(i64, ResponsePerformance)>,
++    ) {
++        let mut history = self.state.lock().expect("response history lock");
++        history.has_older |= page.next_cursor.is_some();
++        for (model, started_at) in models {
++            history.record_model(model, started_at);
++        }
++        for (started_at, last) in last_generations {
++            history.record_generation(started_at, last);
++        }
++        for record in page.data {
++            // A live publication wins over the startup database snapshot.
++            history
++                .recent
++                .entry(record.attempt_id)
++                .or_insert(RetainedAttempt {
++                    record,
++                    observed_at: None,
++                });
++        }
++        history.trim(chrono::Utc::now().timestamp());
+     }
+ 
+     /// Resynchronize live subscribers without reviving unfinished stored records.
+     pub fn notification_snapshot(&self) -> Vec<ResponseAttempt> {
+-        self.state
+-            .lock()
+-            .expect("response history lock")
++        let mut history = self.state.lock().expect("response history lock");
++        history.trim(chrono::Utc::now().timestamp());
++        history
+             .recent
+             .values()
+             .rev()
+@@ -130,17 +253,29 @@ impl ResponseHistory {
+ }
+ 
+ impl HistoryState {
+-    fn record_generation(&mut self, performance: ResponsePerformance) {
++    fn record_model(&mut self, model: String, started_at: i64) {
++        self.models
++            .entry(model)
++            .and_modify(|latest| *latest = (*latest).max(started_at))
++            .or_insert(started_at);
++    }
++
++    fn record_generation(&mut self, started_at: i64, performance: ResponsePerformance) {
+         let current = self
+             .last_generations
+             .entry(performance.thread_id)
+-            .or_insert_with(|| performance.clone());
+-        if current.attempt_id < performance.attempt_id {
+-            *current = performance;
++            .or_insert_with(|| (started_at, performance.clone()));
++        if current.1.attempt_id < performance.attempt_id {
++            *current = (started_at, performance);
+         }
+     }
+ 
+-    fn trim(&mut self) {
++    fn trim(&mut self, now: i64) {
++        let cutoff = now - DIAGNOSTIC_RETENTION_SECONDS;
++        self.recent.retain(|_, row| row.record.started_at >= cutoff);
++        self.models.retain(|_, started_at| *started_at >= cutoff);
++        self.last_generations
++            .retain(|_, (started_at, _)| *started_at >= cutoff);
+         while self.recent.len() > RECENT_RESPONSE_LIMIT {
+             self.recent.pop_first();
+             self.has_older = true;
+@@ -150,3 +285,6 @@ impl HistoryState {
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++mod backup_tests;
+diff --git a/codex-rs/core/src/response_history/backup.rs b/codex-rs/core/src/response_history/backup.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history/backup.rs
+@@ -0,0 +1,376 @@
++//! One ordered writer keeps disk work outside response generation.
++
++use super::RECENT_RESPONSE_LIMIT;
++use super::ResponseHistory;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_state::ResponseHistoryStore;
++use std::sync::Weak;
++use std::time::Duration;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++use tokio::sync::watch;
++
++// Each attempt already includes the native SQLite busy timeout. Keep retries
++// finite so flush and shutdown can report a persistent lock instead of hanging.
++const WRITE_RETRY_DELAYS: [Duration; 3] = [
++    Duration::from_millis(250),
++    Duration::from_millis(500),
++    Duration::from_secs(1),
++];
++
++#[derive(Debug)]
++pub(super) struct Backup {
++    sender: mpsc::UnboundedSender<Command>,
++    status: watch::Receiver<Option<Result<ResponseHistoryStore, String>>>,
++}
++
++enum Command {
++    Write(ResponseAttempt),
++    Flush(oneshot::Sender<Result<(), String>>),
++}
++
++impl Backup {
++    pub(super) fn start(
++        store: Option<ResponseHistoryStore>,
++        history: Weak<ResponseHistory>,
++    ) -> Self {
++        let (sender, mut receiver) = mpsc::unbounded_channel();
++        let (status_tx, status) = watch::channel(None);
++        tokio::spawn(async move {
++            let store = async {
++                let store =
++                    store.ok_or_else(|| anyhow::anyhow!("native response storage unavailable"))?;
++                let page = store
++                    .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
++                    .await?;
++                let models = store.models().await?;
++                let last_generations = store.last_generations().await?;
++                if let Some(history) = history.upgrade() {
++                    history.restore(page, models, last_generations);
++                }
++                anyhow::Ok(store)
++            }
++            .await;
++            let mut failure = store.as_ref().err().map(|error| format!("{error:#}"));
++            if let Some(error) = &failure {
++                tracing::warn!(%error, "response history unavailable");
++            }
++            status_tx.send_replace(Some(match &store {
++                Ok(store) => Ok(store.clone()),
++                Err(error) => Err(format!("{error:#}")),
++            }));
++            while let Some(command) = receiver.recv().await {
++                match command {
++                    Command::Write(record) => {
++                        if let Ok(store) = &store {
++                            let mut delays = WRITE_RETRY_DELAYS.into_iter();
++                            loop {
++                                let Err(error) = store.write(&record).await else {
++                                    if status_tx.borrow().as_ref().is_some_and(Result::is_err) {
++                                        // Clear only a recovered write's transient error. A
++                                        // different record cannot repair a terminal failure.
++                                        status_tx.send_replace(Some(
++                                            failure.clone().map_or_else(|| Ok(store.clone()), Err),
++                                        ));
++                                    }
++                                    break;
++                                };
++                                let delay = is_sqlite_busy(&error).then(|| delays.next()).flatten();
++                                let error = format!("{error:#}");
++                                status_tx.send_replace(Some(Err(error.clone())));
++                                if let Some(delay) = delay {
++                                    // Retain this exact revision ahead of all later writes
++                                    // and barriers; response publication remains independent.
++                                    tokio::time::sleep(delay).await;
++                                } else {
++                                    tracing::warn!(
++                                        %error,
++                                        attempt_id = %record.attempt_id,
++                                        revision = record.revision,
++                                        "could not persist response history"
++                                    );
++                                    failure = Some(error);
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    Command::Flush(reply) => {
++                        let _ = reply.send(failure.clone().map_or(Ok(()), Err));
++                    }
++                }
++            }
++        });
++        Self { sender, status }
++    }
++
++    pub(super) fn write(&self, record: ResponseAttempt) {
++        // Dropping the last sender lets the worker drain accepted writes.
++        if self.sender.send(Command::Write(record)).is_err() {
++            tracing::warn!("response history writer stopped");
++        }
++    }
++
++    pub(super) fn error(&self) -> Option<String> {
++        if self.sender.is_closed() {
++            return Some("response history writer stopped".into());
++        }
++        self.status
++            .borrow()
++            .as_ref()
++            .and_then(|status| status.as_ref().err())
++            .cloned()
++    }
++
++    pub(super) fn is_ready(&self) -> bool {
++        self.status.borrow().is_some()
++    }
++
++    pub(super) async fn ready(&self) -> Result<ResponseHistoryStore, String> {
++        let mut status = self.status.clone();
++        status
++            .wait_for(Option::is_some)
++            .await
++            .map_err(|_| "response history writer stopped".to_owned())?
++            .as_ref()
++            .expect("initialized response history")
++            .clone()
++    }
++
++    pub(super) async fn flush(&self) -> Result<(), String> {
++        let (reply, done) = oneshot::channel();
++        self.sender
++            .send(Command::Flush(reply))
++            .map_err(|_| "response history writer stopped".to_owned())?;
++        done.await
++            .map_err(|_| "response history writer stopped".to_owned())?
++    }
++}
++
++fn is_sqlite_busy(error: &anyhow::Error) -> bool {
++    error
++        .downcast_ref::<sqlx::Error>()
++        .and_then(sqlx::Error::as_database_error)
++        .and_then(|error| error.code())
++        .and_then(|code| code.parse::<i32>().ok())
++        // SQLite's low byte is the primary result code, including BUSY extensions.
++        .is_some_and(|code| code & 0xff == 5)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::ResponseMetrics;
++    use crate::response_history::tests::context;
++    use crate::response_history::tests::recording;
++    use codex_api::ResponseObservation;
++    use codex_api::ResponseObserver;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++    use codex_protocol::response_metrics::ResponseAttemptStatus;
++    use codex_state::SqliteConfig;
++    use codex_utils_absolute_path::test_support::PathExt;
++    use pretty_assertions::assert_eq;
++    use serde_json::json;
++    use sqlx::SqlitePool;
++    use std::sync::Arc;
++    use std::time::Duration;
++    use tokio::time::Instant;
++
++    async fn logs_pool(home: &std::path::Path) -> SqlitePool {
++        let sqlite = SqliteConfig::new_for_testing(home.abs());
++        sqlite
++            .open_read_write_pool(&sqlite.logs_db_path())
++            .await
++            .unwrap()
++    }
++
++    #[tokio::test]
++    async fn lock_recovery_clears_error_and_preserves_ordered_disk_pages() {
++        let home = tempfile::tempdir().unwrap();
++        let (metrics, history, runtime) = recording(home.path()).await;
++        let backup = history.backup();
++        backup.ready().await.unwrap();
++        let writer_pool = logs_pool(home.path()).await;
++        let writer = writer_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
++        let mut status = backup.status.clone();
++        let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++        attempt.sent(Instant::now());
++        attempt.received(
++            ResponseObservation {
++                usage: Some(json!({"output_tokens": 77})),
++                ..Default::default()
++            },
++            Instant::now(),
++        );
++        attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++        let expected = history.notification_snapshot()[0].clone();
++        for _ in 0..RECENT_RESPONSE_LIMIT {
++            let later = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++            later.ended(ResponseAttemptEnd::Completed, Instant::now());
++        }
++        // Wait for the real SQLite busy timeout, rather than guessing when the
++        // first write has failed or changing the production connection policy.
++        tokio::time::timeout(
++            Duration::from_secs(10),
++            status.wait_for(|status| status.as_ref().is_some_and(Result::is_err)),
++        )
++        .await
++        .unwrap()
++        .unwrap();
++        let pending = history
++            .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
++            .await;
++        assert!(pending.persistence_error.is_some());
++        assert_eq!(pending.data.len(), RECENT_RESPONSE_LIMIT);
++        writer.rollback().await.unwrap();
++        history.flush().await.unwrap();
++        assert_eq!(backup.error(), None);
++        let recent = history
++            .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
++            .await;
++        assert_eq!(recent.persistence_error, None);
++        let before = recent.next_cursor.unwrap().parse().unwrap();
++        let older = history.page(None, None, None, Some(before), 10).await;
++        assert_eq!(older.persistence_error, None);
++        assert_eq!(older.data, vec![expected]);
++        assert_eq!(older.data[0].tokens.output, Some(77));
++        assert_eq!(older.next_cursor, None);
++        writer_pool.close().await;
++        runtime.close().await;
++    }
++
++    #[tokio::test]
++    async fn exhausted_lock_retries_remain_visible_after_an_unrelated_write() {
++        let home = tempfile::tempdir().unwrap();
++        let (metrics, history, runtime) = recording(home.path()).await;
++        let backup = history.backup();
++        backup.ready().await.unwrap();
++        let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++        attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++        history.flush().await.unwrap();
++        let mut unsaved = history.notification_snapshot()[0].clone();
++        unsaved.attempt_id = uuid::Uuid::now_v7();
++        let writer_pool = logs_pool(home.path()).await;
++        let writer = writer_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
++        backup.write(unsaved.clone());
++        let error = tokio::time::timeout(Duration::from_secs(30), history.flush())
++            .await
++            .unwrap()
++            .unwrap_err();
++        assert!(error.contains("database is locked"));
++        assert_eq!(backup.error(), Some(error.clone()));
++        writer.rollback().await.unwrap();
++        let mut later = unsaved.clone();
++        later.attempt_id = uuid::Uuid::now_v7();
++        backup.write(later.clone());
++        assert_eq!(history.flush().await, Err(error.clone()));
++        assert_eq!(backup.error(), Some(error));
++        let saved = runtime
++            .response_history()
++            .page(None, None, None, None, 10)
++            .await
++            .unwrap();
++        assert!(saved.data.contains(&later));
++        assert!(
++            saved
++                .data
++                .iter()
++                .all(|record| record.attempt_id != unsaved.attempt_id)
++        );
++        writer_pool.close().await;
++        runtime.close().await;
++    }
++
++    #[tokio::test]
++    async fn non_lock_write_failure_is_reported_without_retry_delay() {
++        let home = tempfile::tempdir().unwrap();
++        let (metrics, history, runtime) = recording(home.path()).await;
++        let backup = history.backup();
++        backup.ready().await.unwrap();
++        let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++        attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++        history.flush().await.unwrap();
++        let mut invalid = history.notification_snapshot()[0].clone();
++        invalid.elapsed_ms = u64::MAX;
++        backup.write(invalid);
++        let error = tokio::time::timeout(Duration::from_secs(1), history.flush())
++            .await
++            .unwrap()
++            .unwrap_err();
++        assert_eq!(backup.error(), Some(error));
++        runtime.close().await;
++    }
++
++    #[tokio::test]
++    async fn recent_pages_and_publications_do_not_wait_for_storage() {
++        let history = Arc::new(ResponseHistory::new(None));
++        let (sender, mut pending) = mpsc::unbounded_channel();
++        let (_status_tx, status) = watch::channel(None);
++        history.backup.set(Backup { sender, status }).unwrap();
++        let empty = tokio::time::timeout(
++            Duration::from_secs(1),
++            history.page(None, None, Some(ResponseAttemptStatus::Working), None, 100),
++        )
++        .await
++        .unwrap();
++        assert!(empty.data.is_empty());
++        assert_eq!(empty.next_cursor, None);
++        let (updates, mut first) = tokio::sync::broadcast::channel(1024);
++        let mut second = updates.subscribe();
++        let retained = Arc::clone(&history);
++        let metrics = Arc::new(ResponseMetrics::new(move |record| {
++            retained.record(record.clone());
++            updates.send(record).unwrap();
++        }));
++        let now = Instant::now();
++        let attempt = metrics.start(context(), now, chrono::Utc::now().timestamp());
++        let working = tokio::time::timeout(
++            Duration::from_secs(1),
++            history.page(None, None, Some(ResponseAttemptStatus::Working), None, 100),
++        )
++        .await
++        .unwrap();
++        assert_eq!(working.data.len(), 1);
++        assert_eq!(working.next_cursor, None);
++        attempt.prepared(512);
++        attempt.sent(now);
++        attempt.received(
++            ResponseObservation {
++                payload_bytes: 300,
++                response_id: Some("resp-official".into()),
++                ..Default::default()
++            },
++            now + Duration::from_millis(200),
++        );
++        attempt.ended(ResponseAttemptEnd::Completed, now + Duration::from_secs(1));
++        let page = tokio::time::timeout(
++            Duration::from_secs(1),
++            history.page(None, None, None, None, 100),
++        )
++        .await
++        .unwrap();
++        assert_eq!(page.data, history.notification_snapshot());
++        assert_eq!(page.data[0].received_payload_bytes, 300);
++        assert!(page.next_cursor.is_some());
++        let mut saved = Vec::new();
++        while let Ok(Command::Write(record)) = pending.try_recv() {
++            saved.push(record);
++        }
++        let saved_record = saved.last().unwrap();
++        assert_eq!(saved_record, &page.data[0]);
++        assert_eq!(saved_record.sent_payload_bytes, Some(512));
++        assert_eq!(saved_record.response_id.as_deref(), Some("resp-official"));
++        assert_eq!(saved_record.elapsed_ms, 1000);
++        let mut published = Vec::new();
++        while let Ok(update) = first.try_recv() {
++            assert_eq!(second.try_recv().unwrap(), update);
++            published.push(update);
++        }
++        assert_eq!(published, saved);
++        assert!(
++            published
++                .windows(2)
++                .all(|rows| rows[0].revision < rows[1].revision)
++        );
++    }
++}
+diff --git a/codex-rs/core/src/response_history/backup_tests.rs b/codex-rs/core/src/response_history/backup_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history/backup_tests.rs
+@@ -0,0 +1,191 @@
++use super::tests::context;
++use super::tests::recording;
++use super::*;
++use codex_api::ResponseObservation;
++use codex_api::ResponseObserver;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_state::SqliteConfig;
++use codex_utils_absolute_path::test_support::PathExt;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::time::Duration;
++
++#[tokio::test]
++async fn live_and_restored_history_exclude_expired_records_before_maintenance() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    let now = chrono::Utc::now().timestamp();
++    let mut expired_context = context();
++    expired_context.requested_model = "expired-model".into();
++    let expired = metrics.start(
++        expired_context,
++        Instant::now(),
++        now - DIAGNOSTIC_RETENTION_SECONDS - 1,
++    );
++    expired.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let current = metrics.start(context(), Instant::now(), now);
++    current.ended(ResponseAttemptEnd::Completed, Instant::now());
++    history.flush().await.unwrap();
++    let expected = history.notification_snapshot();
++    assert_eq!(expected.len(), 1);
++    let reopened = Arc::new(ResponseHistory::new(history.store.clone()));
++    for source in [&history, &reopened] {
++        let page = source.page(None, None, None, None, 100).await;
++        assert_eq!(page.persistence_error, None);
++        assert_eq!(page.data, expected);
++        assert_eq!(page.models, vec!["model"]);
++        assert_eq!(
++            page.last_generation.unwrap().attempt_id,
++            expected[0].attempt_id
++        );
++        assert_eq!(source.notification_snapshot(), expected);
++    }
++}
++
++#[tokio::test]
++async fn ordered_backup_preserves_final_tokens_and_freezes_unfinished_records() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    attempt.sent(Instant::now());
++    attempt.received(
++        ResponseObservation {
++            usage: Some(json!({"input_tokens": 80, "input_tokens_details": {
++            "cached_tokens": 40, "cache_write_tokens": 10}, "output_tokens": 30,
++            "output_tokens_details": {"reasoning_tokens": 20}})),
++            terminal: Some(ResponseAttemptEnd::Failed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    let unfinished = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    unfinished.sent(Instant::now());
++    // No yield: the response writer has not run, but the consumer already owns
++    // the final accounting and live record independently of storage readiness.
++    let finished = history.notification_snapshot()[1].clone();
++    assert_eq!(finished.tokens.reasoning, Some(20));
++    history.flush().await.unwrap();
++    assert!(
++        SqliteConfig::new_for_testing(home.path().abs())
++            .logs_db_path()
++            .is_file()
++    );
++    let reopened = Arc::new(ResponseHistory::new(history.store.clone()));
++    let page = reopened.page(None, None, None, None, 100).await;
++    assert!(page.persistence_error.is_none());
++    assert_eq!(page.data[1], finished);
++    assert_eq!(page.data[0].end_reason, None);
++    assert!(page.active_attempt_ids.is_empty());
++    assert_eq!(
++        page.last_generation.unwrap().attempt_id,
++        finished.attempt_id
++    );
++    assert_eq!(reopened.notification_snapshot(), vec![finished]);
++    let working = reopened
++        .page(None, None, Some(ResponseAttemptStatus::Working), None, 100)
++        .await;
++    assert!(working.data.is_empty());
++    assert_eq!(working.next_cursor, None);
++    let retained_unfinished = reopened
++        .page(
++            None,
++            None,
++            Some(ResponseAttemptStatus::Unfinished),
++            None,
++            100,
++        )
++        .await;
++    assert_eq!(retained_unfinished.data, page.data[..1]);
++    // Restored records have no live tracker or synthetic monotonic clock.
++    tokio::time::pause();
++    tokio::time::advance(Duration::from_secs(60)).await;
++    assert_eq!(
++        reopened.page(None, None, None, None, 100).await.data,
++        page.data
++    );
++    tokio::time::resume();
++    drop(unfinished);
++    history.flush().await.unwrap();
++}
++
++#[tokio::test]
++async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, runtime) = recording(home.path()).await;
++    let selected = context();
++    let thread_id = selected.thread_id;
++    let oldest = metrics.start(selected, Instant::now(), chrono::Utc::now().timestamp());
++    oldest.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let expected = history.notification_snapshot()[0].clone();
++    for _ in 0..RECENT_RESPONSE_LIMIT {
++        let mut context = context();
++        context.requested_model = "other-model".into();
++        let attempt = metrics.start(context, Instant::now(), chrono::Utc::now().timestamp());
++        attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    }
++    history.flush().await.unwrap();
++    runtime.close().await;
++    let (reopened_metrics, reopened, _reopened_runtime) = recording(home.path()).await;
++    let first = reopened
++        .page(
++            thread_id,
++            Some("model"),
++            Some(ResponseAttemptStatus::Completed),
++            None,
++            100,
++        )
++        .await;
++    assert!(first.data.is_empty());
++    assert_eq!(first.models, vec!["model", "other-model"]);
++    assert_eq!(
++        first.last_generation.unwrap().attempt_id,
++        expected.attempt_id
++    );
++    let cursor = Uuid::parse_str(&first.next_cursor.unwrap()).unwrap();
++    let new = reopened_metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    let older = reopened
++        .page(
++            thread_id,
++            Some("model"),
++            Some(ResponseAttemptStatus::Completed),
++            Some(cursor),
++            100,
++        )
++        .await;
++    assert_eq!(older.data, vec![expected]);
++    assert_eq!(older.next_cursor, None);
++    assert_eq!(older.active_attempt_ids.len(), 1);
++    drop(new);
++    reopened.flush().await.unwrap();
++}
++
++#[tokio::test]
++async fn storage_failure_is_visible_without_losing_live_records() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, runtime) = recording(home.path()).await;
++    runtime.close().await;
++    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    attempt.ended(ResponseAttemptEnd::Canceled, Instant::now());
++    assert!(history.flush().await.is_err());
++    let page = history.page(None, None, None, None, 100).await;
++    assert_eq!(page.data, history.notification_snapshot());
++    assert!(page.persistence_error.unwrap().contains("closed"));
++}
++
++#[tokio::test]
++async fn unavailable_native_storage_preserves_live_records_and_reports_failure() {
++    let history = Arc::new(ResponseHistory::new(None));
++    let retained = Arc::clone(&history);
++    let metrics = Arc::new(crate::ResponseMetrics::new(move |record| {
++        retained.record(record)
++    }));
++    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    assert!(history.flush().await.is_err());
++    let page = history.page(None, None, None, None, 100).await;
++    assert_eq!(page.data, history.notification_snapshot());
++    assert_eq!(
++        page.persistence_error.as_deref(),
++        Some("native response storage unavailable")
++    );
++}
+diff --git a/codex-rs/core/src/response_history/tests.rs b/codex-rs/core/src/response_history/tests.rs
+--- a/codex-rs/core/src/response_history/tests.rs
++++ b/codex-rs/core/src/response_history/tests.rs
+@@ -5,15 +5,27 @@ use codex_api::ResponseObservation;
+ use codex_api::ResponseObserver;
+ use codex_protocol::response_metrics::ResponseAttemptEnd;
+ use codex_protocol::response_metrics::ResponseTokenCounts;
++use codex_state::SqliteConfig;
++use codex_state::StateRuntime;
++use codex_utils_absolute_path::test_support::PathExt;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+ use std::time::Duration;
+ 
+-pub(super) fn recording() -> (Arc<ResponseMetrics>, Arc<ResponseHistory>) {
+-    let history = Arc::new(ResponseHistory::default());
++pub(super) async fn recording(
++    home: &std::path::Path,
++) -> (
++    Arc<ResponseMetrics>,
++    Arc<ResponseHistory>,
++    Arc<StateRuntime>,
++) {
++    let runtime = StateRuntime::init(SqliteConfig::new_for_testing(home.abs()), "test".into())
++        .await
++        .unwrap();
++    let history = Arc::new(ResponseHistory::new(Some(runtime.response_history())));
+     let retained = Arc::clone(&history);
+     let metrics = Arc::new(ResponseMetrics::new(move |record| retained.record(record)));
+-    (metrics, history)
++    (metrics, history, runtime)
+ }
+ 
+ pub(super) fn context() -> ResponseAttemptContext {
+@@ -26,12 +38,49 @@ pub(super) fn context() -> ResponseAttemptContext {
+     }
+ }
+ 
+-#[tokio::test(start_paused = true)]
++#[tokio::test]
++async fn idle_history_expires_records_models_and_last_generations_together() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    let now = chrono::Utc::now().timestamp();
++    let attempt = metrics.start(context(), Instant::now(), now);
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    history.flush().await.unwrap();
++    let mut state = history.state.lock().unwrap();
++    state.trim(now + DIAGNOSTIC_RETENTION_SECONDS);
++    assert_eq!(state.recent.len(), 1);
++    assert_eq!(state.models.len(), 1);
++    assert_eq!(state.last_generations.len(), 1);
++    // A late restore must not shorten the model's latest observation.
++    state.record_model("model".into(), now - 1);
++    state.trim(now + DIAGNOSTIC_RETENTION_SECONDS + 1);
++    assert!(state.recent.is_empty());
++    assert!(state.models.is_empty());
++    assert!(state.last_generations.is_empty());
++    drop(state);
++    assert!(history.notification_snapshot().is_empty());
++}
++
++#[tokio::test]
+ async fn pages_keep_live_identities_and_last_generation_outside_filters() {
+-    let (metrics, history) = recording();
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    assert_eq!(
++        history
++            .page(None, None, None, None, 1)
++            .await
++            .persistence_error,
++        None
++    );
++    // Initialize SQLite before pausing the clock used by retained live records.
++    tokio::time::pause();
+     let first_context = context();
+     let thread_id = first_context.thread_id;
+-    let first = metrics.start(first_context, Instant::now(), 1000);
++    let first = metrics.start(
++        first_context,
++        Instant::now(),
++        chrono::Utc::now().timestamp(),
++    );
+     first.sent(Instant::now());
+     first.received(
+         ResponseObservation {
+@@ -43,7 +92,7 @@ async fn pages_keep_live_identities_and_last_generation_outside_filters() {
+         Instant::now(),
+     );
+     let first_row = history.page(None, None, None, None, 1).await.data.remove(0);
+-    let second = metrics.start(context(), Instant::now(), 1000);
++    let second = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
+     let second_id = history.page(None, None, None, None, 1).await.data[0].attempt_id;
+     tokio::time::advance(Duration::from_secs(2)).await;
+     let page = history.page(None, None, None, None, 1).await;
+@@ -77,15 +126,18 @@ async fn pages_keep_live_identities_and_last_generation_outside_filters() {
+             .active_attempt_ids
+             .is_empty()
+     );
++    tokio::time::resume();
++    history.flush().await.unwrap();
+ }
+ 
+ #[tokio::test]
+ async fn evicted_snapshots_do_not_keep_trackers_alive_or_displace_newer_history() {
+-    let (metrics, history) = recording();
+-    let oldest = metrics.start(context(), Instant::now(), 1000);
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    let oldest = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
+     let oldest_id = history.page(None, None, None, None, 1).await.data[0].attempt_id;
+     for _ in 0..RECENT_RESPONSE_LIMIT {
+-        drop(metrics.start(context(), Instant::now(), 1000));
++        drop(metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp()));
+     }
+     let rows = history
+         .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
+@@ -109,12 +161,22 @@ async fn evicted_snapshots_do_not_keep_trackers_alive_or_displace_newer_history(
+             .data,
+         rows
+     );
++    history.flush().await.unwrap();
+ }
+ 
+-#[tokio::test(start_paused = true)]
++#[tokio::test]
+ async fn terminal_receipt_stops_retained_clocks_before_output_validation() {
+-    let (metrics, history) = recording();
+-    let attempt = metrics.start(context(), Instant::now(), 1000);
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    assert_eq!(
++        history
++            .page(None, None, None, None, 1)
++            .await
++            .persistence_error,
++        None
++    );
++    tokio::time::pause();
++    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
+     attempt.sent(Instant::now());
+     tokio::time::advance(Duration::from_secs(1)).await;
+     attempt.received(
+@@ -139,16 +201,31 @@ async fn terminal_receipt_stops_retained_clocks_before_output_validation() {
+     assert_eq!(completed.data[0].attempt_id, pending.data[0].attempt_id);
+     assert!(completed.data[0].revision > pending.data[0].revision);
+     assert_eq!(history.notification_snapshot(), completed.data);
++    tokio::time::resume();
++    history.flush().await.unwrap();
+ }
+ 
+-#[tokio::test(start_paused = true)]
++#[tokio::test]
+ async fn status_and_model_filters_page_live_transitions_before_limiting() {
+-    let (metrics, history) = recording();
+-    let older = metrics.start(context(), Instant::now(), 1000);
+-    let newer = metrics.start(context(), Instant::now(), 1000);
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, _runtime) = recording(home.path()).await;
++    assert_eq!(
++        history
++            .page(None, None, None, None, 1)
++            .await
++            .persistence_error,
++        None
++    );
++    tokio::time::pause();
++    let older = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    let newer = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
+     let mut other_context = context();
+     other_context.requested_model = "other".into();
+-    let other = metrics.start(other_context, Instant::now(), 1000);
++    let other = metrics.start(
++        other_context,
++        Instant::now(),
++        chrono::Utc::now().timestamp(),
++    );
+     let first = history
+         .page(
+             None,
+@@ -227,4 +304,6 @@ async fn status_and_model_filters_page_live_transitions_before_limiting() {
+     assert_eq!(completed.data[0].attempt_id, cursor);
+     assert_eq!(completed.last_generation.unwrap().attempt_id, cursor);
+     drop((older, other));
++    tokio::time::resume();
++    history.flush().await.unwrap();
+ }

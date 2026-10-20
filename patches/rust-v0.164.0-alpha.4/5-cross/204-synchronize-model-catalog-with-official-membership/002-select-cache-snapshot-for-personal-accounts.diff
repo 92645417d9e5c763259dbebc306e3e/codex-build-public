@@ -1,0 +1,265 @@
+select-cache-snapshot-for-personal-accounts
+
+Lane: cross
+
+Unit: synchronize-model-catalog-with-official-membership
+
+ChildPatch: select-cache-snapshot-for-personal-accounts
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -10,6 +10,7 @@ use chrono::DateTime;
+ use chrono::Utc;
+ use codex_http_client::HttpClientFactory;
+ use codex_login::AuthManager;
++use codex_protocol::account::PlanType;
+ use codex_protocol::auth::AuthMode;
+ use codex_protocol::config_types::CollaborationModeMask;
+ use codex_protocol::error::Result as CoreResult;
+@@ -95,6 +96,8 @@ pub enum RefreshStrategy {
+     Offline,
+     /// Use cache if available and fresh, otherwise fetch from the network.
+     OnlineIfUncached,
++    /// Prefer a readable same-account snapshot for personal-account model-list startup.
++    CachedSnapshotOrOnline,
+ }
+ 
+ impl RefreshStrategy {
+@@ -103,6 +106,7 @@ impl RefreshStrategy {
+             Self::Online => "online",
+             Self::Offline => "offline",
+             Self::OnlineIfUncached => "online_if_uncached",
++            Self::CachedSnapshotOrOnline => "cached_snapshot_or_online",
+         }
+     }
+ }
+@@ -629,19 +633,30 @@ impl OpenAiModelsManager {
+         if !self.should_refresh_models().await {
+             if matches!(
+                 refresh_strategy,
+-                RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
++                RefreshStrategy::Offline
++                    | RefreshStrategy::OnlineIfUncached
++                    | RefreshStrategy::CachedSnapshotOrOnline
+             ) {
+-                self.try_load_cache().await;
++                self.try_load_cache(/*read_snapshot*/ false).await;
+             }
+             return Ok(());
+         }
+         match refresh_strategy {
+             RefreshStrategy::Offline => {
+-                self.try_load_cache().await;
++                self.try_load_cache(/*read_snapshot*/ false).await;
+                 Ok(())
+             }
+             RefreshStrategy::OnlineIfUncached => {
+-                if self.try_load_cache().await {
++                if self.try_load_cache(/*read_snapshot*/ false).await {
++                    return Ok(());
++                }
++                self.fetch_and_update_models(http_client_factory).await
++            }
++            RefreshStrategy::CachedSnapshotOrOnline => {
++                let found = self
++                    .try_load_cache(self.is_personal_chatgpt_account())
++                    .await;
++                if found {
+                     return Ok(());
+                 }
+                 self.fetch_and_update_models(http_client_factory).await
+@@ -751,6 +766,17 @@ impl OpenAiModelsManager {
+                 .is_some_and(|auth_manager| auth_manager.auth_mode() == Some(AuthMode::ApiKey))
+     }
+ 
++    fn is_personal_chatgpt_account(&self) -> bool {
++        self.auth_manager.as_ref().is_some_and(|auth_manager| {
++            personal_chatgpt_account(
++                auth_manager.auth_mode(),
++                auth_manager
++                    .auth_cached()
++                    .and_then(|auth| auth.account_plan_type()),
++            )
++        })
++    }
++
+     async fn should_refresh_models(&self) -> bool {
+         self.endpoint_client.uses_codex_backend().await
+             || self.endpoint_client.has_command_auth()
+@@ -810,8 +836,8 @@ impl OpenAiModelsManager {
+         }
+     }
+ 
+-    /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+-    async fn try_load_cache(&self) -> bool {
++    /// Read a fresh cache entry or a same-identity snapshot, retaining native invalidation.
++    async fn try_load_cache(&self, read_snapshot: bool) -> bool {
+         let Some(cache) = self.cache.as_ref() else {
+             return false;
+         };
+@@ -831,7 +857,12 @@ impl OpenAiModelsManager {
+                 return false;
+             }
+         }
+-        let cache_entry = match cache.load(&client_version).await {
++        let cached = if read_snapshot {
++            cache.load_any().await
++        } else {
++            cache.load(&client_version).await
++        };
++        let cache_entry = match cached {
+             Ok(Some(cache_entry)) => cache_entry,
+             Ok(None) => {
+                 info!("models cache: no usable cache entry");
+@@ -845,7 +876,8 @@ impl OpenAiModelsManager {
+         if cache_entry.fetched_at == DateTime::<Utc>::MIN_UTC {
+             return false;
+         }
+-        if cache_entry.client_version.as_deref() != Some(client_version.as_str()) {
++        if !read_snapshot && cache_entry.client_version.as_deref() != Some(client_version.as_str())
++        {
+             info!(
+                 expected_version = client_version,
+                 cached_version = ?cache_entry.client_version,
+@@ -863,6 +895,14 @@ impl OpenAiModelsManager {
+     }
+ }
+ 
++fn personal_chatgpt_account(auth_mode: Option<AuthMode>, plan_type: Option<PlanType>) -> bool {
++    auth_mode == Some(AuthMode::Chatgpt)
++        && matches!(
++            plan_type,
++            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++        )
++}
++
+ impl ModelsManager for StaticModelsManager {
+     fn get_default_model<'a>(
+         &'a self,
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -42,6 +42,31 @@ mod model_info_overrides_tests;
+ const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
+     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+ 
++#[test]
++fn cached_snapshot_selection_is_personal_chatgpt_only() {
++    for plan in [PlanType::Plus, PlanType::Pro, PlanType::ProLite] {
++        assert!(personal_chatgpt_account(
++            Some(AuthMode::Chatgpt),
++            Some(plan)
++        ));
++        assert!(!personal_chatgpt_account(
++            Some(AuthMode::ApiKey),
++            Some(plan)
++        ));
++    }
++    for plan in [
++        PlanType::Free,
++        PlanType::SelfServeBusinessProLite,
++        PlanType::Enterprise,
++    ] {
++        assert!(!personal_chatgpt_account(
++            Some(AuthMode::Chatgpt),
++            Some(plan)
++        ));
++    }
++    assert!(!personal_chatgpt_account(Some(AuthMode::Chatgpt), None));
++}
++
+ fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
+     remote_model_with_visibility(slug, display, priority, "list")
+ }
+@@ -346,10 +371,9 @@ async fn mutate_file_cache_for_test<F>(codex_home: &Path, f: F)
+ where
+     F: FnOnce(&mut ModelsCacheEntry),
+ {
+-    let client_version = crate::client_version_to_whole();
+     let cache = FileModelsCache::new(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+     let mut entry = cache
+-        .load(&client_version)
++        .load_any()
+         .await
+         .expect("cache load succeeds")
+         .expect("cache entry exists");
+@@ -428,6 +452,73 @@ async fn local_catalog_reload_updates_the_shared_snapshot() {
+     assert!(!selected.used_fallback_model_metadata);
+ }
+ 
++#[tokio::test]
++async fn cached_snapshot_accepts_stale_same_identity_and_rejects_other_identity() {
++    let codex_home = tempdir().expect("temp dir");
++    let seed = openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        TestModelsEndpoint::new(vec![vec![remote_model("cached", "Cached", 0)]]),
++    );
++    seed.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
++        .await
++        .expect("seed online cache");
++    mutate_file_cache_for_test(codex_home.path(), |entry| {
++        entry.fetched_at = Utc::now() - chrono::Duration::hours(1);
++        entry.client_version = Some("old-version".to_string());
++    })
++    .await;
++
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("online", "Online", 0)]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++    assert!(manager.try_load_cache(/*read_snapshot*/ true).await);
++    assert_eq!(endpoint.fetch_count(), 0);
++    assert!(
++        manager
++            .get_remote_models()
++            .await
++            .iter()
++            .any(|model| model.slug == "cached")
++    );
++
++    mutate_file_cache_for_test(codex_home.path(), |entry| {
++        entry.identity = Some("another-account".to_string());
++    })
++    .await;
++    let other = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++    assert!(!other.try_load_cache(/*read_snapshot*/ true).await);
++}
++
++#[tokio::test]
++async fn cached_snapshot_preserves_upstream_invalidation() {
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("cached", "Cached", 0)]]);
++    let seed = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++    seed.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
++        .await
++        .expect("seed online cache");
++
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++    {
++        let mut current = manager.remote_models.write().await;
++        current.base.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
++        current.base.models.clear();
++        current.active_models.clear();
++    }
++    let before = manager.get_remote_models().await;
++    assert!(!manager.try_load_cache(/*read_snapshot*/ true).await);
++    assert_eq!(manager.get_remote_models().await, before);
++
++    mutate_file_cache_for_test(codex_home.path(), |entry| {
++        entry.fetched_at = chrono::DateTime::<Utc>::MIN_UTC;
++    })
++    .await;
++    let restarted = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++    let before = restarted.get_remote_models().await;
++    assert!(!restarted.try_load_cache(/*read_snapshot*/ true).await);
++    assert_eq!(restarted.get_remote_models().await, before);
++    assert_eq!(endpoint.fetch_count(), 1);
++}
++
+ #[tokio::test]
+ async fn local_catalog_overlays_remote_models_without_mutating_official_cache() {
+     let codex_home = tempdir().expect("temp dir");

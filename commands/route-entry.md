@@ -25,7 +25,7 @@ TopLevelReleaseTermOwner
 ```
 
 - Baseline maps to `release-baseline` and BaselineEstablishedAndCleanupComplete.
-- Roll selects ReleaseRollForward for the sole task and continues only within approved boundaries. Unit and Lane transitions consume its explicit user-approval decision. Requested read-only exploration still precedes its handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
+- Roll selects ReleaseRollForward for the sole task's complete declared Patch set unless the user limits its scope. Requested interactive stops consume their read-only exploration before handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
 - Before BuildInstall, consume TaskWorkspace's pending-obligation decision.
 - Resolve the requested package-only or installation terminal from user intent; ask only when it is ambiguous.
 - Install selects `build-install --install`, without a home-link, candidate or export predecessor.
@@ -45,8 +45,8 @@ TopLevelReleaseTermOwner
 - Roll implementation and cumulative source acceptance remain with the product agent.
 - Requested subagent review follows PatchAcceptance without creating a parallel implementation or acceptance owner.
 - Source publication consumes the product agent's complete current-native design and cumulative Patch acceptance before process construction.
-- PreparePatchForApproval consumes ReleaseRollForward's next-Unit or next-Lane decision, material contract and requirement-cost choices, or an explicitly requested interactive choice.
-- A general Roll request supplies no blanket approval for later boundaries or unmeasured optimization additions.
+- PreparePatchForApproval consumes ReleaseRollForward's missing-authority, material contract and requirement-cost decisions, or an explicitly requested interactive choice.
+- Ordinary Unit and Lane transitions within the user's Roll scope continue without a new approval question.
 - ConvergeAcceptedWorktrees precedes next-Patch or Fork selection after Unit or Flat Patch closure and on reentry. GitCustody removes covered numbered parents independently of Main's suffix; full Main coverage then promotes. Return to the selected successor without a helper topology command or test gate.
 - DraftIssue selects claim-reviewed UpstreamBugReport.
 - EditNamedTask selects TaskWorkspace's reconciliation, publication and requested recap.
@@ -95,7 +95,7 @@ PublicInvocationConstruction
 - Preserve each frozen test selection without splitting its invocation, moving tests between Units, or invoking an internal producer. Launch failure reports the executable, error, and argument count without echoing the expanded command.
 - Generic repository tests receive RunnerEnv's bounded sixteen-test default. Existing native --test-threads, --jobs, or -j arguments may select one positive value no greater than 16; they do not alter the frozen test selection or authorize a broader run.
 - `runner-exec --help`, `repository-format --help`, and `patch-replay --help` are successful read-only parser views before admission. This route selects purpose; help owns syntax without a second option inventory.
-- Construct `repository-maintenance` only from the installed endpoint and its documented roots, source, release, attempt, and deadline; it fixes the repository-selected `just bazel-lock-update` process.
+- Construct Bazel `repository-maintenance` only from the installed endpoint and its documented roots, source, release, attempt, and fixed `--deadline 90m`; it fixes the repository-selected `just bazel-lock-update` process.
 - Fork derives its ordinal from existing current-release numbered branch refs. It accepts no record root, caller-supplied ordinal, or maximum.
 - List uses the effective root defaults or overrides; actual source identity selects live Current, a retained parent, or a canonical prefix declared in SourcePrefixes, never root-flag presence.
 - RunnerExec owns its fixed current slot; callers choose no AttemptID. After reap, a new selected check replaces that slot regardless of the old outcome. Full interruption instead follows Finalize `--resume` on unchanged input. Findings return to the owning Patch without a mandatory broader test or topology change.

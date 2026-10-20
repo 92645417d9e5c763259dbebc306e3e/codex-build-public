@@ -57,7 +57,7 @@
 - A partial ChildPatchSequence remains open with its unfinished obligations.
 - Report semantic acceptance, native structural admission and selected test outcomes separately.
 - Native transport proves structure, bytes, formatting and rollback only.
-- Closure and successful checks do not approve entry into another Unit or Lane; consume ReleaseRollForward's boundary decision before that successor.
+- Closure and successful checks do not authorize changed scope or contracts; consume ReleaseRollForward's scope decision before continuation.
 - Focused tests answer source questions after publication; automatic reconstruction and non-idempotent fixup folds require their corresponding focused tests before advancement.
 - Prior failures remain evidence without creating a full-suite gate.
 - Git frontier coverage and semantic closure retain their own evidence requirements.

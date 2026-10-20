@@ -1,0 +1,362 @@
+persist-integration-settings-in-shared-file
+
+Lane: cross
+
+Unit: configure-integrations-through-shared-file
+
+ChildPatch: persist-integration-settings-in-shared-file
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/integrations.rs b/codex-rs/app-server/src/integrations.rs
+--- a/codex-rs/app-server/src/integrations.rs
++++ b/codex-rs/app-server/src/integrations.rs
+@@ -1,10 +1,19 @@
+ use std::collections::BTreeSet;
+ use std::fmt;
++use std::io;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
+ 
+ use codex_app_server_protocol::ProxyConfig;
+ use codex_app_server_protocol::TelegramNotificationKind;
+ use serde::Deserialize;
+ use serde::Serialize;
++use tempfile::NamedTempFile;
++
++const INTEGRATIONS_FILE_NAME: &str = "integrations.json";
+ 
+ pub(crate) const DEFAULT_GITHUB_CHECK_INTERVAL_HOURS: u16 = 20;
+ pub(crate) const MIN_GITHUB_CHECK_INTERVAL_HOURS: u16 = 1;
+@@ -18,6 +27,117 @@ pub(crate) struct IntegrationsConfig {
+     pub(crate) telegram: Option<TelegramConfig>,
+ }
+ 
++/// Shared by all integration processors in one app-server process.
++pub(crate) struct IntegrationsStore {
++    path: PathBuf,
++    config: Mutex<IntegrationsConfig>,
++}
++
++impl IntegrationsStore {
++    pub(crate) fn load(codex_home: &Path) -> io::Result<Self> {
++        let path = codex_home.join(INTEGRATIONS_FILE_NAME);
++        reject_symlink(&path)?;
++        let config: IntegrationsConfig = match std::fs::read(&path) {
++            Ok(contents) => serde_json::from_slice(&contents).map_err(|error| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!(
++                        "invalid integrations.json at line {}, column {}",
++                        error.line(),
++                        error.column(),
++                    ),
++                )
++            })?,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => IntegrationsConfig::default(),
++            Err(error) => return Err(error),
++        };
++        if let Some(github) = &config.github {
++            github.validate()?;
++        }
++        if let Some(telegram) = &config.telegram {
++            telegram.validate()?;
++        }
++        Ok(Self {
++            path,
++            config: Mutex::new(config),
++        })
++    }
++
++    pub(crate) fn proxy(&self) -> ProxyConfig {
++        self.config
++            .lock()
++            .expect("integration settings")
++            .proxy
++            .clone()
++    }
++
++    pub(crate) fn github(&self) -> Option<GithubConfig> {
++        self.config
++            .lock()
++            .expect("integration settings")
++            .github
++            .clone()
++    }
++
++    pub(crate) fn telegram(&self) -> Option<TelegramConfig> {
++        self.config
++            .lock()
++            .expect("integration settings")
++            .telegram
++            .clone()
++    }
++
++    /// Persist a proxy configuration already validated by the routing owner.
++    pub(crate) async fn set_proxy(self: &Arc<Self>, proxy: ProxyConfig) -> io::Result<()> {
++        self.update(move |config| config.proxy = proxy).await
++    }
++
++    /// Persist validated Telegram settings, or disable Telegram alone.
++    pub(crate) async fn set_telegram(
++        self: &Arc<Self>,
++        telegram: Option<TelegramConfig>,
++    ) -> io::Result<()> {
++        self.update(move |config| config.telegram = telegram).await
++    }
++
++    async fn update(
++        self: &Arc<Self>,
++        update: impl FnOnce(&mut IntegrationsConfig) + Send + 'static,
++    ) -> io::Result<()> {
++        let store = Arc::clone(self);
++        tokio::task::spawn_blocking(move || {
++            let mut config = store.config.lock().expect("integration settings");
++            // A failed write must leave the currently active settings intact.
++            let mut next = config.clone();
++            update(&mut next);
++            reject_symlink(&store.path)?;
++            let parent = store.path.parent().expect("integration settings parent");
++            std::fs::create_dir_all(parent)?;
++            let mut file = NamedTempFile::new_in(parent)?;
++            serde_json::to_writer_pretty(&mut file, &next).map_err(io::Error::other)?;
++            file.write_all(b"\n")?;
++            file.as_file().sync_all()?;
++            file.persist(&store.path)?;
++            *config = next;
++            Ok(())
++        })
++        .await
++        .map_err(io::Error::other)?
++    }
++}
++
++fn reject_symlink(path: &Path) -> io::Result<()> {
++    match std::fs::symlink_metadata(path) {
++        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "integrations.json must not be a symlink",
++        )),
++        Ok(_) => Ok(()),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
++        Err(error) => Err(error),
++    }
++}
++
+ #[derive(Clone, Deserialize, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub(crate) struct GithubConfig {
+@@ -26,6 +146,21 @@ pub(crate) struct GithubConfig {
+     pub(crate) check_interval_hours: u16,
+ }
+ 
++impl GithubConfig {
++    fn validate(&self) -> io::Result<()> {
++        validate_credential(&self.token, "github.token")?;
++        if !(MIN_GITHUB_CHECK_INTERVAL_HOURS..=MAX_GITHUB_CHECK_INTERVAL_HOURS)
++            .contains(&self.check_interval_hours)
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "github.check_interval_hours must be between 1 and 168",
++            ));
++        }
++        Ok(())
++    }
++}
++
+ impl fmt::Debug for GithubConfig {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         formatter
+@@ -46,6 +181,23 @@ pub(crate) struct TelegramConfig {
+     pub(crate) completion_min_duration_ms: u64,
+ }
+ 
++impl TelegramConfig {
++    pub(crate) fn validate(&self) -> io::Result<()> {
++        validate_credential(&self.bot_token, "telegram.bot_token")?;
++        validate_credential(&self.chat_id, "telegram.chat_id")
++    }
++}
++
++fn validate_credential(value: &str, field: &str) -> io::Result<()> {
++    if value.trim().is_empty() || value.chars().any(char::is_control) {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            format!("invalid {field}"),
++        ));
++    }
++    Ok(())
++}
++
+ impl fmt::Debug for TelegramConfig {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         formatter
+@@ -68,3 +220,7 @@ fn default_github_check_interval_hours() -> u16 {
+ pub(crate) fn default_completion_min_duration_ms() -> u64 {
+     30_000
+ }
++
++#[cfg(test)]
++#[path = "integrations_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/integrations_tests.rs b/codex-rs/app-server/src/integrations_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/integrations_tests.rs
+@@ -0,0 +1,149 @@
++use std::os::unix::fs::MetadataExt;
++
++use codex_app_server_protocol::ProxyDefinition;
++use pretty_assertions::assert_eq;
++
++use super::*;
++
++fn telegram_config() -> TelegramConfig {
++    TelegramConfig {
++        bot_token: "bot-secret".into(),
++        chat_id: "chat-secret".into(),
++        notifications: BTreeSet::from([
++            TelegramNotificationKind::TurnCompletion,
++            TelegramNotificationKind::NeedsInput,
++            TelegramNotificationKind::ModelChanges,
++        ]),
++        completion_min_duration_ms: default_completion_min_duration_ms(),
++    }
++}
++
++#[test]
++fn loads_shared_settings_and_redacts_credentials() {
++    let home = tempfile::tempdir().unwrap();
++    let store = IntegrationsStore::load(home.path()).unwrap();
++    assert_eq!(store.proxy(), ProxyConfig::default());
++    assert!(store.github().is_none());
++    assert!(store.telegram().is_none());
++    let config = IntegrationsConfig {
++        proxy: ProxyConfig {
++            entries: vec![ProxyDefinition {
++                alias: "local".into(),
++                url: "http://user:proxy-secret@localhost:8080".into(),
++            }],
++            ..ProxyConfig::default()
++        },
++        github: Some(GithubConfig {
++            token: "github-secret".into(),
++            check_interval_hours: DEFAULT_GITHUB_CHECK_INTERVAL_HOURS,
++        }),
++        telegram: Some(telegram_config()),
++    };
++    let rendered = format!("{config:?}");
++    for secret in ["proxy-secret", "github-secret", "bot-secret", "chat-secret"] {
++        assert!(!rendered.contains(secret));
++    }
++    std::fs::write(
++        home.path().join(INTEGRATIONS_FILE_NAME),
++        serde_json::to_vec(&config).unwrap(),
++    )
++    .unwrap();
++    let store = IntegrationsStore::load(home.path()).unwrap();
++    assert_eq!(store.proxy(), config.proxy);
++    assert_eq!(store.github().unwrap().token, "github-secret");
++    assert_eq!(
++        store.telegram().unwrap().notifications,
++        telegram_config().notifications
++    );
++}
++
++#[tokio::test]
++async fn concurrent_updates_preserve_other_sections_and_private_permissions() {
++    let home = tempfile::tempdir().unwrap();
++    std::fs::write(
++        home.path().join(INTEGRATIONS_FILE_NAME),
++        r#"{"github":{"token":"github-secret"}}"#,
++    )
++    .unwrap();
++    let store = Arc::new(IntegrationsStore::load(home.path()).unwrap());
++    let proxy = ProxyConfig {
++        enabled: true,
++        selected: Some("local".into()),
++        entries: vec![ProxyDefinition {
++            alias: "local".into(),
++            url: "http://localhost:8080".into(),
++        }],
++    };
++    let (proxy_result, telegram_result) = tokio::join!(
++        store.set_proxy(proxy.clone()),
++        store.set_telegram(Some(telegram_config())),
++    );
++    proxy_result.unwrap();
++    telegram_result.unwrap();
++    let reloaded = IntegrationsStore::load(home.path()).unwrap();
++    assert_eq!(reloaded.proxy(), proxy);
++    assert_eq!(reloaded.github().unwrap().token, "github-secret");
++    assert_eq!(reloaded.github().unwrap().check_interval_hours, 20);
++    assert_eq!(
++        reloaded.telegram().unwrap().completion_min_duration_ms,
++        30_000
++    );
++    assert_eq!(
++        std::fs::metadata(home.path().join(INTEGRATIONS_FILE_NAME))
++            .unwrap()
++            .mode()
++            & 0o777,
++        0o600,
++    );
++    store.set_telegram(None).await.unwrap();
++    let reloaded = IntegrationsStore::load(home.path()).unwrap();
++    assert!(reloaded.telegram().is_none());
++    assert_eq!(reloaded.proxy(), proxy);
++    assert_eq!(reloaded.github().unwrap().token, "github-secret");
++}
++
++#[tokio::test]
++async fn failed_writes_preserve_active_settings() {
++    let home = tempfile::tempdir().unwrap();
++    let store = Arc::new(IntegrationsStore::load(home.path()).unwrap());
++    std::fs::create_dir(home.path().join(INTEGRATIONS_FILE_NAME)).unwrap();
++    assert!(store.set_telegram(Some(telegram_config())).await.is_err());
++    assert!(store.telegram().is_none());
++    assert_eq!(store.proxy(), ProxyConfig::default());
++}
++
++#[test]
++fn invalid_settings_report_fields_without_secret_values() {
++    let home = tempfile::tempdir().unwrap();
++    for contents in [
++        r#"{"github":{"token":"github-secret","check_interval_hours":0}}"#,
++        r#"{"telegram":{"bot_token":"bot-secret","chat_id":"chat-secret","notifications":["secret-invalid-kind"]}}"#,
++        r#"{"github":{"token":"github-secret","secret-unexpected-field":1}}"#,
++        "",
++    ] {
++        std::fs::write(home.path().join(INTEGRATIONS_FILE_NAME), contents).unwrap();
++        let error = IntegrationsStore::load(home.path())
++            .err()
++            .expect("invalid settings");
++        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++        assert!(!error.to_string().contains("secret"));
++    }
++}
++
++#[tokio::test]
++async fn shared_settings_reject_symlinks_on_load_and_write() {
++    let home = tempfile::tempdir().unwrap();
++    let store = Arc::new(IntegrationsStore::load(home.path()).unwrap());
++    std::os::unix::fs::symlink("target", home.path().join(INTEGRATIONS_FILE_NAME)).unwrap();
++    let error = IntegrationsStore::load(home.path())
++        .err()
++        .expect("symlink rejected");
++    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++    let error = store
++        .set_telegram(Some(telegram_config()))
++        .await
++        .unwrap_err();
++    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++    assert!(!home.path().join("target").exists());
++    assert!(store.telegram().is_none());
++}

@@ -1,0 +1,1389 @@
+serve-usage-reports-through-app-server
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: serve-usage-reports-through-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1374,6 +1374,12 @@ client_request_definitions! {
+         response: v2::GetStorageCapacityResponse,
+     },
+ 
++    UsageRead => "usage/read" {
++        params: v2::UsageReadParams,
++        serialization: None,
++        response: v2::UsageReadResponse,
++    },
++
+     ConsumeAccountRateLimitResetCredit => "account/rateLimitResetCredit/consume" {
+         params: v2::ConsumeAccountRateLimitResetCreditParams,
+         serialization: global("account-auth"),
+@@ -3286,6 +3292,19 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn serialize_usage_read() -> Result<()> {
++        let request = ClientRequest::UsageRead {
++            request_id: RequestId::Integer(1),
++            params: v2::UsageReadParams { refresh: true },
++        };
++        assert_eq!(
++            json!({"method": "usage/read", "id": 1, "params": {"refresh": true}}),
++            serde_json::to_value(&request)?,
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn serialize_get_account_token_usage() -> Result<()> {
+         let request = ClientRequest::GetAccountTokenUsage {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -42,6 +42,7 @@ mod thread_data;
+ mod thread_prediction;
+ mod thread_usage;
+ mod turn;
++mod usage;
+ mod user_verification;
+ mod windows_sandbox;
+ 
+@@ -88,6 +89,7 @@ pub use thread_data::*;
+ pub use thread_prediction::*;
+ pub use thread_usage::*;
+ pub use turn::*;
++pub use usage::*;
+ pub use user_verification::*;
+ pub use windows_sandbox::*;
+ 
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/usage.rs b/codex-rs/app-server-protocol/src/protocol/v2/usage.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/usage.rs
+@@ -0,0 +1,26 @@
++use crate::JsonSchema;
++use crate::TS;
++pub use codex_protocol::usage::*;
++use serde::Deserialize;
++use serde::Serialize;
++use std::sync::Arc;
++
++#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageReadParams {
++    /// Explicitly rebuild the server's shared snapshot, which otherwise never expires.
++    #[serde(default)]
++    pub refresh: bool,
++}
++
++#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageReadResponse {
++    pub report: Arc<UsageReport>,
++    /// True when this request rebuilt the snapshot instead of reading the cache.
++    /// Older running servers do not report this distinction.
++    #[serde(default)]
++    pub refreshed: bool,
++}
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -164,6 +164,7 @@ pub(crate) struct MessageProcessor {
+     git_processor: GitRequestProcessor,
+     github_processor: GithubProcessor,
+     initialize_processor: InitializeRequestProcessor,
++    usage: crate::usage::Service,
+     marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+     proxy_processor: ProxyProcessor,
+@@ -637,6 +638,7 @@ impl MessageProcessor {
+             git_processor,
+             github_processor,
+             initialize_processor,
++            usage: crate::usage::Service::new(config.codex_home.to_path_buf()),
+             marketplace_processor,
+             mcp_processor,
+             proxy_processor,
+@@ -1913,6 +1915,12 @@ impl MessageProcessor {
+             ClientRequest::GetStorageCapacity { .. } => {
+                 self.account_processor.get_storage_capacity()
+             }
++            ClientRequest::UsageRead { params, .. } => self
++                .usage
++                .read(params)
++                .await
++                .map(|response| Some(response.into()))
++                .map_err(crate::error_code::internal_error),
+             ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
+                 self.account_processor
+                     .consume_account_rate_limit_reset_credit(params)
+diff --git a/codex-rs/app-server/src/usage/aggregate.rs b/codex-rs/app-server/src/usage/aggregate.rs
+--- a/codex-rs/app-server/src/usage/aggregate.rs
++++ b/codex-rs/app-server/src/usage/aggregate.rs
+@@ -1,10 +1,10 @@
+ use super::Error;
+ use super::Rows;
+-use super::UsageRange;
+ use super::UsageReport;
+ use super::credits;
+ use super::quota;
+ use super::reader;
++use super::types::PricedUsage;
+ use super::types::Usage;
+ use chrono::DateTime;
+ use chrono::Datelike;
+@@ -12,36 +12,34 @@ use chrono::Duration;
+ use chrono::FixedOffset;
+ use chrono::NaiveDate;
+ use chrono::Utc;
++use codex_app_server_protocol::UsagePriceRates;
+ use codex_models_manager::model_pricing::Prices;
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+ use std::path::Path;
+ 
+-fn period_date(date: NaiveDate, period: UsageRange) -> NaiveDate {
++#[derive(Clone, Copy)]
++enum Period {
++    Daily,
++    Weekly,
++    Monthly,
++    Yearly,
++}
++
++fn period_date(date: NaiveDate, period: Period) -> NaiveDate {
+     match period {
+-        UsageRange::Today
+-        | UsageRange::Yesterday
+-        | UsageRange::Daily
+-        | UsageRange::Heatmap
+-        | UsageRange::Quota => date,
+-        UsageRange::Weekly => {
+-            date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+-        }
+-        UsageRange::Monthly => date.with_day(1).unwrap_or(date),
+-        UsageRange::Yearly => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date),
++        Period::Daily => date,
++        Period::Weekly => date - Duration::days(i64::from(date.weekday().num_days_from_monday())),
++        Period::Monthly => date.with_day(1).unwrap_or(date),
++        Period::Yearly => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date),
+     }
+ }
+ 
+-fn period_key(date: NaiveDate, period: UsageRange) -> String {
++fn period_key(date: NaiveDate, period: Period) -> String {
+     match period {
+-        UsageRange::Today
+-        | UsageRange::Yesterday
+-        | UsageRange::Daily
+-        | UsageRange::Weekly
+-        | UsageRange::Heatmap
+-        | UsageRange::Quota => date.to_string(),
+-        UsageRange::Monthly => date.format("%Y-%m").to_string(),
+-        UsageRange::Yearly => date.format("%Y").to_string(),
++        Period::Daily | Period::Weekly => date.to_string(),
++        Period::Monthly => date.format("%Y-%m").to_string(),
++        Period::Yearly => date.format("%Y").to_string(),
+     }
+ }
+ 
+@@ -54,7 +52,6 @@ pub(super) fn load(
+     let refreshed_at = DateTime::<Utc>::from_timestamp_millis(now)
+         .ok_or("invalid report time")?
+         .with_timezone(&timezone);
+-    let today = refreshed_at.date_naive();
+     let reader::Events {
+         mut events,
+         models,
+@@ -111,9 +108,15 @@ pub(super) fn load(
+     });
+     diagnostics.duplicate_events = before - events.len();
+     diagnostics.unique_events = events.len();
++    let latest_usage_at = events
++        .iter()
++        .map(|event| event.millis)
++        .max()
++        .and_then(DateTime::<Utc>::from_timestamp_millis)
++        .map(|time| time.with_timezone(&timezone));
+     let mut groups = BTreeMap::<(NaiveDate, usize), Usage>::new();
+     let mut missing_prices = BTreeSet::new();
+-    let mut costs = BTreeMap::new();
++    let mut priced_usage = Vec::new();
+     let recent = now.saturating_sub(quota::RECENT_DAYS * 24 * 60 * 60 * 1_000);
+     for event in events {
+         let Some(time) = DateTime::<Utc>::from_timestamp_millis(event.millis) else {
+@@ -135,24 +138,31 @@ pub(super) fn load(
+             );
+             (quote.usd, quote.input_threshold != 0)
+         });
+-        if event.quota_millis >= recent && event.quota_millis <= now {
+-            *costs.entry(event.quota_millis).or_default() += cost;
+-        }
+         groups
+             .entry((date, event.model))
+             .or_default()
+             .add(event.tokens, cost, long);
++        if event.quota_millis >= recent && event.quota_millis <= now {
++            priced_usage.push(PricedUsage {
++                millis: event.quota_millis,
++                model,
++                tokens: event.tokens,
++                cost,
++                long,
++            });
++        }
+     }
++    priced_usage.sort_unstable_by_key(|event| event.millis);
+     let mut rows = Rows::new();
+     let mut weekly_rows = Rows::new();
+     let mut monthly_rows = Rows::new();
+     let mut yearly_rows = Rows::new();
+     for ((date, model), row) in groups {
+         for (period, rows) in [
+-            (UsageRange::Daily, &mut rows),
+-            (UsageRange::Weekly, &mut weekly_rows),
+-            (UsageRange::Monthly, &mut monthly_rows),
+-            (UsageRange::Yearly, &mut yearly_rows),
++            (Period::Daily, &mut rows),
++            (Period::Weekly, &mut weekly_rows),
++            (Period::Monthly, &mut monthly_rows),
++            (Period::Yearly, &mut yearly_rows),
+         ] {
+             rows.entry(period_key(period_date(date, period), period))
+                 .or_default()
+@@ -161,17 +171,36 @@ pub(super) fn load(
+                 .add_usage(&row);
+         }
+     }
+-    let quota = quota::estimate(&costs, &mut observations, now);
+-    let credits = credits::summarize(&costs, &mut credits, now);
++    let quota = quota::estimate(&priced_usage, &mut observations, now);
++    let credits = credits::summarize(&priced_usage, &mut credits, now);
+     Ok(UsageReport {
+         refreshed_at,
+-        today,
+-        timezone,
++        build_duration_ms: None,
++        latest_usage_at,
+         rows,
+         weekly_rows,
+         monthly_rows,
+         yearly_rows,
+-        prices,
++        prices: prices
++            .into_iter()
++            .map(|(model, price)| {
++                let intervals = price
++                    .intervals()
++                    .map(|(threshold, rates)| {
++                        (
++                            threshold,
++                            UsagePriceRates {
++                                input: rates.input,
++                                cache_read: rates.cache_read,
++                                cache_write: rates.cache_write,
++                                output: rates.output,
++                            },
++                        )
++                    })
++                    .collect();
++                (model, intervals)
++            })
++            .collect(),
+         quota,
+         credits,
+         missing_prices,
+diff --git a/codex-rs/app-server/src/usage/aggregate_tests.rs b/codex-rs/app-server/src/usage/aggregate_tests.rs
+--- a/codex-rs/app-server/src/usage/aggregate_tests.rs
++++ b/codex-rs/app-server/src/usage/aggregate_tests.rs
+@@ -285,23 +285,18 @@ fn migrated_parent_replay_and_archive_copy_are_counted_once() {
+     assert!((daily.rows["2026-02-01"]["gpt-5.4"].cost - 0.00072).abs() < 1e-12);
+     assert_eq!(daily.diagnostics.replayed_events, 1);
+     assert_eq!(daily.diagnostics.skipped_non_paginated, 1);
+-    for (range, period) in [
+-        (UsageRange::Today, "2026-02-01"),
+-        (UsageRange::Weekly, "2026-01-26"),
+-        (UsageRange::Monthly, "2026-02"),
+-        (UsageRange::Yearly, "2026"),
++    for (rows, period) in [
++        (&daily.rows, "2026-02-01"),
++        (&daily.weekly_rows, "2026-01-26"),
++        (&daily.monthly_rows, "2026-02"),
++        (&daily.yearly_rows, "2026"),
+     ] {
+         assert_eq!(
+-            daily
+-                .periods(range)
+-                .find(|(key, _)| key.as_str() == period)
+-                .unwrap()
+-                .1
+-                .get("gpt-5.4"),
++            rows[period].get("gpt-5.4"),
+             daily.rows["2026-02-01"].get("gpt-5.4")
+         );
+     }
+-    assert!(daily.periods(UsageRange::Yesterday).next().is_none());
++    assert!(!daily.rows.contains_key("2026-01-31"));
+ }
+ 
+ #[test]
+@@ -468,6 +463,11 @@ fn mixed_context_totals_retain_token_partitions_and_the_prices_used() {
+     let report = report(directory.path());
+     let usage = &report.rows["2026-02-01"]["gpt-5.4"];
+     assert_eq!(usage.tokens.subtract(usage.long_tokens).input, 100);
++    assert_eq!(
++        report.latest_usage_at,
++        Some(DateTime::parse_from_rfc3339("2026-02-01T08:01:00+08:00").unwrap())
++    );
++    assert!(report.latest_usage_at.unwrap() < report.refreshed_at);
+     assert_eq!(usage.long_tokens.input, 280_000);
+     assert_eq!(usage.long_tokens.output, 100);
+     let mut total = super::super::types::Usage::default();
+@@ -475,10 +475,10 @@ fn mixed_context_totals_retain_token_partitions_and_the_prices_used() {
+     assert_eq!(&total, usage);
+     assert_eq!(
+         report.prices["gpt-5.4"]
+-            .intervals()
++            .iter()
+             .map(|(threshold, rates)| {
+                 (
+-                    threshold,
++                    *threshold,
+                     [
+                         rates.input,
+                         rates.cache_read,
+@@ -530,7 +530,13 @@ fn weekly_quota_uses_priced_canonical_snapshots_without_counting_repeated_delive
+     let now = DateTime::parse_from_rfc3339("2026-02-01T04:00:00Z")
+         .unwrap()
+         .timestamp_millis();
+-    let unpriced = load(directory.path(), Prices::new(), report.timezone, now).unwrap();
++    let unpriced = load(
++        directory.path(),
++        Prices::new(),
++        *report.refreshed_at.offset(),
++        now,
++    )
++    .unwrap();
+     assert!(unpriced.quota.is_empty());
+     assert!(unpriced.missing_prices.contains("gpt-5.4"));
+     assert_eq!(unpriced.rows["2026-02-01"]["gpt-5.4"].tokens.total, 150_000);
+@@ -770,6 +776,10 @@ fn native_response_records_keep_incomplete_costs_and_deduplicate_copies_by_ident
+     assert_eq!(total.long_tokens.input, 280_000);
+     assert!((total.cost - 1.12088).abs() < 1e-12);
+     assert!((total.short_cost - 0.00048).abs() < 1e-12);
++    assert_eq!(
++        report.latest_usage_at,
++        Some(DateTime::parse_from_rfc3339("2026-02-01T08:02:00+08:00").unwrap()),
++    );
+ }
+ 
+ #[test]
+@@ -792,6 +802,10 @@ fn deferred_snapshot_does_not_move_a_response_to_another_calendar_day() {
+     assert!(!report.rows.contains_key("2026-02-01"));
+     assert_eq!(report.monthly_rows["2026-01"]["gpt-5.4"].tokens.total, 110);
+     assert!(!report.monthly_rows.contains_key("2026-02"));
++    assert_eq!(
++        report.latest_usage_at,
++        Some(DateTime::parse_from_rfc3339("2026-01-31T23:59:59+08:00").unwrap()),
++    );
+ }
+ 
+ #[test]
+@@ -843,11 +857,37 @@ fn native_response_records_preserve_preceding_request_quota_and_credit_costs() {
+             assert_eq!(report.credits[0].used_credits, 2.0);
+             assert_eq!(report.credits[0].sample_count, 3);
+             assert!((report.credits[0].observed_cost_usd - 0.3).abs() < 1e-12);
++            let detail = &report.credits[0].model_usage.as_ref().unwrap()["gpt-5.4"];
++            assert_eq!(detail.tokens.input, 150_000);
++            assert!((detail.cost - 0.3).abs() < 1e-12);
+         } else {
+             assert_eq!(report.quota.len(), 1);
+             assert_eq!(report.quota[0].sample_count, 3);
+             assert!((report.quota[0].observed_cost_usd - 0.3).abs() < 1e-12);
+             assert!((report.quota[0].estimated_weekly_cost_usd - 0.75).abs() < 1e-12);
++            let detail = &report.quota[0].model_usage.as_ref().unwrap()["gpt-5.4"];
++            assert_eq!(detail.tokens.input, 150_000);
++            assert!((detail.cost - 0.3).abs() < 1e-12);
++        }
++        let mut wire = serde_json::to_value(&report).unwrap();
++        assert_eq!(
++            serde_json::from_value::<UsageReport>(wire.clone()).unwrap(),
++            report
++        );
++        // An older running server has period totals but no cached model detail.
++        for kind in ["quota", "credits"] {
++            for period in wire[kind].as_array_mut().unwrap() {
++                period.as_object_mut().unwrap().remove("modelUsage");
++            }
++        }
++        let decoded: UsageReport = serde_json::from_value(wire).unwrap();
++        let mut expected = report;
++        for period in &mut expected.quota {
++            period.model_usage = None;
++        }
++        for period in &mut expected.credits {
++            period.model_usage = None;
+         }
++        assert_eq!(decoded, expected);
+     }
+ }
+diff --git a/codex-rs/app-server/src/usage/credits.rs b/codex-rs/app-server/src/usage/credits.rs
+--- a/codex-rs/app-server/src/usage/credits.rs
++++ b/codex-rs/app-server/src/usage/credits.rs
+@@ -1,10 +1,25 @@
+ use super::quota::RECENT_DAYS;
+ use super::types::CreditObservation;
++use super::types::PricedUsage;
++use super::types::usage_by_model;
+ pub(super) use codex_app_server_protocol::UsageCreditPeriod as Period;
+-use std::collections::BTreeMap;
++use std::ops::Range;
++
++struct CurrentPeriod {
++    period: Period,
++    lowest_balance: f64,
++    usage_range: Range<usize>,
++}
++
++impl CurrentPeriod {
++    fn finish(mut self, usage: &[PricedUsage<'_>]) -> Period {
++        self.period.model_usage = Some(usage_by_model(&usage[self.usage_range]));
++        self.period
++    }
++}
+ 
+ pub(super) fn summarize(
+-    costs: &BTreeMap<i64, f64>,
++    usage: &[PricedUsage<'_>],
+     observations: &mut Vec<CreditObservation>,
+     now: i64,
+ ) -> Vec<Period> {
+@@ -12,17 +27,18 @@ pub(super) fn summarize(
+     observations.retain(|sample| sample.millis >= since && sample.millis <= now);
+     observations.sort_by_key(|sample| sample.millis);
+     let mut periods = Vec::new();
+-    let mut current: Option<(Period, f64)> = None;
+-    let mut previous: Option<(&CreditObservation, f64)> = None;
+-    let mut costs = costs.iter().peekable();
++    let mut current: Option<CurrentPeriod> = None;
++    let mut previous: Option<(&CreditObservation, f64, usize)> = None;
++    let mut usage_index = 0;
+     let mut cumulative_cost = 0.0;
+     for same_instant in observations.chunk_by(|left, right| left.millis == right.millis) {
+         let sample = &same_instant[0];
+         // Returned balances describe the preceding request, just like quota observations.
+-        while let Some((_, cost)) = costs.next_if(|(millis, _)| **millis < sample.millis) {
+-            cumulative_cost += cost;
++        while usage_index < usage.len() && usage[usage_index].millis < sample.millis {
++            cumulative_cost += usage[usage_index].cost;
++            usage_index += 1;
+         }
+-        let prior = previous.replace((sample, cumulative_cost));
++        let prior = previous.replace((sample, cumulative_cost, usage_index));
+         let interval = if same_instant.iter().any(|other| {
+             other.balance != sample.balance || other.quota_exhausted != sample.quota_exhausted
+         }) {
+@@ -30,29 +46,30 @@ pub(super) fn summarize(
+             previous = None;
+             None
+         } else {
+-            prior.and_then(|(prior, prior_cost)| {
++            prior.and_then(|(prior, prior_cost, prior_usage_index)| {
+                 prior
+                     .balance
+                     .zip(sample.balance)
+-                    .map(|(before, after)| (prior, prior_cost, before, after))
++                    .map(|(before, after)| (prior, prior_cost, prior_usage_index, before, after))
+             })
+         };
+-        if let Some((prior, prior_cost, before, after)) = interval {
++        if let Some((prior, prior_cost, prior_usage_index, before, after)) = interval {
+             let cost = cumulative_cost - prior_cost;
+-            if let Some((period, lowest_balance)) = &mut current {
++            if let Some(current) = &mut current {
+                 // Concurrent responses can return an older, higher balance. Only a
+                 // new low proves additional spending; a plateau is not recovery.
+-                if after < *lowest_balance || sample.quota_exhausted {
+-                    period.ended_at.clone_from(&sample.timestamp);
+-                    period.used_credits += (*lowest_balance - after).max(0.0);
+-                    *lowest_balance = lowest_balance.min(after);
+-                    period.observed_cost_usd += cost;
+-                    period.sample_count += 1;
++                if after < current.lowest_balance || sample.quota_exhausted {
++                    current.period.ended_at.clone_from(&sample.timestamp);
++                    current.period.used_credits += (current.lowest_balance - after).max(0.0);
++                    current.lowest_balance = current.lowest_balance.min(after);
++                    current.period.observed_cost_usd += cost;
++                    current.period.sample_count += 1;
++                    current.usage_range.end = usage_index;
+                     continue;
+                 }
+             } else if after < before {
+-                current = Some((
+-                    Period {
++                current = Some(CurrentPeriod {
++                    period: Period {
+                         started_at: prior.timestamp.clone(),
+                         ended_at: sample.timestamp.clone(),
+                         used_credits: before - after,
+@@ -60,17 +77,18 @@ pub(super) fn summarize(
+                         model_usage: None,
+                         sample_count: 2,
+                     },
+-                    after,
+-                ));
++                    lowest_balance: after,
++                    usage_range: prior_usage_index..usage_index,
++                });
+                 continue;
+             }
+         }
+-        if let Some((period, _)) = current.take() {
+-            periods.push(period);
++        if let Some(period) = current.take() {
++            periods.push(period.finish(usage));
+         }
+     }
+-    if let Some((period, _)) = current {
+-        periods.push(period);
++    if let Some(period) = current {
++        periods.push(period.finish(usage));
+     }
+     periods
+ }
+diff --git a/codex-rs/app-server/src/usage/credits_tests.rs b/codex-rs/app-server/src/usage/credits_tests.rs
+--- a/codex-rs/app-server/src/usage/credits_tests.rs
++++ b/codex-rs/app-server/src/usage/credits_tests.rs
+@@ -15,10 +15,16 @@ fn sample(seconds: i64, balance: Option<f64>) -> CreditObservation {
+     }
+ }
+ 
+-fn costs(entries: &[(i64, f64)]) -> BTreeMap<i64, f64> {
++fn costs(entries: &[(i64, f64)]) -> Vec<PricedUsage<'static>> {
+     entries
+         .iter()
+-        .map(|(seconds, cost)| (BASE + seconds * 1_000, *cost))
++        .map(|(seconds, cost)| PricedUsage {
++            millis: BASE + seconds * 1_000,
++            model: "model",
++            tokens: Default::default(),
++            cost: *cost,
++            long: false,
++        })
+         .collect()
+ }
+ 
+@@ -53,6 +59,8 @@ fn credit_only_deductions_use_preceding_costs_and_stop_at_unchanged_or_higher_ba
+     assert!((periods[1].used_credits - 0.51).abs() < 1e-9);
+     assert!((periods[1].observed_cost_usd - 4.08).abs() < 1e-9);
+     assert_eq!(periods[1].sample_count, 3);
++    assert_eq!(periods[0].model_usage.as_ref().unwrap()["model"].cost, 5.0);
++    assert!((periods[1].model_usage.as_ref().unwrap()["model"].cost - 4.08).abs() < 1e-9);
+ }
+ 
+ #[test]
+@@ -92,6 +100,8 @@ fn duplicate_delivery_does_not_bridge_missing_or_conflicting_balances() {
+     assert_eq!(periods[1].used_credits, 1.0);
+     assert_eq!(periods[1].observed_cost_usd, 2.0);
+     assert_eq!(periods[1].sample_count, 2);
++    assert_eq!(periods[0].model_usage.as_ref().unwrap()["model"].cost, 1.0);
++    assert_eq!(periods[1].model_usage.as_ref().unwrap()["model"].cost, 2.0);
+ }
+ 
+ #[test]
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+--- a/codex-rs/app-server/src/usage/mod.rs
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -6,106 +6,64 @@ mod reader;
+ mod types;
+ mod wire;
+ 
+-use chrono::FixedOffset;
+ use chrono::Local;
+-use chrono::NaiveDate;
++use codex_app_server_protocol::UsageReadParams;
++use codex_app_server_protocol::UsageReadResponse;
++use codex_app_server_protocol::UsageReport;
++use codex_app_server_protocol::UsageRows as Rows;
+ use codex_models_manager::model_pricing;
+-use codex_models_manager::model_pricing::Prices;
+ use std::collections::BTreeMap;
+-use std::collections::BTreeSet;
+ use std::path::Path;
+-use types::Diagnostics;
+-use types::Usage;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::Instant;
++use tokio::sync::Mutex;
+ 
+ type Error = Box<dyn std::error::Error + Send + Sync>;
+-type Rows = BTreeMap<String, BTreeMap<String, Usage>>;
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub(crate) enum UsageRange {
+-    Today,
+-    Yesterday,
+-    Daily,
+-    Weekly,
+-    Monthly,
+-    Yearly,
+-    Heatmap,
+-    Quota,
++/// Owned by the process-wide message processor, never by an individual connection.
++pub(crate) struct Service {
++    codex_home: PathBuf,
++    cached: Mutex<Option<Arc<UsageReport>>>,
+ }
+ 
+-impl UsageRange {
+-    pub(crate) fn label(self) -> &'static str {
+-        match self {
+-            Self::Today => "today",
+-            Self::Yesterday => "yesterday",
+-            Self::Daily => "daily",
+-            Self::Weekly => "weekly",
+-            Self::Monthly => "monthly",
+-            Self::Yearly => "yearly",
+-            Self::Heatmap => "heatmap",
+-            Self::Quota => "weekly quota",
++impl Service {
++    pub(crate) fn new(codex_home: PathBuf) -> Self {
++        Self {
++            codex_home,
++            cached: Mutex::new(None),
+         }
+     }
+-}
+-
+-#[derive(Debug)]
+-pub(crate) struct UsageReport {
+-    pub(crate) refreshed_at: chrono::DateTime<FixedOffset>,
+-    rows: Rows,
+-    weekly_rows: Rows,
+-    monthly_rows: Rows,
+-    yearly_rows: Rows,
+-    prices: Prices,
+-    quota: Vec<quota::Estimate>,
+-    credits: Vec<credits::Period>,
+-    missing_prices: BTreeSet<String>,
+-    diagnostics: Diagnostics,
+-    today: NaiveDate,
+-    timezone: FixedOffset,
+-}
+ 
+-impl UsageReport {
+-    fn periods(
+-        &self,
+-        range: UsageRange,
+-    ) -> impl DoubleEndedIterator<Item = (&String, &BTreeMap<String, Usage>)> {
+-        let rows = match range {
+-            UsageRange::Weekly => &self.weekly_rows,
+-            UsageRange::Monthly => &self.monthly_rows,
+-            UsageRange::Yearly => &self.yearly_rows,
+-            UsageRange::Today
+-            | UsageRange::Yesterday
+-            | UsageRange::Daily
+-            | UsageRange::Heatmap
+-            | UsageRange::Quota => &self.rows,
+-        };
+-        let bounds = match range {
+-            UsageRange::Today => Some((self.today, self.today)),
+-            UsageRange::Yesterday => {
+-                let yesterday = self.today - chrono::Duration::days(1);
+-                Some((yesterday, yesterday))
+-            }
+-            UsageRange::Heatmap => Some((self.today - chrono::Duration::days(364), self.today)),
+-            UsageRange::Quota => Some((
+-                self.today - chrono::Duration::days(quota::RECENT_DAYS),
+-                self.today,
+-            )),
+-            UsageRange::Daily | UsageRange::Weekly | UsageRange::Monthly | UsageRange::Yearly => {
+-                None
+-            }
++    pub(crate) async fn read(&self, params: UsageReadParams) -> Result<UsageReadResponse, String> {
++        // Keep the lock through loading so concurrent clients reuse the same scan.
++        let mut cached = self.cached.lock().await;
++        if !params.refresh
++            && let Some(report) = cached.as_ref()
++        {
++            return Ok(UsageReadResponse {
++                report: Arc::clone(report),
++                refreshed: false,
++            });
+         }
+-        .map(|(start, end)| (start.to_string(), end.to_string()));
+-        rows.iter().filter(move |(date, _)| {
+-            bounds
+-                .as_ref()
+-                .is_none_or(|(start, end)| *date >= start && *date <= end)
++        let codex_home = self.codex_home.clone();
++        let report = tokio::task::spawn_blocking(move || load(&codex_home))
++            .await
++            .map_err(|error| format!("usage task failed: {error}"))??;
++        let report = Arc::new(report);
++        *cached = Some(Arc::clone(&report));
++        Ok(UsageReadResponse {
++            report,
++            refreshed: true,
+         })
+     }
+ }
+ 
+-pub(crate) fn load(codex_home: &Path) -> Result<UsageReport, String> {
++fn load(codex_home: &Path) -> Result<UsageReport, String> {
++    let started = Instant::now();
+     let now = Local::now();
+     let prices = model_pricing::read_prices(codex_home).map_err(|error| error.to_string())?;
+-    let report = aggregate::load(codex_home, prices, *now.offset(), now.timestamp_millis())
++    let mut report = aggregate::load(codex_home, prices, *now.offset(), now.timestamp_millis())
+         .map_err(|error| format!("could not load Codex usage: {error}"))?;
+     model_pricing::ensure_models(
+         codex_home,
+@@ -116,5 +74,10 @@ pub(crate) fn load(codex_home: &Path) -> Result<UsageReport, String> {
+             .map(String::as_str),
+     )
+     .map_err(|error| error.to_string())?;
++    report.build_duration_ms = Some(started.elapsed().as_millis() as u64);
+     Ok(report)
+ }
++
++#[cfg(test)]
++#[path = "service_tests.rs"]
++mod service_tests;
+diff --git a/codex-rs/app-server/src/usage/quota.rs b/codex-rs/app-server/src/usage/quota.rs
+--- a/codex-rs/app-server/src/usage/quota.rs
++++ b/codex-rs/app-server/src/usage/quota.rs
+@@ -1,6 +1,8 @@
+-use std::collections::BTreeMap;
++use std::ops::Range;
+ 
+ use super::types::Observation;
++use super::types::PricedUsage;
++use super::types::usage_by_model;
+ pub(super) use codex_app_server_protocol::UsageQuotaEstimate as Estimate;
+ pub(super) use codex_app_server_protocol::UsageQuotaStatus as Status;
+ 
+@@ -18,10 +20,16 @@ struct Segment<'a> {
+     percent_variance: f64,
+     percent_cost_covariance: f64,
+     count: usize,
++    usage_range: Range<usize>,
+ }
+ 
+ impl<'a> Segment<'a> {
+-    fn new(observation: &'a Observation, cumulative_cost: f64, start_percent: f64) -> Self {
++    fn new(
++        observation: &'a Observation,
++        cumulative_cost: f64,
++        start_percent: f64,
++        usage_index: usize,
++    ) -> Self {
+         Self {
+             start: observation,
+             end: observation,
+@@ -33,11 +41,13 @@ impl<'a> Segment<'a> {
+             percent_variance: 0.0,
+             percent_cost_covariance: 0.0,
+             count: 1,
++            usage_range: usage_index..usage_index,
+         }
+     }
+ 
+-    fn observe(&mut self, observation: &'a Observation, cumulative_cost: f64) {
++    fn observe(&mut self, observation: &'a Observation, cumulative_cost: f64, usage_index: usize) {
+         self.end = observation;
++        self.usage_range.end = usage_index;
+         self.observed_cost = cumulative_cost - self.start_cost;
+         self.count += 1;
+         // Each interval estimates 100 * delta_cost / delta_percent. Weighting
+@@ -78,6 +88,7 @@ impl<'a> Cycle<'a> {
+         &mut self,
+         sample: &'a Observation,
+         cumulative_cost: f64,
++        usage_index: usize,
+         credit_balances: Option<(f64, f64)>,
+     ) {
+         if credit_balances.is_some_and(|(before, after)| before != after) {
+@@ -96,14 +107,19 @@ impl<'a> Cycle<'a> {
+             return;
+         }
+         match self.current.as_mut() {
+-            Some(segment) => segment.observe(sample, cumulative_cost),
++            Some(segment) => segment.observe(sample, cumulative_cost, usage_index),
+             None => {
+-                self.current = Some(Segment::new(sample, cumulative_cost, sample.used_percent));
++                self.current = Some(Segment::new(
++                    sample,
++                    cumulative_cost,
++                    sample.used_percent,
++                    usage_index,
++                ));
+             }
+         }
+     }
+ 
+-    fn estimate(&self, status: Status) -> Option<Estimate> {
++    fn estimate(&self, status: Status, usage: &[PricedUsage<'_>]) -> Option<Estimate> {
+         let mut segments = self
+             .segments
+             .iter()
+@@ -135,7 +151,13 @@ impl<'a> Cycle<'a> {
+             used_percent_start: first.start_percent,
+             used_percent_end: last.end.used_percent,
+             observed_cost_usd: observed_cost,
+-            model_usage: None,
++            model_usage: Some(usage_by_model(
++                self.segments
++                    .iter()
++                    .chain(self.current.iter())
++                    .filter(|segment| segment.span() > 0.0)
++                    .flat_map(|segment| &usage[segment.usage_range.clone()]),
++            )),
+             estimated_weekly_cost_usd: 100.0 * covariance / variance,
+             sample_count: count,
+             status,
+@@ -144,7 +166,7 @@ impl<'a> Cycle<'a> {
+ }
+ 
+ pub(super) fn estimate(
+-    costs: &BTreeMap<i64, f64>,
++    usage: &[PricedUsage<'_>],
+     observations: &mut Vec<Observation>,
+     now: i64,
+ ) -> Vec<Estimate> {
+@@ -168,9 +190,9 @@ pub(super) fn estimate(
+     });
+     let mut estimates = Vec::new();
+     let mut cycle: Option<Cycle<'_>> = None;
+-    let mut costs = costs.iter().peekable();
++    let mut usage_index = 0;
+     let mut cumulative_cost = 0.0;
+-    let mut previous: Option<(&Observation, f64)> = None;
++    let mut previous: Option<(&Observation, f64, usize)> = None;
+     let mut index = 0;
+     while index < observations.len() {
+         let sample = &observations[index];
+@@ -185,15 +207,16 @@ pub(super) fn estimate(
+         }
+         // A response reports quota through the preceding request. Its own usage
+         // enters the next observation, so include the start and exclude the end.
+-        while let Some((_, cost)) = costs.next_if(|(millis, _)| **millis < sample.millis) {
+-            cumulative_cost += cost;
++        while usage_index < usage.len() && usage[usage_index].millis < sample.millis {
++            cumulative_cost += usage[usage_index].cost;
++            usage_index += 1;
+         }
+         let Some(current) = cycle.as_mut() else {
+             cycle = Some(Cycle::new(
+                 sample.resets_at,
+-                Segment::new(sample, cumulative_cost, sample.used_percent),
++                Segment::new(sample, cumulative_cost, sample.used_percent, usage_index),
+             ));
+-            previous = Some((sample, cumulative_cost));
++            previous = Some((sample, cumulative_cost, usage_index));
+             continue;
+         };
+         // Old concurrent responses can carry an earlier reset horizon. They do
+@@ -201,13 +224,13 @@ pub(super) fn estimate(
+         if sample.resets_at < current.reset_horizon.saturating_sub(300) {
+             continue;
+         }
+-        let (prior, prior_cost) = previous
+-            .replace((sample, cumulative_cost))
++        let (prior, prior_cost, prior_usage_index) = previous
++            .replace((sample, cumulative_cost, usage_index))
+             .expect("an existing cycle has a preceding observation");
+         let credit_balances = prior.credit_balance.zip(sample.credit_balance);
+         let credit_changed = credit_balances.is_some_and(|(before, after)| before != after);
+         if sample.resets_at > current.reset_horizon.saturating_add(300) {
+-            if let Some(estimate) = current.estimate(Status::Completed) {
++            if let Some(estimate) = current.estimate(Status::Completed, usage) {
+                 estimates.push(estimate);
+             }
+             // Only a preceding request inside the new weekly window can supply
+@@ -216,17 +239,17 @@ pub(super) fn estimate(
+             let prior_in_cycle =
+                 prior.millis.div_euclid(1_000) >= sample.resets_at.saturating_sub(7 * 24 * 60 * 60);
+             let segment = if credit_changed || !prior_in_cycle {
+-                Segment::new(sample, cumulative_cost, sample.used_percent)
++                Segment::new(sample, cumulative_cost, sample.used_percent, usage_index)
+             } else {
+-                let mut restored = Segment::new(prior, prior_cost, 0.0);
+-                restored.observe(sample, cumulative_cost);
++                let mut restored = Segment::new(prior, prior_cost, 0.0, prior_usage_index);
++                restored.observe(sample, cumulative_cost, usage_index);
+                 restored
+             };
+             cycle = Some(Cycle::new(sample.resets_at, segment));
+             continue;
+         }
+         current.reset_horizon = current.reset_horizon.max(sample.resets_at);
+-        current.observe(sample, cumulative_cost, credit_balances);
++        current.observe(sample, cumulative_cost, usage_index, credit_balances);
+     }
+     if let Some(cycle) = cycle {
+         let status = if cycle.completed {
+@@ -234,7 +257,7 @@ pub(super) fn estimate(
+         } else {
+             Status::Provisional
+         };
+-        if let Some(estimate) = cycle.estimate(status) {
++        if let Some(estimate) = cycle.estimate(status, usage) {
+             estimates.push(estimate);
+         }
+     }
+diff --git a/codex-rs/app-server/src/usage/quota_tests.rs b/codex-rs/app-server/src/usage/quota_tests.rs
+--- a/codex-rs/app-server/src/usage/quota_tests.rs
++++ b/codex-rs/app-server/src/usage/quota_tests.rs
+@@ -16,10 +16,16 @@ fn sample(seconds: i64, percent: f64, reset: i64) -> Observation {
+     }
+ }
+ 
+-fn costs(entries: &[(i64, f64)]) -> BTreeMap<i64, f64> {
++fn costs(entries: &[(i64, f64)]) -> Vec<PricedUsage<'static>> {
+     entries
+         .iter()
+-        .map(|(seconds, cost)| (BASE + seconds * 1_000, *cost))
++        .map(|(seconds, cost)| PricedUsage {
++            millis: BASE + seconds * 1_000,
++            model: "model",
++            tokens: Default::default(),
++            cost: *cost,
++            long: false,
++        })
+         .collect()
+ }
+ 
+@@ -56,6 +62,14 @@ fn reset_closes_previous_cycle_and_keeps_current_provisional() {
+     assert_eq!(estimates[1].used_percent_start, 0.0);
+     assert_eq!(estimates[1].observed_cost_usd, 57.0);
+     assert_eq!(estimates[1].estimated_weekly_cost_usd, 100.0);
++    assert_eq!(
++        estimates[0].model_usage.as_ref().unwrap()["model"].cost,
++        100.0
++    );
++    assert_eq!(
++        estimates[1].model_usage.as_ref().unwrap()["model"].cost,
++        57.0
++    );
+ }
+ 
+ #[test]
+@@ -321,11 +335,14 @@ fn one_cycle_combines_valid_segments_without_measuring_across_a_credit_gap() {
+     for (index, observation) in observations.iter_mut().enumerate() {
+         observation.credit_balance = Some(if index < 2 { 100.0 } else { 90.0 });
+     }
+-    let estimates = estimate(
+-        &costs(&[(0, 20.0), (10, 999.0), (20, 40.0)]),
+-        &mut observations,
+-        BASE + 40_000,
+-    );
++    let mut charges = costs(&[(0, 20.0), (10, 999.0), (20, 40.0), (20, 0.0)]);
++    charges[0].tokens.input = 280_000;
++    charges[0].long = true;
++    charges[1].model = "credit-funded";
++    charges[2].tokens.input = 100;
++    charges[3].model = "unknown model";
++    charges[3].tokens.input = 200;
++    let estimates = estimate(&charges, &mut observations, BASE + 40_000);
+     assert_eq!(estimates.len(), 1);
+     assert_eq!(estimates[0].used_percent_start, 0.0);
+     assert_eq!(estimates[0].used_percent_end, 60.0);
+@@ -333,6 +350,18 @@ fn one_cycle_combines_valid_segments_without_measuring_across_a_credit_gap() {
+     assert_eq!(estimates[0].estimated_weekly_cost_usd, 150.0);
+     assert_eq!(estimates[0].sample_count, 4);
+     assert_eq!(estimates[0].status, Status::Provisional);
++    assert_eq!(
++        estimates[0].model_usage.as_ref().unwrap()["model"].cost,
++        60.0
++    );
++    let models = estimates[0].model_usage.as_ref().unwrap();
++    assert_eq!(models.len(), 2);
++    assert_eq!(models["model"].tokens.input, 280_100);
++    assert_eq!(models["model"].long_tokens.input, 280_000);
++    assert_eq!(models["model"].short_cost, 40.0);
++    assert_eq!(models["model"].long_cost, 20.0);
++    assert_eq!(models["unknown model"].tokens.input, 200);
++    assert_eq!(models["unknown model"].cost, 0.0);
+ }
+ 
+ #[test]
+diff --git a/codex-rs/app-server/src/usage/service_tests.rs b/codex-rs/app-server/src/usage/service_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/service_tests.rs
+@@ -0,0 +1,110 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::fs;
++use std::time::Duration;
++
++#[tokio::test]
++async fn concurrent_clients_share_a_snapshot_without_automatic_expiry() {
++    let home = tempfile::tempdir().unwrap();
++    let service = Service::new(home.path().to_path_buf());
++    let (first, second) = tokio::join!(
++        service.read(UsageReadParams::default()),
++        service.read(UsageReadParams::default()),
++    );
++    let first = first.unwrap();
++    let second = second.unwrap();
++    assert_ne!(first.refreshed, second.refreshed);
++    let first = first.report;
++    let second = second.report;
++    assert!(Arc::ptr_eq(&first, &second));
++    assert_eq!(first.latest_usage_at, None);
++    assert!(first.build_duration_ms.is_some());
++    assert_eq!(first.build_duration_ms, second.build_duration_ms);
++
++    fs::create_dir(home.path().join("sessions")).unwrap();
++    fs::write(
++        home.path().join("sessions/linear.jsonl"),
++        "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"linear\"}}\n",
++    )
++    .unwrap();
++    let cached = service.read(UsageReadParams::default()).await.unwrap();
++    assert!(!cached.refreshed);
++    let cached = cached.report;
++    assert!(Arc::ptr_eq(&first, &cached));
++    assert_eq!(cached.diagnostics.skipped_non_paginated, 0);
++    assert_eq!(cached.build_duration_ms, first.build_duration_ms);
++
++    let refreshed = service
++        .read(UsageReadParams { refresh: true })
++        .await
++        .unwrap();
++    assert!(refreshed.refreshed);
++    let refreshed = refreshed.report;
++    assert!(!Arc::ptr_eq(&first, &refreshed));
++    assert_eq!(refreshed.diagnostics.skipped_non_paginated, 1);
++    let another_client = service.read(UsageReadParams::default()).await.unwrap();
++    assert!(!another_client.refreshed);
++    let another_client = another_client.report;
++    assert!(Arc::ptr_eq(&refreshed, &another_client));
++    assert!(refreshed.build_duration_ms.is_some());
++    assert_eq!(
++        another_client.build_duration_ms,
++        refreshed.build_duration_ms
++    );
++
++    tokio::time::pause();
++    tokio::time::advance(Duration::from_secs(25 * 60 * 60)).await;
++    let aged = service.read(UsageReadParams::default()).await.unwrap();
++    assert!(!aged.refreshed);
++    let aged = aged.report;
++    assert!(Arc::ptr_eq(&refreshed, &aged));
++    assert_eq!(aged.diagnostics.skipped_non_paginated, 1);
++}
++
++#[tokio::test]
++async fn explicit_refresh_reports_scan_errors_and_recovers_on_the_next_request() {
++    let home = tempfile::tempdir().unwrap();
++    let service = Service::new(home.path().to_path_buf());
++    let initial = service.read(UsageReadParams::default()).await.unwrap();
++    fs::write(home.path().join("sessions"), "not a directory").unwrap();
++    assert!(
++        service
++            .read(UsageReadParams { refresh: true })
++            .await
++            .is_err()
++    );
++    let cached = service.read(UsageReadParams::default()).await.unwrap();
++    assert!(Arc::ptr_eq(&initial.report, &cached.report));
++    assert_eq!(
++        cached.report.build_duration_ms,
++        initial.report.build_duration_ms
++    );
++    fs::remove_file(home.path().join("sessions")).unwrap();
++    let response = service
++        .read(UsageReadParams { refresh: true })
++        .await
++        .unwrap();
++    let wire = serde_json::to_value(&response).unwrap();
++    let decoded: UsageReadResponse = serde_json::from_value(wire.clone()).unwrap();
++    assert_eq!(decoded, response);
++    assert!(response.refreshed);
++    assert!(response.report.build_duration_ms.is_some());
++
++    let mut zero_duration = wire.clone();
++    zero_duration["report"]["buildDurationMs"] = serde_json::json!(0);
++    let decoded: UsageReadResponse = serde_json::from_value(zero_duration).unwrap();
++    assert_eq!(decoded.report.build_duration_ms, Some(0));
++
++    // Installing a new TUI does not require restarting the shared server.
++    let mut older_response = wire;
++    older_response.as_object_mut().unwrap().remove("refreshed");
++    older_response["report"]
++        .as_object_mut()
++        .unwrap()
++        .remove("buildDurationMs");
++    let decoded: UsageReadResponse = serde_json::from_value(older_response).unwrap();
++    assert!(!decoded.refreshed);
++    let mut expected = (*response.report).clone();
++    expected.build_duration_ms = None;
++    assert_eq!(*decoded.report, expected);
++}
+diff --git a/codex-rs/app-server/src/usage/types.rs b/codex-rs/app-server/src/usage/types.rs
+--- a/codex-rs/app-server/src/usage/types.rs
++++ b/codex-rs/app-server/src/usage/types.rs
+@@ -1,7 +1,33 @@
++use codex_app_server_protocol::UsageByModel;
+ pub(super) use codex_app_server_protocol::UsageDiagnostics as Diagnostics;
+ pub(super) use codex_app_server_protocol::UsageTokens as Tokens;
+ pub(super) use codex_app_server_protocol::UsageTotals as Usage;
+ 
++/// Already-priced usage retained only for the recent quota and credit window.
++pub(super) struct PricedUsage<'a> {
++    pub(super) millis: i64,
++    pub(super) model: &'a str,
++    pub(super) tokens: Tokens,
++    pub(super) cost: f64,
++    pub(super) long: bool,
++}
++
++pub(super) fn usage_by_model<'a>(
++    events: impl IntoIterator<Item = &'a PricedUsage<'a>>,
++) -> UsageByModel {
++    let mut models = UsageByModel::new();
++    for event in events {
++        if let Some(usage) = models.get_mut(event.model) {
++            usage.add(event.tokens, event.cost, event.long);
++        } else {
++            let mut usage = Usage::default();
++            usage.add(event.tokens, event.cost, event.long);
++            models.insert(event.model.to_owned(), usage);
++        }
++    }
++    models
++}
++
+ #[derive(Debug)]
+ pub(super) struct Observation {
+     pub(super) timestamp: String,
+diff --git a/codex-rs/protocol/src/lib.rs b/codex-rs/protocol/src/lib.rs
+--- a/codex-rs/protocol/src/lib.rs
++++ b/codex-rs/protocol/src/lib.rs
+@@ -36,6 +36,7 @@ pub mod mcp_approval_meta;
+ pub mod mcp_policy;
+ pub mod memory_citation;
+ mod memory_version;
++pub mod usage;
+ pub use memory_version::MemoryVersion;
+ pub mod models;
+ pub mod network_policy;
+diff --git a/codex-rs/protocol/src/usage.rs b/codex-rs/protocol/src/usage.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/protocol/src/usage.rs
+@@ -0,0 +1,198 @@
++use chrono::DateTime;
++use chrono::FixedOffset;
++use schemars::JsonSchema;
++use serde::Deserialize;
++use serde::Serialize;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use ts_rs::TS;
++
++pub type UsageByModel = BTreeMap<String, UsageTotals>;
++pub type UsageRows = BTreeMap<String, UsageByModel>;
++
++/// A single server-local accounting snapshot, shared by all report views and clients.
++#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageReport {
++    /// Snapshot time and the local offset used for its calendar aggregation.
++    #[schemars(with = "String")]
++    #[ts(type = "string")]
++    pub refreshed_at: DateTime<FixedOffset>,
++    /// Complete producer build duration retained with this snapshot, in milliseconds.
++    /// Absent in reports from servers that predate this field; zero is a measured duration.
++    #[serde(default)]
++    pub build_duration_ms: Option<u64>,
++    /// Latest counted JSONL usage timestamp, absent when no owned usage was found.
++    #[schemars(with = "Option<String>")]
++    #[ts(type = "string | null")]
++    pub latest_usage_at: Option<DateTime<FixedOffset>>,
++    pub rows: UsageRows,
++    pub weekly_rows: UsageRows,
++    pub monthly_rows: UsageRows,
++    pub yearly_rows: UsageRows,
++    /// Model prices by inclusive input-token threshold, in USD per million tokens.
++    pub prices: BTreeMap<String, BTreeMap<u64, UsagePriceRates>>,
++    pub quota: Vec<UsageQuotaEstimate>,
++    pub credits: Vec<UsageCreditPeriod>,
++    pub missing_prices: BTreeSet<String>,
++    pub diagnostics: UsageDiagnostics,
++}
++
++/// Input includes both cache buckets; reasoning is already included in output.
++#[derive(
++    Clone,
++    Copy,
++    Debug,
++    Default,
++    Deserialize,
++    Eq,
++    JsonSchema,
++    Ord,
++    PartialEq,
++    PartialOrd,
++    Serialize,
++    TS,
++)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageTokens {
++    pub input: u64,
++    pub cached: u64,
++    pub cache_write: u64,
++    pub output: u64,
++    pub reasoning: u64,
++    pub total: u64,
++}
++
++impl UsageTokens {
++    pub fn subtract(self, previous: Self) -> Self {
++        let input = self.input.saturating_sub(previous.input);
++        let cached = self.cached.saturating_sub(previous.cached).min(input);
++        Self {
++            input,
++            cached,
++            cache_write: self
++                .cache_write
++                .saturating_sub(previous.cache_write)
++                .min(input - cached),
++            output: self.output.saturating_sub(previous.output),
++            reasoning: self.reasoning.saturating_sub(previous.reasoning),
++            total: self.total.saturating_sub(previous.total),
++        }
++    }
++
++    pub fn is_empty(self) -> bool {
++        self.input == 0
++            && self.cached == 0
++            && self.cache_write == 0
++            && self.output == 0
++            && self.reasoning == 0
++    }
++
++    pub fn add(&mut self, other: Self) {
++        self.input += other.input;
++        self.cached += other.cached;
++        self.cache_write += other.cache_write;
++        self.output += other.output;
++        self.reasoning += other.reasoning;
++        self.total += other.total;
++    }
++}
++
++#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageTotals {
++    pub tokens: UsageTokens,
++    pub long_tokens: UsageTokens,
++    pub cost: f64,
++    pub short_cost: f64,
++    pub long_cost: f64,
++}
++
++impl UsageTotals {
++    pub fn add(&mut self, tokens: UsageTokens, cost: f64, long: bool) {
++        self.tokens.add(tokens);
++        self.cost += cost;
++        if long {
++            self.long_tokens.add(tokens);
++            self.long_cost += cost;
++        } else {
++            self.short_cost += cost;
++        }
++    }
++
++    pub fn add_usage(&mut self, other: &Self) {
++        self.tokens.add(other.tokens);
++        self.long_tokens.add(other.long_tokens);
++        self.cost += other.cost;
++        self.short_cost += other.short_cost;
++        self.long_cost += other.long_cost;
++    }
++}
++
++#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageDiagnostics {
++    pub files: usize,
++    pub skipped_non_paginated: usize,
++    pub malformed_records: usize,
++    pub incomplete_tails: usize,
++    pub replayed_events: usize,
++    pub duplicate_events: usize,
++    pub unique_events: usize,
++}
++
++#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsagePriceRates {
++    pub input: f64,
++    pub cache_read: f64,
++    pub cache_write: f64,
++    pub output: f64,
++}
++
++#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum UsageQuotaStatus {
++    Completed,
++    Provisional,
++}
++
++#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageQuotaEstimate {
++    pub started_at: String,
++    pub ended_at: String,
++    pub used_percent_start: f64,
++    pub used_percent_end: f64,
++    pub observed_cost_usd: f64,
++    /// Usage in the measured segments, excluding credit-funded gaps.
++    /// Absent in snapshots from older servers.
++    #[serde(default)]
++    pub model_usage: Option<UsageByModel>,
++    pub estimated_weekly_cost_usd: f64,
++    pub sample_count: usize,
++    pub status: UsageQuotaStatus,
++}
++
++/// A continuous interval of observed credit deductions, without an estimated quota or status.
++#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct UsageCreditPeriod {
++    pub started_at: String,
++    pub ended_at: String,
++    pub used_credits: f64,
++    pub observed_cost_usd: f64,
++    /// Usage in the observed deduction interval, absent in older snapshots.
++    #[serde(default)]
++    pub model_usage: Option<UsageByModel>,
++    /// Number of balance observations spanning the interval, including its starting balance.
++    pub sample_count: usize,
++}

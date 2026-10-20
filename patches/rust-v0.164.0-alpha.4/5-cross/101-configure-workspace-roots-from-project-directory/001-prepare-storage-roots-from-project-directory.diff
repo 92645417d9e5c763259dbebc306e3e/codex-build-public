@@ -1,0 +1,1186 @@
+prepare-storage-roots-from-project-directory
+
+Lane: cross
+
+Unit: configure-workspace-roots-from-project-directory
+
+ChildPatch: prepare-storage-roots-from-project-directory
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Configure the cwd-derived local Workspace across startup, resume and accepted directory changes.
+
+Requires: Unit:normalization/normalize-base-roots-for-processes, FlatPatch:normalization/initialize-tmpdir-before-process-startup, FlatPatch:backend/persist-thread-settings-without-runtime
+
+Provides: Prepare six selected roots and scratch language directories; bind their inherited values, seven-tree Workspace write access and nonrecursive shell-policy root references to the current local cwd at local execution boundaries; preserve canonical thread profiles, captured environments and native constraints; suppress only cwd control discovery when its AGENTS.override.md is empty.
+
+Boundary: Base roots and TMPDIR remain normalization-owned. Approval, network policy, named custom profiles and owner-provided environments retain native ownership. Remote execution never prepares host project roots. Shell templates remain raw until local preparation and invalid references fail that environment. Ancestor, user, system, plugin and explicit skill roots remain discoverable.
+
+Verification: Core tests cover root defaults and overrides, canonical profile preservation, cwd rebinding, constraints, failures, shell-reference syntax, remote inheritance and snapshot isolation. App-server and TUI tests cover start, resume, settings, standalone commands and /cd. Shell, hook, Guardian and MCP tests cover filtering and captured-environment reuse; loader and skill-root tests cover empty overrides and preserved ancestor controls.
+
+CrossGroup: workspace-permissions
+
+
+diff --git a/codex-rs/config/src/shell_environment_policy.rs b/codex-rs/config/src/shell_environment_policy.rs
+--- a/codex-rs/config/src/shell_environment_policy.rs
++++ b/codex-rs/config/src/shell_environment_policy.rs
+@@ -152,6 +152,7 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
+         };
+ 
+         Self {
++            inherited_environment: HashMap::new(),
+             inherit,
+             ignore_default_excludes,
+             exclude: exclude
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -3291,7 +3291,10 @@ async fn default_permissions_can_select_builtin_profile_without_permissions_tabl
+ 
+     assert!(config.explicit_permission_profile_mode);
+     assert!(config.custom_permission_profiles.is_empty());
+-    let policy = config.permissions.file_system_sandbox_policy();
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
+     assert_eq!(
+         config
+             .permissions
+@@ -3305,8 +3308,8 @@ async fn default_permissions_can_select_builtin_profile_without_permissions_tabl
+         "expected :workspace to allow writing the project root, policy: {policy:?}"
+     );
+     assert!(
+-        !policy.can_write_local_path_with_cwd(&cwd.path().join(".git"), cwd.path()),
+-        "expected :workspace to protect project metadata, policy: {policy:?}"
++        policy.can_write_local_path_with_cwd(&cwd.path().join(".git"), cwd.path()),
++        "published Workspace makes project metadata writable, policy: {policy:?}"
+     );
+     Ok(())
+ }
+@@ -3679,7 +3682,10 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project(
+     .await?;
+ 
+     let mxc_selected = prefer_mxc && codex_sandboxing::windows_mxc_available();
+-    let policy = config.permissions.file_system_sandbox_policy();
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
+     assert_eq!(
+         config
+             .permissions
+@@ -3703,8 +3709,8 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project(
+             "expected trusted project fallback to use :workspace, policy: {policy:?}"
+         );
+         assert!(
+-            !policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
+-            "expected :workspace metadata carveouts, policy: {policy:?}"
++            policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
++            "published Workspace makes project metadata writable, policy: {policy:?}"
+         );
+     }
+     Ok(())
+@@ -3734,7 +3740,10 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
+     )
+     .await?;
+ 
+-    let policy = config.permissions.file_system_sandbox_policy();
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
+     assert_eq!(
+         config
+             .permissions
+@@ -3762,15 +3771,131 @@ async fn empty_config_defaults_to_builtin_profile_for_untrusted_project() -> std
+             "expected untrusted project fallback to use :workspace, policy: {policy:?}"
+         );
+         assert!(
+-            !policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
+-            "expected :workspace metadata carveouts, policy: {policy:?}"
++            policy.can_write_local_path_with_cwd(&cwd.path().join(".codex"), cwd.path()),
++            "published Workspace makes project metadata writable, policy: {policy:?}"
++        );
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn implicit_builtin_workspace_uses_selected_storage_roots() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            projects: Some(HashMap::from([(
++                cwd.path().to_string_lossy().to_string(),
++                ProjectConfig {
++                    trust_level: Some(TrustLevel::Trusted),
++                },
++            )])),
++            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
++                network_access: true,
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    let roots = config
++        .local_storage_roots()
++        .map_err(std::io::Error::other)?;
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
++    for path in [cwd.path().to_path_buf(), cwd.path().join(".git/config")]
++        .into_iter()
++        .chain(
++            roots
++                .directories()
++                .map(|root| root.as_path().join("nested/file")),
++        )
++    {
++        assert!(
++            policy.can_write_local_path_with_cwd(&path, cwd.path()),
++            "expected Workspace to write {path:?}, policy: {policy:?}"
++        );
++    }
++    for path in [codex_home.path(), std::path::Path::new("/tmp/unrelated")] {
++        assert!(
++            !policy.can_write_local_path_with_cwd(path, cwd.path()),
++            "unexpected Workspace write to {path:?}, policy: {policy:?}"
++        );
++    }
++    assert_eq!(
++        config.permissions.network_sandbox_policy(),
++        NetworkSandboxPolicy::Enabled
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn supplied_builtin_workspace_uses_selected_storage_roots() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let supplied = PermissionProfile::workspace_write_with(
++        &[],
++        NetworkSandboxPolicy::Enabled,
++        /*exclude_tmpdir_env_var*/ false,
++        /*exclude_slash_tmp*/ false,
++    );
++    let mut config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            permission_profile: Some(supplied),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    let roots = config
++        .local_storage_roots()
++        .map_err(std::io::Error::other)?;
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
++    for path in [cwd.path().join(".git/config")].into_iter().chain(
++        roots
++            .directories()
++            .map(|root| root.as_path().join("nested/file")),
++    ) {
++        assert!(
++            policy.can_write_local_path_with_cwd(&path, cwd.path()),
++            "{path:?}"
+         );
+     }
++    assert!(
++        !policy.can_write_local_path_with_cwd(std::path::Path::new("/tmp/unrelated"), cwd.path())
++    );
++    assert_eq!(
++        config.permissions.network_sandbox_policy(),
++        NetworkSandboxPolicy::Enabled
++    );
++    config
++        .permissions
++        .set_workspace_roots(vec![codex_home.abs()]);
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
++    assert!(!policy.can_write_local_path_with_cwd(codex_home.path(), cwd.path()));
++    assert!(policy.can_write_local_path_with_cwd(&cwd.path().join(".git/config"), cwd.path()));
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_settings()
++async fn implicit_builtin_workspace_keeps_network_but_replaces_legacy_filesystem_roots()
+ -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+     let cwd = TempDir::new()?;
+@@ -3788,7 +3913,7 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
+             )])),
+             sandbox_workspace_write: Some(SandboxWorkspaceWrite {
+                 writable_roots: vec![extra_root.clone()],
+-                network_access: true,
++                network_access: false,
+                 exclude_tmpdir_env_var: true,
+                 exclude_slash_tmp: false,
+             }),
+@@ -3806,14 +3931,23 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
+     )
+     .await?;
+ 
+-    let policy = config.permissions.file_system_sandbox_policy();
+     assert!(
+-        policy.can_write_local_path_with_cwd(extra_root.as_path(), cwd.path()),
+-        "expected implicit :workspace to preserve sandbox_workspace_write.writable_roots, policy: {policy:?}"
++        config
++            .permissions
++            .file_system_sandbox_policy()
++            .can_write_local_path_with_cwd(extra_root.as_path(), cwd.path())
++    );
++    let permissions = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?;
++    let policy = permissions.file_system_sandbox_policy();
++    assert!(
++        !policy.can_write_local_path_with_cwd(extra_root.as_path(), cwd.path()),
++        "legacy writable_roots must not broaden the seven Workspace trees, policy: {policy:?}"
+     );
+     assert_eq!(
+-        config.permissions.network_sandbox_policy(),
+-        NetworkSandboxPolicy::Enabled
++        permissions.network_sandbox_policy(),
++        NetworkSandboxPolicy::Restricted
+     );
+     assert_eq!(
+         config.permissions.active_permission_profile(),
+@@ -3821,17 +3955,17 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
+         "implicit :workspace cannot be faithfully re-selected when it includes \
+          legacy sandbox_workspace_write settings"
+     );
+-    match config.legacy_sandbox_policy() {
++    match permissions.legacy_sandbox_policy(cwd.path()) {
+         SandboxPolicy::WorkspaceWrite {
+             writable_roots,
+             network_access,
+             exclude_tmpdir_env_var,
+             exclude_slash_tmp,
+         } => {
+-            assert!(writable_roots.contains(&extra_root));
+-            assert!(network_access);
++            assert!(!writable_roots.contains(&extra_root));
++            assert!(!network_access);
+             assert!(exclude_tmpdir_env_var);
+-            assert!(!exclude_slash_tmp);
++            assert!(exclude_slash_tmp);
+         }
+         sandbox_policy => panic!("expected workspace-write projection, got {sandbox_policy:?}"),
+     }
+@@ -3839,7 +3973,7 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
+ }
+ 
+ #[tokio::test]
+-async fn implicit_builtin_workspace_profile_preserves_add_dir_metadata_carveouts()
++async fn implicit_builtin_workspace_does_not_expand_for_additional_directories()
+ -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+     let cwd = TempDir::new()?;
+@@ -3872,19 +4006,24 @@ async fn implicit_builtin_workspace_profile_preserves_add_dir_metadata_carveouts
+     )
+     .await?;
+ 
+-    let policy = config.permissions.file_system_sandbox_policy();
++    let policy = config
++        .prepare_local_permissions()
++        .map_err(std::io::Error::other)?
++        .file_system_sandbox_policy();
+     let extra_root = extra_root.path().abs();
+     assert!(
+-        policy.can_write_local_path_with_cwd(extra_root.as_path(), cwd.path()),
+-        "expected implicit :workspace to preserve additional writable roots, policy: {policy:?}"
++        !policy.can_write_local_path_with_cwd(extra_root.as_path(), cwd.path()),
++        "additional directories must not broaden the seven Workspace trees, policy: {policy:?}"
+     );
+     for subpath in [".git", ".agents", ".codex", ".aws"] {
+         assert!(
+             !policy.can_write_local_path_with_cwd(&extra_root.join(subpath), cwd.path()),
+-            "expected implicit :workspace to preserve legacy metadata carveout for {subpath}, \
+-             policy: {policy:?}"
++            "metadata outside the Workspace trees must remain read-only, policy: {policy:?}"
+         );
+     }
++    for subpath in [".git", ".agents", ".codex", ".aws"] {
++        assert!(policy.can_write_local_path_with_cwd(&cwd.path().join(subpath), cwd.path()));
++    }
+     Ok(())
+ }
+ 
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -179,8 +179,10 @@ pub(crate) use runtime_refresh::RuntimeConfigRefresh;
+ pub use runtime_refresh::TUI_MCP_SERVER_NAMES;
+ #[cfg(test)]
+ mod schema;
++pub(crate) mod storage_roots;
+ mod token_budget_startup;
+ mod windows_sandbox_config;
++mod workspace_permissions;
+ pub use auth_keyring::bootstrap_auth_config;
+ pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
+ pub use codex_agent_roles::AgentRoleConfig;
+@@ -1643,6 +1645,35 @@ async fn config_toml_from_layers(layers: &ConfigLayerStack) -> std::io::Result<C
+ }
+ 
+ impl Config {
++    fn local_storage_roots(&self) -> anyhow::Result<storage_roots::StorageRoots> {
++        storage_roots::StorageRoots::for_cwd(
++            self.cwd.as_path(),
++            self.codex_home.as_path(),
++            self.codex_harness.as_path(),
++        )
++    }
++
++    /// Resolves this configuration's host project environment without creating directories.
++    pub fn local_storage_environment(&self) -> anyhow::Result<HashMap<String, String>> {
++        self.local_storage_roots()?.environment()
++    }
++
++    /// Prepares project-root variables for local services outside a thread environment.
++    pub fn prepare_local_storage_environment(&self) -> anyhow::Result<HashMap<String, String>> {
++        self.local_storage_roots()?.ensure()?.environment()
++    }
++
++    /// Prepares matching shell and constrained filesystem permissions for standalone execution.
++    pub fn prepare_local_permissions(&self) -> anyhow::Result<Permissions> {
++        let roots = self.local_storage_roots()?.ensure()?;
++        let mut permissions = self.permissions.clone();
++        permissions
++            .permission_profile_state
++            .bind_local_workspace(&self.cwd, &roots)?;
++        permissions.shell_environment_policy.inherited_environment = roots.environment()?;
++        Ok(permissions)
++    }
++
+     pub fn sqlite_config(&self) -> &codex_state::SqliteConfig {
+         &self.sqlite
+     }
+@@ -3816,11 +3847,8 @@ impl Config {
+                 && default_permissions == BUILT_IN_WORKSPACE_PROFILE
+                 && cfg.sandbox_workspace_write.is_some()
+             {
+-                // The implicit built-in profile preserves legacy
+-                // `[sandbox_workspace_write]` customizations, but explicitly
+-                // selecting `:workspace` intentionally ignores those legacy
+-                // settings. Do not advertise a re-selectable active profile
+-                // when doing so would lose roots, network, or tmp settings.
++                // Implicit Workspace still honors the legacy network setting. Advertising
++                // a named profile here would make resume select the built-in network default.
+                 None
+             } else {
+                 let selected_profile_extends = cfg
+diff --git a/codex-rs/core/src/config/resolved_permission_profile.rs b/codex-rs/core/src/config/resolved_permission_profile.rs
+--- a/codex-rs/core/src/config/resolved_permission_profile.rs
++++ b/codex-rs/core/src/config/resolved_permission_profile.rs
+@@ -1,9 +1,13 @@
++use super::storage_roots::StorageRoots;
++use super::workspace_permissions::is_builtin_workspace;
++use super::workspace_permissions::workspace_permission_profile;
+ use codex_config::Constrained;
+ use codex_config::ConstraintResult;
+ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::models::PermissionProfileSnapshot;
+ use codex_protocol::models::ProfileWorkspaceRoot;
++use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_path_uri::PathUri;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -68,6 +72,34 @@ impl PermissionProfileState {
+         self.permission_profile.get().profile_workspace_roots()
+     }
+ 
++    pub(crate) fn is_builtin_workspace(&self, cwd: &AbsolutePathBuf) -> bool {
++        is_builtin_workspace(
++            self.permission_profile.get().permission_profile(),
++            self.active_permission_profile().as_ref(),
++            cwd,
++        )
++    }
++
++    pub(crate) fn bind_local_workspace(
++        &mut self,
++        cwd: &AbsolutePathBuf,
++        roots: &StorageRoots,
++    ) -> ConstraintResult<()> {
++        if !self.is_builtin_workspace(cwd) {
++            return Ok(());
++        }
++        let profile = workspace_permission_profile(
++            self.permission_profile.get().permission_profile(),
++            cwd,
++            roots,
++        );
++        let snapshot = PermissionProfileSnapshot::from_session_snapshot(
++            profile,
++            self.active_permission_profile(),
++        );
++        self.permission_profile.set(snapshot)
++    }
++
+     pub(crate) fn can_set_legacy_permission_profile(
+         &self,
+         permission_profile: &PermissionProfile,
+@@ -80,8 +112,7 @@ impl PermissionProfileState {
+         &mut self,
+         permission_profile: PermissionProfile,
+     ) -> ConstraintResult<()> {
+-        self.permission_profile
+-            .set(PermissionProfileSnapshot::legacy(permission_profile))
++        self.set_permission_profile_snapshot(PermissionProfileSnapshot::legacy(permission_profile))
+     }
+ 
+     pub(crate) fn set_permission_profile_snapshot(
+diff --git a/codex-rs/core/src/config/storage_roots.rs b/codex-rs/core/src/config/storage_roots.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/config/storage_roots.rs
+@@ -0,0 +1,183 @@
++use anyhow::Context;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use std::collections::HashMap;
++use std::ffi::OsStr;
++use std::ffi::OsString;
++use std::path::Path;
++use std::path::PathBuf;
++
++pub(crate) struct StorageRoots {
++    project_scratch_root: AbsolutePathBuf,
++    project_runtime_root: AbsolutePathBuf,
++    project_persistent_root: AbsolutePathBuf,
++    repos_root: AbsolutePathBuf,
++    skills_root: AbsolutePathBuf,
++    skills_scratch_root: AbsolutePathBuf,
++}
++
++impl StorageRoots {
++    pub(crate) fn for_cwd(
++        cwd: &Path,
++        codex_home: &Path,
++        codex_harness: &Path,
++    ) -> anyhow::Result<Self> {
++        Self::resolve(cwd, codex_home, codex_harness, |name| {
++            std::env::var_os(name)
++        })
++    }
++
++    fn resolve(
++        cwd: &Path,
++        codex_home: &Path,
++        codex_harness: &Path,
++        mut variable: impl FnMut(&str) -> Option<OsString>,
++    ) -> anyhow::Result<Self> {
++        let relative = project_relative_directory(cwd);
++        let project_leaf = relative
++            .file_name()
++            .context("project-relative directory has no final component")?;
++
++        Ok(Self {
++            project_scratch_root: absolute_override(
++                "PROJECT_SCRATCH_ROOT",
++                codex_harness.join(&relative),
++                &mut variable,
++            )?,
++            project_runtime_root: project_root_from_base(
++                "PROJECT_RUNTIME_ROOT",
++                "TMPDIR",
++                project_leaf,
++                &mut variable,
++            )?,
++            project_persistent_root: project_root_from_base(
++                "PROJECT_PERSISTENT_ROOT",
++                "HOME",
++                project_leaf,
++                &mut variable,
++            )?,
++            repos_root: project_root_from_base(
++                "REPOS_ROOT",
++                "HOME",
++                OsStr::new("repos"),
++                &mut variable,
++            )?,
++            skills_root: absolute_override(
++                "SKILLS_ROOT",
++                codex_home.join("skills"),
++                &mut variable,
++            )?,
++            skills_scratch_root: absolute_override(
++                "SKILLS_SCRATCH_ROOT",
++                codex_harness.join("skills"),
++                &mut variable,
++            )?,
++        })
++    }
++
++    pub(crate) fn ensure(mut self) -> anyhow::Result<Self> {
++        ensure_root("PROJECT_SCRATCH_ROOT", &mut self.project_scratch_root)?;
++        for language in ["python", "go", "rust"] {
++            let child = self.project_scratch_root.join(language);
++            std::fs::create_dir_all(child.as_path())
++                .with_context(|| format!("failed to ensure PROJECT_SCRATCH_ROOT/{language}"))?;
++        }
++        ensure_root("PROJECT_RUNTIME_ROOT", &mut self.project_runtime_root)?;
++        ensure_root("PROJECT_PERSISTENT_ROOT", &mut self.project_persistent_root)?;
++        ensure_root("REPOS_ROOT", &mut self.repos_root)?;
++        ensure_root("SKILLS_ROOT", &mut self.skills_root)?;
++        ensure_root("SKILLS_SCRATCH_ROOT", &mut self.skills_scratch_root)?;
++        Ok(self)
++    }
++
++    pub(crate) fn environment(&self) -> anyhow::Result<HashMap<String, String>> {
++        [
++            ("PROJECT_SCRATCH_ROOT", &self.project_scratch_root),
++            ("PROJECT_RUNTIME_ROOT", &self.project_runtime_root),
++            ("PROJECT_PERSISTENT_ROOT", &self.project_persistent_root),
++            ("REPOS_ROOT", &self.repos_root),
++            ("SKILLS_ROOT", &self.skills_root),
++            ("SKILLS_SCRATCH_ROOT", &self.skills_scratch_root),
++        ]
++        .into_iter()
++        .map(|(name, path)| {
++            let value = path
++                .as_path()
++                .to_str()
++                .with_context(|| format!("{name} is not valid UTF-8"))?;
++            Ok((name.to_owned(), value.to_owned()))
++        })
++        .collect()
++    }
++
++    pub(crate) fn directories(&self) -> [&AbsolutePathBuf; 6] {
++        [
++            &self.project_scratch_root,
++            &self.project_runtime_root,
++            &self.project_persistent_root,
++            &self.repos_root,
++            &self.skills_root,
++            &self.skills_scratch_root,
++        ]
++    }
++}
++
++fn ensure_root(name: &str, path: &mut AbsolutePathBuf) -> anyhow::Result<()> {
++    std::fs::create_dir_all(path.as_path())
++        .with_context(|| format!("failed to ensure {name} at {}", path.display()))?;
++    *path = path
++        .canonicalize()
++        .with_context(|| format!("failed to resolve {name} at {}", path.display()))?;
++    Ok(())
++}
++
++fn project_relative_directory(cwd: &Path) -> PathBuf {
++    let project = cwd
++        .file_name()
++        .filter(|name| !name.is_empty())
++        .unwrap_or_else(|| OsStr::new("workspace"));
++    let group = cwd
++        .parent()
++        .and_then(Path::file_name)
++        .filter(|name| !name.is_empty())
++        .unwrap_or_else(|| OsStr::new("root"));
++    PathBuf::from(group).join(project)
++}
++
++fn absolute_override(
++    name: &str,
++    default: PathBuf,
++    variable: &mut impl FnMut(&str) -> Option<OsString>,
++) -> anyhow::Result<AbsolutePathBuf> {
++    let path = variable(name)
++        .filter(|value| !value.is_empty())
++        .map_or(default, PathBuf::from);
++    absolute_path(name, path)
++}
++
++fn project_root_from_base(
++    name: &str,
++    base_name: &str,
++    project_leaf: &OsStr,
++    variable: &mut impl FnMut(&str) -> Option<OsString>,
++) -> anyhow::Result<AbsolutePathBuf> {
++    if let Some(override_path) = variable(name).filter(|value| !value.is_empty()) {
++        return absolute_path(name, PathBuf::from(override_path));
++    }
++    let base = variable(base_name)
++        .filter(|value| !value.is_empty())
++        .map(PathBuf::from)
++        .with_context(|| format!("{base_name} is required for default {name}"))?;
++    if !base.is_absolute() {
++        anyhow::bail!("{base_name} must be an absolute path");
++    }
++    absolute_path(name, base.join(project_leaf))
++}
++
++fn absolute_path(name: &str, path: PathBuf) -> anyhow::Result<AbsolutePathBuf> {
++    AbsolutePathBuf::from_absolute_path_checked(path)
++        .with_context(|| format!("{name} must be an absolute path"))
++}
++
++#[cfg(test)]
++#[path = "storage_roots_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/config/storage_roots_tests.rs b/codex-rs/core/src/config/storage_roots_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/config/storage_roots_tests.rs
+@@ -0,0 +1,181 @@
++use super::StorageRoots;
++use pretty_assertions::assert_eq;
++use std::path::Path;
++
++#[test]
++fn ensure_creates_selected_roots_and_only_the_language_children() {
++    let base = tempfile::tempdir().unwrap();
++    let cwd = base.path().join("repos/project");
++    std::fs::create_dir_all(&cwd).unwrap();
++    let codex_home = base.path().join("codex");
++    let harness = base.path().join("harness");
++    let user_home = base.path().join("home");
++    let runtime_base = base.path().join("tmp");
++    let roots = StorageRoots::resolve(&cwd, &codex_home, &harness, |name| match name {
++        "HOME" => Some(user_home.as_os_str().to_owned()),
++        "TMPDIR" => Some(runtime_base.as_os_str().to_owned()),
++        _ => None,
++    })
++    .unwrap()
++    .ensure()
++    .unwrap();
++
++    for path in [
++        &roots.project_scratch_root,
++        &roots.project_runtime_root,
++        &roots.project_persistent_root,
++        &roots.repos_root,
++        &roots.skills_root,
++        &roots.skills_scratch_root,
++    ] {
++        assert!(path.is_dir());
++        assert_eq!(path.as_path(), path.as_path().canonicalize().unwrap());
++    }
++    let mut children = std::fs::read_dir(&roots.project_scratch_root)
++        .unwrap()
++        .map(|entry| entry.unwrap().file_name())
++        .collect::<Vec<_>>();
++    children.sort();
++    assert_eq!(
++        children,
++        ["go", "python", "rust"].map(std::ffi::OsString::from)
++    );
++}
++
++#[test]
++fn ensure_rejects_a_file_in_place_of_a_selected_root() {
++    let base = tempfile::tempdir().unwrap();
++    let occupied = base.path().join("occupied");
++    std::fs::write(&occupied, "file").unwrap();
++    let cwd = base.path().join("repos/project");
++    std::fs::create_dir_all(&cwd).unwrap();
++    let roots = StorageRoots::resolve(&cwd, base.path(), base.path(), |name| match name {
++        "HOME" => Some(base.path().as_os_str().to_owned()),
++        "PROJECT_RUNTIME_ROOT" => Some(occupied.as_os_str().to_owned()),
++        _ => None,
++    })
++    .unwrap();
++    let error = roots.ensure().err().unwrap();
++    assert!(error.to_string().contains("PROJECT_RUNTIME_ROOT"));
++    assert!(error.to_string().contains(&occupied.display().to_string()));
++}
++
++#[test]
++fn entered_cwd_maps_to_the_project_relative_directory() {
++    let roots = StorageRoots::resolve(
++        Path::new("/home/person/repos/codex"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "HOME" => Some("/home/person".into()),
++            "TMPDIR" => Some("/tmp".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/harness/repos/codex")
++    );
++    assert_eq!(
++        roots.project_runtime_root.as_path(),
++        Path::new("/tmp/codex")
++    );
++    assert_eq!(
++        roots.project_persistent_root.as_path(),
++        Path::new("/home/person/codex")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/home/person/repos"));
++    assert_eq!(roots.skills_root.as_path(), Path::new("/codex/skills"));
++    assert_eq!(
++        roots.skills_scratch_root.as_path(),
++        Path::new("/harness/skills")
++    );
++}
++
++#[test]
++fn repos_root_is_independent_of_the_entered_cwd() {
++    let roots = StorageRoots::resolve(
++        Path::new("/worktrees/group/project"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "HOME" => Some("/home/person".into()),
++            "TMPDIR" => Some("/tmp".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/harness/group/project")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/home/person/repos"));
++}
++
++#[test]
++fn explicit_absolute_roots_override_defaults_without_requiring_home() {
++    let roots = StorageRoots::resolve(
++        Path::new("/home/person/repos/codex"),
++        Path::new("/codex"),
++        Path::new("/harness"),
++        |name| match name {
++            "PROJECT_SCRATCH_ROOT" => Some("/work/scratch".into()),
++            "PROJECT_RUNTIME_ROOT" => Some("/work/runtime".into()),
++            "PROJECT_PERSISTENT_ROOT" => Some("/work/persistent".into()),
++            "REPOS_ROOT" => Some("/work/repos".into()),
++            _ => None,
++        },
++    )
++    .unwrap();
++    assert_eq!(
++        roots.project_scratch_root.as_path(),
++        Path::new("/work/scratch")
++    );
++    assert_eq!(roots.repos_root.as_path(), Path::new("/work/repos"));
++    assert_eq!(
++        roots.project_runtime_root.as_path(),
++        Path::new("/work/runtime")
++    );
++    assert_eq!(
++        roots.project_persistent_root.as_path(),
++        Path::new("/work/persistent")
++    );
++}
++
++#[test]
++fn derived_roots_require_their_base_environment() {
++    let cwd = Path::new("/home/person/repos/codex");
++    let root = Path::new("/harness");
++    assert!(
++        StorageRoots::resolve(cwd, root, root, |name| {
++            (name == "HOME").then(|| "/home/person".into())
++        })
++        .is_err()
++    );
++    assert!(
++        StorageRoots::resolve(cwd, root, root, |name| match name {
++            "TMPDIR" => Some("/tmp".into()),
++            "REPOS_ROOT" => Some("/home/person/repos".into()),
++            _ => None,
++        })
++        .is_err()
++    );
++}
++
++#[test]
++fn relative_root_override_is_rejected() {
++    assert!(
++        StorageRoots::resolve(
++            Path::new("/home/person/repos/codex"),
++            Path::new("/codex"),
++            Path::new("/harness"),
++            |name| match name {
++                "HOME" => Some("/home/person".into()),
++                "PROJECT_SCRATCH_ROOT" => Some("relative".into()),
++                _ => None,
++            },
++        )
++        .is_err()
++    );
++}
+diff --git a/codex-rs/core/src/config/workspace_permissions.rs b/codex-rs/core/src/config/workspace_permissions.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/config/workspace_permissions.rs
+@@ -0,0 +1,246 @@
++use super::permissions::BUILT_IN_WORKSPACE_PROFILE;
++use super::storage_roots::StorageRoots;
++use codex_config::SandboxModeRequirement;
++use codex_config::sandbox_mode_requirement_for_permission_profile;
++use codex_protocol::models::ActivePermissionProfile;
++use codex_protocol::models::PermissionProfile;
++use codex_protocol::permissions::FileSystemAccessMode;
++use codex_protocol::permissions::FileSystemPath;
++use codex_protocol::permissions::FileSystemSandboxEntry;
++use codex_protocol::permissions::FileSystemSandboxPolicy;
++use codex_protocol::permissions::FileSystemSpecialPath;
++use codex_protocol::permissions::PROTECTED_METADATA_PATH_NAMES;
++use codex_protocol::protocol::SandboxPolicy;
++use codex_utils_absolute_path::AbsolutePathBuf;
++
++pub(super) fn is_builtin_workspace(
++    profile: &PermissionProfile,
++    active_profile: Option<&ActivePermissionProfile>,
++    cwd: &AbsolutePathBuf,
++) -> bool {
++    if sandbox_mode_requirement_for_permission_profile(profile)
++        != SandboxModeRequirement::WorkspaceWrite
++    {
++        return false;
++    }
++    if let Some(active) = active_profile {
++        return active.id == BUILT_IN_WORKSPACE_PROFILE;
++    }
++    let file_system = profile.file_system_sandbox_policy();
++    // An absolute grant, even to cwd itself, does not declare cwd-following permissions.
++    if !file_system.entries.iter().any(|entry| {
++        entry.access == FileSystemAccessMode::Write
++            && matches!(
++                entry.path,
++                FileSystemPath::Special {
++                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
++                }
++            )
++    }) {
++        return false;
++    }
++    let Ok(legacy) = profile.to_legacy_sandbox_policy(cwd) else {
++        return false;
++    };
++    // Legacy overrides inspect existing metadata; native profile compilation adds
++    // skip-if-missing metadata entries for its declared roots. Admit both native
++    // Workspace forms, while preserving richer anonymous read/write carveouts.
++    if file_system.is_semantically_equivalent_to(
++        &FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
++            &legacy,
++            cwd,
++            &file_system,
++        ),
++        cwd,
++    ) {
++        return true;
++    }
++    let SandboxPolicy::WorkspaceWrite {
++        writable_roots,
++        exclude_tmpdir_env_var,
++        exclude_slash_tmp,
++        ..
++    } = legacy
++    else {
++        return false;
++    };
++    let mut configured =
++        FileSystemSandboxPolicy::workspace_write(&[], exclude_tmpdir_env_var, exclude_slash_tmp)
++            .with_materialized_project_roots_for_workspace_roots(&writable_roots);
++    configured.preserve_deny_read_restrictions_from(&file_system);
++    file_system.is_semantically_equivalent_to(&configured, cwd)
++}
++
++pub(super) fn workspace_permission_profile(
++    profile: &PermissionProfile,
++    cwd: &AbsolutePathBuf,
++    storage_roots: &StorageRoots,
++) -> PermissionProfile {
++    let mut entries = vec![FileSystemSandboxEntry::new(
++        FileSystemPath::Special {
++            value: FileSystemSpecialPath::Root,
++        },
++        FileSystemAccessMode::Read,
++    )];
++    // Bind the entered cwd rather than symbolic workspace folders, which can change later.
++    for root in std::iter::once(cwd).chain(storage_roots.directories()) {
++        entries.push(FileSystemSandboxEntry::new(
++            root.clone().into(),
++            FileSystemAccessMode::Write,
++        ));
++        // Native policy gives these names implicit read-only protection unless explicitly granted.
++        for name in PROTECTED_METADATA_PATH_NAMES {
++            entries.push(FileSystemSandboxEntry::new(
++                root.join(name).into(),
++                FileSystemAccessMode::Write,
++            ));
++        }
++    }
++    let mut file_system = FileSystemSandboxPolicy::restricted(entries);
++    file_system.preserve_deny_read_restrictions_from(&profile.file_system_sandbox_policy());
++    PermissionProfile::from_runtime_permissions_with_enforcement(
++        profile.enforcement(),
++        &file_system,
++        profile.network_sandbox_policy(),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::path::Path;
++
++    #[test]
++    fn anonymous_split_policy_keeps_its_read_only_carveout() {
++        let directory = tempfile::tempdir().unwrap();
++        let cwd = AbsolutePathBuf::from_absolute_path(directory.path()).unwrap();
++        let docs = cwd.join("docs");
++        std::fs::create_dir(&docs).unwrap();
++        let mut policy = PermissionProfile::workspace_write().file_system_sandbox_policy();
++        policy.entries.push(FileSystemSandboxEntry::new(
++            docs.into(),
++            FileSystemAccessMode::Read,
++        ));
++        let profile = PermissionProfile::from_runtime_permissions(
++            &policy,
++            codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
++        );
++        let mut state = crate::config::PermissionProfileState::from_constrained_legacy(
++            codex_config::Constrained::allow_any(profile.clone()),
++        )
++        .unwrap();
++        let roots =
++            StorageRoots::for_cwd(&cwd, Path::new("/codex"), Path::new("/harness")).unwrap();
++        state.bind_local_workspace(&cwd, &roots).unwrap();
++        assert_eq!(state.permission_profile(), &profile);
++        assert!(
++            !state
++                .permission_profile()
++                .file_system_sandbox_policy()
++                .can_write_local_path_with_cwd(&cwd.join("docs/file"), &cwd)
++        );
++    }
++
++    #[test]
++    fn local_workspace_binding_preserves_the_source_snapshot() {
++        let first = AbsolutePathBuf::from_absolute_path_checked("/projects/first").unwrap();
++        let second = AbsolutePathBuf::from_absolute_path_checked("/projects/second").unwrap();
++        let extra = AbsolutePathBuf::from_absolute_path_checked("/remote/extra").unwrap();
++        let profile = PermissionProfile::workspace_write_with(
++            std::slice::from_ref(&extra),
++            codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
++            true,
++            false,
++        );
++        let active = ActivePermissionProfile {
++            id: BUILT_IN_WORKSPACE_PROFILE.into(),
++            extends: None,
++        };
++        let state = crate::config::PermissionProfileState::from_constrained_active_profile(
++            codex_config::Constrained::allow_any(profile.clone()),
++            Some(active.clone()),
++            vec![extra.clone().into()],
++        )
++        .unwrap();
++        let original = state.snapshot();
++        let first_roots =
++            StorageRoots::for_cwd(&first, Path::new("/codex"), Path::new("/harness")).unwrap();
++        let mut first_permissions = state.clone();
++        first_permissions
++            .bind_local_workspace(&first, &first_roots)
++            .unwrap();
++        assert_eq!(state.snapshot(), original);
++        assert_eq!(first_permissions.active_permission_profile(), Some(active));
++        assert!(first_permissions.profile_workspace_roots().is_empty());
++        let first_snapshot = first_permissions.snapshot();
++        let policy = first_snapshot
++            .permission_profile()
++            .file_system_sandbox_policy();
++        assert!(policy.can_write_local_path_with_cwd(&first.join(".git/config"), &first));
++        assert!(!policy.can_write_local_path_with_cwd(&extra.join("file"), &first));
++
++        let second_roots =
++            StorageRoots::for_cwd(&second, Path::new("/codex"), Path::new("/harness")).unwrap();
++        let mut second_permissions = state.clone();
++        second_permissions
++            .bind_local_workspace(&second, &second_roots)
++            .unwrap();
++        assert_eq!(state.snapshot(), original);
++        assert!(
++            second_permissions
++                .permission_profile()
++                .file_system_sandbox_policy()
++                .can_write_local_path_with_cwd(&second.join(".git/config"), &second)
++        );
++        assert_eq!(
++            first_snapshot.permission_profile().network_sandbox_policy(),
++            codex_protocol::permissions::NetworkSandboxPolicy::Restricted
++        );
++
++        assert_eq!(state.permission_profile(), &profile);
++        assert_eq!(state.profile_workspace_roots().len(), 1);
++        assert_eq!(first_permissions.snapshot(), first_snapshot);
++    }
++
++    #[test]
++    fn workspace_and_six_storage_trees_are_fully_writable() {
++        let cwd = AbsolutePathBuf::from_absolute_path_checked("/workspace").unwrap();
++        let roots =
++            StorageRoots::for_cwd(&cwd, Path::new("/codex"), Path::new("/harness")).unwrap();
++        let policy =
++            workspace_permission_profile(&PermissionProfile::workspace_write(), &cwd, &roots)
++                .file_system_sandbox_policy();
++        for root in std::iter::once(&cwd).chain(roots.directories()) {
++            for suffix in [
++                "file",
++                ".git/config",
++                ".agents/skills/example",
++                ".codex/config.toml",
++                ".aws/config",
++                "any/nested/path",
++            ] {
++                let path = root.join(suffix);
++                assert!(
++                    policy.can_write_local_path_with_cwd(&path, &cwd),
++                    "expected write access to {path:?}"
++                );
++            }
++        }
++        for path in [
++            "/codex/config.toml",
++            "/harness/app-server/runtime",
++            "/tmp/unrelated",
++            "/var/tmp/unrelated",
++        ] {
++            assert!(
++                !policy.can_write_local_path_with_cwd(Path::new(path), &cwd),
++                "unexpected write access to {path}"
++            );
++        }
++        let unrelated = AbsolutePathBuf::from_absolute_path_checked("/unrelated").unwrap();
++        let materialized = policy
++            .clone()
++            .materialize_project_roots_with_workspace_roots(&[unrelated]);
++        assert_eq!(materialized, policy);
++    }
++}
+diff --git a/codex-rs/exec-server/src/local_process.rs b/codex-rs/exec-server/src/local_process.rs
+--- a/codex-rs/exec-server/src/local_process.rs
++++ b/codex-rs/exec-server/src/local_process.rs
+@@ -784,6 +784,7 @@ pub(crate) fn apply_exec_metadata(
+ 
+ pub(crate) fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy {
+     ShellEnvironmentPolicy {
++        inherited_environment: HashMap::new(),
+         inherit: env_policy.inherit.clone(),
+         ignore_default_excludes: env_policy.ignore_default_excludes,
+         exclude: env_policy
+diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs
+--- a/codex-rs/protocol/src/config_types.rs
++++ b/codex-rs/protocol/src/config_types.rs
+@@ -238,6 +238,10 @@ pub type EnvironmentVariablePattern = WildMatchPattern<'*', '?'>;
+ /// 5. If non-empty, filter the map using the `include_only` patterns.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct ShellEnvironmentPolicy {
++    /// Environment-scoped values merged into inherited variables before filtering.
++    /// These do not bypass `inherit`, excludes, or explicit configured overrides.
++    pub inherited_environment: HashMap<String, String>,
++
+     /// Starting point when building the environment.
+     pub inherit: ShellEnvironmentPolicyInherit,
+ 
+@@ -261,6 +265,7 @@ pub struct ShellEnvironmentPolicy {
+ impl Default for ShellEnvironmentPolicy {
+     fn default() -> Self {
+         Self {
++            inherited_environment: HashMap::new(),
+             inherit: ShellEnvironmentPolicyInherit::All,
+             ignore_default_excludes: true,
+             exclude: Vec::new(),
+diff --git a/codex-rs/protocol/src/shell_environment.rs b/codex-rs/protocol/src/shell_environment.rs
+--- a/codex-rs/protocol/src/shell_environment.rs
++++ b/codex-rs/protocol/src/shell_environment.rs
+@@ -110,6 +110,12 @@ pub fn populate_env<I>(
+ where
+     I: IntoIterator<Item = (String, String)>,
+ {
++    let vars = vars.into_iter().chain(
++        policy
++            .inherited_environment
++            .iter()
++            .map(|(name, value)| (name.clone(), value.clone())),
++    );
+     // Step 1 - determine the starting set of variables based on the
+     // `inherit` strategy.
+     let mut env_map: HashMap<String, String> = match policy.inherit {
+diff --git a/codex-rs/protocol/src/shell_environment_tests.rs b/codex-rs/protocol/src/shell_environment_tests.rs
+--- a/codex-rs/protocol/src/shell_environment_tests.rs
++++ b/codex-rs/protocol/src/shell_environment_tests.rs
+@@ -9,6 +9,40 @@ const CHILD_MODE_ENV_VAR: &str = "CODEX_SHELL_ENVIRONMENT_SCRUBBER_TEST_MODE";
+ const TEST_NAME: &str =
+     "shell_environment::tests::command_scrubber_removes_names_from_real_child_environment";
+ 
++#[test]
++fn scoped_inheritance_preserves_filters_and_explicit_overrides() {
++    let mut policy = ShellEnvironmentPolicy {
++        inherited_environment: HashMap::from([
++            ("PROJECT_SCRATCH_ROOT".into(), "/selected/scratch".into()),
++            ("PROJECT_RUNTIME_ROOT".into(), "/selected/runtime".into()),
++        ]),
++        ..Default::default()
++    };
++    let ambient = [("PROJECT_SCRATCH_ROOT".into(), "/old/scratch".into())];
++    let environment = populate_env(ambient.clone(), &policy, None);
++    assert_eq!(environment, policy.inherited_environment);
++
++    policy.exclude = vec![EnvironmentVariablePattern::new("PROJECT_RUNTIME_ROOT")];
++    assert!(!populate_env(ambient.clone(), &policy, None).contains_key("PROJECT_RUNTIME_ROOT"));
++    policy
++        .r#set
++        .insert("PROJECT_RUNTIME_ROOT".into(), "/explicit/runtime".into());
++    assert_eq!(
++        populate_env(ambient.clone(), &policy, None)["PROJECT_RUNTIME_ROOT"],
++        "/explicit/runtime"
++    );
++
++    for inherit in [
++        ShellEnvironmentPolicyInherit::None,
++        ShellEnvironmentPolicyInherit::Core,
++    ] {
++        policy.inherit = inherit;
++        assert_eq!(populate_env(ambient.clone(), &policy, None), policy.r#set);
++    }
++    policy.include_only = vec![EnvironmentVariablePattern::new("PATH")];
++    assert!(populate_env(ambient, &policy, None).is_empty());
++}
++
+ #[test]
+ fn tool_call_id_replaces_platform_equivalent_names() {
+     let representable = format!("exec-雪-{}", "x".repeat(512));
+diff --git a/codex-rs/rmcp-client/src/stdio_server_launcher.rs b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+--- a/codex-rs/rmcp-client/src/stdio_server_launcher.rs
++++ b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+@@ -759,6 +759,7 @@ mod tests {
+             &HashMap::new(),
+         );
+         let mut policy = ShellEnvironmentPolicy {
++            inherited_environment: HashMap::new(),
+             inherit: exec_policy.inherit,
+             ignore_default_excludes: exec_policy.ignore_default_excludes,
+             exclude: exec_policy

@@ -1,0 +1,1384 @@
+route-control-center-actions-through-app
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: route-control-center-actions-through-app
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -221,6 +221,7 @@ mod config_panel;
+ mod config_persistence;
+ mod connector_mentions;
+ mod control_center_data;
++mod control_center_input;
+ mod control_center_observations;
+ mod control_center_responses;
+ mod control_center_shutdown;
+@@ -933,6 +934,7 @@ impl App {
+         };
+         if self.reconnect.offline
+             && !transcript_owns_input
++            && !matches!(self.overlay, Some(Overlay::ControlCenter(_)))
+             && !self.chat_widget.keymap_contexts().is_warnings()
+             && !self
+                 .chat_widget
+@@ -962,8 +964,9 @@ impl App {
+         {
+             self.cancel_pending_key_chord();
+         }
+-        if matches!(&event, TuiEvent::FocusLost)
+-            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
++        if !matches!(&self.overlay, Some(Overlay::ControlCenter(_)))
++            && (matches!(&event, TuiEvent::FocusLost)
++                || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved))
+         {
+             self.chat_widget.interrupt_config_editor_transition();
+         }
+@@ -1061,7 +1064,10 @@ impl App {
+         }
+         if self.reconnect.offline
+             && !self.chat_widget.keymap_contexts().is_warnings()
+-            && !matches!(&self.overlay, Some(Overlay::Transcript(_)))
++            && !matches!(
++                &self.overlay,
++                Some(Overlay::Transcript(_) | Overlay::ControlCenter(_))
++            )
+             && let TuiEvent::Key(key) = &event
+             && !(self.overlay.is_none()
+                 && self.chat_widget.no_modal_or_popup_active()
+@@ -1123,6 +1129,12 @@ impl App {
+             _ => {}
+         }
+ 
++        if let Some(control) = self
++            .handle_control_center_input(tui, app_server, &event)
++            .await
++        {
++            return Ok(control);
++        }
+         self.refresh_control_center_details(app_server, &event);
+         if self.overlay.is_some() {
+             let _ = self
+diff --git a/codex-rs/tui/src/app/control_center_input.rs b/codex-rs/tui/src/app/control_center_input.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_input.rs
+@@ -0,0 +1,155 @@
++//! One entry and contextual actions consume native settings and guarded shutdown.
++
++use super::App;
++use super::AppRunControl;
++use crate::app_event::AppEvent;
++use crate::app_server_session::AppServerSession;
++use crate::bottom_pane::BottomPaneView;
++use crate::bottom_pane::SelectionItem;
++use crate::bottom_pane::SelectionViewParams;
++use crate::dialog::DialogResources;
++use crate::key_hint;
++use crate::pager_overlay::CenterScreen;
++use crate::pager_overlay::Overlay;
++use crate::tui;
++use crate::tui::TuiEvent;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++
++pub(super) fn control_center_shortcut(key: KeyEvent) -> bool {
++    key_hint::alt(KeyCode::Char('`')).is_press(key)
++}
++
++impl App {
++    pub(super) async fn handle_control_center_input(
++        &mut self,
++        tui: &mut tui::Tui,
++        app_server: &mut AppServerSession,
++        event: &TuiEvent,
++    ) -> Option<AppRunControl> {
++        let Some(Overlay::ControlCenter(center)) = &mut self.overlay else {
++            return None;
++        };
++        if center.has_dialog() {
++            match event {
++                TuiEvent::Key(key) => {
++                    if key_hint::ctrl(KeyCode::Char('c')).is_press(*key) {
++                        center.dialogs.on_ctrl_c();
++                    } else {
++                        center
++                            .dialogs
++                            .handle_key_event(*key, self.routed_key_activation.take());
++                    }
++                }
++                TuiEvent::Paste(text) => {
++                    center
++                        .dialogs
++                        .handle_paste(text.replace("\r\n", "\n").replace('\r', "\n"));
++                }
++                // The dialog owns input; a covered table must not copy or scroll.
++                TuiEvent::Mouse(_) => {}
++                _ => return None,
++            }
++            return Some(AppRunControl::Continue);
++        }
++        let TuiEvent::Key(key) = event else {
++            return None;
++        };
++        let settings = if center.screen == CenterScreen::Summary {
++            if key_hint::plain(KeyCode::Char('p')).is_press(*key) {
++                Some(AppEvent::OpenProxy)
++            } else if key_hint::plain(KeyCode::Char('t')).is_press(*key) {
++                Some(AppEvent::OpenTelegram)
++            } else {
++                None
++            }
++        } else {
++            None
++        };
++        if let Some(settings) = settings {
++            self.app_event_tx.send(settings);
++            return Some(AppRunControl::Continue);
++        }
++        if key_hint::plain(KeyCode::Char('q')).is_press(*key) {
++            let eligibility = self.check_idle_daemon_shutdown(app_server).await;
++            self.show_control_center_quit_dialog(tui, eligibility);
++            return Some(AppRunControl::Continue);
++        }
++        None
++    }
++
++    pub(super) fn show_settings_view(&mut self, view: Box<dyn BottomPaneView>) {
++        if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++            center.dialogs.push(view);
++        } else {
++            self.chat_widget.show_bottom_pane_view(view);
++        }
++    }
++
++    pub(super) fn show_settings_selection(
++        &mut self,
++        tui: &tui::Tui,
++        mut params: SelectionViewParams,
++    ) {
++        if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++            let resources = DialogResources {
++                app_event_tx: &self.app_event_tx,
++                keymap: &self.keymap,
++                frame_requester: &tui.frame_requester(),
++                vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++            };
++            if let Some(view_id) = params.view_id
++                && let Some(selected) = center
++                    .dialogs
++                    .iter()
++                    .rev()
++                    .find(|view| view.view_id() == Some(view_id))
++                    .and_then(|view| view.selected_index())
++            {
++                params.initial_selected_idx = Some(selected);
++                center
++                    .dialogs
++                    .replace_selection_if_present(view_id, params, resources);
++            } else {
++                center
++                    .dialogs
++                    .push(Box::new(resources.selection_view(params)));
++            }
++        } else if let Some(view_id) = params.view_id
++            && let Some(selected) = self.chat_widget.selected_index_for_present_view(view_id)
++        {
++            params.initial_selected_idx = Some(selected);
++            self.chat_widget
++                .replace_selection_view_if_present(view_id, params);
++        } else {
++            self.chat_widget.show_selection_view(params);
++        }
++    }
++
++    pub(super) fn show_control_center_settings_notice(
++        &mut self,
++        tui: &tui::Tui,
++        title: &str,
++        message: &str,
++    ) {
++        if matches!(self.overlay, Some(Overlay::ControlCenter(_))) {
++            self.show_settings_selection(
++                tui,
++                SelectionViewParams {
++                    title: Some(title.to_owned()),
++                    subtitle: Some(message.to_owned()),
++                    items: vec![SelectionItem {
++                        name: "Close".into(),
++                        dismiss_on_select: true,
++                        ..Default::default()
++                    }],
++                    ..SelectionViewParams::picker()
++                },
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "control_center_input_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app/control_center_input_tests.rs b/codex-rs/tui/src/app/control_center_input_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_input_tests.rs
+@@ -0,0 +1,759 @@
++use super::*;
++use crate::keymap::KeymapContext;
++use crate::pager_overlay::ControlCenter;
++use crate::render::renderable::Renderable;
++use crate::usage::UsageRange;
++use codex_app_server_protocol::UsageReadResponse;
++use crossterm::event::KeyModifiers;
++use pretty_assertions::assert_eq;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::sync::mpsc::UnboundedReceiver;
++
++// These checks own App routing. Dialog, accounting and daemon protocols retain their own tests.
++struct Fixture {
++    app: Box<App>,
++    tui: tui::Tui,
++    server: AppServerSession,
++    events: UnboundedReceiver<AppEvent>,
++    commands: UnboundedReceiver<crate::app_command::AppCommand>,
++}
++
++impl Fixture {
++    async fn new() -> crate::app::Result<Self> {
++        let (app, events, commands) = crate::app::tests::make_test_app_with_channels().await;
++        let server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++        Ok(Self {
++            app,
++            tui: crate::tui::test_support::make_test_tui()?,
++            server,
++            events,
++            commands,
++        })
++    }
++
++    async fn key(&mut self, key: impl Into<KeyEvent>) -> crate::app::Result<AppRunControl> {
++        Box::pin(self.app.handle_tui_event(
++            &mut self.tui,
++            &mut self.server,
++            TuiEvent::Key(key.into()),
++        ))
++        .await
++    }
++
++    async fn dispatch(&mut self, event: AppEvent) -> crate::app::Result<AppRunControl> {
++        Box::pin(
++            self.app
++                .handle_event(&mut self.tui, &mut self.server, event),
++        )
++        .await
++    }
++
++    fn center(&self) -> &ControlCenter {
++        let Some(Overlay::ControlCenter(center)) = &self.app.overlay else {
++            panic!("retained center")
++        };
++        center
++    }
++
++    fn text(&mut self) -> String {
++        let Some(Overlay::ControlCenter(center)) = &mut self.app.overlay else {
++            panic!("retained center")
++        };
++        let area = Rect::new(0, 0, 200, 32);
++        let mut buffer = Buffer::empty(area);
++        center.render(area, &mut buffer);
++        buffer
++            .content
++            .chunks_exact(200)
++            .map(|row| {
++                row.iter()
++                    .map(|cell| cell.symbol())
++                    .collect::<String>()
++                    .trim()
++                    .to_owned()
++            })
++            .collect::<Vec<_>>()
++            .join("\n")
++    }
++
++    async fn open_settings(&mut self, key: char, title: &str) -> crate::app::Result<()> {
++        self.app.chat_widget.insert_str("Preserved draft");
++        self.app.open_control_center(&mut self.tui);
++        while self.events.try_recv().is_ok() {}
++        self.key(KeyCode::Char(key)).await?;
++        tokio::time::timeout(Duration::from_secs(10), async {
++            while !self.text().contains(title) {
++                let event = self.events.recv().await.expect("settings event");
++                self.dispatch(event).await?;
++            }
++            Ok::<_, color_eyre::Report>(())
++        })
++        .await??;
++        assert!(!self.app.chat_widget.has_active_modal());
++        let text = self.text();
++        assert!(text.contains("Summary") && text.contains("Responses") && text.contains(title));
++        assert!(self.tui.is_alt_screen_active());
++        Ok(())
++    }
++
++    async fn finish(self) -> crate::app::Result<()> {
++        self.server.shutdown().await?;
++        Ok(())
++    }
++}
++
++#[tokio::test]
++async fn settings_routes_preserve_native_popup_surfaces_in_both_hosts() -> crate::app::Result<()> {
++    let openers: [(&str, fn(&mut App, &tui::Tui)); 6] = [
++        ("Proxy", |app, tui| {
++            app.open_proxy_menu(tui, Default::default());
++        }),
++        ("Add proxy", |app, tui| {
++            app.open_proxy_add_alias(tui, Default::default());
++        }),
++        ("Bot token", |app, tui| {
++            app.open_telegram_menu(tui, Default::default());
++        }),
++        ("Telegram", |app, tui| {
++            app.open_telegram_menu(
++                tui,
++                codex_app_server_protocol::TelegramCommandResponse {
++                    configured: true,
++                    ..Default::default()
++                },
++            );
++        }),
++        ("Telegram notifications", |app, tui| {
++            app.open_telegram_notifications(
++                tui,
++                codex_app_server_protocol::TelegramCommandResponse {
++                    configured: true,
++                    ..Default::default()
++                },
++            );
++        }),
++        ("Notifications setup", |app, tui| {
++            app.open_telegram_setup(
++                tui,
++                codex_app_server_protocol::TelegramSetup {
++                    bot_token: "bot-secret".into(),
++                    chat_id: "chat-secret".into(),
++                    notifications: Default::default(),
++                },
++            );
++        }),
++    ];
++    for bg in [(24, 24, 24), (245, 245, 245)] {
++        for in_center in [false, true] {
++            for (title, open) in openers {
++                let mut app = crate::app::test_support::make_test_app().await;
++                let mut tui = crate::tui::test_support::make_test_tui()?;
++                crate::terminal_palette::with_test_default_colors(
++                    crate::terminal_probe::DefaultColors {
++                        fg: (128, 128, 128),
++                        bg,
++                    },
++                    || {
++                        if in_center {
++                            app.open_control_center(&mut tui);
++                        }
++                        open(&mut app, &tui);
++                        let panel = crate::style::user_message_style()
++                            .bg
++                            .expect("known palette supplies the native panel");
++                        let area = Rect::new(0, 0, 80, 24);
++                        let mut buffer = Buffer::empty(area);
++                        let backdrop = ratatui::style::Color::Magenta;
++                        buffer.set_style(area, ratatui::style::Style::default().bg(backdrop));
++                        if in_center {
++                            assert!(!app.chat_widget.has_active_modal());
++                            let Some(Overlay::ControlCenter(center)) = &app.overlay else {
++                                panic!("retained control center")
++                            };
++                            center
++                                .dialogs
++                                .centered_view()
++                                .expect("control center owns a centered dialog")
++                                .render(area, &mut buffer);
++                            let first_dialog_cell = buffer
++                                .content
++                                .iter()
++                                .find(|cell| cell.bg != backdrop)
++                                .expect("settings dialog painted its surface");
++                            assert_eq!(first_dialog_cell.bg, panel, "{title}");
++                            assert_eq!(buffer[(0, 0)].bg, backdrop);
++                        } else {
++                            assert!(app.overlay.is_none());
++                            assert!(app.chat_widget.has_active_modal());
++                            app.chat_widget.render(area, &mut buffer);
++                        }
++                        let title_cells = buffer
++                            .content
++                            .chunks_exact(usize::from(area.width))
++                            .flat_map(|row| row.windows(title.len()))
++                            .find(|cells| {
++                                cells
++                                    .iter()
++                                    .zip(title.chars())
++                                    .all(|(cell, ch)| cell.symbol().chars().eq(std::iter::once(ch)))
++                            })
++                            .expect("settings title is visible through its actual host");
++                        assert!(
++                            title_cells.iter().all(|cell| cell.bg == panel),
++                            "{title}, center={in_center}"
++                        );
++                    },
++                );
++            }
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn entry_and_report_actions_preserve_keymap_and_request_ownership() -> crate::app::Result<()>
++{
++    let mut fixture = Fixture::new().await?;
++    let entry = KeyEvent::new(KeyCode::Char('`'), KeyModifiers::ALT);
++    let config = toml::from_str("[composer]\nsubmit = 'alt-`'")?;
++    fixture.app.keymap = crate::keymap::RuntimeKeymap::from_config(&config).expect("valid keymap");
++    fixture
++        .app
++        .chat_widget
++        .apply_keymap_update(config, &fixture.app.keymap);
++    fixture.key(entry).await?;
++    assert!(fixture.app.overlay.is_none());
++    fixture.app.keymap = crate::keymap::RuntimeKeymap::defaults();
++    fixture
++        .app
++        .chat_widget
++        .apply_keymap_update(Default::default(), &fixture.app.keymap);
++    fixture.app.chat_widget.toggle_vim_mode_and_notify();
++    fixture.app.chat_widget.insert_str("abc");
++    fixture
++        .app
++        .chat_widget
++        .handle_key_event(KeyCode::Char('i').into());
++    assert!(!fixture.app.should_recover_vim_insert_escape(entry));
++    fixture
++        .app
++        .chat_widget
++        .open_keymap_debug(&fixture.app.keymap);
++    fixture.key(entry).await?;
++    assert!(fixture.app.overlay.is_none());
++    fixture
++        .app
++        .chat_widget
++        .handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
++    fixture.key(entry).await?;
++    let request_id = fixture.app.usage_request.as_ref().unwrap().id;
++    let requests = std::iter::from_fn(|| fixture.events.try_recv().ok());
++    assert_eq!(
++        requests
++            .filter(|event| matches!(event, AppEvent::LoadUsage { refresh: false, .. }))
++            .count(),
++        1
++    );
++    fixture
++        .dispatch(AppEvent::UsageLoaded {
++            request_id,
++            result: Ok(UsageReadResponse {
++                report: Arc::new(crate::usage::test_report()),
++                refreshed: false,
++            }),
++        })
++        .await?;
++    fixture
++        .key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT))
++        .await?;
++    assert_eq!(
++        fixture.center().screen,
++        CenterScreen::Usage(UsageRange::Daily)
++    );
++    fixture.key(KeyCode::Char('p')).await?;
++    fixture.key(KeyCode::Char('t')).await?;
++    assert!(
++        fixture.events.try_recv().is_err(),
++        "settings belong to Summary"
++    );
++    fixture.key(KeyCode::Char('r')).await?;
++    let AppEvent::LoadUsage {
++        request_id: refresh_id,
++        refresh,
++    } = fixture.events.try_recv()?
++    else {
++        panic!("usage refresh")
++    };
++    assert!(refresh);
++    assert_ne!(refresh_id, request_id);
++    assert!(
++        fixture.events.try_recv().is_err(),
++        "usage refresh never reloads response pages"
++    );
++    assert!(fixture.center().report().is_none());
++    fixture.app.reconnect.offline = true;
++    fixture
++        .dispatch(AppEvent::UsageLoaded {
++            request_id: refresh_id,
++            result: Err("disconnected".into()),
++        })
++        .await?;
++    assert!(fixture.app.usage_request.is_none());
++    assert!(fixture.text().contains("Usage unavailable: disconnected"));
++    fixture.key(KeyCode::Esc).await?;
++    assert_eq!(fixture.center().screen, CenterScreen::Summary);
++    fixture.key(KeyCode::Esc).await?;
++    assert!(fixture.app.overlay.is_none());
++    assert!(fixture.commands.try_recv().is_err());
++    fixture.finish().await
++}
++
++#[tokio::test]
++async fn proxy_settings_own_editor_input_cursor_and_return_to_the_same_center()
++-> crate::app::Result<()> {
++    let mut fixture = Fixture::new().await?;
++    let config = toml::from_str("[list]\ncancel = ['esc', 'ctrl-x c']")?;
++    fixture.app.keymap = crate::keymap::RuntimeKeymap::from_config(&config).expect("valid keymap");
++    fixture.open_settings('p', "Proxy").await?;
++    let request = fixture.app.usage_request.as_ref().map(|request| request.id);
++    fixture.key(KeyCode::Char('a')).await?;
++    let event = fixture.events.try_recv()?;
++    fixture.dispatch(event).await?;
++    assert!(
++        fixture
++            .app
++            .active_keymap_contexts()
++            .contains(KeymapContext::Editor)
++    );
++    fixture
++        .app
++        .handle_tui_event(
++            &mut fixture.tui,
++            &mut fixture.server,
++            TuiEvent::Paste("route".into()),
++        )
++        .await?;
++    fixture.key(KeyCode::Char('r')).await?;
++    assert!(
++        fixture.events.try_recv().is_err(),
++        "editor r must not refresh usage"
++    );
++    // Submit after the native paste detector's single-character window.
++    tokio::time::sleep(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay()).await;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(&event, AppEvent::OpenProxyAddUrl { alias, .. } if alias == "router"));
++    fixture.dispatch(event).await?;
++    let dialog = fixture
++        .center()
++        .dialogs
++        .centered_view()
++        .expect("URL editor");
++    let (x, y) = dialog
++        .cursor_pos(Rect::new(0, 0, 200, 32))
++        .expect("editor cursor");
++    assert!((64..136).contains(&x) && (1..31).contains(&y));
++    fixture
++        .app
++        .handle_tui_event(
++            &mut fixture.tui,
++            &mut fixture.server,
++            TuiEvent::Paste("invalid".into()),
++        )
++        .await?;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    fixture.dispatch(event).await?;
++    assert!(fixture.text().contains("Failed to save proxy settings"));
++    fixture.key(KeyCode::Esc).await?;
++    assert!(!fixture.center().has_dialog());
++    while let Ok(event) = fixture.events.try_recv() {
++        assert!(!matches!(event, AppEvent::WriteProxyConfig { .. }));
++        fixture.dispatch(event).await?;
++    }
++    let mut config = codex_app_server_protocol::ProxyConfig {
++        entries: vec![codex_app_server_protocol::ProxyDefinition {
++            alias: "lan".into(),
++            url: "https://user:secret@127.0.0.1:8443".into(),
++        }],
++        ..Default::default()
++    };
++    fixture
++        .dispatch(AppEvent::WriteProxyConfig {
++            config: config.clone(),
++            reopen_picker: true,
++        })
++        .await?;
++    let path = fixture.app.config.codex_home.join("integrations.json");
++    let original = std::fs::read(&path)?;
++    fixture.key(KeyCode::Char(' ')).await?;
++    assert!(fixture.text().contains("[x] Enabled"));
++    assert!(!fixture.text().contains("secret"));
++    assert!(fixture.events.try_recv().is_err());
++    assert_eq!(std::fs::read(&path)?, original);
++    assert_eq!(fixture.server.proxy_read().await?.config, config);
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    config.enabled = true;
++    config.selected = Some("lan".into());
++    assert!(matches!(&event,
++        AppEvent::WriteProxyConfig { config: saved, reopen_picker: false } if saved == &config
++    ));
++    assert!(fixture.events.try_recv().is_err());
++    assert!(!fixture.center().has_dialog());
++    fixture.dispatch(event).await?;
++    assert_eq!(fixture.server.proxy_read().await?.config, config);
++    assert_eq!(fixture.app.proxy_alias.as_deref(), Some("lan"));
++    let saved = std::fs::read(&path)?;
++    fixture.key(KeyCode::Char('p')).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenProxy));
++    fixture.dispatch(event).await?;
++    fixture.key(KeyCode::Char(' ')).await?;
++    fixture.key(KeyCode::Esc).await?;
++    assert!(fixture.events.try_recv().is_err());
++    assert_eq!(fixture.server.proxy_read().await?.config, config);
++    assert_eq!(std::fs::read(&path)?, saved);
++    fixture.dispatch(AppEvent::OpenProxy).await?;
++    fixture
++        .app
++        .handle_tui_event(&mut fixture.tui, &mut fixture.server, TuiEvent::Draw)
++        .await?;
++    fixture
++        .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
++        .await?;
++    fixture.key(KeyCode::Char('c')).await?;
++    assert!(!fixture.center().has_dialog());
++    assert!(!fixture.app.chat_widget.has_active_modal());
++    assert_eq!(
++        fixture.app.usage_request.as_ref().map(|request| request.id),
++        request
++    );
++    assert_eq!(
++        fixture.app.chat_widget.composer_text_with_pending(),
++        "Preserved draft"
++    );
++    fixture.finish().await
++}
++
++#[tokio::test]
++async fn telegram_settings_keep_masked_input_nested_views_and_covered_updates()
++-> crate::app::Result<()> {
++    use codex_app_server_protocol::TelegramCommandKind;
++    use codex_app_server_protocol::TelegramCommandParams;
++    use codex_app_server_protocol::TelegramCommandResponse;
++    use codex_app_server_protocol::TelegramNotificationKind;
++
++    let mut fixture = Fixture::new().await?;
++    fixture.open_settings('t', "Bot token").await?;
++    fixture
++        .app
++        .handle_tui_event(
++            &mut fixture.tui,
++            &mut fixture.server,
++            TuiEvent::Paste("bot-secret".into()),
++        )
++        .await?;
++    assert!(!fixture.text().contains("bot-secret"));
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenTelegramChat { .. }));
++    fixture.dispatch(event).await?;
++    assert!(fixture.text().contains("Chat ID"));
++    fixture
++        .app
++        .handle_tui_event(
++            &mut fixture.tui,
++            &mut fixture.server,
++            TuiEvent::Paste("chat-id".into()),
++        )
++        .await?;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenTelegramSetup { .. }));
++    fixture.dispatch(event).await?;
++    assert!(fixture.text().contains("Notifications setup"));
++    fixture.key(KeyCode::Char(' ')).await?;
++    assert!(fixture.events.try_recv().is_err());
++    fixture.key(KeyCode::Esc).await?;
++    assert!(!fixture.center().has_dialog());
++    fixture.server.shutdown().await?;
++    let path = fixture.app.config.codex_home.join("integrations.json");
++    std::fs::write(
++        &path,
++        r#"{"telegram":{"bot_token":"bot-secret","chat_id":"chat-secret","notifications":["turnCompletion"]}}"#,
++    )?;
++    fixture.server = crate::start_embedded_app_server_for_picker(&fixture.app.config).await?;
++    let config = TelegramCommandResponse {
++        configured: true,
++        notifications: [TelegramNotificationKind::TurnCompletion].into(),
++        message: None,
++    };
++    fixture.key(KeyCode::Char('t')).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenTelegram));
++    fixture.dispatch(event).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(
++        event,
++        AppEvent::TelegramCommand {
++            params: TelegramCommandParams::Read {}
++        }
++    ));
++    fixture.dispatch(event).await?;
++    let event = tokio::time::timeout(Duration::from_secs(10), fixture.events.recv())
++        .await?
++        .expect("Telegram read result");
++    assert!(matches!(&event,
++        AppEvent::TelegramCommandFinished { kind: TelegramCommandKind::Read, result: Ok(read) }
++            if read == &config
++    ));
++    fixture.dispatch(event).await?;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenTelegramNotifications));
++    fixture.dispatch(event).await?;
++    let text = fixture.text();
++    for label in [
++        "Turn completion",
++        "Input needed",
++        "Codex prereleases",
++        "Codex releases",
++        "Model changes",
++    ] {
++        assert!(text.contains(label), "{text}");
++    }
++    assert!(!text.contains("bot-secret") && !text.contains("chat-secret"));
++    let original = std::fs::read(&path)?;
++    fixture.key(KeyCode::Down).await?;
++    fixture.key(KeyCode::Char(' ')).await?;
++    assert!(fixture.text().contains("[x] Input needed"));
++    assert!(fixture.events.try_recv().is_err());
++    assert_eq!(std::fs::read(&path)?, original);
++    fixture
++        .dispatch(AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::SetNotification,
++            result: Err("Delivery rejected".into()),
++        })
++        .await?;
++    fixture
++        .dispatch(AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::Read,
++            result: Ok(config.clone()),
++        })
++        .await?;
++    fixture
++        .dispatch(AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::SetNotification,
++            result: Ok(config.clone()),
++        })
++        .await?;
++    assert!(
++        fixture
++            .text()
++            .contains("Telegram command failed: Delivery rejected")
++    );
++    while let Ok(event) = fixture.events.try_recv() {
++        assert!(!matches!(event, AppEvent::TelegramCommand { .. }));
++        fixture.dispatch(event).await?;
++    }
++    fixture.key(KeyCode::Esc).await?;
++    let text = fixture.text();
++    assert!(text.contains("Telegram notifications"), "{text}");
++    assert!(text.contains("[x] Turn completion"), "{text}");
++    assert!(text.contains("[x] Input needed"), "{text}");
++    assert!(text.contains("[ ] Codex prereleases"), "{text}");
++    fixture.key(KeyCode::Char(' ')).await?;
++    assert!(fixture.text().contains("[ ] Input needed"));
++    fixture.key(KeyCode::Char(' ')).await?;
++    assert!(fixture.events.try_recv().is_err());
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(
++        event,
++        AppEvent::TelegramCommand {
++            params: TelegramCommandParams::SetNotification {
++                notification: TelegramNotificationKind::NeedsInput,
++                enabled: true,
++            }
++        }
++    ));
++    assert!(fixture.events.try_recv().is_err());
++    fixture.dispatch(event).await?;
++    let event = tokio::time::timeout(Duration::from_secs(10), fixture.events.recv())
++        .await?
++        .expect("confirmed notification result");
++    let saved_config = match &event {
++        AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::SetNotification,
++            result: Ok(config),
++        } => config.clone(),
++        _ => panic!("expected successful notification write"),
++    };
++    assert!(
++        saved_config
++            .notifications
++            .contains(&TelegramNotificationKind::NeedsInput)
++    );
++    fixture.dispatch(event).await?;
++    let saved = std::fs::read(&path)?;
++    assert_ne!(saved, original);
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::OpenTelegramNotifications));
++    fixture.dispatch(event).await?;
++    assert!(fixture.text().contains("[x] Input needed"));
++    fixture.key(KeyCode::Down).await?;
++    fixture.key(KeyCode::Char(' ')).await?;
++    fixture.key(KeyCode::Esc).await?;
++    assert!(fixture.events.try_recv().is_err());
++    assert_eq!(std::fs::read(&path)?, saved);
++    assert_eq!(
++        fixture.center().dialogs.last().unwrap().selected_index(),
++        Some(0)
++    );
++    fixture.key(KeyCode::Down).await?;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(
++        event,
++        AppEvent::TelegramCommand {
++            params: TelegramCommandParams::Disable {}
++        }
++    ));
++    fixture.dispatch(event).await?;
++    let event = tokio::time::timeout(Duration::from_secs(10), fixture.events.recv())
++        .await?
++        .expect("disabled Telegram result");
++    assert!(matches!(
++        event,
++        AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::Disable,
++            result: Ok(_)
++        }
++    ));
++    fixture.dispatch(event).await?;
++    assert!(fixture.text().contains("Telegram notifications disabled."));
++    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
++    assert!(document["telegram"].is_null());
++    fixture.key(KeyCode::Esc).await?;
++    fixture
++        .dispatch(AppEvent::TelegramCommandFinished {
++            kind: TelegramCommandKind::SetNotification,
++            result: Ok(saved_config),
++        })
++        .await?;
++    assert!(!fixture.center().has_dialog());
++    assert!(!fixture.app.chat_widget.has_active_modal());
++    assert_eq!(fixture.center().screen, CenterScreen::Summary);
++    assert_eq!(
++        fixture.app.chat_widget.composer_text_with_pending(),
++        "Preserved draft"
++    );
++    fixture.finish().await
++}
++
++#[tokio::test]
++async fn response_filters_keep_arrow_ownership_over_global_bindings() -> crate::app::Result<()> {
++    use codex_protocol::response_metrics::ResponseAttemptStatus;
++
++    let mut fixture = Fixture::new().await?;
++    fixture.app.open_control_center(&mut fixture.tui);
++    let Some(Overlay::ControlCenter(center)) = &mut fixture.app.overlay else {
++        unreachable!()
++    };
++    center.responses.history.models.insert("model-a".into());
++    while fixture.events.try_recv().is_ok() {}
++    fixture
++        .key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
++        .await?;
++    assert!(
++        fixture
++            .app
++            .active_keymap_contexts()
++            .contains(KeymapContext::List)
++    );
++    fixture.key(KeyCode::Char('r')).await?;
++    assert!(fixture.events.try_recv().is_err());
++    // A valid configured chord must not steal the response filter's fixed arrow.
++    let config = toml::from_str("[list]\nmove_left = []\nmove_down = 'left x'")?;
++    fixture.app.keymap = crate::keymap::RuntimeKeymap::from_config(&config).expect("valid keymap");
++    fixture.key(KeyCode::Left).await?;
++    assert!(!fixture.app.key_chord_matcher.is_pending());
++    assert_eq!(fixture.center().responses.history.model(), Some("model-a"));
++    fixture.key(KeyCode::Right).await?;
++    assert_eq!(
++        fixture.center().responses.history.status(),
++        Some(ResponseAttemptStatus::Working)
++    );
++    for (key, offset) in [
++        (KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), 8),
++        (KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), 0),
++    ] {
++        fixture.key(key).await?;
++        assert_eq!(fixture.center().table_interaction.column_offset, offset);
++        assert_eq!(fixture.center().screen, CenterScreen::Responses);
++        assert!(!fixture.center().has_dialog());
++    }
++    fixture.key(KeyCode::Esc).await?;
++    assert!(fixture.app.overlay.is_none());
++    fixture.finish().await
++}
++
++#[tokio::test]
++async fn quit_dialog_cancels_by_default_and_rechecks_before_exiting() -> crate::app::Result<()> {
++    let mut fixture = Fixture::new().await?;
++    fixture.app.chat_widget.insert_str("Preserved draft");
++    fixture.app.open_control_center(&mut fixture.tui);
++    while fixture.events.try_recv().is_ok() {}
++    while fixture.commands.try_recv().is_ok() {}
++    fixture.app.reconnect.offline = true;
++    fixture.key(KeyCode::Char('q')).await?;
++    assert!(fixture.text().contains("Cannot quit"));
++    fixture.key(KeyCode::Esc).await?;
++    assert!(!fixture.center().has_dialog());
++    // The daemon protocol tests own each eligibility outcome. An earlier Ok is no reservation.
++    fixture
++        .app
++        .show_control_center_quit_dialog(&mut fixture.tui, Ok(()));
++    fixture.key(KeyCode::Enter).await?;
++    assert!(
++        fixture.events.try_recv().is_err(),
++        "default dismissal cannot request shutdown"
++    );
++    assert!(!fixture.center().has_dialog());
++    fixture
++        .app
++        .show_control_center_quit_dialog(&mut fixture.tui, Ok(()));
++    fixture.key(KeyCode::Up).await?;
++    fixture.key(KeyCode::Enter).await?;
++    let event = fixture.events.try_recv()?;
++    assert!(matches!(event, AppEvent::ConfirmControlCenterQuit));
++    assert!(matches!(
++        fixture.dispatch(event).await?,
++        AppRunControl::Continue
++    ));
++    assert!(
++        fixture.text().contains("Cannot quit"),
++        "the current embedded connection is ineligible"
++    );
++    assert_eq!(
++        fixture.app.chat_widget.composer_text_with_pending(),
++        "Preserved draft"
++    );
++    assert!(
++        fixture.commands.try_recv().is_err(),
++        "shutdown never interrupts a thread"
++    );
++    fixture.key(KeyCode::Esc).await?;
++    fixture.key(KeyCode::Esc).await?;
++    assert!(fixture.app.overlay.is_none());
++    assert!(matches!(
++        fixture.dispatch(AppEvent::ConfirmControlCenterQuit).await?,
++        AppRunControl::Continue
++    ));
++    fixture.finish().await
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -53,6 +53,12 @@ impl App {
+             && !matches!(
+                 &event,
+                 AppEvent::OpenDaemonMenu
++                    | AppEvent::LoadUsage { .. }
++                    | AppEvent::UsageLoaded { .. }
++                    | AppEvent::ControlCenterTimingLoaded { .. }
++                    | AppEvent::ControlCenterGithubLoaded { .. }
++                    | AppEvent::ReadResponseAttempts { .. }
++                    | AppEvent::ResponseAttemptsLoaded { .. }
+                     | AppEvent::ConfirmControlCenterQuit
+                     | AppEvent::OpenWarnings
+                     | AppEvent::StatusLineSetup { .. }
+@@ -166,7 +172,11 @@ impl App {
+         match event {
+             AppEvent::OpenProxy => match app_server.proxy_read().await {
+                 Ok(response) => self.open_proxy_menu(tui, response.config),
+-                Err(error) => self.chat_widget.add_error_message(format!("Failed to read proxy settings: {error:#}")),
++                Err(error) => {
++                    let message = format!("Failed to read proxy settings: {error:#}");
++                    self.show_control_center_settings_notice(tui, "Proxy", &message);
++                    self.chat_widget.add_error_message(message);
++                }
+             },
+             AppEvent::OpenProxyAddAlias { config } => {
+                 self.open_proxy_add_alias(tui, config);
+@@ -182,7 +192,11 @@ impl App {
+                         self.open_proxy_menu(tui, response.config);
+                     }
+                 }
+-                Err(error) => self.chat_widget.add_error_message(format!("Failed to save proxy settings: {error:#}")),
++                Err(error) => {
++                    let message = format!("Failed to save proxy settings: {error:#}");
++                    self.show_control_center_settings_notice(tui, "Proxy", &message);
++                    self.chat_widget.add_error_message(message);
++                }
+             },
+             AppEvent::OpenTelegram => {
+                 self.app_event_tx.send(AppEvent::TelegramCommand {
+@@ -198,7 +212,11 @@ impl App {
+                 match result {
+                     Ok(response) if response.configured => self.open_telegram_notifications(tui, response),
+                     Ok(response) => self.open_telegram_menu(tui, response),
+-                    Err(error) => self.chat_widget.add_error_message(format!("Failed to read Telegram settings: {error}")),
++                    Err(error) => {
++                        let message = format!("Failed to read Telegram settings: {error}");
++                        self.show_control_center_settings_notice(tui, "Telegram", &message);
++                        self.chat_widget.add_error_message(message);
++                    }
+                 }
+             }
+             AppEvent::OpenTelegramChat { draft } => self.open_telegram_chat(tui, draft),
+@@ -224,7 +242,9 @@ impl App {
+                         self.open_telegram_menu(tui, response);
+                     }
+                     codex_app_server_protocol::TelegramCommandKind::Disable => {
+-                        self.chat_widget.add_info_message("Telegram notifications disabled.".to_string(), None);
++                        let message = "Telegram notifications disabled.";
++                        self.show_control_center_settings_notice(tui, "Telegram", message);
++                        self.chat_widget.add_info_message(message.to_string(), None);
+                     }
+                     codex_app_server_protocol::TelegramCommandKind::SetNotification
+                     | codex_app_server_protocol::TelegramCommandKind::Completion
+@@ -235,7 +255,9 @@ impl App {
+                         | codex_app_server_protocol::TelegramCommandKind::NeedsInput) {
+                         tracing::warn!(%error, "Telegram notification failed");
+                     } else {
+-                        self.chat_widget.add_error_message(format!("Telegram command failed: {error}"));
++                        let message = format!("Telegram command failed: {error}");
++                        self.show_control_center_settings_notice(tui, "Telegram", &message);
++                        self.chat_widget.add_error_message(message);
+                     }
+                 }
+             },
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -4,6 +4,7 @@
+ //! entry, Ctrl-L clear, external editor launch, agent navigation shortcuts, and legacy Vim
+ //! Escape recovery for the active composer or command-center rename editor.
+ 
++use super::control_center_input::control_center_shortcut;
+ use super::*;
+ use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
+ use crate::keymap::bindings_for_action;
+@@ -43,6 +44,7 @@ impl App {
+             && !(!rename_active
+                 && key_event.kind == KeyEventKind::Press
+                 && matches!(key_event.code, KeyCode::Char('v' | 'V')))
++            && !(!rename_active && control_center_shortcut(key_event))
+             // The owned transcript has a fixed compact tool-visibility shortcut.
+             && !(!rename_active
+                 && self.local_settings.tui.fullscreen_transcript
+@@ -54,12 +56,7 @@ impl App {
+                 && self.chat_widget.composer_text_with_pending().is_empty()
+                 && (previous_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)
+                     || next_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)))
+-            && !keymap_action_ids()
+-                .filter(|action| active_contexts.contains_action(*action))
+-                .any(|action| {
+-                    bindings_for_action(&self.keymap, action.context.config_name(), action.action)
+-                        .is_some_and(|bindings| bindings.is_pressed(key_event))
+-                })
++            && !self.active_key_binding_matches(key_event)
+             && !matches!(
+                 self.key_chord_matcher.clone().advance(
+                     key_event,
+@@ -76,19 +73,21 @@ impl App {
+         key_event: KeyEvent,
+     ) -> Option<KeyEvent> {
+         self.routed_key_activation = None;
+-        if self.chat_widget.take_key_chord_reset() {
++        if self.take_active_dialog_key_chord_reset() {
+             self.cancel_pending_key_chord();
+         }
+-        if self
+-            .chat_widget
+-            .consume_view_transition_key_event(key_event)
+-        {
+-            return None;
++        // Ordinary config handoffs must see the physical key before a chord or global shortcut
++        // consumes it. Control Center settings do not use the config-editor handoff.
++        if !matches!(&self.overlay, Some(Overlay::ControlCenter(_))) {
++            if self
++                .chat_widget
++                .consume_view_transition_key_event(key_event)
++            {
++                return None;
++            }
++            self.chat_widget
++                .observe_config_editor_transition_key_event(key_event);
+         }
+-        // Pending config handoffs must see the physical key before a chord or global shortcut
+-        // consumes it.
+-        self.chat_widget
+-            .observe_config_editor_transition_key_event(key_event);
+         self.transcript_view.set_keymap_bindings(&self.keymap);
+         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+             overlay.set_keymap_bindings(&self.keymap);
+@@ -96,6 +95,11 @@ impl App {
+         if self.overlay.is_none() && self.chat_widget.handle_quick_dial_menu(key_event) {
+             return None;
+         }
++        if matches!(&self.overlay, Some(Overlay::ControlCenter(center)) if center.owns_key(key_event))
++        {
++            self.cancel_pending_key_chord();
++            return Some(key_event);
++        }
+         if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.owns_interaction_key(key_event))
+             || (tui.is_owned_screen()
+                 && self.overlay.is_none()
+@@ -170,6 +174,13 @@ impl App {
+                 if was_pending && !self.key_chord_matcher.is_pending() {
+                     self.set_key_chord_hint_override(/*items*/ None);
+                 }
++                if matches!(&self.overlay, Some(Overlay::ControlCenter(center)) if center.screen != crate::pager_overlay::CenterScreen::Responses && !center.has_dialog())
++                    && crate::key_hint::plain(KeyCode::Char('r')).is_press(key_event)
++                    && !self.active_key_binding_matches(key_event)
++                {
++                    self.refresh_usage(tui);
++                    return None;
++                }
+                 Some(key_event)
+             }
+             crate::keymap::KeyChordMatch::Pending(_) => {
+@@ -199,7 +210,7 @@ impl App {
+     }
+ 
+     pub(super) fn expire_pending_key_chord(&mut self) {
+-        if self.chat_widget.take_key_chord_reset() {
++        if self.take_active_dialog_key_chord_reset() {
+             self.cancel_pending_key_chord();
+         }
+         let contexts = self.active_keymap_contexts();
+@@ -215,6 +226,24 @@ impl App {
+         }
+     }
+ 
++    fn take_active_dialog_key_chord_reset(&mut self) -> bool {
++        if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++            center.dialogs.take_key_chord_reset()
++        } else {
++            self.chat_widget.take_key_chord_reset()
++        }
++    }
++
++    fn active_key_binding_matches(&self, key: KeyEvent) -> bool {
++        let contexts = self.active_keymap_contexts();
++        keymap_action_ids()
++            .filter(|action| contexts.contains_action(*action))
++            .any(|action| {
++                bindings_for_action(&self.keymap, action.context.config_name(), action.action)
++                    .is_some_and(|bindings| bindings.is_pressed(key))
++            })
++    }
++
+     fn set_key_chord_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
+         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
+             overlay.key_chord_hint = items.clone();
+@@ -231,10 +260,18 @@ impl App {
+         use crate::keymap::KeymapContext;
+         use crate::keymap::KeymapContextSet;
+ 
++        if let Some(Overlay::ControlCenter(center)) = &self.overlay
++            && let Some(dialog) = center.dialogs.last()
++        {
++            return dialog.keymap_contexts().with_voice_toggle(&self.keymap);
++        }
+         if let Some(overlay) = &self.overlay {
+             let context = if matches!(overlay, Overlay::Transcript(view) if view.is_search_editing())
+             {
+                 KeymapContext::Editor
++            } else if matches!(overlay, Overlay::ControlCenter(center) if center.screen == crate::pager_overlay::CenterScreen::Responses)
++            {
++                KeymapContext::List
+             } else {
+                 KeymapContext::Pager
+             };
+@@ -603,6 +640,13 @@ impl App {
+         }
+ 
+         let find_transcript = self.keymap.app.find_transcript.is_pressed(key_event);
++        if app_keymap_shortcuts_available
++            && control_center_shortcut(key_event)
++            && !self.active_key_binding_matches(key_event)
++        {
++            self.open_control_center(tui);
++            return;
++        }
+         if app_keymap_shortcuts_available
+             && (self.keymap.app.open_transcript.is_pressed(key_event) || find_transcript)
+         {
+diff --git a/codex-rs/tui/src/app/proxy.rs b/codex-rs/tui/src/app/proxy.rs
+--- a/codex-rs/tui/src/app/proxy.rs
++++ b/codex-rs/tui/src/app/proxy.rs
+@@ -14,7 +14,7 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = proxy_dialogs::menu(config, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
++        self.show_settings_view(Box::new(view));
+     }
+ 
+     pub(super) fn open_proxy_add_alias(&mut self, tui: &Tui, config: ProxyConfig) {
+@@ -26,7 +26,7 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = proxy_dialogs::add_alias(config, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
++        self.show_settings_view(Box::new(view));
+     }
+ 
+     pub(super) fn open_proxy_add_url(&mut self, tui: &Tui, config: ProxyConfig, alias: String) {
+@@ -38,6 +38,6 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = proxy_dialogs::add_url(config, alias, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
++        self.show_settings_view(Box::new(view));
+     }
+ }
+diff --git a/codex-rs/tui/src/app/telegram.rs b/codex-rs/tui/src/app/telegram.rs
+--- a/codex-rs/tui/src/app/telegram.rs
++++ b/codex-rs/tui/src/app/telegram.rs
+@@ -1,5 +1,4 @@
+ use super::App;
+-use crate::bottom_pane::SelectionViewParams;
+ use crate::dialog::DialogResources;
+ use crate::telegram_dialogs;
+ use crate::telegram_dialogs::TelegramSetupDraft;
+@@ -67,7 +66,7 @@ impl App {
+ 
+     pub(super) fn open_telegram_menu(&mut self, tui: &Tui, config: TelegramCommandResponse) {
+         if config.configured {
+-            self.show_telegram_selection(telegram_dialogs::settings());
++            self.show_settings_selection(tui, telegram_dialogs::settings());
+             return;
+         }
+         let frames = tui.frame_requester();
+@@ -78,7 +77,7 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = telegram_dialogs::menu(config, &resources);
+-        self.chat_widget.show_bottom_pane_view(view);
++        self.show_settings_view(view);
+     }
+ 
+     pub(super) fn open_telegram_chat(&mut self, tui: &Tui, draft: TelegramSetupDraft) {
+@@ -90,7 +89,7 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = telegram_dialogs::chat(draft, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
++        self.show_settings_view(Box::new(view));
+     }
+ 
+     pub(super) fn open_telegram_setup(&mut self, tui: &Tui, setup: TelegramSetup) {
+@@ -102,7 +101,7 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = telegram_dialogs::setup(setup, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
++        self.show_settings_view(Box::new(view));
+     }
+ 
+     pub(super) fn open_telegram_notifications(
+@@ -118,18 +117,6 @@ impl App {
+             vim_enabled: self.chat_widget.composer_is_vim_enabled(),
+         };
+         let view = telegram_dialogs::notifications(config, &resources);
+-        self.chat_widget.show_bottom_pane_view(Box::new(view));
+-    }
+-
+-    fn show_telegram_selection(&mut self, mut params: SelectionViewParams) {
+-        if let Some(view_id) = params.view_id
+-            && let Some(selected) = self.chat_widget.selected_index_for_present_view(view_id)
+-        {
+-            params.initial_selected_idx = Some(selected);
+-            self.chat_widget
+-                .replace_selection_view_if_present(view_id, params);
+-        } else {
+-            self.chat_widget.show_selection_view(params);
+-        }
++        self.show_settings_view(Box::new(view));
+     }
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/shortcut_overlay.rs b/codex-rs/tui/src/bottom_pane/shortcut_overlay.rs
+--- a/codex-rs/tui/src/bottom_pane/shortcut_overlay.rs
++++ b/codex-rs/tui/src/bottom_pane/shortcut_overlay.rs
+@@ -86,6 +86,10 @@ pub(super) fn lines(props: &FooterProps, width: u16) -> Vec<Line<'static>> {
+         action: "Subagents (empty prompt)",
+     });
+     session.push(hints.focus_activity, "Inspect activity");
++    session.entries.push(Shortcut::new(
++        key_hint::alt(KeyCode::Char('`')),
++        "Control center",
++    ));
+     session.entries.push(Shortcut::new(
+         key_hint::ctrl(KeyCode::Char('c')),
+         if props.is_task_running {
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -782,7 +782,12 @@ mod tests {
+                 assert!(row(area.height - 1).contains("q quit"));
+                 2
+             } else {
+-                assert!(row(area.height - 1).contains("esc back"));
++                let footer = row(area.height - 1);
++                assert!(footer.contains("esc back"), "{screen:?}: {footer}");
++                assert!(footer.contains("r refresh cache"), "{screen:?}: {footer}");
++                if screen == CenterScreen::Quotas {
++                    assert!(footer.contains("period"), "{footer}");
++                }
+                 0
+             };
+             assert!(row(area.height - 1).ends_with("Loading usage..."));
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -207,6 +207,27 @@ impl ControlCenter {
+         true
+     }
+ 
++    pub(crate) fn owns_key(&self, key: KeyEvent) -> bool {
++        if self.has_dialog() {
++            return false;
++        }
++        key_hint::plain(KeyCode::Esc).is_press(key)
++            || key_hint::plain(KeyCode::Tab).is_press(key)
++            || key_hint::shift(KeyCode::BackTab).is_press(key)
++            || key_hint::plain(KeyCode::Char('q')).is_press(key)
++            || TableInteraction::horizontal_key(key)
++            || (self.screen == CenterScreen::Responses && ResponseTab::owns_key(key))
++            || (self.screen != CenterScreen::Responses
++                && [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right]
++                    .into_iter()
++                    .any(|code| key_hint::plain(code).is_press(key)))
++            || (self.screen == CenterScreen::Summary
++                && (CenterScreen::shortcut(key).is_some()
++                    || [KeyCode::Enter, KeyCode::Char('p'), KeyCode::Char('t')]
++                        .into_iter()
++                        .any(|code| key_hint::plain(code).is_press(key))))
++    }
++
+     pub(crate) fn show_quit_dialog(
+         &mut self,
+         eligibility: std::result::Result<(), String>,

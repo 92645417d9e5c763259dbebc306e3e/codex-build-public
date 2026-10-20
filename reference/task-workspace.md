@@ -65,7 +65,7 @@ ClosedPatchTaskReductionOwner
 ```
 
 - Apply conflict retains the successful prefix and selected open Patch; conflict alone selects no approval stop.
-- Consume ReleaseRollForward's scope, measured-benefit and boundary-approval decisions before dependent work.
+- Consume ReleaseRollForward's scope and measured-benefit decisions before dependent work.
 - Missing evidence and an explicit pause still stop their dependent successor.
 - Every release anchor ends with an empty or populated `## Additional Instructions` section reserved for user-added bullets.
 - Keep this heading last when creating or updating the anchor, including when its bullets have been consumed.
@@ -117,8 +117,8 @@ ClosedPatchTaskReductionOwner
 - With no selected open Patch, omit its fields.
 - Reread the postimage to ensure prose and fields choose the same remaining action before continuing.
 - Closure consumes direct cumulative semantic acceptance and GitCustody convergence before publishing the task and invoking its successor.
-- When that successor leaves the approved Unit or crosses a Lane, retain the concrete proposal and required user decision instead of treating task publication as approval.
-- Preserve established approval for unchanged work inside the same Unit without introducing an approval field or another state owner.
+- Continue declared work within the user's Roll scope without repeated approval or an approval field.
+- Retain any missing user decision or explicit pause with its unresolved obligation instead of treating task publication as approval.
 - Before closing a lane, compare every admitted source Unit, Flat Patch and ordered Child Patch in that lane with its accepted current Git responsibility and the authorized disposition of every difference.
 - Any missing or unexplained entry forbids lane crossing, a completion claim or removal of its pending work.
 - A shorter closed prefix may still be exported without closing its unfinished lane.
@@ -134,7 +134,7 @@ ClosedPatchTaskReductionOwner
 - Its completed endpoint has no open selection until the product owner reconciles the remaining work and selects the next authorized action.
 - Publish the selected Patch, complete Unit sequence, adopted topology, pre-authoring terminal, cause and successor before authoring. Keep that selection through Unit-local reset, rebase and final Child Commits. At the completed source boundary publish its actual terminal before a selected test; retain unresolved verification or behavior. No per-Child transition or premature Unit closure follows a partial prefix. A handoff during authoring preserves the unfinished selection and truthful continuation.
 - Candidates before topology resolution are unordered; declared order survives reduction.
-- Roll executes the reconciled order only while its assignment and boundary entry are authorized; an explicit pause selects read-only exploration on clean Current.
+- Roll executes the reconciled order within the user's authorized scope; an explicit pause selects read-only exploration on clean Current.
 - Preserve the complete approved purpose and its establishing source or user decision. Candidate rejection does not cancel requirements; task wording, repair hypotheses and tests cannot replace or narrow them.
 - Record findings and any selected complete reconstruction against their assigned Unit or Flat Patch. Retain every unmet obligation and its original authority until implemented or explicitly withdrawn; a shorter or passing replacement cannot clear it. Tree-wide plans retain unresolved requirements only.
 - The rewrite start decision records actual Main, proposed start, and disposition of existing Lane children and suffix sources before Fork or reset. Desired state never replaces observed facts.

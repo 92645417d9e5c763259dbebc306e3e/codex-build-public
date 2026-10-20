@@ -52,7 +52,9 @@ BazelModuleAcquisitionOwner
 `-- Terminal: ClassifiedMaintenanceTerminal
 ```
 
-- The Bazel `repository-maintenance` operation consumes one selected real product worktree, fixed project roots, release, attempt, and positive deadline after its dependency owner changes `Cargo.toml` or `Cargo.lock`.
+- The Bazel `repository-maintenance` operation consumes one selected real product worktree, fixed project roots, release, and attempt after its dependency owner changes `Cargo.toml` or `Cargo.lock`.
+- Invoke Bazel maintenance with `--deadline 90m` for the total acquisition and offline recipe execution.
+- This Bazel budget leaves Cargo lock maintenance, formatting, builds, and test deadlines unchanged.
 - RepositoryMaintenance admits only the exact release MainWorktree or numbered fork branch while allowing its unstaged tracked dependency-owner postimage; RepositoryFormatting owns its separate tracked-input admission, while tests, replay, suites, and export retain clean-source admission.
 - The maintenance source projection rejects active Git sequencing state, and its preimage disables rename folding before rejecting staged changes including intent-to-add index entries, untracked, deleted, nondependency, and preexisting `MODULE.bazel.lock` changes before product execution.
 - Admission expands RepositoryMaintenanceSupport and requires manifest-selected `bin/just`, manifest-selected Bazelisk at `bin/bazel`, and the exact source `.bazelversion` before creating an attempt or changing source bytes.

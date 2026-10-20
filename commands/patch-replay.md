@@ -78,7 +78,6 @@ ProjectedSchemaTransformOwner
 ## Unit Flat Patch And Child Patch Transport
 
 - Before Apply, reconstruction, Commit or Revise, consume ReleaseRollForward's supported purpose and placement decision, PatchFormat's semantic naming rule and PatchAcceptance's applicable source review. Native transport checks custody and rollback, not semantic completeness. A Git failure retains bounded stderr, rejected identity and the accepted prefix.
-- The caller must obtain ReleaseRollForward's explicit user approval for each crossed Unit or Lane boundary before transport; a retained-source range cannot bypass that decision by crossing several boundaries in one call.
 
 ```
 CurrentPatchRevision
@@ -143,7 +142,7 @@ DeclaredPrefixPatchSetOwner
 - It generates only on the clean official-parent target before GitDiffs, without reading a predecessor worktree or export.
 - Exported-prefix Apply forbids `--lane` and every `--end-*`.
 - Retained-worktree Apply selects a Unit, Flat Patch or generated tail with exactly one `--start-*` and an optional matching `--end-*`.
-- The end selector is inclusive and bounds the already approved unchanged source range before the next planned rewrite or unapproved boundary.
+- The end selector is inclusive and bounds the unchanged source range within the user's Roll scope before the next planned rewrite or selected stop.
 - Omission of an end selector continues to select only the start responsibility.
 - Commit and Revise accept only `--flat-patch` or `--unit` plus `--child-patch`; no Transform or generic selector.
 - Live Apply uses task Current target and exact retained Source. Before effects, match the selected source Unit children or unique strict suffix to ChildPatchSequence. A GitDiff conflict retains its accepted prefix.

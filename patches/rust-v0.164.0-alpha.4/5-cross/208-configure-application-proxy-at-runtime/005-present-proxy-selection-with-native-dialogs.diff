@@ -1,0 +1,1147 @@
+present-proxy-selection-with-native-dialogs
+
+Lane: cross
+
+Unit: configure-application-proxy-at-runtime
+
+ChildPatch: present-proxy-selection-with-native-dialogs
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -250,6 +250,7 @@ mod permission_shortcuts;
+ mod pets;
+ mod platform_actions;
+ mod plugin_mentions;
++mod proxy;
+ mod rate_limit_refresh;
+ mod realtime_delivery;
+ mod realtime_settings;
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -163,6 +163,26 @@ impl App {
+             event => (event, None),
+         };
+         match event {
++            AppEvent::OpenProxy => match app_server.proxy_read().await {
++                Ok(response) => self.open_proxy_menu(tui, response.config),
++                Err(error) => self.chat_widget.add_error_message(format!("Failed to read proxy settings: {error:#}")),
++            },
++            AppEvent::OpenProxyAddAlias { config } => {
++                self.open_proxy_add_alias(tui, config);
++            }
++            AppEvent::OpenProxyAddUrl { config, alias } => {
++                self.open_proxy_add_url(tui, config, alias);
++            }
++            AppEvent::WriteProxyConfig { config, reopen_picker } => match app_server.proxy_write(config).await {
++                Ok(response) => {
++                    self.proxy_alias = response.active_alias;
++                    self.proxy_address = response.active_address;
++                    if reopen_picker {
++                        self.open_proxy_menu(tui, response.config);
++                    }
++                }
++                Err(error) => self.chat_widget.add_error_message(format!("Failed to save proxy settings: {error:#}")),
++            },
+             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+             AppEvent::ConfirmDaemonRestart => self.confirm_daemon_restart(),
+             AppEvent::RunDaemonRestart => {
+diff --git a/codex-rs/tui/src/app/proxy.rs b/codex-rs/tui/src/app/proxy.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/proxy.rs
+@@ -0,0 +1,43 @@
++use super::App;
++use crate::dialog::DialogResources;
++use crate::proxy_dialogs;
++use crate::tui::Tui;
++use codex_app_server_protocol::ProxyConfig;
++
++impl App {
++    pub(super) fn open_proxy_menu(&mut self, tui: &Tui, config: ProxyConfig) {
++        let frames = tui.frame_requester();
++        let resources = DialogResources {
++            app_event_tx: &self.app_event_tx,
++            keymap: &self.keymap,
++            frame_requester: &frames,
++            vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++        };
++        let view = proxy_dialogs::menu(config, &resources);
++        self.chat_widget.show_bottom_pane_view(Box::new(view));
++    }
++
++    pub(super) fn open_proxy_add_alias(&mut self, tui: &Tui, config: ProxyConfig) {
++        let frames = tui.frame_requester();
++        let resources = DialogResources {
++            app_event_tx: &self.app_event_tx,
++            keymap: &self.keymap,
++            frame_requester: &frames,
++            vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++        };
++        let view = proxy_dialogs::add_alias(config, &resources);
++        self.chat_widget.show_bottom_pane_view(Box::new(view));
++    }
++
++    pub(super) fn open_proxy_add_url(&mut self, tui: &Tui, config: ProxyConfig, alias: String) {
++        let frames = tui.frame_requester();
++        let resources = DialogResources {
++            app_event_tx: &self.app_event_tx,
++            keymap: &self.keymap,
++            frame_requester: &frames,
++            vim_enabled: self.chat_widget.composer_is_vim_enabled(),
++        };
++        let view = proxy_dialogs::add_url(config, alias, &resources);
++        self.chat_widget.show_bottom_pane_view(Box::new(view));
++    }
++}
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -76,6 +76,8 @@ mod history_hydration_tests;
+ #[path = "tests/permission_shortcuts_tests.rs"]
+ mod permission_shortcuts_tests;
+ mod plugin_catalog;
++#[path = "tests/proxy.rs"]
++mod proxy;
+ mod rate_limits;
+ #[path = "tests/realtime_handoff_e2e.rs"]
+ mod realtime_handoff_e2e;
+diff --git a/codex-rs/tui/src/app/tests/proxy.rs b/codex-rs/tui/src/app/tests/proxy.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/proxy.rs
+@@ -0,0 +1,119 @@
++use super::make_test_app_with_channels;
++use crate::app_event::AppEvent;
++use crate::chatwidget::tests::helpers::render_bottom_popup;
++use crate::tui::TuiEvent;
++use codex_app_server_protocol::ProxyConfig;
++use codex_app_server_protocol::ProxyDefinition;
++use color_eyre::eyre::Result;
++use crossterm::event::KeyCode;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn proxy_picker_rpc_round_trip_persists_and_updates_app_state() -> Result<()> {
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.handle_event(&mut tui, &mut server, AppEvent::OpenProxy)
++        .await?;
++    assert!(render_bottom_popup(&app.chat_widget, 80).contains("Proxy"));
++    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
++        .await?;
++    assert!(app.chat_widget.no_modal_or_popup_active());
++    let mut config = ProxyConfig {
++        entries: vec![ProxyDefinition {
++            alias: "lan".to_string(),
++            url: "https://user:secret@127.0.0.1:8443".to_string(),
++        }],
++        ..Default::default()
++    };
++    app.handle_event(
++        &mut tui,
++        &mut server,
++        AppEvent::WriteProxyConfig {
++            config: config.clone(),
++            reopen_picker: true,
++        },
++    )
++    .await?;
++    let popup = render_bottom_popup(&app.chat_widget, 80);
++    assert!(popup.contains("lan"));
++    assert!(!popup.contains("secret"));
++    assert!(app.proxy_alias.is_none());
++    assert!(app.proxy_address.is_none());
++    let path = app.config.codex_home.join("integrations.json");
++    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
++    assert_eq!(
++        serde_json::from_value::<ProxyConfig>(document["proxy"].clone())?,
++        config
++    );
++    app.handle_tui_event(
++        &mut tui,
++        &mut server,
++        TuiEvent::Key(KeyCode::Char(' ').into()),
++    )
++    .await?;
++    assert!(render_bottom_popup(&app.chat_widget, 80).contains("[x] Enabled"));
++    assert!(events.try_recv().is_err());
++    assert_eq!(server.proxy_read().await?.config, config);
++    assert!(app.proxy_alias.is_none());
++    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Enter.into()))
++        .await?;
++    let event = events.try_recv().expect("confirmed proxy settings");
++    config.enabled = true;
++    config.selected = Some("lan".to_string());
++    assert!(
++        matches!(&event, AppEvent::WriteProxyConfig { config: written, reopen_picker: false } if written == &config)
++    );
++    assert!(events.try_recv().is_err());
++    assert!(app.chat_widget.no_modal_or_popup_active());
++    app.handle_event(&mut tui, &mut server, event).await?;
++    assert_eq!(app.proxy_alias.as_deref(), Some("lan"));
++    assert_eq!(app.proxy_address.as_deref(), Some("127.0.0.1:8443"));
++    let enabled = server.proxy_read().await?;
++    assert_eq!(enabled.config, config);
++    assert_eq!(enabled.active_alias.as_deref(), Some("lan"));
++    assert_eq!(enabled.active_address.as_deref(), Some("127.0.0.1:8443"));
++    app.handle_event(&mut tui, &mut server, AppEvent::OpenProxy)
++        .await?;
++    app.handle_tui_event(
++        &mut tui,
++        &mut server,
++        TuiEvent::Key(KeyCode::Char(' ').into()),
++    )
++    .await?;
++    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
++        .await?;
++    assert!(events.try_recv().is_err());
++    assert!(app.chat_widget.no_modal_or_popup_active());
++    assert_eq!(server.proxy_read().await?.config, config);
++    assert_eq!(app.proxy_alias.as_deref(), Some("lan"));
++
++    app.handle_event(&mut tui, &mut server, AppEvent::OpenProxy)
++        .await?;
++    for key in [KeyCode::Char(' '), KeyCode::Enter] {
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into()))
++            .await?;
++    }
++    let event = events.try_recv().expect("confirmed disabled proxy");
++    config.enabled = false;
++    assert!(
++        matches!(&event, AppEvent::WriteProxyConfig { config: written, reopen_picker: false } if written == &config)
++    );
++    assert!(events.try_recv().is_err());
++    assert!(app.chat_widget.no_modal_or_popup_active());
++    app.handle_event(&mut tui, &mut server, event).await?;
++    assert!(app.proxy_alias.is_none());
++    assert!(app.proxy_address.is_none());
++    let disabled = server.proxy_read().await?;
++    assert_eq!(disabled.config, config);
++    assert!(disabled.generation > enabled.generation);
++    assert!(disabled.active_alias.is_none());
++    assert!(disabled.active_address.is_none());
++    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
++    assert_eq!(
++        serde_json::from_value::<ProxyConfig>(document["proxy"].clone())?,
++        config
++    );
++    server.shutdown().await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -295,6 +295,18 @@ pub(crate) struct AgentPickerThreadRefresh {
+ #[allow(clippy::large_enum_variant)]
+ #[derive(Debug, IntoStaticStr)]
+ pub(crate) enum AppEvent {
++    OpenProxy,
++    OpenProxyAddAlias {
++        config: codex_app_server_protocol::ProxyConfig,
++    },
++    OpenProxyAddUrl {
++        config: codex_app_server_protocol::ProxyConfig,
++        alias: String,
++    },
++    WriteProxyConfig {
++        config: codex_app_server_protocol::ProxyConfig,
++        reopen_picker: bool,
++    },
+     AccountEmailLoaded {
+         request_id: uuid::Uuid,
+         email: Option<String>,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -83,6 +83,7 @@ mod empty_state_policy;
+ mod hook_status;
+ mod mcp_server_elicitation;
+ mod multi_select_picker;
++mod proxy_picker_view;
+ pub(crate) use multi_select_picker::MultiSelectItem;
+ pub(crate) use multi_select_picker::MultiSelectPicker;
+ #[cfg(test)]
+@@ -187,6 +188,7 @@ pub(crate) use list_selection_view::SideContentWidth;
+ pub(crate) use list_selection_view::popup_content_width;
+ pub(crate) use list_selection_view::side_by_side_layout_widths;
+ pub(crate) use memories_settings_view::MemoriesSettingsView;
++pub(crate) use proxy_picker_view::ProxyPickerView;
+ use slash_commands::ServiceTierCommand;
+ mod feedback_note_view;
+ mod feedback_view;
+diff --git a/codex-rs/tui/src/bottom_pane/proxy_picker_view.rs b/codex-rs/tui/src/bottom_pane/proxy_picker_view.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/proxy_picker_view.rs
+@@ -0,0 +1,371 @@
++use codex_app_server_protocol::ProxyConfig;
++use codex_http_client::HttpClientFactory;
++use codex_http_client::OutboundProxyPolicy;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++use std::time::Instant;
++
++use crate::app_event::AppEvent;
++use crate::app_event_sender::AppEventSender;
++use crate::dialog::DialogFrame;
++use crate::key_hint;
++use crate::key_hint::KeyBindingListExt;
++use crate::keymap::ListAction;
++use crate::keymap::ListKeymap;
++use crate::render::renderable::Renderable;
++use crate::tui::FrameRequester;
++
++use super::CancellationEvent;
++use super::bottom_pane_view::BottomPaneView;
++use super::picker_rows::measure_rows_height;
++use super::picker_rows::render_rows;
++use super::popup_consts::MAX_POPUP_ROWS;
++use super::scroll_state::ScrollState;
++use super::selection_popup_common::GenericDisplayRow;
++use super::selection_popup_common::wrap_styled_line;
++
++const TRACE_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
++const PROXY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
++
++pub(crate) struct ProxyPickerView {
++    config: ProxyConfig,
++    state: ScrollState,
++    complete: bool,
++    app_event_tx: AppEventSender,
++    keymap: ListKeymap,
++    probe_descriptions: Arc<Mutex<BTreeMap<String, String>>>,
++    probe_tasks: Vec<tokio::task::JoinHandle<()>>,
++}
++
++impl ProxyPickerView {
++    pub(crate) fn new(
++        config: ProxyConfig,
++        app_event_tx: AppEventSender,
++        keymap: ListKeymap,
++        frame_requester: FrameRequester,
++    ) -> Self {
++        let mut state = ScrollState::new();
++        state.selected_idx = (!config.entries.is_empty()).then_some(0);
++        let probe_descriptions = Arc::new(Mutex::new(
++            config
++                .entries
++                .iter()
++                .map(|proxy| (proxy.alias.clone(), "Testing...".to_string()))
++                .collect(),
++        ));
++        let view = Self {
++            config,
++            state,
++            complete: false,
++            app_event_tx,
++            keymap,
++            probe_descriptions,
++            probe_tasks: Vec::new(),
++        };
++        #[cfg(not(test))]
++        {
++            let mut view = view;
++            view.start_probes(frame_requester);
++            view
++        }
++        #[cfg(test)]
++        {
++            let _ = frame_requester;
++            view
++        }
++    }
++
++    fn start_probes(&mut self, frame_requester: FrameRequester) {
++        for proxy in &self.config.entries {
++            let alias = proxy.alias.clone();
++            let proxy_url = proxy.url.clone();
++            let descriptions = Arc::clone(&self.probe_descriptions);
++            let frame_requester = frame_requester.clone();
++            self.probe_tasks.push(tokio::spawn(async move {
++                let description = probe_proxy_identity(&proxy_url)
++                    .await
++                    .map(|(ip, location, latency_ms)| {
++                        format!("{ip} | {location} | {latency_ms} ms")
++                    })
++                    .unwrap_or_else(|_| "Unavailable".to_string());
++                descriptions
++                    .lock()
++                    .expect("proxy probe descriptions")
++                    .insert(alias, description);
++                frame_requester.schedule_frame();
++            }));
++        }
++    }
++
++    fn toggle_or_select(&mut self) {
++        let Some(selected) = self.state.selected_idx else {
++            return;
++        };
++        match selected {
++            0 if self.config.enabled => self.config.enabled = false,
++            0 if !self.config.entries.is_empty() => {
++                if self.config.selected.is_none() {
++                    self.config.selected =
++                        self.config.entries.first().map(|proxy| proxy.alias.clone());
++                }
++                self.config.enabled = true;
++            }
++            0 => {}
++            index => {
++                if let Some(proxy) = self.config.entries.get(index - 1) {
++                    self.config.selected = Some(proxy.alias.clone());
++                }
++            }
++        }
++    }
++
++    fn delete_selected(&mut self) {
++        let Some(index) = self
++            .state
++            .selected_idx
++            .and_then(|index| index.checked_sub(1))
++        else {
++            return;
++        };
++        if index >= self.config.entries.len() {
++            return;
++        }
++        let removed = self.config.entries.remove(index);
++        if self.config.selected.as_deref() == Some(removed.alias.as_str()) {
++            self.config.selected = self.config.entries.first().map(|proxy| proxy.alias.clone());
++        }
++        if self.config.entries.is_empty() {
++            self.config.enabled = false;
++            self.state.reset();
++        } else {
++            self.state.selected_idx = Some((index + 1).min(self.config.entries.len()));
++        }
++        let len = self.row_count();
++        self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
++    }
++
++    fn row_count(&self) -> usize {
++        self.config.entries.len() + usize::from(!self.config.entries.is_empty())
++    }
++
++    fn rows(&self) -> Vec<GenericDisplayRow> {
++        if self.config.entries.is_empty() {
++            return Vec::new();
++        }
++        let descriptions = self
++            .probe_descriptions
++            .lock()
++            .expect("proxy probe descriptions");
++        let entries = std::iter::once(("Enabled", self.config.enabled, None)).chain(
++            self.config.entries.iter().map(|proxy| {
++                (
++                    proxy.alias.as_str(),
++                    self.config.selected.as_deref() == Some(proxy.alias.as_str()),
++                    descriptions.get(&proxy.alias).cloned(),
++                )
++            }),
++        );
++        entries
++            .enumerate()
++            .map(|(index, (name, checked, description))| {
++                let focused = self.state.selected_idx == Some(index);
++                let cursor = if focused { '›' } else { ' ' };
++                let indent = if index == 0 { "" } else { "  " };
++                let checkbox = if checked { 'x' } else { ' ' };
++                GenericDisplayRow {
++                    name: format!("{cursor} {indent}[{checkbox}] {name}"),
++                    selection_style: Some(super::picker_style::selection_style()),
++                    wrap_indent: Some(if index == 0 { 6 } else { 8 }),
++                    description,
++                    is_disabled: index > 0 && !self.config.enabled && !focused,
++                    ..Default::default()
++                }
++            })
++            .collect()
++    }
++
++    fn footer_hint(&self) -> Line<'static> {
++        let mut hints = Vec::new();
++        if let Some(selected) = self.state.selected_idx {
++            hints.extend([
++                key_hint::plain(KeyCode::Char(' ')).into(),
++                if selected == 0 {
++                    " toggle · "
++                } else {
++                    " select · "
++                }
++                .dim(),
++            ]);
++        }
++        if let Some(hint) = self.keymap.primary_hint(ListAction::Accept) {
++            hints.extend(hint.spans());
++            hints.push(" apply · ".dim());
++        }
++        hints.extend([key_hint::plain(KeyCode::Char('a')).into(), " add".dim()]);
++        if self.state.selected_idx.is_some_and(|index| index > 0) {
++            hints.extend([
++                " · ".dim(),
++                key_hint::plain(KeyCode::Char('d')).into(),
++                " delete".dim(),
++            ]);
++        }
++        if let Some(hint) = self.keymap.primary_hint(ListAction::Cancel) {
++            hints.push(" · ".dim());
++            hints.extend(hint.spans());
++            hints.push(" cancel".dim());
++        }
++        Line::from(hints)
++    }
++}
++
++impl Drop for ProxyPickerView {
++    fn drop(&mut self) {
++        for task in &self.probe_tasks {
++            task.abort();
++        }
++    }
++}
++
++fn parse_proxy_identity(body: &str) -> Result<(String, String), String> {
++    let field = |name: &str| {
++        body.lines()
++            .find_map(|line| line.strip_prefix(name))
++            .map(str::trim)
++            .filter(|value| !value.is_empty())
++            .map(str::to_string)
++    };
++    let ip = field("ip=").ok_or_else(|| "trace response omitted ip".to_string())?;
++    let location = field("loc=").ok_or_else(|| "trace response omitted loc".to_string())?;
++    Ok((ip, location))
++}
++
++async fn probe_proxy_identity(proxy_url: &str) -> Result<(String, String, u64), String> {
++    let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
++        .build_client_for_proxy_probe(proxy_url)
++        .map_err(|error| error.to_string())?;
++    let started_at = Instant::now();
++    let body = client
++        .get(TRACE_URL)
++        .timeout(PROXY_PROBE_TIMEOUT)
++        .send()
++        .await
++        .map_err(|error| error.to_string())?
++        .error_for_status()
++        .map_err(|error| error.to_string())?
++        .text()
++        .await
++        .map_err(|error| error.to_string())?;
++    let (ip, location) = parse_proxy_identity(&body)?;
++    let latency_ms = started_at
++        .elapsed()
++        .as_millis()
++        .max(1)
++        .min(u128::from(u64::MAX)) as u64;
++    Ok((ip, location, latency_ms))
++}
++
++impl BottomPaneView for ProxyPickerView {
++    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
++        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
++    }
++
++    fn handle_key_event(&mut self, event: KeyEvent) {
++        let len = self.row_count();
++        let visible = MAX_POPUP_ROWS.min(len).max(1);
++        match event {
++            _ if self.keymap.move_up.is_pressed(event) => {
++                self.state.move_up_wrap(len);
++                self.state.ensure_visible(len, visible);
++            }
++            _ if self.keymap.move_down.is_pressed(event) => {
++                self.state.move_down_wrap(len);
++                self.state.ensure_visible(len, visible);
++            }
++            _ if self.keymap.page_up.is_pressed(event) => self.state.page_up_clamped(len, visible),
++            _ if self.keymap.page_down.is_pressed(event) => {
++                self.state.page_down_clamped(len, visible)
++            }
++            _ if self.keymap.jump_top.is_pressed(event) => self.state.jump_top(len, visible),
++            _ if self.keymap.jump_bottom.is_pressed(event) => self.state.jump_bottom(len, visible),
++            _ if key_hint::plain(KeyCode::Char(' ')).is_press(event) => self.toggle_or_select(),
++            _ if key_hint::plain(KeyCode::Char('a')).is_press(event) => {
++                self.app_event_tx.send(AppEvent::OpenProxyAddAlias {
++                    config: self.config.clone(),
++                });
++                self.complete = true;
++            }
++            _ if key_hint::plain(KeyCode::Char('d')).is_press(event) => self.delete_selected(),
++            _ if self.keymap.accept.is_pressed(event) => {
++                self.app_event_tx.send(AppEvent::WriteProxyConfig {
++                    config: self.config.clone(),
++                    reopen_picker: false,
++                });
++                self.complete = true;
++            }
++            _ if self.keymap.cancel.is_pressed(event) => self.complete = true,
++            _ => {}
++        }
++    }
++
++    fn is_complete(&self) -> bool {
++        self.complete
++    }
++
++    fn on_ctrl_c(&mut self) -> CancellationEvent {
++        self.complete = true;
++        CancellationEvent::Handled
++    }
++}
++
++impl Renderable for ProxyPickerView {
++    fn render(&self, area: Rect, buf: &mut Buffer) {
++        if area.is_empty() {
++            return;
++        }
++        let hint = self.footer_hint();
++        let hints = wrap_styled_line(&hint, DialogFrame::footer_width(area.width));
++        let frame = DialogFrame::new(area, hints.len() as u16);
++        frame.render(buf);
++        let content = frame.body();
++        let rows = self.rows();
++        let [header, _, list] = super::picker_rows::layout(
++            content,
++            1,
++            0,
++            measure_rows_height(&rows, &self.state, MAX_POPUP_ROWS, content.width),
++        );
++        Line::from("Proxy".bold()).render(header, buf);
++        render_rows(
++            list,
++            buf,
++            &rows,
++            &self.state,
++            MAX_POPUP_ROWS,
++            "  No proxy configured. Press a to add one.",
++        );
++        Paragraph::new(hints).render(frame.footer(), buf);
++    }
++
++    fn desired_height(&self, width: u16) -> u16 {
++        measure_rows_height(&self.rows(), &self.state, MAX_POPUP_ROWS, width)
++            .saturating_add(5)
++            .saturating_add(
++                wrap_styled_line(&self.footer_hint(), DialogFrame::footer_width(width)).len()
++                    as u16,
++            )
++    }
++}
++
++#[cfg(test)]
++#[path = "proxy_picker_view_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/bottom_pane/proxy_picker_view_tests.rs b/codex-rs/tui/src/bottom_pane/proxy_picker_view_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/proxy_picker_view_tests.rs
+@@ -0,0 +1,272 @@
++use codex_app_server_protocol::ProxyDefinition;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use pretty_assertions::assert_eq;
++use tokio::sync::mpsc::unbounded_channel;
++
++use super::*;
++
++fn test_view(
++    config: ProxyConfig,
++) -> (
++    ProxyPickerView,
++    tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++) {
++    let (tx, rx) = unbounded_channel();
++    (
++        ProxyPickerView::new(
++            config,
++            AppEventSender::new(tx),
++            crate::keymap::RuntimeKeymap::defaults().list,
++            FrameRequester::test_dummy(),
++        ),
++        rx,
++    )
++}
++
++fn render(view: &ProxyPickerView) -> (Buffer, String) {
++    let area = Rect::new(0, 0, 80, view.desired_height(80));
++    let mut buffer = Buffer::empty(area);
++    view.render(area, &mut buffer);
++    let text = buffer.content.iter().map(|cell| cell.symbol()).collect();
++    (buffer, text)
++}
++
++fn alias_cell(buffer: &Buffer) -> &ratatui::buffer::Cell {
++    let y = (0..buffer.area.height)
++        .find(|&y| {
++            (0..buffer.area.width)
++                .map(|x| buffer[(x, y)].symbol())
++                .collect::<String>()
++                .contains("stable-lan")
++        })
++        .expect("proxy row");
++    &buffer[(8, y)]
++}
++
++fn configuration() -> ProxyConfig {
++    ProxyConfig {
++        enabled: false,
++        selected: None,
++        entries: vec![
++            ProxyDefinition {
++                alias: "stable-lan".to_string(),
++                url: "http://192.0.2.1:8080".to_string(),
++            },
++            ProxyDefinition {
++                alias: "backup".to_string(),
++                url: "https://user:secret@192.0.2.2:8443".to_string(),
++            },
++        ],
++    }
++}
++
++#[test]
++fn proxy_picker_stages_selection_and_deletion_until_apply() {
++    let (mut view, mut rx) = test_view(configuration());
++    view.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
++    view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
++    view.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
++    assert!(rx.try_recv().is_err());
++    view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++    let AppEvent::WriteProxyConfig {
++        config,
++        reopen_picker,
++    } = rx.try_recv().expect("apply")
++    else {
++        panic!("unexpected event");
++    };
++    let mut expected = configuration();
++    expected.enabled = true;
++    expected.selected = Some("backup".to_string());
++    expected.entries.remove(0);
++    assert_eq!(config, expected);
++    assert!(!reopen_picker);
++    assert!(view.is_complete());
++
++    let (mut view, mut rx) = test_view(configuration());
++    view.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
++    view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++    assert!(rx.try_recv().is_err());
++    assert!(view.is_complete());
++}
++
++#[test]
++fn proxy_picker_renders_enabled_and_disabled_selection() {
++    let (mut view, _rx) = test_view(configuration());
++    view.config.selected = Some("stable-lan".to_string());
++    for enabled in [false, true] {
++        if enabled {
++            view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++            view.handle_key_event(KeyEvent::from(KeyCode::Down));
++        }
++        let (buffer, text) = render(&view);
++        assert!(text.contains("[x] stable-lan"));
++        assert!(text.contains("Testing..."));
++        assert!(!text.contains("secret"));
++        assert!(!text.contains("Disabled"));
++        assert!(!text.contains("shell commands"));
++        let alias = alias_cell(&buffer);
++        assert_eq!(
++            alias.modifier.contains(ratatui::style::Modifier::DIM),
++            !enabled
++        );
++        if enabled {
++            let selected = super::super::picker_style::selection_style();
++            assert_eq!(
++                alias.bg,
++                selected.bg.unwrap_or(ratatui::style::Color::Reset)
++            );
++            assert_eq!(
++                alias.modifier.contains(ratatui::style::Modifier::REVERSED),
++                selected
++                    .add_modifier
++                    .contains(ratatui::style::Modifier::REVERSED)
++            );
++        }
++    }
++}
++
++#[test]
++fn proxy_picker_uses_the_shared_body_and_wrapped_footer_surfaces() {
++    crate::terminal_palette::with_test_default_colors(
++        crate::terminal_probe::DefaultColors {
++            fg: (240, 240, 240),
++            bg: (0, 0, 0),
++        },
++        || {
++            let (view, _rx) = test_view(configuration());
++            for width in [20, 40, 72] {
++                let area = Rect::new(3, 2, width, view.desired_height(width));
++                let mut buffer = Buffer::empty(area);
++                for cell in &mut buffer.content {
++                    cell.set_bg(ratatui::style::Color::Blue);
++                }
++                view.render(area, &mut buffer);
++                assert_eq!(
++                    buffer[(area.x, area.y)].bg,
++                    crate::style::user_message_style().bg.unwrap()
++                );
++                let footer_height =
++                    wrap_styled_line(&view.footer_hint(), width.saturating_sub(2)).len() as u16;
++                let mut footer = String::new();
++                for y in area.bottom() - footer_height..area.bottom() {
++                    for x in area.left()..area.right() {
++                        assert_eq!(buffer[(x, y)].bg, ratatui::style::Color::Reset);
++                        footer.push_str(buffer[(x, y)].symbol());
++                    }
++                }
++                assert!(footer.starts_with("  ") && footer.contains("esc"));
++            }
++        },
++    );
++}
++
++#[test]
++fn proxy_picker_uses_configured_list_keys_and_ignores_release_events() {
++    let (mut view, mut rx) = test_view(configuration());
++    view.keymap.accept = vec![key_hint::plain(KeyCode::Char('x'))];
++    view.keymap.cancel = vec![key_hint::plain(KeyCode::Char('z'))];
++    let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
++    view.handle_key_event(space);
++    view.handle_key_event(KeyEvent {
++        kind: KeyEventKind::Release,
++        ..space
++    });
++    assert!(view.config.enabled);
++    assert!(rx.try_recv().is_err());
++    let (_, text) = render(&view);
++    assert!(text.contains("x apply"));
++    assert!(text.contains("z cancel"));
++    view.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    assert!(!view.is_complete());
++    view.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
++    assert!(
++        matches!(rx.try_recv(), Ok(AppEvent::WriteProxyConfig { config, .. }) if config.enabled)
++    );
++}
++
++#[test]
++fn deleting_a_scrolled_selected_proxy_keeps_selection_visible_and_disables_the_last_entry() {
++    let config = ProxyConfig {
++        entries: (0..25)
++            .map(|index| ProxyDefinition {
++                alias: format!("proxy-{index}"),
++                url: "http://127.0.0.1:8080".to_string(),
++            })
++            .collect(),
++        ..Default::default()
++    };
++    let (mut view, mut rx) = test_view(config);
++    view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++    view.handle_key_event(KeyEvent::from(KeyCode::Up));
++    view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++    assert_eq!(view.config.selected.as_deref(), Some("proxy-24"));
++    assert!(view.state.scroll_top > 0);
++    while !view.config.entries.is_empty() {
++        view.handle_key_event(KeyEvent::from(KeyCode::Char('d')));
++        if !view.config.entries.is_empty() {
++            let selected = view.state.selected_idx.expect("remaining proxy row");
++            assert!(selected < 1 + view.config.entries.len());
++            assert!(selected >= view.state.scroll_top);
++            assert!(selected < view.state.scroll_top + MAX_POPUP_ROWS);
++        }
++        assert!(rx.try_recv().is_err());
++    }
++    assert_eq!(view.config, ProxyConfig::default());
++    assert_eq!(view.state.scroll_top, 0);
++    assert_eq!(view.state.selected_idx, None);
++    assert!(view.rows().is_empty());
++    view.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    assert!(
++        matches!(rx.try_recv(), Ok(AppEvent::WriteProxyConfig { config, .. }) if config == ProxyConfig::default())
++    );
++}
++
++#[test]
++fn empty_proxy_picker_shows_add_guidance_without_inactive_controls() {
++    let (mut view, mut rx) = test_view(ProxyConfig::default());
++    for code in [
++        KeyCode::Down,
++        KeyCode::Up,
++        KeyCode::Char(' '),
++        KeyCode::Char('d'),
++    ] {
++        view.handle_key_event(KeyEvent::from(code));
++    }
++    assert_eq!(view.state.selected_idx, None);
++    assert_eq!(view.config, ProxyConfig::default());
++    let (_, text) = render(&view);
++    assert!(text.contains("No proxy configured. Press a to add one."));
++    assert!(!text.contains("Enabled"));
++    assert!(!text.contains("toggle"));
++    assert!(!text.contains("delete"));
++    assert!(rx.try_recv().is_err());
++    view.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
++    assert!(
++        matches!(rx.try_recv(), Ok(AppEvent::OpenProxyAddAlias { config }) if config == ProxyConfig::default())
++    );
++}
++
++#[test]
++fn adding_from_the_picker_preserves_the_staged_configuration_without_writing() {
++    let (mut view, mut rx) = test_view(configuration());
++    view.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
++    view.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
++    let Ok(AppEvent::OpenProxyAddAlias { config }) = rx.try_recv() else {
++        panic!("expected alias step")
++    };
++    assert!(config.enabled);
++    assert_eq!(config.selected.as_deref(), Some("stable-lan"));
++    assert!(view.is_complete());
++    assert!(rx.try_recv().is_err());
++}
++
++#[test]
++fn proxy_trace_identity_requires_ip_and_location() {
++    assert_eq!(
++        parse_proxy_identity("fl=1\nip=203.0.113.7\nloc=SG\n"),
++        Ok(("203.0.113.7".to_string(), "SG".to_string()))
++    );
++    assert!(parse_proxy_identity("ip=203.0.113.7\n").is_err());
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -199,6 +199,7 @@ pub(crate) mod onboarding;
+ mod oss_selection;
+ mod pager_overlay;
+ mod projectless;
++mod proxy_dialogs;
+ pub(crate) mod public_widgets;
+ mod render;
+ mod resize_reflow_cap;
+diff --git a/codex-rs/tui/src/proxy_dialogs.rs b/codex-rs/tui/src/proxy_dialogs.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/proxy_dialogs.rs
+@@ -0,0 +1,65 @@
++//! Proxy configuration content, constructed independently of its dialog host.
++
++use crate::app_event::AppEvent;
++use crate::bottom_pane::ProxyPickerView;
++use crate::bottom_pane::custom_prompt_view::CustomPromptView;
++use crate::dialog::DialogResources;
++use codex_app_server_protocol::ProxyConfig;
++use codex_app_server_protocol::ProxyDefinition;
++
++pub(crate) fn menu(config: ProxyConfig, resources: &DialogResources<'_>) -> ProxyPickerView {
++    ProxyPickerView::new(
++        config,
++        resources.app_event_tx.clone(),
++        resources.keymap.list.clone(),
++        resources.frame_requester.clone(),
++    )
++}
++
++pub(crate) fn add_alias(config: ProxyConfig, resources: &DialogResources<'_>) -> CustomPromptView {
++    let tx = resources.app_event_tx.clone();
++    resources.text_prompt(CustomPromptView::new(
++        "Add proxy".to_string(),
++        "Enter an alias".to_string(),
++        String::new(),
++        Some("This alias identifies the proxy in the control center.".to_string()),
++        Box::new(move |alias| {
++            let alias = alias.trim();
++            if !alias.is_empty() {
++                tx.send(AppEvent::OpenProxyAddUrl {
++                    config: config.clone(),
++                    alias: alias.to_string(),
++                });
++            }
++        }),
++    ))
++}
++
++pub(crate) fn add_url(
++    config: ProxyConfig,
++    alias: String,
++    resources: &DialogResources<'_>,
++) -> CustomPromptView {
++    let tx = resources.app_event_tx.clone();
++    resources.text_prompt(CustomPromptView::new(
++        "Add proxy".to_string(),
++        "Enter an http:// or https:// proxy URL".to_string(),
++        String::new(),
++        Some(format!("Alias: {alias}")),
++        Box::new(move |url| {
++            let mut config = config.clone();
++            config.entries.push(ProxyDefinition {
++                alias: alias.clone(),
++                url: url.trim().to_string(),
++            });
++            tx.send(AppEvent::WriteProxyConfig {
++                config,
++                reopen_picker: true,
++            });
++        }),
++    ))
++}
++
++#[cfg(test)]
++#[path = "proxy_dialogs_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/proxy_dialogs_tests.rs b/codex-rs/tui/src/proxy_dialogs_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/proxy_dialogs_tests.rs
+@@ -0,0 +1,129 @@
++use super::*;
++use crate::app_event_sender::AppEventSender;
++use crate::dialog::DialogStack;
++use crate::keymap::RuntimeKeymap;
++use crate::tui::FrameRequester;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn adding_a_proxy_uses_real_prompt_callbacks_and_preserves_staged_settings() {
++    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++    let events = AppEventSender::new(tx);
++    let keymap = RuntimeKeymap::defaults();
++    let frames = FrameRequester::test_dummy();
++    let resources = DialogResources {
++        app_event_tx: &events,
++        keymap: &keymap,
++        frame_requester: &frames,
++        vim_enabled: false,
++    };
++    let mut dialogs = DialogStack::new(frames.clone());
++    let config = ProxyConfig {
++        enabled: true,
++        selected: Some("existing".to_string()),
++        entries: vec![ProxyDefinition {
++            alias: "existing".to_string(),
++            url: "http://127.0.0.1:8080".to_string(),
++        }],
++    };
++    dialogs.push(Box::new(add_alias(config.clone(), &resources)));
++    dialogs.handle_paste("  backup  ".to_string());
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::Enter), None);
++    let AppEvent::OpenProxyAddUrl {
++        config: staged,
++        alias,
++    } = rx.try_recv().expect("URL step")
++    else {
++        panic!("expected URL step")
++    };
++    assert_eq!(staged, config);
++    assert_eq!(alias, "backup");
++    assert!(rx.try_recv().is_err());
++    dialogs.push(Box::new(add_url(staged, alias, &resources)));
++    dialogs.handle_paste(" https://user:secret@127.0.0.1:8443 ".to_string());
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::Enter), None);
++    let AppEvent::WriteProxyConfig {
++        config: written,
++        reopen_picker,
++    } = rx.try_recv().expect("write")
++    else {
++        panic!("expected write")
++    };
++    let mut expected = config;
++    expected.entries.push(ProxyDefinition {
++        alias: "backup".to_string(),
++        url: "https://user:secret@127.0.0.1:8443".to_string(),
++    });
++    assert_eq!(written, expected);
++    assert!(reopen_picker);
++    assert!(!format!("{written:?}").contains("secret"));
++    assert!(rx.try_recv().is_err());
++    assert!(dialogs.is_empty());
++}
++
++#[test]
++fn cancelled_proxy_alias_and_url_prompts_do_not_write() {
++    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++    let events = AppEventSender::new(tx);
++    let keymap = RuntimeKeymap::defaults();
++    let frames = FrameRequester::test_dummy();
++    let resources = DialogResources {
++        app_event_tx: &events,
++        keymap: &keymap,
++        frame_requester: &frames,
++        vim_enabled: false,
++    };
++    for url_step in [false, true] {
++        let mut dialogs = DialogStack::new(frames.clone());
++        let view = if url_step {
++            add_url(ProxyConfig::default(), "lan".to_string(), &resources)
++        } else {
++            add_alias(ProxyConfig::default(), &resources)
++        };
++        dialogs.push(Box::new(view));
++        dialogs.handle_paste("unfinished".to_string());
++        dialogs.handle_key_event(KeyEvent::from(KeyCode::Esc), None);
++        assert!(rx.try_recv().is_err());
++        assert!(dialogs.is_empty());
++    }
++}
++
++#[test]
++fn independent_proxy_dialogs_use_current_editor_and_list_bindings() {
++    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++    let events = AppEventSender::new(tx);
++    let mut config = codex_config::types::TuiKeymap::default();
++    config.editor.move_left = Some(codex_config::types::KeybindingsSpec::One(
++        codex_config::types::KeybindingSpec("f2".into()),
++    ));
++    config.list.accept = Some(codex_config::types::KeybindingsSpec::One(
++        codex_config::types::KeybindingSpec("f3".into()),
++    ));
++    let keymap = RuntimeKeymap::from_config(&config).expect("valid dialog bindings");
++    let frames = FrameRequester::test_dummy();
++    let resources = DialogResources {
++        app_event_tx: &events,
++        keymap: &keymap,
++        frame_requester: &frames,
++        vim_enabled: false,
++    };
++    let mut dialogs = DialogStack::new(frames.clone());
++    dialogs.push(Box::new(add_alias(ProxyConfig::default(), &resources)));
++    dialogs.handle_paste("ab".into());
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::F(2)), None);
++    dialogs.handle_paste("x".into());
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::Enter), None);
++    assert!(matches!(rx.try_recv(), Ok(AppEvent::OpenProxyAddUrl { alias, .. }) if alias == "axb"));
++    assert!(dialogs.is_empty());
++    dialogs.push(Box::new(menu(ProxyConfig::default(), &resources)));
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::Enter), None);
++    assert!(!dialogs.is_empty());
++    assert!(rx.try_recv().is_err());
++    dialogs.handle_key_event(KeyEvent::from(KeyCode::F(3)), None);
++    assert!(
++        matches!(rx.try_recv(), Ok(AppEvent::WriteProxyConfig { config, reopen_picker: false }) if config == ProxyConfig::default())
++    );
++    assert!(dialogs.is_empty());
++}

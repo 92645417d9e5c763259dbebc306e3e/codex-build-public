@@ -1,0 +1,865 @@
+expose-system-prompts-for-local-editing
+
+Lane: cross
+
+Unit: reload-model-prompts-at-context-boundaries
+
+ChildPatch: expose-system-prompts-for-local-editing
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Expose editable per-model prompt files and reload model-owned instructions when starting a new local context window without changing pinned model metadata.
+
+Requires: Unit:cross/materialize-model-catalog-from-local-file
+
+Provides: Seed home/instructions atomically without clobbering edits, select exact then longest-family safe filenames, retain explicit config precedence and native prompts on invalid files, and refresh model-provenance instructions in request, model-switch, and recorded incremental-tools prefixes with coherent native snapshots at window boundaries.
+
+Boundary: Custom or inherited non-model instructions remain pinned; model catalog selection, metadata, official caches, tool declarations, context ordering, attribution, and ordinary compaction retain their native owners.
+
+Verification: instructions_overlay and manager tests cover matching, seeding, edits, and precedence; core retained-step and model_instruction_windows tests cover unchanged within-window prompts, refreshed window prefixes, custom instructions, Responses, and Responses Lite with both tool-declaration modes.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+--- a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+@@ -720,6 +720,7 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
+         BTreeSet::from([
+             "config.toml".to_string(),
+             "installation_id".to_string(),
++            "instructions".to_string(),
+             "models.json".to_string(),
+             "skills".to_string(),
+         ]),
+diff --git a/codex-rs/core/tests/suite/base_instructions.rs b/codex-rs/core/tests/suite/base_instructions.rs
+--- a/codex-rs/core/tests/suite/base_instructions.rs
++++ b/codex-rs/core/tests/suite/base_instructions.rs
+@@ -46,7 +46,12 @@ fn managed_model(slug: &str, instructions: &str) -> ModelInfo {
+     model
+ }
+ 
+-async fn refresh_catalog(test: &TestCodex, server: &MockServer, model: &str, instructions: &str) {
++async fn refresh_model_prompt(
++    test: &TestCodex,
++    server: &MockServer,
++    model: &str,
++    instructions: &str,
++) {
+     let etag = format!("\"{model}-{}\"", instructions.len());
+     let models = vec![managed_model(model, instructions)];
+     responses::mount_models_once_with_etag(server, ModelsResponse { models }, &etag).await;
+@@ -55,6 +60,14 @@ async fn refresh_catalog(test: &TestCodex, server: &MockServer, model: &str, ins
+         .get_models_manager()
+         .list_models(RefreshStrategy::Online, client_factory)
+         .await;
++    // The exposed prompt file remains authoritative after catalog refreshes.
++    std::fs::write(
++        test.codex_home_path()
++            .join("instructions")
++            .join(format!("{model}.md")),
++        instructions,
++    )
++    .expect("write the model prompt fixture");
+ }
+ 
+ async fn send_turn(test: &TestCodex, server: &MockServer, text: &str) -> Result<Request> {
+@@ -149,7 +162,7 @@ async fn catalog_and_model_changes_preserve_the_window_base(
+     let first_request = send_turn(&test, &server, "first turn").await?;
+     assert!(model_updates(&first_request).is_empty());
+ 
+-    refresh_catalog(&test, &server, MODEL, UPDATED).await;
++    refresh_model_prompt(&test, &server, MODEL, UPDATED).await;
+     let updated_request = send_turn(&test, &server, "use refreshed instructions").await?;
+     let mut updates = Vec::new();
+     if incremental_tools && custom_instructions.is_none() {
+@@ -164,7 +177,7 @@ async fn catalog_and_model_changes_preserve_the_window_base(
+     let unchanged_request = send_turn(&test, &server, "keep refreshed instructions").await?;
+     assert_eq!(model_updates(&unchanged_request), updates);
+ 
+-    refresh_catalog(&test, &server, MODEL, "").await;
++    refresh_model_prompt(&test, &server, MODEL, "").await;
+     let cleared_request = send_turn(&test, &server, "clear managed instructions").await?;
+     if incremental_tools && custom_instructions.is_none() {
+         updates.push("<model_instructions>\nThe previous base instructions no longer apply. No replacement base instructions are active.\n</model_instructions>".to_string());
+@@ -192,7 +205,7 @@ async fn catalog_and_model_changes_preserve_the_window_base(
+     assert!(!compacted_request.body_contains_text(ORIGINAL));
+     assert!(!compacted_request.body_contains_text(UPDATED));
+ 
+-    refresh_catalog(&test, &server, SWITCHED_MODEL, SWITCHED).await;
++    refresh_model_prompt(&test, &server, SWITCHED_MODEL, SWITCHED).await;
+     let switched_request = switch_model(&test, &server, SWITCHED_MODEL).await?;
+     let updates = vec![match custom_instructions {
+         None => format!(
+diff --git a/codex-rs/models-manager/src/instructions_overlay.rs b/codex-rs/models-manager/src/instructions_overlay.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/models-manager/src/instructions_overlay.rs
+@@ -0,0 +1,320 @@
++use codex_protocol::openai_models::ModelInfo;
++use std::collections::BTreeMap;
++use std::io;
++use std::io::ErrorKind;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use tokio::fs;
++use tracing::warn;
++
++pub(crate) const INSTRUCTIONS_OVERLAY_DIR: &str = "instructions";
++
++pub(crate) fn dir_path(codex_home: &Path) -> PathBuf {
++    codex_home.join(INSTRUCTIONS_OVERLAY_DIR)
++}
++
++pub(crate) async fn apply(dir: &Path, catalog_slug: &str, model: &mut ModelInfo) -> bool {
++    let Some(path) = matching_overlay_path(dir, catalog_slug).await else {
++        return false;
++    };
++    let template = match fs::read_to_string(&path).await {
++        Ok(template) if !template.trim().is_empty() => template,
++        Ok(_) => {
++            warn!(path = %path.display(), catalog_slug, "instructions overlay must not be empty");
++            return false;
++        }
++        Err(err) if err.kind() == ErrorKind::NotFound => return false,
++        Err(err) => {
++            warn!(path = %path.display(), catalog_slug, "failed to read instructions overlay: {err}");
++            return false;
++        }
++    };
++    let Some(messages) = model.model_messages.as_mut() else {
++        return false;
++    };
++    messages.instructions_template = Some(template);
++    true
++}
++
++pub(crate) async fn seed(dir: &Path, models: &[ModelInfo]) {
++    if let Err(err) = fs::create_dir_all(dir).await {
++        warn!(path = %dir.display(), "failed to create instructions overlay directory: {err}");
++        return;
++    }
++    let snapshot = match OverlayIndex::capture(dir).await {
++        Ok(snapshot) => snapshot,
++        Err(err) => {
++            warn!(path = %dir.display(), "failed to scan instructions overlay directory: {err}");
++            return;
++        }
++    };
++    for model in models {
++        let Some(template) = model
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref())
++            .filter(|template| !template.trim().is_empty())
++        else {
++            continue;
++        };
++        let Some(path) = model_path(dir, &model.slug) else {
++            warn!(model = %model.slug, "instructions overlay catalog slug is unsafe");
++            continue;
++        };
++        if snapshot.matching_path(&model.slug).is_some() {
++            continue;
++        }
++        if let Err(err) = create_new(&path, template).await
++            && err.kind() != ErrorKind::AlreadyExists
++        {
++            warn!(path = %path.display(), model = %model.slug, "failed to seed instructions overlay: {err}");
++        }
++    }
++}
++
++#[derive(Default)]
++struct OverlayIndex {
++    paths_by_stem: BTreeMap<String, PathBuf>,
++}
++
++impl OverlayIndex {
++    async fn capture(dir: &Path) -> io::Result<Self> {
++        let mut entries = match fs::read_dir(dir).await {
++            Ok(entries) => entries,
++            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
++            Err(err) => return Err(err),
++        };
++        let mut index = Self::default();
++        while let Some(entry) = entries.next_entry().await? {
++            let path = entry.path();
++            let Some(stem) = path
++                .extension()
++                .filter(|extension| *extension == "md")
++                .and_then(|_| path.file_stem())
++                .and_then(|stem| stem.to_str())
++                .filter(|stem| is_safe_catalog_slug(stem))
++            else {
++                continue;
++            };
++            index.paths_by_stem.insert(stem.to_string(), path);
++        }
++        Ok(index)
++    }
++
++    fn matching_path(&self, catalog_slug: &str) -> Option<&Path> {
++        if !is_safe_catalog_slug(catalog_slug) {
++            return None;
++        }
++        self.paths_by_stem
++            .get(catalog_slug)
++            .map(PathBuf::as_path)
++            .or_else(|| {
++                self.paths_by_stem
++                    .iter()
++                    .filter(|(stem, _)| catalog_slug.starts_with(stem.as_str()))
++                    .max_by_key(|(stem, _)| stem.len())
++                    .map(|(_, path)| path.as_path())
++            })
++    }
++}
++
++fn model_path(dir: &Path, catalog_slug: &str) -> Option<PathBuf> {
++    is_safe_catalog_slug(catalog_slug).then(|| dir.join(format!("{catalog_slug}.md")))
++}
++
++async fn matching_overlay_path(dir: &Path, catalog_slug: &str) -> Option<PathBuf> {
++    if !is_safe_catalog_slug(catalog_slug) {
++        return None;
++    }
++    match OverlayIndex::capture(dir).await {
++        Ok(index) => index.matching_path(catalog_slug).map(Path::to_path_buf),
++        Err(err) => {
++            warn!(path = %dir.display(), catalog_slug, "failed to scan instructions overlay directory: {err}");
++            None
++        }
++    }
++}
++
++fn is_safe_catalog_slug(catalog_slug: &str) -> bool {
++    let bytes = catalog_slug.as_bytes();
++    bytes
++        .first()
++        .copied()
++        .is_some_and(is_ascii_lowercase_alphanumeric)
++        && bytes
++            .last()
++            .copied()
++            .is_some_and(is_ascii_lowercase_alphanumeric)
++        && bytes
++            .iter()
++            .copied()
++            .all(|byte| is_ascii_lowercase_alphanumeric(byte) || matches!(byte, b'-' | b'_' | b'.'))
++        && !catalog_slug.contains("..")
++}
++
++fn is_ascii_lowercase_alphanumeric(byte: u8) -> bool {
++    byte.is_ascii_lowercase() || byte.is_ascii_digit()
++}
++
++async fn create_new(path: &Path, contents: &str) -> io::Result<()> {
++    let path = path.to_path_buf();
++    let contents = contents.as_bytes().to_vec();
++    tokio::task::spawn_blocking(move || {
++        let parent = path
++            .parent()
++            .ok_or_else(|| io::Error::other("instructions overlay target has no parent"))?;
++        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
++        staged.write_all(&contents)?;
++        staged.as_file().sync_all()?;
++        staged
++            .persist_noclobber(path)
++            .map(|_| ())
++            .map_err(|error| error.error)
++    })
++    .await
++    .map_err(io::Error::other)?
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn model_with_prompt(slug: &str, prompt: &str) -> ModelInfo {
++        let mut model = crate::bundled_models_response()
++            .expect("bundled models should parse")
++            .models
++            .into_iter()
++            .find(|model| model.model_messages.is_some())
++            .expect("bundled catalog should include instruction messages");
++        model.slug = slug.to_string();
++        model
++            .model_messages
++            .as_mut()
++            .expect("test model should have messages")
++            .instructions_template = Some(prompt.to_string());
++        model
++    }
++
++    fn prompt(model: &ModelInfo) -> Option<&str> {
++        model
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref())
++    }
++
++    #[test]
++    fn catalog_slug_paths_use_a_positive_ascii_filename_policy() {
++        let dir = Path::new("instructions");
++        assert_eq!(
++            model_path(dir, "gpt-5.2_codex"),
++            Some(dir.join("gpt-5.2_codex.md"))
++        );
++        for slug in [
++            "",
++            ".",
++            "..",
++            ".hidden",
++            "gpt.",
++            "gpt..5",
++            "../gpt-5",
++            "provider/gpt-5",
++            "gpt 5",
++            "GPT-5",
++            "模型",
++        ] {
++            assert_eq!(model_path(dir, slug), None, "accepted unsafe slug {slug:?}");
++        }
++    }
++
++    #[tokio::test]
++    async fn seed_is_idempotent_and_respects_existing_family_files() {
++        let temp = tempfile::tempdir().expect("create temp dir");
++        let dir = dir_path(temp.path());
++        seed(
++            &dir,
++            &[
++                model_with_prompt("gpt-5.4", "base"),
++                model_with_prompt("gpt-5.4-mini", "mini"),
++            ],
++        )
++        .await;
++        assert_eq!(
++            fs::read_to_string(dir.join("gpt-5.4.md")).await.unwrap(),
++            "base"
++        );
++        assert_eq!(
++            fs::read_to_string(dir.join("gpt-5.4-mini.md"))
++                .await
++                .unwrap(),
++            "mini"
++        );
++        seed(&dir, &[model_with_prompt("gpt-5.4", "replacement")]).await;
++        assert_eq!(
++            fs::read_to_string(dir.join("gpt-5.4.md")).await.unwrap(),
++            "base"
++        );
++
++        let family_dir = dir_path(&temp.path().join("family"));
++        fs::create_dir_all(&family_dir).await.unwrap();
++        fs::write(family_dir.join("gpt-5.md"), "family")
++            .await
++            .unwrap();
++        seed(&family_dir, &[model_with_prompt("gpt-5.6-sol", "exact")]).await;
++        assert!(!family_dir.join("gpt-5.6-sol.md").exists());
++    }
++
++    #[tokio::test]
++    async fn exact_then_longest_family_overlay_applies_and_invalid_content_does_not() {
++        let temp = tempfile::tempdir().expect("create temp dir");
++        let dir = dir_path(temp.path());
++        fs::create_dir_all(&dir).await.unwrap();
++        fs::write(dir.join("gpt-5.md"), "broad").await.unwrap();
++        fs::write(dir.join("gpt-5.6.md"), "specific").await.unwrap();
++        let mut model = model_with_prompt("requested", "original");
++        assert!(apply(&dir, "gpt-5.6-sol", &mut model).await);
++        assert_eq!(prompt(&model), Some("specific"));
++
++        fs::write(dir.join("gpt-5.6-sol.md"), "exact")
++            .await
++            .unwrap();
++        assert!(apply(&dir, "gpt-5.6-sol", &mut model).await);
++        assert_eq!(prompt(&model), Some("exact"));
++
++        fs::write(dir.join("empty.md"), " \n").await.unwrap();
++        assert!(!apply(&dir, "empty", &mut model).await);
++        assert_eq!(prompt(&model), Some("exact"));
++        fs::create_dir(dir.join("unreadable.md")).await.unwrap();
++        assert!(!apply(&dir, "unreadable", &mut model).await);
++        assert_eq!(prompt(&model), Some("exact"));
++    }
++
++    #[tokio::test]
++    async fn concurrent_seed_is_atomic_and_never_clobbers_the_winner() {
++        let temp = tempfile::tempdir().expect("create temp dir");
++        let dir = dir_path(temp.path());
++        let first = vec![model_with_prompt("seed-race", "first")];
++        let second = vec![model_with_prompt("seed-race", "second")];
++        tokio::join!(seed(&dir, &first), seed(&dir, &second));
++        let winner = fs::read_to_string(dir.join("seed-race.md")).await.unwrap();
++        assert!(winner == "first" || winner == "second");
++        seed(&dir, &[model_with_prompt("seed-race", "later")]).await;
++        assert_eq!(
++            fs::read_to_string(dir.join("seed-race.md")).await.unwrap(),
++            winner
++        );
++    }
++
++    #[tokio::test]
++    async fn failed_install_cleans_up_and_preserves_the_winner() {
++        let temp = tempfile::tempdir().expect("create temp dir");
++        let target = temp.path().join("model.md");
++        std::fs::write(&target, "user").unwrap();
++        assert_eq!(
++            create_new(&target, "seed").await.unwrap_err().kind(),
++            ErrorKind::AlreadyExists
++        );
++        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user");
++        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
++    }
++}
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -1,6 +1,7 @@
+ pub mod cache;
+ pub mod collaboration_mode_presets;
+ pub(crate) mod config;
++pub(crate) mod instructions_overlay;
+ pub mod manager;
+ pub(crate) mod model_catalog;
+ pub mod model_info;
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -3,6 +3,7 @@ use crate::cache::ModelsCache;
+ use crate::cache::ModelsCacheEntry;
+ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use crate::config::ModelsManagerConfig;
++use crate::instructions_overlay;
+ use crate::model_catalog;
+ use crate::model_info;
+ use chrono::DateTime;
+@@ -295,6 +296,7 @@ pub struct OpenAiModelsManager {
+     remote_models: RwLock<ModelsCatalogState>,
+     cache: Option<Arc<dyn ModelsCache>>,
+     model_catalog_path: Option<PathBuf>,
++    instructions_overlay_dir: Option<PathBuf>,
+     endpoint_client: SharedModelsEndpointClient,
+     catalog_source: CatalogSource,
+     api_key_model_discovery_enabled: AtomicBool,
+@@ -323,6 +325,7 @@ impl OpenAiModelsManager {
+     ) -> Self {
+         let cache_path = codex_home.join(MODEL_CACHE_FILE);
+         let model_catalog_path = model_catalog::path(&codex_home);
++        let instructions_overlay_dir = instructions_overlay::dir_path(&codex_home);
+         model_catalog::ensure_default(&model_catalog_path);
+         Self::new_with_optional_cache(
+             Some(Arc::new(FileModelsCache::new(
+@@ -330,6 +333,7 @@ impl OpenAiModelsManager {
+                 DEFAULT_MODEL_CACHE_TTL,
+             ))),
+             Some(model_catalog_path),
++            Some(instructions_overlay_dir),
+             endpoint_client,
+             auth_manager,
+         )
+@@ -343,6 +347,7 @@ impl OpenAiModelsManager {
+         Self::new_with_optional_cache(
+             /*cache*/ None,
+             /*model_catalog_path*/ None,
++            /*instructions_overlay_dir*/ None,
+             endpoint_client,
+             auth_manager,
+         )
+@@ -360,6 +365,7 @@ impl OpenAiModelsManager {
+         Self::new_with_optional_cache(
+             Some(cache),
+             /*model_catalog_path*/ None,
++            /*instructions_overlay_dir*/ None,
+             endpoint_client,
+             auth_manager,
+         )
+@@ -368,6 +374,7 @@ impl OpenAiModelsManager {
+     fn new_with_optional_cache(
+         cache: Option<Arc<dyn ModelsCache>>,
+         model_catalog_path: Option<PathBuf>,
++        instructions_overlay_dir: Option<PathBuf>,
+         endpoint_client: Arc<dyn ModelsEndpointClient>,
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+@@ -389,6 +396,7 @@ impl OpenAiModelsManager {
+             }),
+             cache,
+             model_catalog_path,
++            instructions_overlay_dir,
+             api_key_model_discovery_enabled: AtomicBool::new(false),
+             endpoint_client,
+             catalog_source: CatalogSource::Default,
+@@ -506,6 +514,9 @@ impl ModelsManager for OpenAiModelsManager {
+         Box::pin(async move {
+             let mut state = self.remote_models.write().await;
+             state.active_models = self.materialize_local_catalog(state.base.models.clone());
++            let active_models = state.active_models.clone();
++            drop(state);
++            self.seed_instruction_overlays(&active_models).await;
+         })
+     }
+ 
+@@ -517,16 +528,26 @@ impl ModelsManager for OpenAiModelsManager {
+     ) -> ModelsManagerFuture<'a, ModelInfo> {
+         Box::pin(async move {
+             let models = self.get_remote_models().await;
+-            match &self.catalog_source {
+-                CatalogSource::Default => {
+-                    construct_model_info_from_candidates(model, &models, config)
+-                }
+-                CatalogSource::ExplicitProvider(_) => construct_model_info(
++            self.seed_instruction_overlays(&models).await;
++            let (mut model_info, catalog_slug) = match &self.catalog_source {
++                CatalogSource::Default => model_info_from_candidates(model, &models),
++                CatalogSource::ExplicitProvider(_) => model_info_from_remote(
+                     model,
+                     models.into_iter().find(|candidate| candidate.slug == model),
+-                    config,
+                 ),
++            };
++            if let Some(dir) = self.instructions_overlay_dir.as_ref() {
++                let prompt_slug = if let Some(slug) = catalog_slug.as_deref() {
++                    slug
++                } else {
++                    // Uncatalogued models still own the native generic prompt.
++                    // Expose it without adding a model to the catalog.
++                    instructions_overlay::seed(dir, std::slice::from_ref(&model_info)).await;
++                    model
++                };
++                instructions_overlay::apply(dir, prompt_slug, &mut model_info).await;
+             }
++            model_info::with_config_overrides(model_info, config)
+         })
+     }
+ 
+@@ -559,9 +580,9 @@ impl OpenAiModelsManager {
+         {
+             error!("failed to refresh available models: {err}");
+         }
+-        ModelsResponse {
+-            models: self.get_remote_models().await,
+-        }
++        let models = self.get_remote_models().await;
++        self.seed_instruction_overlays(&models).await;
++        ModelsResponse { models }
+     }
+ 
+     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+@@ -766,10 +787,13 @@ impl OpenAiModelsManager {
+             entry.models = models;
+         }
+         let active_models = self.materialize_local_catalog(entry.models.clone());
++        let seed_models = active_models.clone();
+         *current = ModelsCatalogState {
+             base: entry,
+             active_models,
+         };
++        drop(current);
++        self.seed_instruction_overlays(&seed_models).await;
+         true
+     }
+ 
+@@ -780,6 +804,12 @@ impl OpenAiModelsManager {
+         }
+     }
+ 
++    async fn seed_instruction_overlays(&self, models: &[ModelInfo]) {
++        if let Some(dir) = self.instructions_overlay_dir.as_ref() {
++            instructions_overlay::seed(dir, models).await;
++        }
++    }
++
+     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+     async fn try_load_cache(&self) -> bool {
+         let Some(cache) = self.cache.as_ref() else {
+@@ -973,28 +1003,35 @@ pub(crate) fn construct_model_info_from_candidates(
+     candidates: &[ModelInfo],
+     config: &ModelsManagerConfig,
+ ) -> ModelInfo {
++    let (model_info, _) = model_info_from_candidates(model, candidates);
++    model_info::with_config_overrides(model_info, config)
++}
++
++fn model_info_from_candidates(
++    model: &str,
++    candidates: &[ModelInfo],
++) -> (ModelInfo, Option<String>) {
+     // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
+     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
+     let remote = find_model_by_longest_prefix(model, candidates)
+         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
+-    construct_model_info(model, remote, config)
++    model_info_from_remote(model, remote)
+ }
+ 
+-fn construct_model_info(
+-    model: &str,
+-    remote: Option<ModelInfo>,
+-    config: &ModelsManagerConfig,
+-) -> ModelInfo {
+-    let model_info = if let Some(remote) = remote {
+-        ModelInfo {
+-            slug: model.to_string(),
+-            used_fallback_model_metadata: false,
+-            ..remote
+-        }
++fn model_info_from_remote(model: &str, remote: Option<ModelInfo>) -> (ModelInfo, Option<String>) {
++    if let Some(remote) = remote {
++        let catalog_slug = remote.slug.clone();
++        (
++            ModelInfo {
++                slug: model.to_string(),
++                used_fallback_model_metadata: false,
++                ..remote
++            },
++            Some(catalog_slug),
++        )
+     } else {
+-        model_info::model_info_from_slug(model)
+-    };
+-    model_info::with_config_overrides(model_info, config)
++        (model_info::model_info_from_slug(model), None)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -358,6 +358,20 @@ fn write_models_document(codex_home: &Path, document: serde_json::Value) {
+     .expect("write local model catalog");
+ }
+ 
++fn write_instructions_overlay(codex_home: &Path, catalog_slug: &str, prompt: &str) {
++    let dir = crate::instructions_overlay::dir_path(codex_home);
++    std::fs::create_dir_all(&dir).expect("create instructions overlay directory");
++    std::fs::write(dir.join(format!("{catalog_slug}.md")), prompt)
++        .expect("write instructions overlay");
++}
++
++fn instructions_template(model: &ModelInfo) -> Option<&str> {
++    model
++        .model_messages
++        .as_ref()
++        .and_then(|messages| messages.instructions_template.as_deref())
++}
++
+ #[tokio::test]
+ async fn implicit_local_catalog_is_available_before_the_first_refresh() {
+     let codex_home = tempdir().expect("temp dir");
+@@ -559,6 +573,208 @@ async fn explicit_provider_catalog_stays_authoritative_across_local_reload_and_f
+     );
+ }
+ 
++#[tokio::test]
++async fn instructions_overlay_uses_catalog_slug_and_config_keeps_final_precedence() {
++    let codex_home = tempdir().expect("temp dir");
++    let official = remote_model("gpt-5.6-sol", "Sol", /*priority*/ 0);
++    let manager = openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        TestModelsEndpoint::new(vec![vec![official]]),
++    );
++    manager
++        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++
++    write_instructions_overlay(codex_home.path(), "gpt-5.6-sol", "local prompt");
++    let matched = manager
++        .get_model_info("gpt-5.6-sol-latest", &ModelsManagerConfig::default())
++        .await;
++    assert_eq!(matched.slug, "gpt-5.6-sol-latest");
++    assert_eq!(instructions_template(&matched), Some("local prompt"));
++
++    let namespaced = manager
++        .get_model_info("provider/gpt-5.6-sol", &ModelsManagerConfig::default())
++        .await;
++    assert_eq!(instructions_template(&namespaced), Some("local prompt"));
++
++    write_instructions_overlay(codex_home.path(), "gpt-5.6-sol", "edited prompt");
++    let edited = manager
++        .get_model_info("gpt-5.6-sol", &ModelsManagerConfig::default())
++        .await;
++    assert_eq!(instructions_template(&edited), Some("edited prompt"));
++
++    let configured = manager
++        .get_model_info(
++            "gpt-5.6-sol",
++            &ModelsManagerConfig {
++                base_instructions: Some("configured prompt".to_string()),
++                ..Default::default()
++            },
++        )
++        .await;
++    assert_eq!(
++        instructions_template(&configured),
++        Some("configured prompt")
++    );
++}
++
++#[tokio::test]
++async fn generic_prompts_are_exposed_and_reloaded_without_mutating_model_metadata() {
++    for declared_locally in [false, true] {
++        let codex_home = tempdir().expect("temp dir");
++        if declared_locally {
++            write_models_document(
++                codex_home.path(),
++                json!({"models": [{"slug": "generic-model"}]}),
++            );
++        }
++        let official = remote_model("catalog-model", "Catalog", /*priority*/ 0);
++        let manager = openai_manager_for_tests(
++            codex_home.path().to_path_buf(),
++            TestModelsEndpoint::new(vec![vec![official]]),
++        );
++        manager
++            .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++            .await;
++        let catalog = manager.get_remote_models().await;
++        write_instructions_overlay(codex_home.path(), "catalog-model", "local prompt");
++        let selected = manager
++            .get_model_info("catalog-model-alias", &ModelsManagerConfig::default())
++            .await;
++        assert_eq!(instructions_template(&selected), Some("local prompt"));
++
++        let mut native = model_info::local_model_defaults("generic-model");
++        native.used_fallback_model_metadata = !declared_locally;
++        assert_eq!(
++            manager
++                .get_model_info("generic-model", &ModelsManagerConfig::default())
++                .await,
++            native
++        );
++        let prompt_path =
++            crate::instructions_overlay::dir_path(codex_home.path()).join("generic-model.md");
++        assert_eq!(
++            std::fs::read_to_string(&prompt_path).expect("read exposed generic prompt"),
++            model_info::BASE_INSTRUCTIONS
++        );
++        write_instructions_overlay(codex_home.path(), "generic-model", "edited generic prompt");
++        let mut edited = native.clone();
++        edited
++            .model_messages
++            .as_mut()
++            .unwrap()
++            .instructions_template = Some("edited generic prompt".to_string());
++        assert_eq!(
++            manager
++                .get_model_info("generic-model", &ModelsManagerConfig::default())
++                .await,
++            edited
++        );
++        let configured = manager
++            .get_model_info(
++                "generic-model",
++                &ModelsManagerConfig {
++                    base_instructions: Some("explicit prompt".to_string()),
++                    ..Default::default()
++                },
++            )
++            .await;
++        assert_eq!(instructions_template(&configured), Some("explicit prompt"));
++        assert_eq!(
++            std::fs::read_to_string(&prompt_path).unwrap(),
++            "edited generic prompt"
++        );
++        std::fs::write(&prompt_path, " \n").unwrap();
++        assert_eq!(
++            manager
++                .get_model_info("generic-model", &ModelsManagerConfig::default())
++                .await,
++            native,
++            "an invalid file falls back to native instructions, not the previous edit"
++        );
++        assert_eq!(manager.get_remote_models().await, catalog);
++    }
++}
++
++#[tokio::test]
++async fn network_and_cache_publication_seed_without_clobbering_user_edits() {
++    let codex_home = tempdir().expect("temp dir");
++    let official = remote_model("seeded-model", "Seeded", /*priority*/ 0);
++    let manager = openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        TestModelsEndpoint::new(vec![vec![official]]),
++    );
++    manager
++        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++    let overlay_path =
++        crate::instructions_overlay::dir_path(codex_home.path()).join("seeded-model.md");
++    assert_eq!(
++        std::fs::read_to_string(&overlay_path).expect("read seeded overlay"),
++        "base instructions"
++    );
++
++    std::fs::write(&overlay_path, "user edit").expect("edit seeded overlay");
++    let cache_manager = openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        TestModelsEndpoint::new(Vec::new()),
++    );
++    cache_manager
++        .raw_model_catalog(
++            RefreshStrategy::OnlineIfUncached,
++            DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await;
++    assert_eq!(
++        std::fs::read_to_string(overlay_path).expect("read preserved overlay"),
++        "user edit"
++    );
++}
++
++#[tokio::test]
++async fn explicit_provider_model_selection_and_prompt_matching_are_independent() {
++    let codex_home = tempdir().expect("temp dir");
++    let official = remote_model("provider-model", "Provider Model", /*priority*/ 0);
++    let endpoint = TestModelsEndpoint::with_command_auth(vec![Ok(vec![official.clone()])]);
++    let manager = OpenAiModelsManager::new(
++        codex_home.path().to_path_buf(),
++        endpoint,
++        /*auth_manager*/ None,
++    )
++    .with_provider_catalog();
++    manager
++        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++    write_instructions_overlay(codex_home.path(), "provider-model", "local provider prompt");
++
++    let selected = manager
++        .get_model_info("provider-model", &ModelsManagerConfig::default())
++        .await;
++    assert_eq!(
++        instructions_template(&selected),
++        Some("local provider prompt")
++    );
++    assert!(!selected.used_fallback_model_metadata);
++    for (alias, prompt) in [
++        ("provider-model-alias", "local provider prompt"),
++        ("namespace/provider-model", model_info::BASE_INSTRUCTIONS),
++    ] {
++        let mut expected = model_info::model_info_from_slug(alias);
++        expected
++            .model_messages
++            .as_mut()
++            .unwrap()
++            .instructions_template = Some(prompt.to_string());
++        assert_eq!(
++            manager
++                .get_model_info(alias, &ModelsManagerConfig::default())
++                .await,
++            expected
++        );
++    }
++    assert_eq!(manager.get_remote_models().await, vec![official]);
++}
++
+ #[tokio::test]
+ async fn file_cache_implements_models_cache_contract() {
+     let codex_home = tempdir().expect("temp dir");

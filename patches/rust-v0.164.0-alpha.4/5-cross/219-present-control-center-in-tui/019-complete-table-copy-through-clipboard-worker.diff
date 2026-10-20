@@ -1,0 +1,218 @@
+complete-table-copy-through-clipboard-worker
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: complete-table-copy-through-clipboard-worker
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app/clipboard.rs b/codex-rs/tui/src/app/clipboard.rs
+--- a/codex-rs/tui/src/app/clipboard.rs
++++ b/codex-rs/tui/src/app/clipboard.rs
+@@ -56,6 +56,9 @@ impl App {
+     pub(super) fn finish_clipboard(&mut self, tui: &mut tui::Tui, event: &TuiEvent) {
+         let current = tui.is_owned_screen() && self.overlay.is_none();
+         if let Some(completion) = tui.clipboard.poll() {
++            if let Some(Overlay::ControlCenter(center)) = &mut self.overlay {
++                center.table_interaction.finish_copy(completion);
++            }
+             if let Some(characters) = self.chat_widget.finish_clipboard(completion, current) {
+                 self.transcript_view
+                     .show_copy_feedback(&completion.1, characters);
+diff --git a/codex-rs/tui/src/clipboard_copy/worker_tests.rs b/codex-rs/tui/src/clipboard_copy/worker_tests.rs
+--- a/codex-rs/tui/src/clipboard_copy/worker_tests.rs
++++ b/codex-rs/tui/src/clipboard_copy/worker_tests.rs
+@@ -13,6 +13,188 @@ use crossterm::event::KeyModifiers;
+ use pretty_assertions::assert_eq;
+ use std::time::Duration;
+ 
++#[tokio::test]
++async fn table_cell_clicks_use_the_clipboard_worker_and_truthful_footer_feedback() {
++    use crate::app_event::AppEvent;
++    use crate::app_event_sender::AppEventSender;
++    use crate::pager_overlay::CenterScreen;
++    use crate::pager_overlay::ControlCenter;
++    use crossterm::event::MouseButton;
++    use crossterm::event::MouseEvent;
++    use crossterm::event::MouseEventKind;
++    use ratatui::buffer::Buffer;
++    use ratatui::layout::Rect;
++
++    let id = uuid::Uuid::from_u128(42).to_string();
++    // Cell geometry and outcome wording use the shared table and feedback tests.
++    // This boundary owns actual worker delivery, modal input and close-while-pending custody.
++    for close_while_pending in [false, true] {
++        let target = id.as_str();
++        let expected = "Copied 36 chars to host clipboard";
++        let mut app = crate::app::test_support::make_test_app().await;
++        let mut tui = crate::tui::test_support::make_test_tui().unwrap();
++        let mut server = crate::start_embedded_app_server_for_picker(&app.config)
++            .await
++            .unwrap();
++        let (draws, mut drawn) = tokio::sync::broadcast::channel(1);
++        let (started, start_rx) = mpsc::channel();
++        let (release, released) = mpsc::channel();
++        tui.clipboard
++            .start(
++                FrameRequester::new(draws),
++                move |text, format, setup| {
++                    setup.begin_delivery().unwrap();
++                    started.send((text.to_owned(), format)).unwrap();
++                    released.recv().unwrap();
++                    (Ok(CopyOutcome::Copied(None)), None)
++                },
++                || |_| unreachable!("copy-only backend"),
++            )
++            .unwrap();
++
++        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
++        let mut center = ControlCenter::new(
++            None,
++            crate::dialog::DialogResources {
++                app_event_tx: &AppEventSender::new(events),
++                keymap: &app.keymap,
++                frame_requester: &tui.frame_requester(),
++                vim_enabled: false,
++            },
++            220,
++            1.0,
++            app.chat_widget.model_catalog(),
++        );
++        let AppEvent::ReadResponseAttempts { request_id, .. } = received.try_recv().unwrap() else {
++            panic!("initial response history request")
++        };
++        let mut attempt = crate::response_timing::tests::attempt(42, None);
++        attempt.requested_model = "model-for-copy".into();
++        center.responses.history.finish(
++            request_id,
++            Ok(crate::response_timing::tests::page(vec![attempt])),
++            Ok(codex_models_manager::model_pricing::Prices::new()),
++            Instant::now(),
++        );
++        center.screen = CenterScreen::Responses;
++        center.set_report(Ok(Arc::new(crate::usage::test_report())));
++        app.overlay = Some(Overlay::ControlCenter(Box::new(center)));
++        let render = |app: &mut crate::app::App| {
++            let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++                panic!("control center remains open")
++            };
++            let area = Rect::new(0, 0, 220, 24);
++            let mut buffer = Buffer::empty(area);
++            center.render(area, &mut buffer);
++            buffer
++                .content
++                .chunks_exact(220)
++                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
++                .collect::<Vec<_>>()
++        };
++        let rows = render(&mut app);
++        let (row, column) = rows
++            .iter()
++            .enumerate()
++            .find_map(|(row, text)| {
++                let start = text.find(target)?;
++                Some((row as u16, text[..start].chars().count() as u16))
++            })
++            .expect("painted table cell");
++        let click = MouseEvent {
++            kind: MouseEventKind::Down(MouseButton::Left),
++            // Cell padding copies the same complete text as its visible glyphs.
++            column: column - 1,
++            row,
++            modifiers: KeyModifiers::NONE,
++        };
++        for mouse in [
++            MouseEvent { column: 0, ..click },
++            MouseEvent { column: 2, ..click },
++            MouseEvent {
++                modifiers: KeyModifiers::CONTROL,
++                ..click
++            },
++            MouseEvent {
++                kind: MouseEventKind::Up(MouseButton::Left),
++                ..click
++            },
++            MouseEvent {
++                kind: MouseEventKind::Down(MouseButton::Right),
++                ..click
++            },
++        ] {
++            app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(mouse))
++                .await
++                .unwrap();
++            assert!(!tui.clipboard.is_busy());
++        }
++        let Some(Overlay::ControlCenter(center)) = &mut app.overlay else {
++            panic!("control center")
++        };
++        center.show_quit_dialog(
++            Err("cannot quit".into()),
++            crate::dialog::DialogResources {
++                app_event_tx: &AppEventSender::new(tokio::sync::mpsc::unbounded_channel().0),
++                keymap: &app.keymap,
++                frame_requester: &tui.frame_requester(),
++                vim_enabled: false,
++            },
++        );
++        render(&mut app);
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
++            .await
++            .unwrap();
++        assert!(!tui.clipboard.is_busy());
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
++            .await
++            .unwrap();
++        render(&mut app);
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
++            .await
++            .unwrap();
++        assert_eq!(
++            start_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
++            (target.to_owned(), CopyFormat::PlainText)
++        );
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::Mouse(click))
++            .await
++            .unwrap();
++        let rows = render(&mut app);
++        assert_eq!(
++            rows.last().unwrap().trim(),
++            format!("Copying {} chars…", target.chars().count())
++        );
++        assert!(rows.last().unwrap().ends_with("… "));
++        if close_while_pending {
++            app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
++                .await
++                .unwrap();
++            assert!(app.overlay.is_none());
++            assert!(tui.clipboard.is_busy());
++        }
++        release.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(5), drawn.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        app.handle_tui_event(&mut tui, &mut server, TuiEvent::FocusLost)
++            .await
++            .unwrap();
++        assert!(!tui.clipboard.is_busy());
++        assert!(start_rx.try_recv().is_err());
++        if close_while_pending {
++            assert!(app.overlay.is_none());
++        } else {
++            let rows = render(&mut app);
++            let footer = rows.last().unwrap();
++            assert_eq!(footer.trim(), expected);
++            assert!(footer.ends_with(&format!("{expected} ")));
++        }
++        server.shutdown().await.unwrap();
++    }
++}
++
+ #[tokio::test]
+ async fn blocked_copy_allows_overlay_exit_rejects_backlog_and_wakes_completion() {
+     let mut tui = crate::tui::test_support::make_test_tui().unwrap();

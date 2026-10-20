@@ -21,8 +21,8 @@ CurrentWorktreeRollTransition
 LocalResponsibilityRollOwner
 +-- Consumer: TaskNamedPatchAndReadOnlyEvidenceConsumer
 +-- Select: complete canonical inventory and Git coverage identify the first unconsumed responsibility before OriginalPatchPurposeOwner admits its purpose and placement
-+-- Authority: explicit user scope controls Unit and Lane entry without changing declared responsibilities or order
-+-- Continue: Apply only within supported purpose placement and approved boundaries
++-- Authority: the user-selected Roll scope covers declared Unit and Lane transitions without changing responsibilities or order
++-- Continue: Apply within supported purpose placement and user scope without repeated approval
 +-- Rewrite: reconstruct a rejected Patch inside its declared Unit or Flat Patch after read-only purpose analysis
 +-- Change: material contract or requirement-cost choices use PreparePatchForApproval
 +-- Conflict: retain the successful prefix and reconstruct inside the same approved responsibility
@@ -32,14 +32,11 @@ LocalResponsibilityRollOwner
 ```
 
 - Root and lane note changes retain separate exact current-user approval; Roll execution never grants it.
-- Before leaving the approved Unit for later work or entering another Unit or Lane, present the completed frontier, concrete next scope, retained obligations and proposed action through PreparePatchForApproval.
-- Obtain explicit user approval before the next boundary's transport, source authoring or historical-edit Fork.
-- Approval may name a sequence of Unit and Lane transitions in advance, but a general Roll, continue or do-not-stop request does not approve unnamed later boundaries.
-- A reply to a concrete next-scope proposal may approve that scope without requiring the user to repeat its technical name.
-- Continue Child Patches, corrections, checks and interrupted work inside the same unchanged approved Unit without another boundary question.
-- A material contract change still repeats the existing scope decision even within that Unit.
-- Read-only investigation may prepare a boundary proposal while dependent source and transport remain paused.
-- Task order, clean Apply, closure, tests, export and helper success supply no approval for another boundary.
+- Unless the user limits scope or selects an interactive pause, Roll migrates the sole task's complete declared Patch set across Units and Lanes.
+- Continue unchanged transport, in-scope reconstruction, checks and interrupted work without repeating established approval.
+- New or unsupported scope, material contract or requirement-cost choices, and structural changes consume OriginalPatchPurposeOwner's existing approval decision before dependent effects.
+- Read-only investigation may prepare a missing-authority proposal while its dependent source and transport remain paused.
+- Task order, clean Apply, closure, tests, export and helper success cannot authorize changed scope or contracts.
 - Product evidence may change direction only within the sole current release. TaskIndex admits exactly one unfinished release task and no release selector or ordering policy.
 - TaskWorkspace publishes one release-roll-<Tag>.md as Active. SourcePrefixes declares the exact canonical tag directories available to that task; the first tag is its primary predecessor. Read the selected responsibility's complete Unit or Flat Patch and preserve its contract across source changes.
 - Entry and material returns select TaskWorkspace reconciliation and closure before continuing.
@@ -59,7 +56,7 @@ LocalResponsibilityRollOwner
 - Failed checks return to read-only diagnosis; retain the selected full-suite failure as evidence.
 - Publish the actual temporary source terminal and Patch-owner fold plan in the sole task. `git format-patch` only the contiguous focused-tested temporary source commits, not generated tail, into the exact `<ProjectScratchRoot>/fixup-handoff/<Tag>` child. Require a real scratch root and absent tag child; reentry verifies patch bytes without overwriting. This is not canonical export. Another complete Finalize occurs only on an explicit user request, never as handoff admission.
 - Treat the handoff as read-only evidence and enter Editing Committed Patch History at the first affected Patch. Its ordinary Fork, helper Commit, retained-parent comparison, and Main convergence own the fold. Prepare any generated tail before comparing the final fork and tested temporary Main source trees. Exact equality needs no test; if an owner rewrite makes them unequal, run corresponding focused tests on the fork and repair any failure there before promotion. No extra full suite or topology follows. Only rewritten canonical Patches enter `export`.
-- After purpose, placement and boundary approval, clean unchanged Apply needs no focused test gate. Reconstruction runs corresponding focused tests before closure. Other post-baseline tests follow their diagnostic purpose. A closed nonfinal Lane exports its clean prefix before the next-boundary approval decision.
+- After purpose, placement and scope acceptance, clean unchanged Apply needs no focused test gate. Reconstruction runs corresponding focused tests before closure. Other post-baseline tests follow their diagnostic purpose. A closed nonfinal Lane exports its clean prefix before its authorized successor.
 - Helper failure retains the actual test evidence and topology without phase or cursor; it does not turn a freely selected test into a full-suite prerequisite.
 - PatchAcceptance resolves platform conditions against current user authority and version notes before dependent authoring, including resumed rewrites and conflict reconstruction. Normalization closure consumes its cumulative audit before selected full verification.
 
@@ -244,14 +241,14 @@ OriginalPatchPurposeOwner
 - Compare their complete ordered typed inventory, including every Flat Patch, Unit ChildPatchSequence and generated Transform, with current user decisions and actual Git coverage.
 - Directory-only or file-only discovery cannot establish Patch membership, the next responsibility or lane closure.
 - Select the first unconsumed responsibility after accounting for approved renames, replacements, native fulfillment and explicit withdrawals at their existing owners.
-- That inventory selects the next proposal, not permission to cross its Unit or Lane boundary.
+- That inventory selects the next responsibility within the user's Roll scope, not authority for changed scope or contracts.
 - A bypassed responsibility, incomplete committed Unit or unexplained order difference keeps its lane open and returns to its earliest affected owner before further transport.
 - Reuse unchanged source inventories, refresh Current after source mutations, and recompute the comparison when its frontier or controlling decisions change.
-- After a selected rewrite, choose the complete contiguous unchanged retained suffix whose responsibilities and crossed boundaries are already approved.
-- Bound that range immediately before the next planned rewrite, unapproved boundary or end of the retained source.
+- After a selected rewrite, choose the complete contiguous unchanged retained suffix supported by the user's Roll scope.
+- Bound that range immediately before the next planned rewrite, user-selected stop, unsupported responsibility or end of the retained source.
 - Invoke the existing retained-source Apply range once instead of issuing one call and manual anchor edit for each unchanged Unit or Flat Patch.
 - A planned rewrite remains outside the range even when its historical GitDiff would apply cleanly.
-- Required source review and boundary approval precede the range; transport success cannot supply them.
+- Required source review and scope acceptance precede the range; transport success cannot supply them.
 - Consume its conflict or completed endpoint before TaskWorkspace reconciliation, retained-frontier convergence and any required publication.
 - A retained range does not change initial exported-prefix replay, grant new Lane authority or add a complete-suite gate.
 - Keep this comparison in native List and Git evidence and unresolved task scope, without a parallel manifest, progress ledger or completion record.
@@ -304,5 +301,5 @@ RetainedFrontierCoverageOwner
 ## Publication And Retirement
 
 - Export always publishes the current ordered source prefix; it creates no completion state and does not restrict later draft additions. Schema and snapshot remain the replaceable generated tail, never artifacts or permanent lane markers.
-- Ordinary lane crossing consumes clean prefix export, the existing source selection and explicit user approval of that concrete next boundary. Removing a generated tail for later source preserves historical evidence but grants no acceptance to changed source.
+- Ordinary lane crossing consumes clean prefix export and the existing source selection within the user's Roll scope. Removing a generated tail for later source preserves historical evidence but grants no acceptance to changed source.
 - Same-tag export uses the existing one-generation rotation without automatic retry. Later source invalidates acceptance for the new tip, not historical immutable evidence.
