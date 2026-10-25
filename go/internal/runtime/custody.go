@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -160,7 +161,7 @@ func runNativeWithin(runtimeRoot, action string, duration time.Duration, cancell
 	output := filepath.Join(root, "result")
 	arguments = append(arguments, output)
 	var diagnostic string
-	data, diagnostic, err = runNativeProcess(root, script, action, arguments, nativeEnvironment(root), 1<<20, output, window.remaining(), cancellation, nil)
+	data, diagnostic, err = runNativeProcess(root, script, action, arguments, nativeEnvironment(root), 1<<20, output, window.remaining(), cancellation, nil, nil)
 	if message := strings.TrimSpace(diagnostic); err != nil && message != "" {
 		err = errors.Join(err, errors.New(message))
 	}
@@ -198,13 +199,52 @@ const nativeDiagnosticMarker = "\n... stderr truncated ...\n"
 type diagnosticWriter struct {
 	data      []byte
 	truncated bool
+	onPhase   func(string)
+	line      []byte
+	longLine  bool
 }
 
 func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 	written := len(data)
+	if writer.onPhase == nil {
+		writer.appendDiagnostic(data)
+		return written, nil
+	}
+	for len(data) != 0 {
+		newline := bytes.IndexByte(data, '\n')
+		fragmentSize := len(data)
+		if newline >= 0 {
+			fragmentSize = newline + 1
+		}
+		fragment := data[:fragmentSize]
+		data = data[fragmentSize:]
+		if writer.longLine || len(writer.line)+len(fragment) > nativeDiagnosticLimit {
+			writer.appendDiagnostic(writer.line)
+			writer.line = writer.line[:0]
+			writer.appendDiagnostic(fragment)
+			writer.longLine = newline < 0
+			continue
+		}
+		writer.line = append(writer.line, fragment...)
+		if newline < 0 {
+			continue
+		}
+		phase, notice := strings.CutPrefix(string(writer.line), "codex-build phase: repository-format ")
+		phase, _, complete := strings.Cut(phase, " elapsed-ms=")
+		if notice && complete && phase != "" {
+			writer.onPhase("RepositoryFormatting " + phase)
+		} else {
+			writer.appendDiagnostic(writer.line)
+		}
+		writer.line = writer.line[:0]
+	}
+	return written, nil
+}
+
+func (writer *diagnosticWriter) appendDiagnostic(data []byte) {
 	if !writer.truncated && len(writer.data)+len(data) <= nativeDiagnosticLimit {
 		writer.data = append(writer.data, data...)
-		return written, nil
+		return
 	}
 	headLimit := (nativeDiagnosticLimit - len(nativeDiagnosticMarker)) / 2
 	tailLimit := nativeDiagnosticLimit - len(nativeDiagnosticMarker) - headLimit
@@ -218,7 +258,7 @@ func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 		tail = append(tail, data[max(0, len(data)-tailLimit):]...)
 		writer.data = append(append(head, nativeDiagnosticMarker...), tail...)
 		writer.truncated = true
-		return written, nil
+		return
 	}
 	tail := writer.data[headLimit+len(nativeDiagnosticMarker):]
 	if len(data) >= tailLimit {
@@ -227,14 +267,15 @@ func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 		copy(tail, tail[len(data):])
 		copy(tail[tailLimit-len(data):], data)
 	}
-	return written, nil
 }
 
 func (writer *diagnosticWriter) String() string {
+	writer.appendDiagnostic(writer.line)
+	writer.line = nil
 	return string(writer.data)
 }
 
-func runNativeProcess(attempt, script, action string, arguments, environment []string, limit int64, resultPath string, deadline time.Duration, cancellation <-chan os.Signal, onLive func()) ([]byte, string, error) {
+func runNativeProcess(attempt, script, action string, arguments, environment []string, limit int64, resultPath string, deadline time.Duration, cancellation <-chan os.Signal, onLive func(), onPhase func(string)) ([]byte, string, error) {
 	window := newDeadline(deadline, cancellation)
 	if err := window.check(); err != nil {
 		return nil, "", err
@@ -249,7 +290,7 @@ func runNativeProcess(attempt, script, action string, arguments, environment []s
 		return nil, "", errors.Join(seekErr, syncClose(log), errors.New("native log exceeded its bound"))
 	}
 	writer := &boundedWriter{writer: log, remaining: limit - used}
-	stderr := &diagnosticWriter{}
+	stderr := &diagnosticWriter{onPhase: onPhase}
 	command := exec.Command(script, append([]string{action}, arguments...)...)
 	command.Env = environment
 	command.Stdout, command.Stderr = writer, io.MultiWriter(writer, stderr)

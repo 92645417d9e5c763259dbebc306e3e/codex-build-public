@@ -1,0 +1,721 @@
+render-weekly-quota-with-shared-tables
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: render-weekly-quota-with-shared-tables
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/usage/mod.rs b/codex-rs/tui/src/usage/mod.rs
+--- a/codex-rs/tui/src/usage/mod.rs
++++ b/codex-rs/tui/src/usage/mod.rs
+@@ -2,6 +2,7 @@
+ mod render;
+ 
+ pub(crate) use render::render;
++pub(crate) use render::render_quota_detail;
+ pub(crate) use render::render_selected;
+ #[cfg(test)]
+ pub(crate) use render::tests::report as test_report;
+diff --git a/codex-rs/tui/src/usage/render.rs b/codex-rs/tui/src/usage/render.rs
+--- a/codex-rs/tui/src/usage/render.rs
++++ b/codex-rs/tui/src/usage/render.rs
+@@ -1,3 +1,5 @@
++mod quota;
++
+ use std::collections::BTreeMap;
+ 
+ use crate::render::renderable::Renderable;
+@@ -54,13 +56,20 @@ pub(crate) fn render_summary(
+     lines
+ }
+ 
+-pub(crate) fn render_quotas(report: &UsageReport, width: u16) -> Vec<Box<dyn Renderable>> {
+-    quota::render(
+-        &report.quota,
+-        *report.refreshed_at.offset(),
+-        width,
+-        &Palette::current(),
+-    )
++pub(crate) fn render_quotas(
++    report: &UsageReport,
++    selected: usize,
++    width: u16,
++) -> (Vec<Box<dyn Renderable>>, Option<usize>) {
++    quota::render(report, selected, width, &Palette::current())
++}
++
++pub(crate) fn render_quota_detail(
++    report: &UsageReport,
++    selected: usize,
++    width: u16,
++) -> Vec<Box<dyn Renderable>> {
++    quota::render_detail(report, selected, width, &Palette::current())
+ }
+ 
+ fn diagnostics(report: &UsageReport) -> Vec<Box<dyn Renderable>> {
+diff --git a/codex-rs/tui/src/usage/render/quota.rs b/codex-rs/tui/src/usage/render/quota.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/usage/render/quota.rs
+@@ -0,0 +1,628 @@
++use super::cost_cell;
++use super::count;
++use super::number;
++use super::numeric_table;
++use super::price_table;
++use super::usage_table;
++use crate::control_center_table as table;
++use crate::control_center_table::Cell;
++use crate::control_center_table::Column;
++use crate::control_center_table::Palette;
++use crate::control_center_table::Table;
++use crate::control_center_table::descending_rows;
++use crate::render::renderable::Renderable;
++use chrono::DateTime;
++use chrono::FixedOffset;
++use codex_app_server_protocol::UsageCreditPeriod;
++use codex_app_server_protocol::UsageQuotaEstimate as Estimate;
++use codex_app_server_protocol::UsageQuotaStatus as Status;
++use codex_app_server_protocol::UsageReport;
++use ratatui::text::Line;
++
++const DATE_FORMAT: &str = "%Y-%m-%d %H:%M";
++
++pub(super) fn render(
++    report: &UsageReport,
++    selected: usize,
++    width: u16,
++    palette: &Palette,
++) -> (Vec<Box<dyn Renderable>>, Option<usize>) {
++    let weekly = descending_rows(&report.quota, |estimate| {
++        DateTime::parse_from_rfc3339(&estimate.started_at).expect("validated quota timestamp")
++    });
++    let credits = descending_rows(&report.credits, |period| {
++        DateTime::parse_from_rfc3339(&period.started_at).expect("validated credit timestamp")
++    });
++    let timezone = *report.refreshed_at.offset();
++    let credit_table = render_credits(&credits, selected, timezone, width, palette);
++    let weekly_table = render_weekly(
++        &weekly,
++        selected.checked_sub(credits.len()),
++        timezone,
++        width,
++        palette,
++    );
++    let selected_row = credits
++        .get(selected)
++        .map(|_| credit_table.row_offset(selected + 2))
++        .or_else(|| {
++            let index = selected.checked_sub(credits.len())?;
++            weekly.get(index).map(|_| {
++                usize::from(credit_table.desired_height(width))
++                    + 1
++                    + weekly_table.row_offset(index + 2)
++            })
++        });
++    (
++        vec![
++            credit_table.into(),
++            Line::default().into(),
++            weekly_table.into(),
++        ],
++        selected_row,
++    )
++}
++
++pub(super) fn render_detail(
++    report: &UsageReport,
++    selected: usize,
++    width: u16,
++    palette: &Palette,
++) -> Vec<Box<dyn Renderable>> {
++    let timezone = *report.refreshed_at.offset();
++    let (period, models) = if selected < report.credits.len() {
++        let credits = descending_rows(&report.credits, |period| {
++            DateTime::parse_from_rfc3339(&period.started_at).expect("validated credit timestamp")
++        });
++        let period = credits[selected];
++        (
++            render_credits(&[period], 0, timezone, width, palette),
++            period.model_usage.as_ref(),
++        )
++    } else {
++        let weekly = descending_rows(&report.quota, |period| {
++            DateTime::parse_from_rfc3339(&period.started_at).expect("validated quota timestamp")
++        });
++        let period = weekly[selected - report.credits.len()];
++        (
++            render_weekly(&[period], Some(0), timezone, width, palette),
++            period.model_usage.as_ref(),
++        )
++    };
++    let mut tables: Vec<Box<dyn Renderable>> = vec![period.into(), Line::default().into()];
++    match models {
++        Some(models) if !models.is_empty() => {
++            tables.push(usage_table(report, None, models, width, palette).into());
++            tables.push(Line::default().into());
++            tables.push(price_table(report, models, width, palette).into());
++        }
++        other => {
++            let message = if other.is_some() {
++                "No usage in this period"
++            } else {
++                "Period usage unavailable"
++            };
++            let mut cell = Cell::text(message);
++            cell.style = cell.style.dim();
++            tables.push(table::render(&[message.len()], &[vec![cell]], palette).into());
++        }
++    }
++    tables
++}
++
++fn render_weekly(
++    estimates: &[&Estimate],
++    selected: Option<usize>,
++    timezone: FixedOffset,
++    width: u16,
++    palette: &Palette,
++) -> Table {
++    let mut rows: Vec<_> = estimates
++        .iter()
++        .enumerate()
++        .map(|(index, estimate)| {
++            let started = DateTime::parse_from_rfc3339(&estimate.started_at)
++                .expect("validated quota timestamp");
++            let ended = DateTime::parse_from_rfc3339(&estimate.ended_at)
++                .expect("validated quota timestamp");
++            let mut row = vec![
++                Cell::text(if selected == Some(index) { ">" } else { "" }),
++                Cell::number(local_date(started, timezone)),
++                Cell::number(local_date(ended, timezone)),
++                Cell::number(duration((ended - started).num_seconds())),
++                Cell::value(
++                    Some(estimate.used_percent_end),
++                    number(estimate.used_percent_end, 1, "", "%"),
++                ),
++                cost_cell(estimate.observed_cost_usd, true),
++                cost_cell(estimate.unrecorded_cost_usd(), true),
++                cost_cell(estimate.estimated_weekly_cost_usd, true),
++                Cell::text(status_label(estimate.status)),
++                Cell::value(
++                    Some(estimate.sample_count as f64),
++                    count(estimate.sample_count as u64),
++                ),
++            ];
++            if selected == Some(index) {
++                for cell in &mut row {
++                    cell.style = cell.style.italic();
++                }
++            }
++            row
++        })
++        .collect();
++    if rows.is_empty() {
++        rows.push(vec![
++            Cell::text("No historical quota estimate available").spanning(1, 10),
++        ]);
++    }
++    numeric_table(
++        vec![
++            vec![
++                palette.header("").spanning(2, 1),
++                palette.header("Weekly quotas"),
++                palette.header("").spanning(1, 8),
++            ],
++            [
++                "Started",
++                "Ended",
++                "Duration",
++                "Used",
++                "Observed",
++                "Unrecorded",
++                "Estimated",
++                "Status",
++                "Records",
++            ]
++            .into_iter()
++            .map(|label| palette.header(label))
++            .collect(),
++        ],
++        &[
++            Column::new("", 2, 2),
++            date_column("Started"),
++            date_column("Ended"),
++            Column::new("Duration", duration(0).len(), 12),
++            Column::new("Used", "100.0%".len(), 7),
++            Column::new("Observed", "$0.00".len(), 12),
++            Column::new("Unrecorded", "$0.00".len(), 12),
++            Column::new("Estimated", "$0.00".len(), 12),
++            Column::new(
++                "Status",
++                [Status::Completed, Status::Provisional]
++                    .into_iter()
++                    .map(status_label)
++                    .map(str::len)
++                    .max()
++                    .expect("quota statuses"),
++                11,
++            ),
++            Column::new("Records", "0.00K".len(), 7),
++        ],
++        rows,
++        None,
++        width,
++        palette,
++    )
++}
++
++fn render_credits(
++    credits: &[&UsageCreditPeriod],
++    selected: usize,
++    timezone: FixedOffset,
++    width: u16,
++    palette: &Palette,
++) -> Table {
++    let mut rows: Vec<_> = credits
++        .iter()
++        .enumerate()
++        .map(|(index, period)| {
++            let started = DateTime::parse_from_rfc3339(&period.started_at)
++                .expect("validated credit timestamp");
++            let ended =
++                DateTime::parse_from_rfc3339(&period.ended_at).expect("validated credit timestamp");
++            let mut row = vec![
++                Cell::text(if selected == index { ">" } else { "" }),
++                Cell::number(local_date(started, timezone)),
++                Cell::number(local_date(ended, timezone)),
++                Cell::number(duration((ended - started).num_seconds())),
++                Cell::value(
++                    Some(period.used_credits),
++                    format!("{:.2}", period.used_credits),
++                ),
++                cost_cell(period.observed_cost_usd, true),
++                Cell::value(
++                    Some(period.sample_count as f64),
++                    count(period.sample_count as u64),
++                ),
++            ];
++            if selected == index {
++                for cell in &mut row {
++                    cell.style = cell.style.italic();
++                }
++            }
++            row
++        })
++        .collect();
++    if rows.is_empty() {
++        rows.push(vec![
++            Cell::text("No historical credit deductions available").spanning(1, 7),
++        ]);
++    }
++    numeric_table(
++        vec![
++            vec![
++                palette.header("").spanning(2, 1),
++                palette.header("Credits"),
++                palette.header("").spanning(1, 5),
++            ],
++            [
++                "Started", "Ended", "Duration", "Used", "Observed", "Records",
++            ]
++            .into_iter()
++            .map(|label| palette.header(label))
++            .collect(),
++        ],
++        &[
++            Column::new("", 2, 2),
++            date_column("Started"),
++            date_column("Ended"),
++            Column::new("Duration", duration(0).len(), 12),
++            Column::new("Used", "0.00".len(), 9),
++            Column::new("Observed", "$0.00".len(), 12),
++            Column::new("Records", "0.00K".len(), 7),
++        ],
++        rows,
++        None,
++        width,
++        palette,
++    )
++}
++
++fn duration(seconds: i64) -> String {
++    format!(
++        "{}d {:02}:{:02}:{:02}",
++        seconds / 86_400,
++        seconds / 3_600 % 24,
++        seconds / 60 % 60,
++        seconds % 60,
++    )
++}
++
++fn local_date(value: DateTime<FixedOffset>, timezone: FixedOffset) -> String {
++    value
++        .with_timezone(&timezone)
++        .format(DATE_FORMAT)
++        .to_string()
++}
++
++fn date_column(label: &str) -> Column {
++    let width = "0000-00-00 00:00".len();
++    Column::new(label, width, width)
++}
++
++fn status_label(status: Status) -> &'static str {
++    match status {
++        Status::Completed => "Completed",
++        Status::Provisional => "Provisional",
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::control_center_table::tests::render_lines;
++    use crate::usage::render::tests::report;
++    use codex_app_server_protocol::UsageByModel;
++    use codex_app_server_protocol::UsageTokens;
++    use codex_app_server_protocol::UsageTotals;
++    use itertools::Itertools;
++    use pretty_assertions::assert_eq;
++    use ratatui::buffer::Buffer;
++    use ratatui::layout::Rect;
++
++    fn render_periods(report: &UsageReport, width: u16) -> Vec<ratatui::text::Line<'static>> {
++        let (tables, _) = render(report, 0, width, &Palette::current());
++        let periods = tables;
++        let width = periods
++            .iter()
++            .map(|table| table.desired_width())
++            .max()
++            .unwrap();
++        render_lines(periods, width)
++    }
++
++    #[test]
++    fn quota_cycles_keep_time_order_and_ranked_theme_colors_with_group_headers() {
++        let report = report();
++        let palette = Palette::current();
++        let lines = render_periods(&report, 110);
++        assert!(lines.iter().all(|line| line.width() <= 131));
++        assert!(lines.iter().any(|line| line.width() == 131));
++        let text = lines.iter().join("\n");
++        assert!(!text.contains("Average"));
++        assert!(!text.contains("last 90 days"));
++        assert!(text.contains("2026-09-30 00:30"));
++        assert!(lines[0].to_string().starts_with('┌'));
++        assert!(text.contains("Duration"));
++        assert!(text.contains("Unrecorded"));
++        assert!(text.contains("Status") && text.contains("Records"));
++        assert!(text.contains("Completed") && text.contains("Provisional"));
++        let rows = lines
++            .iter()
++            .filter(|line| {
++                let text = line.to_string();
++                text.starts_with('│') && text.contains('%')
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(rows.len(), 3);
++        assert!(rows[0].to_string().contains("60.0%"));
++        assert!(rows[1].to_string().contains("100.0%"));
++        assert!(rows[2].to_string().contains("20.0%"));
++        for (row, (duration, unrecorded)) in rows.iter().zip([
++            ("0d 16:30:00", "--"),
++            ("6d 00:00:00", "$50.00"),
++            ("1d 00:00:00", "--"),
++        ]) {
++            let text = row.to_string();
++            assert_eq!(text.split('│').nth(4).unwrap().trim(), duration);
++            assert_eq!(text.split('│').nth(7).unwrap().trim(), unrecorded);
++        }
++        for (index, (row, expected)) in rows
++            .iter()
++            .zip([
++                [("60.0%", 8), ("$360.00", 8), ("$600.00", 16)],
++                [("100.0%", 16), ("$450.00", 16), ("$500.00", 1)],
++                [("20.0%", 1), ("$100.00", 1), ("$500.00", 1)],
++            ])
++            .enumerate()
++        {
++            for (value, level) in expected {
++                let actual = row
++                    .spans
++                    .iter()
++                    .find(|span| span.content.contains(value))
++                    .unwrap()
++                    .style;
++                let expected = if index == 0 {
++                    palette.intensity(level).italic()
++                } else {
++                    palette.intensity(level)
++                };
++                assert_eq!(
++                    actual.fg.unwrap_or_default(),
++                    expected.fg.unwrap_or_default()
++                );
++                assert_eq!(actual.add_modifier, expected.add_modifier);
++            }
++        }
++        insta::assert_snapshot!("usage_quota", text);
++    }
++
++    #[test]
++    fn cycle_order_compares_instants_across_timezones() {
++        let mut report = report();
++        report.quota.truncate(2);
++        report.quota[0].started_at = "2026-09-29T01:00:00+02:00".into();
++        report.quota[0].ended_at = "2026-09-29T00:01:02Z".into();
++        report.quota[1].started_at = "2026-09-28T23:30:00Z".into();
++        let text = render_periods(&report, 120).iter().join("\n");
++        assert!(text.find("60.0%").unwrap() < text.find("20.0%").unwrap());
++        assert!(text.contains("0d 01:01:02"));
++    }
++
++    #[test]
++    fn unavailable_history_shows_no_estimate() {
++        let mut report = report();
++        report.quota.clear();
++        report.credits.clear();
++        let lines = render_periods(&report, 120);
++        let text = lines.iter().join("\n");
++        assert!(text.contains("Weekly") && text.contains("Credits"));
++        assert!(text.find("Credits").unwrap() < text.find("Weekly").unwrap());
++        assert!(text.contains("No historical quota estimate available"));
++        assert!(text.contains("No historical credit deductions available"));
++        assert!(!text.contains('$') && !text.contains('%'));
++    }
++
++    #[test]
++    fn credits_show_actual_deductions_in_aligned_groups_without_quota_estimates() {
++        let mut report = report();
++        report.credits = vec![
++            UsageCreditPeriod {
++                started_at: "2026-09-29T01:00:00+02:00".into(),
++                ended_at: "2026-09-29T00:01:02Z".into(),
++                used_credits: 12.345,
++                observed_cost_usd: 7.89,
++                model_usage: None,
++                sample_count: 5,
++            },
++            UsageCreditPeriod {
++                started_at: "2026-09-28T23:30:00Z".into(),
++                ended_at: "2026-09-29T00:00:00Z".into(),
++                used_credits: 0.004,
++                observed_cost_usd: 0.01,
++                model_usage: None,
++                sample_count: 2,
++            },
++        ];
++        let lines = render_periods(&report, 120);
++        let text = lines.iter().join("\n");
++        assert!(text.find("Credits").unwrap() < text.find("Weekly").unwrap());
++        for label in ["Weekly quotas", "Credits"] {
++            let group = text.lines().find(|line| line.contains(label)).unwrap();
++            let cells = group.split('│').collect::<Vec<_>>();
++            assert_eq!(cells.len(), 5);
++            assert_eq!(cells[1].trim(), "");
++            assert_eq!(cells[2].trim(), label);
++            assert_eq!(cells[3].trim(), "");
++            let headers = text.lines().find(|line| line.contains("Started")).unwrap();
++            assert_eq!(
++                cells[2].chars().count(),
++                headers.split('│').nth(2).unwrap().chars().count()
++            );
++        }
++        let credits = text
++            .split_once("Credits")
++            .unwrap()
++            .1
++            .split_once("Weekly")
++            .unwrap()
++            .0;
++        assert!(!credits.contains("Estimated") && !credits.contains("Status"));
++        let rows = credits
++            .lines()
++            .filter(|line| line.contains("2026-09-29"))
++            .collect::<Vec<_>>();
++        let cells = |row: &str| {
++            row.split('│')
++                .skip(2)
++                .take(6)
++                .map(|value| value.trim().to_owned())
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(
++            cells(rows[0]),
++            [
++                "2026-09-29 07:30",
++                "2026-09-29 08:00",
++                "0d 00:30:00",
++                "0.00",
++                "$0.01",
++                "2"
++            ]
++        );
++        assert_eq!(
++            cells(rows[1]),
++            [
++                "2026-09-29 07:00",
++                "2026-09-29 08:01",
++                "0d 01:01:02",
++                "12.35",
++                "$7.89",
++                "5"
++            ]
++        );
++    }
++
++    #[test]
++    fn quota_and_credit_headers_keep_symmetric_padding_with_cursor_columns() {
++        for width in [1, 110, 120, 300, u16::MAX] {
++            let report = report();
++            let palette = Palette::current();
++            let timezone = *report.refreshed_at.offset();
++            let credits = descending_rows(&report.credits, |period| {
++                DateTime::parse_from_rfc3339(&period.started_at).unwrap()
++            });
++            let weekly = descending_rows(&report.quota, |period| {
++                DateTime::parse_from_rfc3339(&period.started_at).unwrap()
++            });
++            for table in [
++                render_credits(&credits, 0, timezone, width, &palette),
++                render_weekly(&weekly, Some(0), timezone, width, &palette),
++            ] {
++                let width = table.desired_width();
++                let lines = render_lines(vec![table.into()], width);
++                crate::control_center_table::tests::assert_symmetric_headers(&lines[..5]);
++            }
++        }
++    }
++
++    #[test]
++    fn selected_period_detail_includes_matching_prices_and_preserves_clipped_copy() {
++        let mut report = report();
++        let usage = UsageTotals {
++            tokens: UsageTokens {
++                input: 1_234_567,
++                total: 1_234_567,
++                ..Default::default()
++            },
++            cost: 7.89,
++            short_cost: 7.89,
++            ..Default::default()
++        };
++        report.credits.push(UsageCreditPeriod {
++            started_at: "2026-09-28T00:00:00Z".into(),
++            ended_at: "2026-09-28T02:00:00Z".into(),
++            used_credits: 2.0,
++            observed_cost_usd: 7.89,
++            model_usage: Some(UsageByModel::from([
++                ("gpt-5.4".into(), usage),
++                ("unknown model".into(), UsageTotals::default()),
++            ])),
++            sample_count: 3,
++        });
++        report.missing_prices.insert("unknown model".into());
++        report.quota[1].model_usage = Some(UsageByModel::from([(
++            "weekly-model".into(),
++            UsageTotals::default(),
++        )]));
++        let original = report.clone();
++        let (tables, row) = render(&report, 0, 200, &Palette::current());
++        assert_eq!(row, Some(5));
++        let text = render_lines(tables, 200).iter().join("\n");
++        assert!(!text.contains("gpt-5.4"));
++        assert!(text.find("Credits").unwrap() < text.find("Weekly quotas").unwrap());
++        let tables = render_detail(&report, 0, 200, &Palette::current());
++        let detail = &tables[2];
++        assert!(detail.desired_width() <= 200);
++        let area = Rect::new(0, 0, detail.desired_width(), detail.desired_height(200));
++        let mut buffer = Buffer::empty(area);
++        detail.render(area, &mut buffer);
++        let cells = detail.copyable_cells(area, 0, 0);
++        assert!(cells.iter().any(|(_, text)| text.as_ref() == "gpt-5.4"));
++        assert!(
++            cells
++                .iter()
++                .any(|(_, text)| text.as_ref() == "unknown model")
++        );
++        assert!(cells.iter().any(|(_, text)| text.as_ref() == "1234567"));
++        assert!(
++            cells
++                .iter()
++                .all(|(_, text)| !text.contains("2026-") && text.as_ref() != "Efficiency")
++        );
++        let token = cells
++            .iter()
++            .find(|(_, text)| text.as_ref() == "1234567")
++            .unwrap()
++            .0;
++        let clipped = Rect::new(3, 2, 5, 12);
++        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 16));
++        detail.render_scrolled(clipped, &mut buffer, 0, token.x);
++        let copied = detail.copyable_cells(clipped, 0, token.x);
++        assert!(copied.iter().any(|(_, text)| text.as_ref() == "1234567"));
++        assert!(
++            copied
++                .iter()
++                .all(|(rect, _)| rect.intersection(clipped) == *rect)
++        );
++        let text = render_lines(tables, 200).iter().join("\n");
++        assert!(text.find("Credits").unwrap() < text.find("gpt-5.4").unwrap());
++        assert!(!text.contains("Weekly quotas"));
++        assert!(text.contains("Efficiency"));
++        assert!(text.contains("$2.5000"));
++        let (_, row) = render(&report, 1, 200, &Palette::current());
++        assert_eq!(row, Some(13));
++        let weekly = render_detail(&report, 1, 200, &Palette::current());
++        let detail = &weekly[2];
++        let cells = detail.copyable_cells(area, 0, 0);
++        assert!(
++            cells
++                .iter()
++                .any(|(_, text)| text.as_ref() == "weekly-model")
++        );
++        assert!(!cells.iter().any(|(_, text)| text.as_ref() == "1234567"));
++        assert_eq!(report, original);
++
++        for (details, expected) in [
++            (None, "Period usage unavailable"),
++            (Some(UsageByModel::new()), "No usage in this period"),
++        ] {
++            report.quota[1].model_usage = details;
++            let tables = render_detail(&report, 1, 200, &Palette::current());
++            let cells = tables[2].copyable_cells(area, 0, 0);
++            assert!(cells.iter().any(|(_, text)| text.as_ref() == expected));
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/usage/render_tests.rs b/codex-rs/tui/src/usage/render_tests.rs
+--- a/codex-rs/tui/src/usage/render_tests.rs
++++ b/codex-rs/tui/src/usage/render_tests.rs
+@@ -53,6 +53,7 @@ pub(crate) fn report() -> UsageReport {
+                 used_percent_start: 0.0,
+                 used_percent_end: 20.0,
+                 observed_cost_usd: 100.0,
++                model_usage: None,
+                 estimated_weekly_cost_usd: 500.0,
+                 sample_count: 3,
+                 status: Status::Completed,
+@@ -63,6 +64,7 @@ pub(crate) fn report() -> UsageReport {
+                 used_percent_start: 0.0,
+                 used_percent_end: 60.0,
+                 observed_cost_usd: 360.0,
++                model_usage: None,
+                 estimated_weekly_cost_usd: 600.0,
+                 sample_count: 5,
+                 status: Status::Provisional,
+@@ -73,6 +75,7 @@ pub(crate) fn report() -> UsageReport {
+                 used_percent_start: 10.0,
+                 used_percent_end: 100.0,
+                 observed_cost_usd: 450.0,
++                model_usage: None,
+                 estimated_weekly_cost_usd: 500.0,
+                 sample_count: 9,
+                 status: Status::Completed,

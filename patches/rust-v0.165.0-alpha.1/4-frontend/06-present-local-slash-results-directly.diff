@@ -1,0 +1,463 @@
+present-local-slash-results-directly
+
+Lane: frontend
+
+FlatPatch: present-local-slash-results-directly
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Present local slash-command results directly without redundant slash-command heading rows.
+
+Requires: Unit:frontend/toggle-tool-visibility-in-compact-transcript
+
+Provides: Remove the echoed heading from status, process, MCP, debug-config and subagent result cells while retaining their content and links; identify mutable status cards by their concrete type and keep usage and rate-limit updates visible in owned and native transcript surfaces.
+
+Boundary: Command dispatch, data collection, copying, permission checks, tool visibility and warning identity remain their existing owners. Preserve status-tail replacement, intervening history, queued output, overlay deferral, resize behavior and mutable-card remeasurement without a composite wrapper retained solely for the removed heading.
+
+Verification: Focused renderer, hyperlink, command-scroll, status-copy, subagent and mutable-status tests cover direct result presentation, owned remeasurement, native tail updates, intervening warnings, overlays, account changes and resize.
+
+
+diff --git a/codex-rs/tui/src/app/agent_status_feed.rs b/codex-rs/tui/src/app/agent_status_feed.rs
+--- a/codex-rs/tui/src/app/agent_status_feed.rs
++++ b/codex-rs/tui/src/app/agent_status_feed.rs
+@@ -32,11 +32,7 @@ impl AgentStatusHistoryCell {
+ 
+ impl HistoryCell for AgentStatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+-        let mut lines: Vec<Line<'static>> = vec![
+-            "/subagents".magenta().into(),
+-            "Sub-agents running".bold().into(),
+-            "".into(),
+-        ];
++        let mut lines: Vec<Line<'static>> = vec!["Sub-agents running".bold().into(), "".into()];
+ 
+         if self.entries.is_empty() {
+             lines.push("  • No sub-agents running.".italic().into());
+diff --git a/codex-rs/tui/src/app/history_ui.rs b/codex-rs/tui/src/app/history_ui.rs
+--- a/codex-rs/tui/src/app/history_ui.rs
++++ b/codex-rs/tui/src/app/history_ui.rs
+@@ -89,19 +89,14 @@ impl App {
+         let width = self
+             .chat_widget
+             .history_wrap_width(tui.terminal.last_known_screen_size.width);
+-        // Owned replay must not eagerly format every historical entry. Composite status cards are
+-        // the only committed cells whose mutable usage data needs insertion-time bookkeeping.
+-        let lines = if !deferred || cell.as_any().is::<history_cell::CompositeHistoryCell>() {
++        // Mutable status cards need insertion-time bookkeeping even in owned replay.
++        let is_status_card = cell.as_any().is::<Arc<crate::status::StatusHistoryCell>>();
++        let lines = if !deferred || is_status_card {
+             cell.display_hyperlink_lines_for_mode(width, self.chat_widget.history_render_mode())
+         } else {
+             Vec::new()
+         };
+-        if cell.as_any().is::<history_cell::CompositeHistoryCell>()
+-            && lines.first().is_some_and(|line| {
+-                line.line.spans.len() == 1 && line.line.spans[0].content.as_ref() == "/status"
+-            })
+-            && let Some(thread_id) = self.chat_widget.thread_id()
+-        {
++        if is_status_card && let Some(thread_id) = self.chat_widget.thread_id() {
+             self.last_thread_usage_status_cell = Some(ThreadUsageStatusHistory {
+                 thread_id,
+                 cell: Arc::downgrade(cell),
+@@ -192,7 +187,7 @@ impl App {
+             return Ok(());
+         }
+         if tui.is_owned_screen() {
+-            // Composite cells are backed by mutable usage state, so the retained view remeasures
++            // Status cards are backed by mutable usage state, so the retained view remeasures
+             // them on its next frame without replacing native terminal history.
+             if let Some(status_history) = self.last_thread_usage_status_cell.as_mut() {
+                 status_history.lines = updated_lines;
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -2460,7 +2460,7 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
+         let event = app_event_rx.try_recv().expect("agent status history cell");
+         if let AppEvent::InsertHistoryCell(cell) = event {
+             let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+-            if rendered.contains("/subagents") {
++            if rendered.contains("Sub-agents running") {
+                 break rendered;
+             }
+         }
+diff --git a/codex-rs/tui/src/app/tests/local_command_scroll_tests.rs b/codex-rs/tui/src/app/tests/local_command_scroll_tests.rs
+--- a/codex-rs/tui/src/app/tests/local_command_scroll_tests.rs
++++ b/codex-rs/tui/src/app/tests/local_command_scroll_tests.rs
+@@ -380,7 +380,7 @@ async fn local_command_and_inline_error_reveal_their_history_output() -> Result<
+             "/model",
+             "Model selection is disabled until startup completes.",
+         ),
+-        ("/status", "/status"),
++        ("/status", "Model:"),
+         ("/keymap invalid", "Usage: /keymap [debug]"),
+     ] {
+         hold_older_history(&mut app, &mut tui);
+diff --git a/codex-rs/tui/src/app/tests/thread_usage.rs b/codex-rs/tui/src/app/tests/thread_usage.rs
+--- a/codex-rs/tui/src/app/tests/thread_usage.rs
++++ b/codex-rs/tui/src/app/tests/thread_usage.rs
+@@ -9,8 +9,9 @@ use pretty_assertions::assert_eq;
+ use ratatui::layout::Rect;
+ use ratatui::layout::Size;
+ 
+-async fn app_with_pending_thread_usage()
+--> Result<(Box<App>, AppServerSession, tui::Tui, ThreadId, u64)> {
++async fn app_with_pending_thread_usage(
++    owned: bool,
++) -> Result<(Box<App>, AppServerSession, tui::Tui, ThreadId, u64)> {
+     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+     let thread_id = ThreadId::new();
+     app.chat_widget.handle_thread_session(test_thread_session(
+@@ -27,6 +28,11 @@ async fn app_with_pending_thread_usage()
+     let mut app_server =
+         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+     let mut tui = crate::tui::test_support::make_test_tui()?;
++    // Model startup's owned screen or --no-alt-screen choice, not a quieter warning policy.
++    tui.set_alt_screen_enabled(owned);
++    tui.set_owned_screen(owned)?;
++    app.local_settings = crate::local_settings::LocalSettings::for_tui(&app.config, &tui);
++    app.chat_widget.local_settings = app.local_settings.clone();
+     tui.terminal.set_viewport_area(Rect::new(
+         /*x*/ 0, /*y*/ 21, /*width*/ 80, /*height*/ 3,
+     ));
+@@ -121,9 +127,9 @@ async fn account_updated_with_backend_only_auth_enables_thread_usage() -> Result
+ #[tokio::test]
+ async fn completed_thread_usage_updates_status_without_scrollback_reflow() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     assert!(!app.transcript_reflow.has_pending_reflow());
+-    assert!(pending_history_text(&tui).contains("/status"));
++    assert!(pending_history_text(&tui).contains("OpenAI Codex"));
+ 
+     let status = Arc::clone(app.transcript_cells.last().expect("status card"));
+ 
+@@ -148,7 +154,7 @@ async fn completed_thread_usage_updates_status_without_scrollback_reflow() -> Re
+ #[tokio::test]
+ async fn thread_usage_after_intervening_history_appends_refreshed_status() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     app.insert_history_cell(
+         &mut tui,
+         Box::new(PlainHistoryCell::new(vec![
+@@ -175,7 +181,7 @@ async fn thread_usage_after_intervening_history_appends_refreshed_status() -> Re
+ #[tokio::test]
+ async fn failed_thread_usage_after_intervening_history_does_not_duplicate_status() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     app.insert_history_cell(
+         &mut tui,
+         Box::new(PlainHistoryCell::new(vec![Line::from(
+@@ -203,7 +209,7 @@ async fn failed_thread_usage_after_intervening_history_does_not_duplicate_status
+ #[tokio::test]
+ async fn thread_usage_finishing_during_overlay_updates_history_after_close() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     tui.set_alt_screen_enabled(/*enabled*/ false);
+     app.open_transcript_overlay(&mut tui);
+ 
+@@ -234,7 +240,7 @@ async fn thread_usage_finishing_during_overlay_updates_history_after_close() ->
+ #[tokio::test]
+ async fn account_change_discards_thread_usage_deferred_while_overlay_is_open() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     tui.set_alt_screen_enabled(/*enabled*/ false);
+     app.open_transcript_overlay(&mut tui);
+     app.handle_event(
+@@ -268,7 +274,7 @@ async fn account_change_discards_thread_usage_deferred_while_overlay_is_open() -
+ #[tokio::test]
+ async fn terminal_reflow_rebases_pending_status_update_to_new_width() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     app.insert_history_cell(
+         &mut tui,
+         Box::new(
+@@ -329,7 +335,7 @@ async fn terminal_reflow_rebases_pending_status_update_to_new_width() -> Result<
+ async fn visible_warning_preserves_status_refresh_and_resize_without_duplicate_diagnostics()
+ -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     // TUI preferences survive a launch without alternate-screen ownership.
+     // A visible warning is intervening history, not an invisible status-tail fixture.
+     assert!(app.local_settings.tui.fullscreen_transcript);
+@@ -410,7 +416,7 @@ async fn visible_warning_preserves_status_refresh_and_resize_without_duplicate_d
+ #[tokio::test]
+ async fn queued_status_reads_refreshed_usage_only_when_emitted() -> Result<()> {
+     let (mut app, mut app_server, mut tui, thread_id, request_id) =
+-        app_with_pending_thread_usage().await?;
++        app_with_pending_thread_usage(/*owned*/ false).await?;
+     let status = Arc::clone(app.transcript_cells.last().unwrap());
+     tui.clear_pending_history_lines();
+     app.native_history.defer(&status);
+@@ -427,3 +433,61 @@ async fn queued_status_reads_refreshed_usage_only_when_emitted() -> Result<()> {
+     app_server.shutdown().await?;
+     Ok(())
+ }
++
++#[tokio::test]
++async fn owned_thread_usage_remeasures_the_same_status_card_after_refresh() -> Result<()> {
++    let (mut app, mut app_server, mut tui, thread_id, request_id) =
++        app_with_pending_thread_usage(/*owned*/ true).await?;
++    assert!(app.local_settings.tui.fullscreen_transcript);
++    assert!(app.local_settings.transcript_mode.is_owned());
++    assert!(tui.is_owned_screen());
++    let status = Arc::clone(app.transcript_cells.last().expect("status card"));
++    app.insert_history_cell(
++        &mut tui,
++        Box::new(history_cell::new_warning_event("visible diagnostic".into())),
++    );
++    let warning = Arc::clone(app.transcript_cells.last().expect("visible warning"));
++    let entries = history_cell::warning_entries(&app.transcript_cells);
++    assert_eq!(entries.len(), 1);
++    assert_eq!(warning.display_lines(90), warning.transcript_lines(90));
++    let area = Rect::new(0, 0, 90, 40);
++    let mut before = ratatui::buffer::Buffer::empty(area);
++    app.transcript_view
++        .render(area, &mut before, &app.transcript_cells);
++    let before_text = before
++        .content
++        .iter()
++        .map(|cell| cell.symbol())
++        .collect::<String>();
++    assert!(!before_text.contains("50 credits"));
++    assert!(before_text.contains("! visible diagnostic"));
++
++    app.handle_event(
++        &mut tui,
++        &mut app_server,
++        successful_thread_usage(thread_id, request_id),
++    )
++    .await?;
++
++    assert_eq!(app.transcript_cells.len(), 2);
++    assert!(Arc::ptr_eq(&status, &app.transcript_cells[0]));
++    assert!(Arc::ptr_eq(&warning, &app.transcript_cells[1]));
++    assert_eq!(
++        history_cell::warning_entries(&app.transcript_cells),
++        entries
++    );
++    let mut after = ratatui::buffer::Buffer::empty(area);
++    app.transcript_view
++        .render(area, &mut after, &app.transcript_cells);
++    let after_text = after
++        .content
++        .iter()
++        .map(|cell| cell.symbol())
++        .collect::<String>();
++    assert!(after_text.contains("50 credits"), "{after_text}");
++    assert!(after_text.contains("! visible diagnostic"), "{after_text}");
++    assert!(tui.pending_history_lines_for_test().is_empty());
++    assert!(!app.transcript_reflow.has_pending_reflow());
++    app_server.shutdown().await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -2003,7 +2003,7 @@ async fn slash_copy_status_yields_to_queued_commands_after_queued_status() {
+         assert!(
+             history
+                 .iter()
+-                .any(|lines| lines_to_single_string(lines).contains("/status"))
++                .any(|lines| lines_to_single_string(lines).contains("Model:"))
+         );
+         assert!(chat.input_queue.queued_user_messages.is_empty());
+ 
+diff --git a/codex-rs/tui/src/debug_config.rs b/codex-rs/tui/src/debug_config.rs
+--- a/codex-rs/tui/src/debug_config.rs
++++ b/codex-rs/tui/src/debug_config.rs
+@@ -123,13 +123,11 @@ fn render_debug_config_lines(
+     stack: &ConfigLayerStack,
+     sandbox_mode_is_effectively_allowed: impl Fn(SandboxModeRequirement) -> bool,
+ ) -> Vec<Line<'static>> {
+-    let mut lines = vec!["/debug-config".magenta().into(), "".into()];
+-
+-    lines.push(
++    let mut lines = vec![
+         "Config layer stack (lowest precedence first):"
+             .bold()
+             .into(),
+-    );
++    ];
+     let mut layers = stack.all_layers_low_to_high().peekable();
+     if layers.peek().is_none() {
+         lines.push("  <none>".dim().into());
+diff --git a/codex-rs/tui/src/history_cell/exec.rs b/codex-rs/tui/src/history_cell/exec.rs
+--- a/codex-rs/tui/src/history_cell/exec.rs
++++ b/codex-rs/tui/src/history_cell/exec.rs
+@@ -258,8 +258,6 @@ impl HistoryCell for UnifiedExecProcessesCell {
+ 
+ pub(crate) fn new_unified_exec_processes_output(
+     processes: Vec<UnifiedExecProcessDetails>,
+-) -> CompositeHistoryCell {
+-    let command = PlainHistoryCell::new(vec!["/ps".magenta().into()]);
+-    let summary = UnifiedExecProcessesCell::new(processes);
+-    CompositeHistoryCell::new(vec![Box::new(command), Box::new(summary)])
++) -> impl HistoryCell {
++    UnifiedExecProcessesCell::new(processes)
+ }
+diff --git a/codex-rs/tui/src/history_cell/mcp.rs b/codex-rs/tui/src/history_cell/mcp.rs
+--- a/codex-rs/tui/src/history_cell/mcp.rs
++++ b/codex-rs/tui/src/history_cell/mcp.rs
+@@ -451,8 +451,6 @@ pub(crate) fn empty_mcp_output() -> WebHyperlinkHistoryCell {
+     docs_line.push_span(" to configure them.".into(), /*destination*/ None);
+ 
+     let lines = vec![
+-        HyperlinkLine::new("/mcp".magenta().into()),
+-        HyperlinkLine::from(""),
+         HyperlinkLine::new(vec!["▪   ".into(), "MCP Tools".bold()].into()),
+         HyperlinkLine::from(""),
+         HyperlinkLine::new("  • No MCP servers configured.".italic().into()),
+@@ -471,12 +469,8 @@ pub(crate) fn new_mcp_tools_output(
+     resource_templates: HashMap<String, Vec<ResourceTemplate>>,
+     auth_statuses: &HashMap<String, McpAuthStatus>,
+ ) -> PlainHistoryCell {
+-    let mut lines: Vec<Line<'static>> = vec![
+-        "/mcp".magenta().into(),
+-        "".into(),
+-        vec!["▪   ".into(), "MCP Tools".bold()].into(),
+-        "".into(),
+-    ];
++    let mut lines: Vec<Line<'static>> =
++        vec![vec!["▪   ".into(), "MCP Tools".bold()].into(), "".into()];
+ 
+     if tools.is_empty() {
+         lines.push("  • No MCP tools available.".italic().into());
+@@ -648,12 +642,8 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
+     statuses: &[McpServerStatus],
+     detail: McpServerStatusDetail,
+ ) -> PlainHistoryCell {
+-    let mut lines: Vec<Line<'static>> = vec![
+-        "/mcp".magenta().into(),
+-        "".into(),
+-        vec!["▪   ".into(), "MCP Tools".bold()].into(),
+-        "".into(),
+-    ];
++    let mut lines: Vec<Line<'static>> =
++        vec![vec!["▪   ".into(), "MCP Tools".bold()].into(), "".into()];
+ 
+     let mut statuses = statuses.iter().collect::<Vec<_>>();
+     statuses.sort_by(|a, b| a.name.cmp(&b.name));
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -438,12 +438,14 @@ fn empty_mcp_output_preserves_docs_hyperlink() {
+         /*columns*/ 12..20,
+         destination.to_string(),
+     )];
++    let display = cell.display_hyperlink_lines(/*width*/ 80);
++    let docs_row = display
++        .iter()
++        .position(|line| line.hyperlinks == expected_link)
++        .expect("MCP documentation link row");
++    assert_eq!(display[docs_row].hyperlinks, expected_link);
+     assert_eq!(
+-        cell.display_hyperlink_lines(/*width*/ 80)[5].hyperlinks,
+-        expected_link
+-    );
+-    assert_eq!(
+-        cell.transcript_hyperlink_lines(/*width*/ 80)[5].hyperlinks,
++        cell.transcript_hyperlink_lines(/*width*/ 80)[docs_row].hyperlinks,
+         expected_link
+     );
+ 
+@@ -451,7 +453,9 @@ fn empty_mcp_output_preserves_docs_hyperlink() {
+     let mut buf = Buffer::empty(area);
+     cell.render(area, &mut buf);
+     assert_eq!(
+-        (0..39).map(|x| buf[(x, 5)].modifier).collect::<Vec<_>>(),
++        (0..39)
++            .map(|x| buf[(x, docs_row as u16)].modifier)
++            .collect::<Vec<_>>(),
+         [
+             vec![Modifier::DIM; 12],
+             vec![Modifier::DIM | Modifier::UNDERLINED; 8],
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -1,6 +1,4 @@
+-use crate::history_cell::CompositeHistoryCell;
+ use crate::history_cell::HistoryCell;
+-use crate::history_cell::PlainHistoryCell;
+ use crate::history_cell::plain_lines;
+ use crate::legacy_core::config::Config;
+ use crate::line_truncation::line_width;
+@@ -123,7 +121,7 @@ impl StatusHistoryHandle {
+ }
+ 
+ #[derive(Debug)]
+-struct StatusHistoryCell {
++pub(crate) struct StatusHistoryCell {
+     model_name: String,
+     model_details: Vec<String>,
+     directory: PathBuf,
+@@ -158,7 +156,7 @@ pub(crate) fn new_status_output(
+     model_name: &str,
+     collaboration_mode: Option<&str>,
+     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+-) -> CompositeHistoryCell {
++) -> Arc<StatusHistoryCell> {
+     let snapshots = rate_limits.map(std::slice::from_ref).unwrap_or_default();
+     new_status_output_with_rate_limits(
+         config,
+@@ -195,7 +193,7 @@ pub(crate) fn new_status_output_with_rate_limits(
+     collaboration_mode: Option<&str>,
+     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+     refreshing_rate_limits: bool,
+-) -> CompositeHistoryCell {
++) -> Arc<StatusHistoryCell> {
+     new_status_output_with_rate_limits_handle(
+         config,
+         config.model_provider.requires_openai_auth,
+@@ -239,8 +237,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
+     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+     agents_summary: String,
+     refreshing_rate_limits: bool,
+-) -> (CompositeHistoryCell, StatusHistoryHandle) {
+-    let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
++) -> (Arc<StatusHistoryCell>, StatusHistoryHandle) {
+     let card = Arc::new(StatusHistoryCell::new(
+         config,
+         requires_openai_auth,
+@@ -265,10 +262,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
+         card: Arc::clone(&card),
+     };
+ 
+-    (
+-        CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)]),
+-        handle,
+-    )
++    (card, handle)
+ }
+ 
+ impl StatusHistoryCell {
+@@ -934,6 +928,10 @@ impl StatusHistoryCell {
+ }
+ 
+ impl HistoryCell for Arc<StatusHistoryCell> {
++    fn has_stable_transcript_height(&self) -> bool {
++        false
++    }
++
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         self.content_lines(width)
+     }
+diff --git a/codex-rs/tui/src/status/mod.rs b/codex-rs/tui/src/status/mod.rs
+--- a/codex-rs/tui/src/status/mod.rs
++++ b/codex-rs/tui/src/status/mod.rs
+@@ -15,6 +15,7 @@ pub(crate) mod remote_connection;
+ mod thread_usage;
+ 
+ pub(crate) use account::StatusAccountDisplay;
++pub(crate) use card::StatusHistoryCell;
+ pub(crate) use card::StatusHistoryHandle;
+ #[cfg(test)]
+ pub(crate) use card::new_status_output;

@@ -64,15 +64,12 @@ func prepareCargo(cache CacheProjection, current cargoIdentity, stage string, wi
 	}
 	action, cause := "Initialized", "IdentityAbsent"
 	if present {
-		requestedSource := current.SourceSelection
 		current.Generation = previous.Generation
-		current.SourceSelection = previous.SourceSelection
-		if current != previous {
+		if current.ToolchainRoot != previous.ToolchainRoot || current.Target != previous.Target {
 			return cargoPreparation{}, errors.New("selected Cargo cache state is incompatible")
 		}
-		current.SourceSelection = requestedSource
 		action, cause = "ReusedWorkspace", "None"
-		if requestedSource != previous.SourceSelection {
+		if current.SourceSelection != previous.SourceSelection {
 			if current.Generation == ^uint64(0) {
 				return cargoPreparation{}, errors.New("Cargo source generation is exhausted")
 			}

@@ -1,0 +1,396 @@
+present-session-recovery-in-tui
+
+Lane: cross
+
+Unit: guard-session-storage-across-local-roots
+
+ChildPatch: present-session-recovery-in-tui
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -269,6 +269,9 @@ mod safety_buffering;
+ mod server_version_notice;
+ mod session_lifecycle;
+ mod session_picker;
++#[cfg(test)]
++#[path = "app/session_recovery_tests.rs"]
++mod session_recovery_tests;
+ mod side;
+ mod startup;
+ pub(crate) mod startup_bootstrap;
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -186,6 +186,9 @@ pub(super) fn server_notification_thread_target(
+             Some(notification.thread_id.as_str())
+         }
+         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
++        ServerNotification::SessionStorageRecovery(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::ContextManagementNotice(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -526,6 +526,15 @@ impl App {
+                 {
+                     return;
+                 }
++                // Copy once after live thread ownership is established, including inactive
++                // owned threads. Replay only presents the retained warning.
++                if let ServerNotification::SessionStorageRecovery(recovery) = &notification {
++                    self.app_event_tx.send(AppEvent::CopySelection {
++                        text: recovery.recovery.jsonl.as_str().into(),
++                        label: "session recovery JSONL".into(),
++                        format: crate::clipboard_copy::CopyFormat::PlainText,
++                    });
++                }
+                 let is_primary = self.primary_thread_id == Some(thread_id)
+                     || (self.primary_thread_id.is_none() && !background_voice);
+                 if is_primary
+diff --git a/codex-rs/tui/src/app/session_recovery_tests.rs b/codex-rs/tui/src/app/session_recovery_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/session_recovery_tests.rs
+@@ -0,0 +1,164 @@
++use super::*;
++use crate::app::tests::make_test_app_with_channels;
++use crate::app::tests::test_thread_session;
++use crate::chatwidget::ReplayKind;
++use crate::clipboard_copy::CopyFormat;
++use codex_app_server_client::AppServerEvent;
++use codex_app_server_protocol::SessionStorageRecoveryNotification;
++use codex_app_server_protocol::ThreadClosedNotification;
++use codex_protocol::protocol::SessionStorageRecoveryEvent;
++use pretty_assertions::assert_eq;
++
++fn recovery(thread_id: ThreadId, saved: bool, jsonl: &str) -> ServerNotification {
++    ServerNotification::SessionStorageRecovery(SessionStorageRecoveryNotification {
++        thread_id: thread_id.to_string(),
++        recovery: SessionStorageRecoveryEvent {
++            original_path: "/sessions/original.jsonl".into(),
++            saved_path: saved.then(|| "/sessions/rescue.jsonl.recovery".into()),
++            write_errors: if saved {
++                Vec::new()
++            } else {
++                vec!["home full".into(), "harness full".into()]
++            },
++            jsonl: jsonl.into(),
++        },
++    })
++}
++
++#[tokio::test]
++async fn live_recovery_copies_inactive_threads_regardless_of_disk_result_but_replay_does_not()
++-> Result<()> {
++    let (mut app, mut events, _) = make_test_app_with_channels().await;
++    let server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    let primary = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(primary, app.config.cwd.to_path_buf()),
++        Vec::new(),
++    )
++    .await?;
++    let jsonl = "{\"ordinal\":9,\"text\":\"a\\nb\"}\n{\"ordinal\":10}\n";
++    while events.try_recv().is_ok() {}
++    let unrelated = ThreadId::new();
++    app.handle_app_server_event(
++        &server,
++        AppServerEvent::ServerNotification(Box::new(recovery(unrelated, false, jsonl))),
++    )
++    .await;
++    assert!(!app.thread_event_channels.contains_key(&unrelated));
++    assert!(
++        !std::iter::from_fn(|| events.try_recv().ok())
++            .any(|event| matches!(event, AppEvent::CopySelection { .. }))
++    );
++    for saved in [false, true] {
++        while events.try_recv().is_ok() {}
++        let background = ThreadId::new();
++        app.ensure_thread_channel(background);
++        let notification = recovery(background, saved, jsonl);
++        app.handle_app_server_event(
++            &server,
++            AppServerEvent::ServerNotification(Box::new(notification.clone())),
++        )
++        .await;
++        let copies = std::iter::from_fn(|| events.try_recv().ok())
++            .filter_map(|event| match event {
++                AppEvent::CopySelection { text, format, .. } => Some((text, format)),
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(copies.len(), 1);
++        assert_eq!(copies[0].0.as_ref(), jsonl);
++        assert_eq!(copies[0].1, CopyFormat::PlainText);
++        assert_eq!(app.active_thread_id, Some(primary));
++        let channel = app
++            .thread_event_channels
++            .get(&background)
++            .expect("inactive recovery retained");
++        assert!(channel.store.lock().await.buffer.iter().any(|event| matches!(event,
++            ThreadBufferedEvent::Notification(notification) if matches!(notification.as_ref(), ServerNotification::SessionStorageRecovery(_))
++        )));
++
++        app.chat_widget
++            .handle_server_notification(notification, Some(ReplayKind::ThreadSnapshot));
++        let replay = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
++        assert!(
++            !replay
++                .iter()
++                .any(|event| matches!(event, AppEvent::CopySelection { .. }))
++        );
++        let cells: Vec<Arc<dyn HistoryCell>> = replay
++            .into_iter()
++            .filter_map(|event| match event {
++                AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
++                _ => None,
++            })
++            .collect();
++        assert!(
++            history_cell::warning_entries(&cells)
++                .iter()
++                .any(|entry| entry.details == jsonl)
++        );
++        app.chat_widget.open_warnings(&cells);
++        app.chat_widget
++            .handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
++        let copied = std::iter::from_fn(|| events.try_recv().ok())
++            .filter_map(|event| match event {
++                AppEvent::CopyWarning(text) => Some(text),
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(copied, vec![jsonl.to_string()]);
++        app.chat_widget.handle_key_event(KeyCode::Esc.into());
++    }
++    server.shutdown().await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn recovery_close_retains_the_view_and_explicit_exit_still_closes() -> Result<()> {
++    let (mut app, mut events, _) = make_test_app_with_channels().await;
++    let thread_id = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(thread_id, app.config.cwd.to_path_buf()),
++        Vec::new(),
++    )
++    .await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.drain_active_thread_events_until(&mut tui, Instant::now() + Duration::from_secs(1))
++        .await?;
++    while events.try_recv().is_ok() {}
++    app.enqueue_thread_notification(thread_id, recovery(thread_id, false, "{\"ordinal\":9}\n"))
++        .await?;
++    let close = ServerNotification::ThreadClosed(ThreadClosedNotification {
++        thread_id: thread_id.to_string(),
++    });
++    app.enqueue_thread_notification(thread_id, close.clone())
++        .await?;
++    app.drain_active_thread_events_until(&mut tui, Instant::now() + Duration::from_secs(1))
++        .await?;
++    let retained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
++    assert!(
++        !retained
++            .iter()
++            .any(|event| matches!(event, AppEvent::Exit(_)))
++    );
++    assert!(retained.iter().any(|event| matches!(event,
++        AppEvent::InsertHistoryCell(cell) if cell.warning_entries().iter().any(|entry| entry.details == "{\"ordinal\":9}\n")
++    )));
++    assert_eq!(app.active_thread_id, Some(thread_id));
++    {
++        let mut store = app.thread_event_channels[&thread_id].store.lock().await;
++        store.rebase_buffer_after_session_refresh();
++        assert!(store.buffer.iter().any(|event| matches!(event,
++            ThreadBufferedEvent::Notification(notification) if matches!(notification.as_ref(), ServerNotification::SessionStorageRecovery(_))
++        )));
++    }
++    app.pending_shutdown_exit_thread_id = Some(thread_id);
++    app.enqueue_thread_notification(thread_id, close).await?;
++    app.drain_active_thread_events_until(&mut tui, Instant::now() + Duration::from_secs(1))
++        .await?;
++    assert!(
++        std::iter::from_fn(|| events.try_recv().ok())
++            .any(|event| matches!(event, AppEvent::Exit(ExitMode::Immediate)))
++    );
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/thread_events.rs b/codex-rs/tui/src/app/thread_events.rs
+--- a/codex-rs/tui/src/app/thread_events.rs
++++ b/codex-rs/tui/src/app/thread_events.rs
+@@ -99,6 +99,7 @@ impl ThreadEventStore {
+                 notification.as_ref(),
+                 ServerNotification::HookStarted(_)
+                     | ServerNotification::HookCompleted(_)
++                    | ServerNotification::SessionStorageRecovery(_)
+                     | ServerNotification::McpServerStatusUpdated(_)
+                     | ServerNotification::McpServerOauthLoginCompleted(_)
+             ),
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1117,7 +1117,22 @@ impl App {
+             };
+             let notification = if guard.active {
+                 guard.push_notification_ref(&notification);
+-                Some(notification)
++                let retain_recovery = is_thread_closed
++                    && self.pending_shutdown_exit_thread_id != Some(thread_id)
++                    && guard.buffer.iter().rev().find_map(|event| match event {
++                        ThreadBufferedEvent::Notification(notification) => {
++                            match notification.as_ref() {
++                                ServerNotification::SessionStorageRecovery(_) => Some(true),
++                                ServerNotification::TurnStarted(_)
++                                | ServerNotification::ThreadStarted(_) => Some(false),
++                                _ => None,
++                            }
++                        }
++                        _ => None,
++                    }) == Some(true);
++                // Record the closed runtime, but keep its warning and clipboard lease visible
++                // instead of exiting or switching threads. Explicit exit keeps its normal route.
++                (!retain_recovery).then_some(notification)
+             } else {
+                 if self
+                     .background_voice
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -256,6 +256,10 @@ impl ChatWidget {
+             ServerNotification::ContextManagementNotice(notification) => {
+                 self.add_info_message(notification.message, /*hint*/ None);
+             }
++            ServerNotification::SessionStorageRecovery(notification) => {
++                self.add_to_history(history_cell::new_session_recovery(notification.recovery));
++                self.request_redraw();
++            }
+             ServerNotification::Warning(notification) => {
+                 if self.warning_display_state.startup_complete
+                     || notification
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -118,6 +118,7 @@ mod request_user_input;
+ mod search;
+ mod separators;
+ mod session;
++mod session_recovery;
+ mod spoken_artifacts;
+ mod startup_warnings;
+ mod warnings;
+@@ -140,6 +141,7 @@ pub(crate) use request_user_input::*;
+ pub(crate) use search::*;
+ pub(crate) use separators::*;
+ pub(crate) use session::*;
++pub(crate) use session_recovery::new_session_recovery;
+ pub(crate) use startup_warnings::StartupWarningsCell;
+ pub(crate) use warnings::WarningEntry;
+ pub(crate) use warnings::WarningHistoryCell;
+diff --git a/codex-rs/tui/src/history_cell/session_recovery.rs b/codex-rs/tui/src/history_cell/session_recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/session_recovery.rs
+@@ -0,0 +1,93 @@
++//! Keep recovery bytes separate from the visible diagnostic so every copy is appendable JSONL.
++
++use super::*;
++use codex_protocol::protocol::SessionStorageRecoveryEvent;
++
++pub(crate) fn new_session_recovery(recovery: SessionStorageRecoveryEvent) -> WarningHistoryCell {
++    let mut lines = vec![
++        Line::from(
++            "• Session stopped after a history write failure. Recovery JSONL is retained in warnings for copying.",
++        ),
++        Line::from(format!("Original: {}", recovery.original_path.display())),
++    ];
++    lines.push(Line::from(match recovery.saved_path {
++        Some(path) => format!("Recovery saved: {}", path.display()),
++        None => "Recovery could not be saved to either storage root.".into(),
++    }));
++    lines.extend(recovery.write_errors.into_iter().map(Line::from));
++    // Native warning identity includes the rescue destination or attempted paths, so separate
++    // failures of the same original file cannot merge their distinct JSONL fragments.
++    let key = lines
++        .iter()
++        .map(ToString::to_string)
++        .collect::<Vec<_>>()
++        .join("\n");
++    let style = crate::style::status_style(crate::style::StatusTone::Attention);
++    WarningHistoryCell {
++        server_version_notice: false,
++        visible_in_transcript: true,
++        key,
++        diagnostic: recovery.jsonl,
++        details: PrefixedWrappedHistoryCell::new(Text::from(lines).style(style), "", "  "),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn recovery_is_visible_but_copy_contains_only_the_exact_jsonl() {
++        let jsonl = "{\"ordinal\":9,\"text\":\"a\\nb\"}\n{\"ordinal\":10}\n";
++        for saved in [false, true] {
++            let cell = new_session_recovery(SessionStorageRecoveryEvent {
++                original_path: "/sessions/original.jsonl".into(),
++                saved_path: saved.then(|| "/sessions/rescue.jsonl.recovery".into()),
++                write_errors: vec!["home unavailable".into()],
++                jsonl: jsonl.into(),
++            });
++            for mode in [HistoryRenderMode::Rich, HistoryRenderMode::Raw] {
++                let lines = cell.display_lines_for_mode(80, mode);
++                let visible = lines
++                    .iter()
++                    .map(ToString::to_string)
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                assert!(visible.starts_with("• "));
++                assert!(visible.contains("Session stopped"));
++                assert!(visible.contains("home unavailable"));
++                assert!(visible.contains("Original: /sessions/original.jsonl"));
++                assert!(!visible.contains(jsonl));
++            }
++            assert_eq!(cell.warning_entries()[0].details, jsonl);
++            assert_eq!(cell.warning_keys().len(), 1);
++        }
++    }
++
++    #[test]
++    fn separate_rescues_of_one_original_file_keep_their_payloads_separate() {
++        for saved in [false, true] {
++            let cells: Vec<std::sync::Arc<dyn HistoryCell>> = ["first", "second"]
++                .into_iter()
++                .map(|name| {
++                    std::sync::Arc::new(new_session_recovery(SessionStorageRecoveryEvent {
++                        original_path: "/sessions/original.jsonl".into(),
++                        saved_path: saved
++                            .then(|| format!("/sessions/{name}.jsonl.recovery").into()),
++                        write_errors: if saved {
++                            Vec::new()
++                        } else {
++                            vec![format!("/sessions/{name}.jsonl.recovery: disk full")]
++                        },
++                        jsonl: format!("{{\"record\":\"{name}\"}}\n"),
++                    })) as std::sync::Arc<dyn HistoryCell>
++                })
++                .collect();
++            let entries = warning_entries(&cells);
++            assert_eq!(entries.len(), 2);
++            assert_eq!(entries[0].details, "{\"record\":\"first\"}\n");
++            assert_eq!(entries[1].details, "{\"record\":\"second\"}\n");
++        }
++    }
++}

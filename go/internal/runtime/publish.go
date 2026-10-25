@@ -72,7 +72,7 @@ func prepareNativeToolchain(options NativeToolchainOptions) (NativeToolchainResu
 	resultPath := filepath.Join(attempt, "result.json")
 	script := filepath.Join(attempt, "native-toolchain.py")
 	arguments := append([]string{options.WorkingRoot, options.ScratchRoot, attempt, resultPath, options.Source}, options.Auxiliary...)
-	data, stderr, runErr := runNativeProcess(attempt, script, "prepare", arguments, nativeEnvironment(attempt), 32<<20, resultPath, core.StageDeadline(), nil, options.OnLive)
+	data, stderr, runErr := runNativeProcess(attempt, script, "prepare", arguments, nativeEnvironment(attempt), 32<<20, resultPath, core.StageDeadline(), nil, options.OnLive, nil)
 	if diagnostic := strings.TrimSpace(stderr); diagnostic != "" {
 		runErr = errors.Join(runErr, errors.New(diagnostic))
 	}

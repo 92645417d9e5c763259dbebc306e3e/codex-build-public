@@ -5,8 +5,10 @@
 - Canonical history is `Lane -> Flat Patch` or `Lane -> Unit -> Child Patch`. A Unit has at least two ordered distinct Child Patches. Each Flat Patch and Child Patch is one commit and GitDiff; no single-Patch Unit exists.
 - Canonical ordinary Lane order is bugfix, normalization, backend, mixed, frontend, cross, and draft.
 - Their directory names are `0-bugfix`, `1-normalization`, `2-backend`, `3-mixed`, `4-frontend`, `5-cross`, and `6-draft` in that order.
-- Upstream remains the official baseline role, not a Patch Lane or exported directory.
-- The initial normalization ExecutableTransform remains the first history row before all ordinary Lanes, including bugfix.
+- UpstreamBaseline is the official parent plus the approved standalone bugfix prefix, not a Patch Lane or exported directory.
+- Bugfix Flat Patches precede the initial normalization ExecutableTransform.
+- A bugfix-only prefix is valid before normalization starts.
+- The initial normalization ExecutableTransform is mandatory before any other ordinary Lane and remains outside the shared Baseline prefix.
 - Commit metadata is discriminated: GitDiff commits name either `FlatPatch` or both `Unit` and `ChildPatch`; ExecutableTransform commits name `Transform` and `TransformPatch`. Generic Unit-as-Patch metadata is invalid.
 - Unit, Flat Patch and Child Patch names use three semantic parts in every Lane: action, object, and method or scope.
 - Each semantic part may contain multiple hyphenated words.
@@ -27,7 +29,7 @@
 - A is immutable and B projects it; GitDiffs retain headers, modes, hunks, and bytes, while invalid forms stay unexported.
 - Targets retain accepted prefixes; another source supplies only the selected Unit or Flat Patch.
 - Commits, not records, order work; List, Apply, Commit, and Export recheck history.
-- Exports regenerate GitDiffs plus root and lane notes and the cross relationship diagram into an absent staged tag. Lane-child ordinals derive from Git history; tag-prev is outside the projection.
+- Exports regenerate GitDiffs plus version-root notes.md and the cross relationship diagram into an absent staged tag. Lane-child ordinals derive from Git history; tag-prev is outside the projection.
 - Each Patch's one commit and GitDiff contains semantic source only; editing an earlier committed child uses Fork.
 - Every Patch retains name, commit, diff bytes, and position. No operation combines or splits Patches. Structure changes require explicit current-user approval.
 - File moves, upstream adaptation, or matching metadata cannot transfer behavior between Units, Flat Patches, or Child Patches.
@@ -73,8 +75,11 @@ PatchGitDiffLineAdmission
 - Recording an independent feature or calling its utility does not move that feature into the recorder's or caller's group.
 - A shared widget qualifies only when the assigned features require coordinated changes to its observable behavior.
 - Neither a real private dependency nor generation impact establishes group membership.
-- Bugfix contains local repairs of demonstrated defects in existing upstream behavior rather than optional optimization features.
-- A defect in an existing private responsibility remains with that owner unless the user explicitly approves a different assignment.
+- Bugfix contains standalone repairs of demonstrated upstream defects, reproducible without normalization or later private features.
+- A bugfix may depend on an earlier standalone bugfix but not a later private responsibility.
+- A defect introduced by private behavior or a private Patch combination belongs to its original Unit or Flat Patch, not bugfix or a new generic integration owner.
+- Discovery during private integration does not make an independently demonstrated upstream defect private.
+- Optional optimization features are not bugfixes.
 - A performance correction is a bugfix only when evidence establishes the breached existing performance obligation; a request to optimize or a measured faster alternative alone does not establish that classification.
 - Normalization retains its existing purpose before formal feature Lanes.
 - Backend, mixed, frontend and cross form the formal prefix; draft retains unfinished or unpromoted features.
@@ -214,7 +219,9 @@ TerminalChromeNormalizationOwner
 - The transform invokes the existing public `repository-format` on its tracked unstaged output using the admitted product roots, release, installed endpoint, and bounded deadline. Both generations begin at the same clean parent; each completes the canonical formatter and rendered-symbol check before staging or comparison. The combined changed paths remain inside `codex-rs/tui` or `codex-rs/mermaid/src`.
 - Only identical formatted generations select the one transform commit. A failed formatter, invalid postimage, unequal generation, or interruption restores the generation's clean parent; nested formatting must stop and clean up before rollback, with its diagnostics and Helper or Product distinction preserved by Apply. No provisional commit or later formatting-only Patch closes this route.
 - Generation stability proves only mechanical projection. The complete codex-tui gate owns private renderer evidence; lane snapshot Finalize later regenerates the authoritative postimage from the complete current source.
-- Its read-only check inspects admitted rendered `.snap` symbols against the resolved font character set after Apply and before Commit or Revise closes. Metadata selects source-owned exclusions and payload exceptions; unsupported new symbols are never learned silently.
+- After initial normalization, its read-only check inspects admitted rendered `.snap` symbols against the resolved font character set after Apply and before Commit or Revise closes.
+- The standalone bugfix prefix preserves upstream chrome and does not invoke normalization or its post-normalization symbol check.
+- Metadata selects source-owned exclusions and payload exceptions; unsupported new symbols are never learned silently.
 - Unknown symbols return a bounded count and representative path, line, codepoint, and Unicode name through the existing transport Conflict output after rollback.
 - For upstream terminal-chrome changes during Roll, the user's standing authorization permits direct SILK custody to maintain this existing mapping and its owning instructions without another approval question.
 - The product owner first distinguishes display chrome from source-owned Unicode payload and carries only the demonstrated mapping defect into SILK.

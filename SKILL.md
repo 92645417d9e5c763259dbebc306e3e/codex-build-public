@@ -36,7 +36,7 @@ TopLevelReleaseTerms
 - Explicit Cleanup restores its supplied Attached `main` worktree to the current `HEAD`, consumes all drained execution records and logs, and preserves only tasks/rust-suite-baselines.json as baseline comparison facts. It may additionally retire one separately named completely published tag.
 - Select one requested term.
 - Only an explicit current-user sync request selects public snapshot publication.
-- Roll, export, build, installation and skill maintenance never trigger sync automatically.
+- Roll, export, build, installation and skill maintenance never trigger public sync automatically.
 
 ## Invariants
 
@@ -44,13 +44,15 @@ TopLevelReleaseTerms
 - A Lane contains Units and Flat Patches. A Unit contains at least two ordered distinct Child Patches. Each Flat Patch and Child Patch is one named commit and GitDiff; Flat Patch is semantic, never a file.
 - Native Git retains PatchFormat's canonical representation; contracts and Requires declarations remain evidence rather than authority for purpose or group membership.
 - The complete formal prefix remains independent of draft, whose consumers may use complete shared formal interfaces.
-- One `export` publishes registered MainWorktree's ordered closed Git prefix, never a fork, isolated lane, or release-completion decision. Semantic artifacts are `.diff`: one per Flat Patch or Unit Child Patch, accompanied by PatchExport's lane documents. `owner` is effect authority, not Patch structure.
+- One `export` publishes registered MainWorktree's ordered closed Git prefix, never a fork, isolated lane, or release-completion decision. Semantic artifacts are `.diff`: one per Flat Patch or Unit Child Patch, accompanied by PatchExport's release documents. `owner` is effect authority, not Patch structure.
 - Apply advances an unchanged Patch only after ReleaseRollForward establishes its authorized purpose and placement. Conflict retains the successful prefix; reconstruct within that boundary and publish through Commit or terminal Revise. Exports remain read-only purpose evidence.
 - ReleaseRollForward requires measured consumer benefit before retaining a performance-motivated addition; functional correctness and fewer apparent operations do not establish that benefit.
 - Continue declared Unit and Lane transitions within the user's Roll scope without repeated approval; ReleaseRollForward owns explicit pauses and missing-authority decisions.
-- Establish Baseline once as comparison evidence. During Roll, uncovered upstream packages join automatically and explicit user-requested coverage alignment may add or remove them at any registered frontier. Tests remain freely selected diagnostics; only the user requests a complete suite. No suite gates Patch closure, Fork, convergence, export, or install. A failed selected suite remains evidence for focused repair, not a rerun demand. An automatic Roll rewrite or non-idempotent fixup fold runs corresponding focused tests before advancing.
+- Establish Baseline on the official parent plus the approved standalone bugfix prefix shared with the product. During Roll, uncovered upstream packages join automatically and explicit user-requested coverage alignment may add or remove them at any registered frontier.
+- Adding, changing or removing a shared bugfix remeasures affected Baseline coverage through FullSuiteAudit before that comparison is reused, even when discovered after private integration.
+- Tests remain freely selected diagnostics; only the user requests a complete product suite. No product suite gates Patch closure, Fork, convergence, export, or install. A failed selected suite remains evidence for focused repair, not a rerun demand. An automatic Roll rewrite or non-idempotent fixup fold runs corresponding focused tests before advancing.
 - Finalize and Prepare own generated tail only when selected. Full-suite results come directly from Finalize; focused snapshots stay private.
-- Version-root notes own shared product constraints; lane notes add only lane-specific guards. PatchAcceptance consumes both scopes before each selected Unit or Flat Patch.
+- One version-root notes.md holds the approved product guards consumed before each selected Unit or Flat Patch.
 - Every cross lane has a maintained `relationships.txt` ASCII graph under PatchExport's document lifecycle. OriginalPatchPurposeOwner and PatchAcceptance consume its functional relationships without treating the diagram as authority or a dependency database.
 - The helper owns baseline preparation, TaskIndex admission, fork ordinals, declared patch transport, mechanical retained-range and generated-tail task synchronization, and task retirement. Product work owns responsibilities, source selection, topology, and judgment.
 - Baseline interruption resumes the same tag, task, global topology and Plan/Stage/Result chain.
@@ -63,7 +65,7 @@ TopLevelReleaseTerms
 - After a rewrite, ReleaseRollForward selects one continuous retained Apply range within user scope up to the next planned rewrite or selected stop instead of repeated per-Unit calls.
 - Commit records one Patch without collapsing a Unit.
 - A Unit or Flat Patch includes its approved behavior, exact structure, and complete producer seams required by approved dependents. Its first commit owns the responsibility contract; other Child Patches do not repeat it.
-- ReleaseRollForward selects rewrite triggers and complete Patch responsibility boundaries. The lang skill's [Rust language owner](/codex/skills/lang/references/rust.md) supplies `PurposeBoundRustChange` to construct and review code inside them before dependent edits and source publication.
+- ReleaseRollForward selects rewrite triggers and complete Patch responsibility boundaries. The rust skill's [construction owner](/codex/skills/rust/references/rust.md) supplies `PurposeBoundRustChange` to construct and review code inside them before dependent edits and source publication.
 - Feature additions, removals and upstream fulfillment consume ReleaseRollForward's behavior-change decision independently of textual conflicts.
 - Roll implementation stays with one product agent.
 - PatchAcceptance owns cumulative source acceptance and the user-selected subagent permission for reviewing multiple Units or Flat Patches.

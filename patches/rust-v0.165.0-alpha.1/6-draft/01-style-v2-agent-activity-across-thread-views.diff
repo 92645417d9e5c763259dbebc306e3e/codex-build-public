@@ -1,0 +1,1083 @@
+style-v2-agent-activity-across-thread-views
+
+Lane: draft
+
+FlatPatch: style-v2-agent-activity-across-thread-views
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+Purpose: Present consistent themed multi-agent v2 activity and root-relative contextual footer labels across live output and history replay without changing agent execution.
+
+Requires: Unit:frontend/style-conversation-surfaces-with-theme
+
+Provides: Capture explicit role model and effort constraints from their existing parse, compare them with the native effective startup snapshot using native effort normalization, and carry the optional display role through existing agent metadata and canonical activity items. Render Started, Interacted, Interrupted and Completed rows through one shared renderer for live and retained thread views, using uppercase underscore-separated path components with slash-separated ancestry and upstream description colors. Render white brackets around a capitalized explicit role in the active theme color, using red only for an observed model or effort mismatch. Omit the badge when the activity has no explicit role observation, including manual invocations and older replay records. Hide the v2 root footer label while retaining uppercase child labels even for a lone child view. Preserve native deferred activity FIFO order, streaming completion and prompt isolation.
+
+Boundary: Own display observations and v2 presentation across thread views. Preserve native role and model precedence, effective effort resolution, configuration effects, agent membership, input admission, completion delivery and model-facing tool output. Reuse existing agent metadata and canonical activity owners without a second registry, render-time reads or stored-metadata backfill. Preserve v1 labels and picker presentation. Keep the formal prefix independent of this draft responsibility.
+
+Verification: Native role-creation and startup-effort checks cover explicit roles, omitted roles, effective alias resolution, mismatch reporting and unchanged child settings. Canonical item, history and app-server conversion checks preserve optional role observations. TUI checks cover dark and light theme role colors, white brackets, red mismatches, uppercase root-relative labels and upstream description colors in live and retained views, absent badges without explicit roles, child ancestry and hidden v2 root labels while retaining v1 behavior. Streaming checks retain authoritative answers, interruption and late-completion behavior, prompt isolation and shared live and replay presentation in FIFO order.
+
+
+diff --git a/codex-rs/analytics/src/tests/suite/turns/events_tests.rs b/codex-rs/analytics/src/tests/suite/turns/events_tests.rs
+--- a/codex-rs/analytics/src/tests/suite/turns/events_tests.rs
++++ b/codex-rs/analytics/src/tests/suite/turns/events_tests.rs
+@@ -526,6 +526,7 @@ async fn turn_event_counts_completed_tool_items() {
+             agents_states: Default::default(),
+         },
+         ThreadItem::SubAgentActivity {
++            role: None,
+             model: None,
+             reasoning_effort: None,
+             id: "sub-agent-activity-1".to_string(),
+@@ -534,6 +535,7 @@ async fn turn_event_counts_completed_tool_items() {
+             agent_path: "/root/child".to_string(),
+         },
+         ThreadItem::SubAgentActivity {
++            role: None,
+             model: None,
+             reasoning_effort: None,
+             id: "sub-agent-activity-completed".to_string(),
+diff --git a/codex-rs/app-server-protocol/src/protocol/event_mapping.rs b/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
+--- a/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
++++ b/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
+@@ -183,6 +183,7 @@ pub fn item_event_to_server_notification(
+         }
+         EventMsg::SubAgentActivity(activity) => {
+             let item = ThreadItem::SubAgentActivity {
++                role: None,
+                 model: activity.model,
+                 reasoning_effort: activity.reasoning_effort,
+                 id: activity.event_id,
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+@@ -1029,6 +1029,7 @@ impl ThreadHistoryBuilder {
+         payload: &codex_protocol::protocol::SubAgentActivityEvent,
+     ) {
+         self.upsert_item_in_current_turn(ThreadItem::SubAgentActivity {
++            role: None,
+             model: payload.model.clone(),
+             reasoning_effort: payload.reasoning_effort.clone(),
+             id: payload.event_id.clone(),
+@@ -5162,6 +5163,10 @@ mod tests {
+     fn completed_sub_agent_activity_updates_completed_parent_turn() {
+         use codex_protocol::protocol::HasLegacyEvent;
+ 
++        let role = Some(codex_protocol::items::SubAgentActivityRole {
++            name: "iris".into(),
++            model_or_effort_mismatch: true,
++        });
+         let child_thread_id = ThreadId::new();
+         let child_path = codex_protocol::AgentPath::root()
+             .join("worker")
+@@ -5170,6 +5175,7 @@ mod tests {
+             thread_id: ThreadId::new(),
+             turn_id: "turn-a".into(),
+             item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {
++                role: None,
+                 model: Some("gpt-5".into()),
+                 reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
+                 id: "spawn-child".into(),
+@@ -5220,6 +5226,7 @@ mod tests {
+                     thread_id: ThreadId::new(),
+                     turn_id: "turn-a".into(),
+                     item: CoreTurnItem::SubAgentActivity(CoreSubAgentActivityItem {
++                        role: role.clone(),
+                         model: None,
+                         reasoning_effort: None,
+                         id: "child-turn-completed".into(),
+@@ -5240,6 +5247,7 @@ mod tests {
+                 vec![
+                     expected_spawn.clone(),
+                     ThreadItem::SubAgentActivity {
++                        role: role.clone(),
+                         model: None,
+                         reasoning_effort: None,
+                         id: "child-turn-completed".into(),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/item.rs b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/item.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/item.rs
+@@ -36,6 +36,7 @@ use codex_protocol::items::DynamicToolCallStatus as CoreDynamicToolCallStatus;
+ pub use codex_protocol::items::McpAppDisplayMode;
+ pub use codex_protocol::items::McpAppUi;
+ use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
++pub use codex_protocol::items::SubAgentActivityRole;
+ use codex_protocol::items::TurnItem as CoreTurnItem;
+ use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
+ use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
+@@ -397,6 +398,10 @@ pub enum ThreadItem {
+     #[serde(rename_all = "camelCase")]
+     #[ts(rename_all = "camelCase")]
+     SubAgentActivity {
++        /// Explicit creation role, when recorded by the v2 activity producer.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        role: Option<SubAgentActivityRole>,
+         /// Resolved model at sub-agent creation; absent from older records and other activities.
+         model: Option<String>,
+         /// Resolved reasoning effort at sub-agent creation, when known.
+@@ -984,6 +989,7 @@ impl From<CoreTurnItem> for ThreadItem {
+                     .collect(),
+             },
+             CoreTurnItem::SubAgentActivity(activity) => ThreadItem::SubAgentActivity {
++                role: activity.role,
+                 model: activity.model,
+                 reasoning_effort: activity.reasoning_effort,
+                 id: activity.id,
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+@@ -3469,6 +3469,10 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
+     );
+ 
+     let sub_agent_activity_item = TurnItem::SubAgentActivity(SubAgentActivityItem {
++        role: Some(SubAgentActivityRole {
++            name: "iris".into(),
++            model_or_effort_mismatch: true,
++        }),
+         model: Some("gpt-5".into()),
+         reasoning_effort: Some(ReasoningEffort::High),
+         id: "activity-1".to_string(),
+@@ -3482,6 +3486,10 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
+     assert_eq!(
+         ThreadItem::from(sub_agent_activity_item),
+         ThreadItem::SubAgentActivity {
++            role: Some(SubAgentActivityRole {
++                name: "iris".into(),
++                model_or_effort_mismatch: true,
++            }),
+             model: Some("gpt-5".into()),
+             reasoning_effort: Some(ReasoningEffort::High),
+             id: "activity-1".to_string(),
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -3383,6 +3383,10 @@ mod tests {
+                     thread_id: conversation_id,
+                     turn_id: "turn-1".to_string(),
+                     item: CoreTurnItem::SubAgentActivity(SubAgentActivityItem {
++                        role: Some(codex_app_server_protocol::SubAgentActivityRole {
++                            name: "iris".into(),
++                            model_or_effort_mismatch: true,
++                        }),
+                         model: None,
+                         reasoning_effort: None,
+                         id: "activity-1".to_string(),
+@@ -3419,6 +3423,10 @@ mod tests {
+             payload,
+             ItemCompletedNotification {
+                 item: ThreadItem::SubAgentActivity {
++                    role: Some(codex_app_server_protocol::SubAgentActivityRole {
++                        name: "iris".into(),
++                        model_or_effort_mismatch: true,
++                    }),
+                     model: None,
+                     reasoning_effort: None,
+                     id: "activity-1".to_string(),
+diff --git a/codex-rs/core/src/agent/child_config.rs b/codex-rs/core/src/agent/child_config.rs
+--- a/codex-rs/core/src/agent/child_config.rs
++++ b/codex-rs/core/src/agent/child_config.rs
+@@ -5,6 +5,7 @@
+ 
+ use crate::agent::role::DEFAULT_ROLE_NAME;
+ use crate::agent::role::apply_role_to_config;
++use crate::agent::types::SpawnAgentRole;
+ use crate::config::Config;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
+@@ -46,6 +47,7 @@ pub(crate) struct SpawnConfigOptions<'a> {
+ pub(crate) struct PreparedSpawnConfig {
+     pub(crate) config: Config,
+     pub(crate) role_name: Option<String>,
++    pub(crate) role_display: Option<SpawnAgentRole>,
+ }
+ 
+ /// Resolves child settings before starting the thread, retaining the invoking tool's precedence.
+@@ -68,10 +70,14 @@ pub(crate) async fn prepare_agent_spawn_config(
+         options.reasoning_effort,
+     )
+     .await?;
++    let mut role_display = None;
+     if !options.full_history_fork
+         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
+     {
+-        apply_spawn_agent_role(session, &mut config, options.role_name).await?;
++        let applied_role = apply_spawn_agent_role(session, &mut config, options.role_name).await?;
++        if options.version == SpawnConfigVersion::V2 && options.role_name.is_some() {
++            role_display = Some(applied_role);
++        }
+         if options.version == SpawnConfigVersion::V2
+             && options.full_history_fork
+             && config.developer_instructions.is_none()
+@@ -97,7 +103,11 @@ pub(crate) async fn prepare_agent_spawn_config(
+             .then_some(DEFAULT_ROLE_NAME)
+         })
+         .map(str::to_owned);
+-    Ok(PreparedSpawnConfig { config, role_name })
++    Ok(PreparedSpawnConfig {
++        config,
++        role_name,
++        role_display,
++    })
+ }
+ 
+ /// Builds the base config snapshot for a newly spawned sub-agent.
+@@ -292,17 +302,17 @@ async fn apply_spawn_agent_role(
+     session: &Session,
+     config: &mut Config,
+     role_name: Option<&str>,
+-) -> Result<(), String> {
++) -> Result<SpawnAgentRole, String> {
+     let previous_model = config.model.clone();
+     let previous_reasoning_effort = config.model_reasoning_effort.clone();
+-    apply_role_to_config(config, role_name).await?;
++    let role = apply_role_to_config(config, role_name).await?;
+     if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
+     {
+-        return Ok(());
++        return Ok(role);
+     }
+ 
+     let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
+-        return Ok(());
++        return Ok(role);
+     };
+     let model = config.model.clone().ok_or_else(|| {
+         "spawn_agent could not resolve the child model for reasoning effort validation".to_string()
+@@ -313,14 +323,15 @@ async fn apply_spawn_agent_role(
+         .get_model_info(&model, &config.to_models_manager_config())
+         .await;
+     if model_info.used_fallback_model_metadata {
+-        return Ok(());
++        return Ok(role);
+     }
+ 
+     validate_spawn_agent_reasoning_effort(
+         &model,
+         &model_info.supported_reasoning_levels,
+         &reasoning_effort,
+-    )
++    )?;
++    Ok(role)
+ }
+ 
+ fn find_spawn_agent_model_name(
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -618,6 +618,7 @@ impl LocalAgentControl {
+             agent_path,
+             agent_nickname,
+             agent_role,
++            role_display: None,
+         })
+     }
+ 
+diff --git a/codex-rs/core/src/agent/control/completion.rs b/codex-rs/core/src/agent/control/completion.rs
+--- a/codex-rs/core/src/agent/control/completion.rs
++++ b/codex-rs/core/src/agent/control/completion.rs
+@@ -73,6 +73,9 @@ impl LocalAgentControl {
+                         initiating_thread_id,
+                         parent_turn_id,
+                         SubAgentActivityItem {
++                            role: self
++                                .get_agent_metadata(outcome.thread_id)
++                                .and_then(|metadata| metadata.role_display),
+                             model: None,
+                             reasoning_effort: None,
+                             id: format!("subagent-completed-{}", outcome.turn_id),
+diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
+--- a/codex-rs/core/src/agent/control/spawn.rs
++++ b/codex-rs/core/src/agent/control/spawn.rs
+@@ -966,6 +966,23 @@ impl LocalAgentControl {
+                 .reasoning_effort
+                 .or_else(|| model_info.default_reasoning_level.clone())
+                 .map(|effort| model_info.resolve_reasoning_effort(effort));
++            agent_metadata.role_display =
++                options
++                    .role_display
++                    .map(|role| codex_protocol::items::SubAgentActivityRole {
++                        model_or_effort_mismatch: role
++                            .model
++                            .as_ref()
++                            .is_some_and(|model| model != &config.model)
++                            || role.reasoning_effort.is_some_and(|expected| {
++                                let expected = model_info.resolve_reasoning_effort(expected);
++                                config
++                                    .reasoning_effort
++                                    .as_ref()
++                                    .is_some_and(|actual| actual != &expected)
++                            }),
++                        name: role.name,
++                    });
+             Some(config)
+         } else {
+             None
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -16,6 +16,7 @@ use crate::agent::types::MessageDeliveryMode;
+ use crate::agent::types::ResolvedMultiAgentV2UsageHints;
+ use crate::agent::types::SpawnAgentForkMode;
+ use crate::agent::types::SpawnAgentOptions;
++use crate::agent::types::SpawnAgentRole;
+ use crate::agent_communication::AgentCommunicationContext;
+ use crate::agent_communication::AgentCommunicationKind;
+ use crate::config::AgentRoleConfig;
+@@ -2092,12 +2093,14 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
+     wait_for_recorded_user_message(thread.as_ref(), "spawned").await;
+ }
+ 
+-#[test_case::test_case(None, ReasoningEffort::Medium; "model default")]
+-#[test_case::test_case(Some(ReasoningEffort::Ultra), ReasoningEffort::XHigh; "resolved ultra")]
++#[test_case::test_case(None, ReasoningEffort::Medium, false; "model default")]
++#[test_case::test_case(Some(ReasoningEffort::Ultra), ReasoningEffort::XHigh, false; "resolved ultra")]
++#[test_case::test_case(Some(ReasoningEffort::High), ReasoningEffort::High, true; "role model mismatch")]
+ #[tokio::test]
+ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
+     selected_effort: Option<ReasoningEffort>,
+     reported_effort: ReasoningEffort,
++    role_model_mismatch: bool,
+ ) {
+     let (home, mut config) = test_config().await;
+     config
+@@ -2126,6 +2129,15 @@ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
+             },
+             source,
+             options: SpawnAgentOptions {
++                role_display: Some(SpawnAgentRole {
++                    name: "configured-role".into(),
++                    model: if role_model_mismatch {
++                        Some("different-role-model".into())
++                    } else {
++                        harness.config.model.clone()
++                    },
++                    reasoning_effort: selected_effort.clone(),
++                }),
+                 parent_thread_id: Some(parent_id),
+                 ..Default::default()
+             },
+@@ -2144,6 +2156,21 @@ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
+         ),
+         (Some(reported_effort), selected_effort),
+     );
++    assert_eq!(
++        agent.metadata.role_display,
++        Some(codex_protocol::items::SubAgentActivityRole {
++            name: "configured-role".into(),
++            model_or_effort_mismatch: role_model_mismatch,
++        })
++    );
++    assert_eq!(
++        harness
++            .control
++            .get_agent_metadata(agent.thread_id)
++            .unwrap()
++            .role_display,
++        agent.metadata.role_display
++    );
+     child.shutdown_and_wait().await.expect("shutdown child");
+     parent.shutdown_and_wait().await.expect("shutdown parent");
+ }
+diff --git a/codex-rs/core/src/agent/role.rs b/codex-rs/core/src/agent/role.rs
+--- a/codex-rs/core/src/agent/role.rs
++++ b/codex-rs/core/src/agent/role.rs
+@@ -3,6 +3,7 @@
+ //! Roles may customize the child or reduce its capabilities, but never replace the parent
+ //! session's authority. A projected layer keeps existing layer-based consumers in sync.
+ 
++use crate::agent::types::SpawnAgentRole;
+ use crate::config::AgentRoleConfig;
+ use crate::config::Config;
+ use crate::config::deserialize_config_toml_with_base;
+@@ -48,10 +49,11 @@ struct AgentRoleOverrides {
+ }
+ 
+ /// Applies typed role overrides to the existing parent-derived configuration.
++/// Returns the constraints from that same parse for live creation observations.
+ pub(crate) async fn apply_role_to_config(
+     config: &mut Config,
+     role_name: Option<&str>,
+-) -> Result<(), String> {
++) -> Result<SpawnAgentRole, String> {
+     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+ 
+     let role = resolve_role_config(config, role_name)
+@@ -70,13 +72,22 @@ async fn apply_role_to_config_inner(
+     config: &mut Config,
+     role_name: &str,
+     role: &AgentRoleConfig,
+-) -> anyhow::Result<()> {
++) -> anyhow::Result<SpawnAgentRole> {
+     let is_built_in = !config.agent_roles.contains_key(role_name);
+     let Some(config_file) = role.config_file.as_ref() else {
+-        return Ok(());
++        return Ok(SpawnAgentRole {
++            name: role_name.to_owned(),
++            model: None,
++            reasoning_effort: None,
++        });
+     };
+     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
++    let applied_role = SpawnAgentRole {
++        name: role_name.to_owned(),
++        model: role_config.model.clone(),
++        reasoning_effort: role_config.model_reasoning_effort.clone(),
++    };
+     let mut overrides = AgentRoleOverrides {
+         developer_instructions: role_config.developer_instructions,
+         model: role_config.model,
+@@ -121,10 +132,10 @@ async fn apply_role_to_config_inner(
+         .as_table()
+         .is_some_and(toml::map::Map::is_empty)
+     {
+-        return Ok(());
++        return Ok(applied_role);
+     }
+     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
+-    Ok(())
++    Ok(applied_role)
+ }
+ 
+ async fn load_role_layer_toml(
+diff --git a/codex-rs/core/src/agent/types.rs b/codex-rs/core/src/agent/types.rs
+--- a/codex-rs/core/src/agent/types.rs
++++ b/codex-rs/core/src/agent/types.rs
+@@ -5,6 +5,8 @@ use crate::context::MultiAgentRoleInstructions;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use codex_protocol::AgentPath;
+ use codex_protocol::ThreadId;
++use codex_protocol::items::SubAgentActivityRole;
++use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::protocol::AgentStatus;
+ use codex_protocol::turn_input::CyberAccessProgram;
+ 
+@@ -16,6 +18,8 @@ pub struct AgentMetadata {
+     pub agent_path: Option<AgentPath>,
+     pub agent_nickname: Option<String>,
+     pub agent_role: Option<String>,
++    /// Explicit creation role, absent for manual invocations and restored metadata.
++    pub role_display: Option<SubAgentActivityRole>,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -25,6 +29,8 @@ pub enum SpawnAgentForkMode {
+ 
+ #[derive(Clone, Debug, Default)]
+ pub struct SpawnAgentOptions {
++    /// Display evidence only; this does not apply a role or change the child settings.
++    pub role_display: Option<SpawnAgentRole>,
+     pub fork_parent_spawn_call_id: Option<String>,
+     pub fork_mode: Option<SpawnAgentForkMode>,
+     pub parent_thread_id: Option<ThreadId>,
+@@ -41,6 +47,14 @@ pub struct SpawnAgentOptions {
+     pub cyber_access_program: Option<CyberAccessProgram>,
+ }
+ 
++/// Model and effort constraints captured by the role parser during explicit v2 creation.
++#[derive(Clone, Debug)]
++pub struct SpawnAgentRole {
++    pub name: String,
++    pub model: Option<String>,
++    pub reasoning_effort: Option<ReasoningEffort>,
++}
++
+ /// Identity and status observed from a loaded agent, without a handle to its runtime.
+ #[derive(Clone, Debug)]
+ pub struct LiveAgent {
+diff --git a/codex-rs/core/src/realtime_history_tests.rs b/codex-rs/core/src/realtime_history_tests.rs
+--- a/codex-rs/core/src/realtime_history_tests.rs
++++ b/codex-rs/core/src/realtime_history_tests.rs
+@@ -258,6 +258,7 @@ fn promotes_backing_agent_artifacts_once_without_a_client_request() {
+         started_at_ms: 0,
+     });
+     let subagent = completed_item(TurnItem::SubAgentActivity(SubAgentActivityItem {
++        role: None,
+         model: None,
+         reasoning_effort: None,
+         id: "subagent-1".to_string(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2628,6 +2628,10 @@ async fn item_completion_without_a_start_uses_completion_timestamp() {
+ async fn subagent_activity_emits_matching_start_and_completion() {
+     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+     let item = codex_protocol::items::SubAgentActivityItem {
++        role: Some(codex_protocol::items::SubAgentActivityRole {
++            name: "iris".into(),
++            model_or_effort_mismatch: false,
++        }),
+         model: Some("requested-model".to_string()),
+         reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
+         id: "activity-1".to_string(),
+diff --git a/codex-rs/core/src/thread_spawn.rs b/codex-rs/core/src/thread_spawn.rs
+--- a/codex-rs/core/src/thread_spawn.rs
++++ b/codex-rs/core/src/thread_spawn.rs
+@@ -146,6 +146,7 @@ pub(crate) async fn spawn(
+             },
+             source: spawn_source,
+             options: SpawnAgentOptions {
++                role_display: prepared.role_display,
+                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.to_string()),
+                 fork_mode,
+                 parent_thread_id: Some(session.thread_id),
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+@@ -125,6 +125,7 @@ async fn handle_spawn_agent(
+                 /*task_name*/ None,
+             )?,
+             options: SpawnAgentOptions {
++                role_display: None,
+                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+                 fork_mode: fork_mode.clone(),
+                 parent_thread_id: Some(session.thread_id),
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -936,7 +936,8 @@ async fn multi_agent_v2_spawn_without_history_allows_agent_type_override() {
+         .start_thread(StartThreadOptions::new((*turn.config).clone()))
+         .await
+         .expect("root thread should start");
+-    set_agent_control(&mut session, manager.agent_control());
++    let control = manager.agent_control();
++    set_agent_control(&mut session, control.clone());
+     session.thread_id = root.thread_id;
+     let mut config = (*turn.config).clone();
+     config
+@@ -982,6 +983,13 @@ async fn multi_agent_v2_spawn_without_history_allows_agent_type_override() {
+     assert_eq!(snapshot.model, "gpt-5-role-override");
+     assert_eq!(snapshot.model_provider_id, parent_provider_id);
+     assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
++    assert_eq!(
++        control.get_agent_metadata(agent_id).unwrap().role_display,
++        Some(codex_protocol::items::SubAgentActivityRole {
++            name: role_name,
++            model_or_effort_mismatch: false,
++        })
++    );
+ }
+ 
+ #[tokio::test]
+@@ -1113,7 +1121,8 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
+         .start_thread(StartThreadOptions::new((*turn.config).clone()))
+         .await
+         .expect("root thread should start");
+-    set_agent_control(&mut session, manager.agent_control());
++    let control = manager.agent_control();
++    set_agent_control(&mut session, control.clone());
+     session.thread_id = root.thread_id;
+     let mut config = (*turn.config).clone();
+     config
+@@ -1167,6 +1176,13 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
+         child_snapshot.session_source.get_agent_path().as_deref(),
+         Some("/root/test_process")
+     );
++    assert_eq!(
++        control
++            .get_agent_metadata(child_thread_id)
++            .unwrap()
++            .role_display,
++        None
++    );
+     assert!(manager.captured_ops().iter().any(|(id, op)| {
+         *id == child_thread_id
+             && matches!(
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/interrupt_agent.rs
+@@ -63,6 +63,7 @@ async fn handle_interrupt_agent(
+         &session,
+         &turn,
+         SubAgentActivityItem {
++            role: snapshot.metadata().role_display.clone(),
+             model: None,
+             reasoning_effort: None,
+             id: call_id,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/message_tool.rs
+@@ -87,6 +87,7 @@ pub(super) async fn handle_message_string_tool(
+         &session,
+         &turn,
+         SubAgentActivityItem {
++            role: receipt.metadata.role_display,
+             model: None,
+             reasoning_effort: None,
+             id: call_id,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -163,6 +163,7 @@ async fn handle_spawn_agent(
+         &session,
+         turn,
+         SubAgentActivityItem {
++            role: spawned_agent.metadata.role_display,
+             model: Some(agent_snapshot.model.clone()),
+             reasoning_effort: agent_snapshot.reasoning_effort.clone(),
+             id: call_id,
+diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
+--- a/codex-rs/core/tests/suite/subagent_notifications.rs
++++ b/codex-rs/core/tests/suite/subagent_notifications.rs
+@@ -2908,6 +2908,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
+         assert_eq!(
+             completed_item,
+             &SubAgentActivityItem {
++                role: None,
+                 model: None,
+                 reasoning_effort: None,
+                 id: format!("subagent-completed-{child_turn_id}"),
+@@ -3226,6 +3227,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn(
+             requester_thread_id,
+             requester_turn_id,
+             SubAgentActivityItem {
++                role: None,
+                 model: None,
+                 reasoning_effort: None,
+                 id: format!("subagent-completed-{worker_followup_turn_id}"),
+diff --git a/codex-rs/protocol/src/items.rs b/codex-rs/protocol/src/items.rs
+--- a/codex-rs/protocol/src/items.rs
++++ b/codex-rs/protocol/src/items.rs
+@@ -364,8 +364,21 @@ pub struct CollabAgentToolCallItem {
+     pub agents_states: HashMap<ThreadId, AgentStatus>,
+ }
+ 
++/// Explicit role and observed startup mismatch carried by v2 activity items.
++#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
++#[serde(rename_all = "camelCase")]
++#[ts(rename_all = "camelCase")]
++pub struct SubAgentActivityRole {
++    pub name: String,
++    /// True only when a known startup model or effort differs from a role constraint.
++    pub model_or_effort_mismatch: bool,
++}
++
+ #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+ pub struct SubAgentActivityItem {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub role: Option<SubAgentActivityRole>,
+     /// Resolved model at sub-agent creation; absent from older records and other activities.
+     pub model: Option<String>,
+     /// Resolved reasoning effort at sub-agent creation, when known.
+diff --git a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+--- a/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration/legacy_event.rs
+@@ -259,6 +259,7 @@ pub(super) fn completed_item(
+         )),
+         EventMsg::SubAgentActivity(event) => Some((
+             TurnItem::SubAgentActivity(SubAgentActivityItem {
++                role: None,
+                 model: event.model.clone(),
+                 reasoning_effort: event.reasoning_effort.clone(),
+                 id: event.event_id.clone(),
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -21,6 +21,7 @@
+ 
+ use crate::multi_agents::AgentPickerThreadEntry;
+ use crate::multi_agents::SubAgentActivityDisplay;
++use crate::multi_agents::agent_path_label;
+ use crate::multi_agents::format_agent_picker_item_name;
+ use crate::multi_agents::next_agent_shortcut;
+ use crate::multi_agents::previous_agent_shortcut;
+@@ -393,8 +394,8 @@ impl AgentNavigationState {
+ 
+     /// Derives the contextual footer label for the currently displayed thread.
+     ///
+-    /// This intentionally returns `None` until there is more than one tracked thread so
+-    /// single-thread sessions do not waste footer space restating the obvious. When metadata for
++    /// V2 hides the root label while retaining readable child paths, including a lone child view.
++    /// V1 returns `None` until there is more than one tracked thread. When metadata for
+     /// the displayed thread is missing, the label falls back to the same generic naming rules used
+     /// by the picker.
+     pub(crate) fn active_agent_label(
+@@ -402,24 +403,30 @@ impl AgentNavigationState {
+         current_displayed_thread_id: Option<ThreadId>,
+         primary_thread_id: Option<ThreadId>,
+     ) -> Option<String> {
+-        if self.threads.len() <= 1 {
+-            return None;
+-        }
+-
+         let thread_id = current_displayed_thread_id?;
+         let is_primary = primary_thread_id == Some(thread_id);
++        if let Some(agent_path) = self
++            .threads
++            .get(&thread_id)
++            .and_then(|entry| entry.agent_path.as_deref())
++            .filter(|agent_path| !agent_path.trim().is_empty())
++        {
++            return (agent_path != codex_protocol::AgentPath::ROOT)
++                .then(|| agent_path_label(agent_path));
++        }
++        if self.threads.len() <= 1
++            || (is_primary
++                && self
++                    .threads
++                    .values()
++                    .any(|entry| entry.agent_path.is_some()))
++        {
++            return None;
++        }
+         Some(
+             self.threads
+                 .get(&thread_id)
+                 .map(|entry| {
+-                    if !is_primary
+-                        && let Some(agent_path) = entry
+-                            .agent_path
+-                            .as_deref()
+-                            .filter(|agent_path| !agent_path.trim().is_empty())
+-                    {
+-                        return format!("`{agent_path}`");
+-                    }
+                     format_agent_picker_item_name(
+                         entry.agent_nickname.as_deref(),
+                         entry.agent_role.as_deref(),
+@@ -605,4 +612,30 @@ mod tests {
+             Some("Main [default]".to_string())
+         );
+     }
++
++    #[test]
++    fn v2_footer_hides_only_root_and_retains_uppercase_child_ancestry() {
++        let (mut state, main, child, grandchild) = populated_state();
++        state.set_agent_path(child, Some("/root/review_task".into()));
++        state.set_agent_path(grandchild, Some("/root/review_task/check_details".into()));
++        assert_eq!(state.active_agent_label(Some(main), Some(main)), None);
++        assert_eq!(
++            state.active_agent_label(Some(child), Some(main)),
++            Some("REVIEW_TASK".into())
++        );
++        assert_eq!(
++            state.active_agent_label(Some(grandchild), Some(main)),
++            Some("REVIEW_TASK/CHECK_DETAILS".into())
++        );
++
++        let mut single = AgentNavigationState::default();
++        single.upsert(child, None, Some("iris".into()), false);
++        single.set_agent_path(child, Some("/root/review_task".into()));
++        assert_eq!(
++            single.active_agent_label(Some(child), Some(child)),
++            Some("REVIEW_TASK".into())
++        );
++        single.set_agent_path(child, Some(codex_protocol::AgentPath::ROOT.into()));
++        assert_eq!(single.active_agent_label(Some(child), Some(child)), None);
++    }
+ }
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -223,8 +223,8 @@ impl App {
+     ///
+     /// The footer sometimes shows ambient context instead of an instructional hint. In multi-agent
+     /// sessions, that contextual row includes the currently viewed agent label. The label is
+-    /// intentionally hidden until there is more than one known thread so single-thread sessions do
+-    /// not spend footer space restating that the user is already on the main conversation.
++    /// hidden for the v2 root while v2 children retain readable root-relative paths. V1 labels
++    /// remain hidden until there is more than one known thread.
+     pub(super) fn sync_active_agent_label(&mut self) {
+         let label = self
+             .agent_navigation
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1570,6 +1570,7 @@ async fn live_app_server_command_output_delta_transcript_snapshot() {
+ async fn live_app_server_sub_agent_activity_renders_once() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     let activity = AppServerThreadItem::SubAgentActivity {
++        role: None,
+         model: None,
+         reasoning_effort: None,
+         id: "activity-1".to_string(),
+diff --git a/codex-rs/tui/src/chatwidget/tests/subagent_activity_tests.rs b/codex-rs/tui/src/chatwidget/tests/subagent_activity_tests.rs
+--- a/codex-rs/tui/src/chatwidget/tests/subagent_activity_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/subagent_activity_tests.rs
+@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
+ 
+ const PREFIX: &str = "The top is PR #42.\n\n";
+ const SUFFIX: &str = "Branch: feature/rollout.";
+-const ACTIVITY: &str = "• Completed `/root/stack_tip`\n";
++const ACTIVITY: &str = "• Completed [Iris] STACK_TIP\n";
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ enum FinalizedEvent {
+@@ -15,6 +15,10 @@ enum FinalizedEvent {
+ 
+ fn complete_subagent(chat: &mut ChatWidget, id: &str) {
+     let item = AppServerThreadItem::SubAgentActivity {
++        role: Some(codex_app_server_protocol::SubAgentActivityRole {
++            name: "iris".into(),
++            model_or_effort_mismatch: false,
++        }),
+         model: None,
+         reasoning_effort: None,
+         id: id.to_string(),
+@@ -231,3 +235,63 @@ async fn terminal_turn_drains_subagents_without_opening_queued_questions() {
+         assert!(chat.interrupts.is_empty());
+     }
+ }
++
++#[tokio::test]
++async fn queued_live_and_replayed_subagent_activity_share_labels_and_keep_fifo_order() {
++    let answer = format!("{PREFIX}{SUFFIX}");
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, PREFIX);
++    chat.run_commit_tick();
++    complete_subagent(&mut chat, "live-activity");
++    chat.handle_thread_item(
++        AppServerThreadItem::SubAgentActivity {
++            role: Some(codex_app_server_protocol::SubAgentActivityRole {
++                name: "iris".into(),
++                model_or_effort_mismatch: true,
++            }),
++            model: None,
++            reasoning_effort: None,
++            id: "replayed-activity".into(),
++            kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
++            agent_thread_id: ThreadId::new().to_string(),
++            agent_path: "/root/replay_task".into(),
++        },
++        "turn-1".into(),
++        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
++    );
++    let restored_child = ThreadId::new();
++    chat.set_collab_agent_metadata(restored_child, Some("Worker".into()), Some("iris".into()));
++    chat.handle_thread_item(
++        AppServerThreadItem::SubAgentActivity {
++            role: None,
++            model: Some("recorded-model".into()),
++            reasoning_effort: None,
++            id: "replayed-without-role".into(),
++            kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
++            agent_thread_id: restored_child.to_string(),
++            agent_path: "/root/older_task".into(),
++        },
++        "turn-1".into(),
++        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
++    );
++    assert!(chat.stream_controller.is_some());
++    assert_eq!(drain_finalized_transcript(&mut rx).0, Vec::new());
++    complete_assistant_message(
++        &mut chat,
++        "message",
++        &answer,
++        Some(MessagePhase::FinalAnswer),
++    );
++    handle_turn_completed(&mut chat, "turn-1", None);
++    assert_eq!(
++        drain_finalized_transcript(&mut rx).0,
++        vec![
++            FinalizedEvent::Answer(answer),
++            FinalizedEvent::History(ACTIVITY.into()),
++            FinalizedEvent::History("• Completed [Iris] REPLAY_TASK\n".into()),
++            FinalizedEvent::History("• Completed OLDER_TASK\n".into()),
++        ]
++    );
++    assert!(chat.interrupts.is_empty());
++}
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -7,6 +7,7 @@
+ use crate::history_cell::PlainHistoryCell;
+ use crate::render::line_utils::prefix_lines;
+ use crate::style::accent_color;
++use crate::style::theme_color_on;
+ use crate::text_formatting::truncate_text;
+ use codex_app_server_protocol::CollabAgentState;
+ use codex_app_server_protocol::CollabAgentStatus;
+@@ -306,30 +307,52 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
+     })
+ }
+ 
++pub(crate) fn agent_path_label(agent_path: &str) -> String {
++    agent_path
++        .strip_prefix("/root/")
++        .unwrap_or(agent_path)
++        .to_ascii_uppercase()
++}
++
+ pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+     let ThreadItem::SubAgentActivity {
+-        kind, agent_path, ..
++        kind,
++        agent_path,
++        role,
++        ..
+     } = item
+     else {
+         return None;
+     };
+-    Some(collab_event(
+-        sub_agent_activity_title(*kind, agent_path),
+-        Vec::new(),
+-    ))
+-}
+-
+-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+-    let (prefix, path) = match kind {
+-        SubAgentActivityKind::Started => ("Started ", agent_path),
+-        SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
+-        SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
+-        SubAgentActivityKind::Completed => ("Completed ", agent_path),
++    let prefix = match kind {
++        SubAgentActivityKind::Started => "Started ",
++        SubAgentActivityKind::Interacted => "Interacted with ",
++        SubAgentActivityKind::Interrupted => "Interrupted ",
++        SubAgentActivityKind::Completed => "Completed ",
+     };
+-    title_spans_line(vec![
+-        Span::from(prefix).bold(),
+-        Span::from(format!("`{path}`")).fg(accent_color()),
+-    ])
++    let mut spans = vec![Span::from(prefix).bold()];
++    if let Some(role) = role {
++        let mut name = role.name.chars();
++        let label = name
++            .next()
++            .into_iter()
++            .flat_map(char::to_uppercase)
++            .chain(name)
++            .collect::<String>();
++        let color = if role.model_or_effort_mismatch {
++            ratatui::style::Color::Red
++        } else {
++            theme_color_on(&["entity.name.type"], None)
++        };
++        spans.extend([
++            "[".white(),
++            Span::from(label).fg(color),
++            "]".white(),
++            " ".into(),
++        ]);
++    }
++    spans.push(Span::from(agent_path_label(agent_path)).fg(accent_color()));
++    Some(collab_event(title_spans_line(spans), Vec::new()))
+ }
+ 
+ fn spawn_end(
+@@ -668,6 +691,7 @@ fn error_summary_spans(error: &str) -> Vec<Span<'static>> {
+ mod tests {
+     use super::*;
+     use crate::history_cell::HistoryCell;
++    use crate::test_support::PathBufExt;
+     #[cfg(target_os = "macos")]
+     use crossterm::event::KeyEvent;
+     #[cfg(target_os = "macos")]
+@@ -678,9 +702,91 @@ mod tests {
+     use ratatui::style::Modifier;
+     use std::collections::HashMap;
+ 
++    #[test]
++    fn v2_activity_preserves_explicit_role_colors_and_labels_across_thread_views() {
++        let original = crate::render::highlight::current_syntax_theme();
++        let mut theme_colors = Vec::new();
++        for (theme, fg, bg) in [
++            ("nord", (220, 230, 240), (20, 35, 50)),
++            ("github", (20, 25, 30), (250, 241, 235)),
++        ] {
++            crate::terminal_palette::with_test_default_colors(
++                crate::terminal_probe::DefaultColors { fg, bg },
++                || {
++                    crate::render::highlight::set_syntax_theme(
++                        crate::render::highlight::resolve_theme_by_name(theme, None).unwrap(),
++                    );
++                    let themed_role = theme_color_on(&["entity.name.type"], None);
++                    theme_colors.push(themed_role);
++                    for mismatch in [None, Some(false), Some(true)] {
++                        let item = ThreadItem::SubAgentActivity {
++                            role: mismatch.map(|model_or_effort_mismatch| {
++                                codex_app_server_protocol::SubAgentActivityRole {
++                                    name: "iris".into(),
++                                    model_or_effort_mismatch,
++                                }
++                            }),
++                            model: Some("actual-model".into()),
++                            reasoning_effort: Some(ReasoningEffortConfig::High),
++                            id: "completed".into(),
++                            kind: SubAgentActivityKind::Completed,
++                            agent_thread_id: ThreadId::new().to_string(),
++                            agent_path: "/root/parent_task/readable_layout_doc_update_phase2"
++                                .into(),
++                        };
++                        let live = sub_agent_activity_history_cell(&item)
++                            .unwrap()
++                            .display_lines(200);
++                        let line = &live[0];
++                        let badge = if mismatch.is_some() { "[Iris] " } else { "" };
++                        assert_eq!(
++                            line.to_string(),
++                            format!(
++                                "• Completed {badge}PARENT_TASK/READABLE_LAYOUT_DOC_UPDATE_PHASE2"
++                            )
++                        );
++                        assert_eq!(line.spans.last().unwrap().style.fg, Some(accent_color()));
++                        if let Some(mismatch) = mismatch {
++                            let role = line
++                                .spans
++                                .iter()
++                                .find(|span| span.content == "Iris")
++                                .unwrap();
++                            assert_eq!(
++                                role.style.fg,
++                                Some(if mismatch { Color::Red } else { themed_role })
++                            );
++                            for bracket in ["[", "]"] {
++                                let span = line
++                                    .spans
++                                    .iter()
++                                    .find(|span| span.content == bracket)
++                                    .unwrap();
++                                assert_eq!(span.style.fg, Some(Color::White));
++                            }
++                        }
++                        let replay = crate::thread_transcript::item_to_cells(
++                            item,
++                            &crate::test_support::test_path_buf("/workspace").abs(),
++                            crate::thread_transcript::RawReasoningVisibility::Hidden,
++                            false,
++                            &mut Default::default(),
++                            None,
++                        );
++                        assert_eq!(replay.len(), 1);
++                        assert_eq!(replay[0].display_lines(200), live);
++                    }
++                },
++            );
++        }
++        crate::render::highlight::set_syntax_theme(original);
++        assert_ne!(theme_colors[0], theme_colors[1]);
++    }
++
+     #[test]
+     fn interacted_sub_agent_activity_does_not_change_liveness() {
+         let item = ThreadItem::SubAgentActivity {
++            role: None,
+             model: None,
+             reasoning_effort: None,
+             id: "activity-1".to_string(),
+@@ -696,6 +802,7 @@ mod tests {
+     fn completed_sub_agent_activity_stops_running_liveness() {
+         let thread_id = ThreadId::new();
+         let item = ThreadItem::SubAgentActivity {
++            role: None,
+             model: None,
+             reasoning_effort: None,
+             id: "activity-1".to_string(),
+diff --git a/codex-rs/tui/src/thread_transcript/other_items_tests.rs b/codex-rs/tui/src/thread_transcript/other_items_tests.rs
+--- a/codex-rs/tui/src/thread_transcript/other_items_tests.rs
++++ b/codex-rs/tui/src/thread_transcript/other_items_tests.rs
+@@ -159,6 +159,7 @@ fn tool_and_notice_projection_uses_normal_transcript_presentation() {
+             ..image
+         }),
+         ThreadItem::SubAgentActivity {
++            role: None,
+             model: None,
+             reasoning_effort: None,
+             id: "agent-1".to_string(),

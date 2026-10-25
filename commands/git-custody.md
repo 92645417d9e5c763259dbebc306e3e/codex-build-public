@@ -80,5 +80,5 @@ ProductOwnedConvergenceOwner
 - After verified promotion, remove superseded numbered worktrees and refs by the same sequence and publish CurrentWorktree as Main, omitting RetainedParents. Preserve the actual terminal and next-open discriminants. This closes existing frontiers, not future draft work.
 - Recheck Git and the task before the next Patch. Interruption resumes these effects from actual remaining paths and refs, correcting only the observed task postimage. Never force deletion, invent recovery refs or states, or rerun tests to conceal partial effects. Convergence creates no Fork, test or export.
 - Explicit Cleanup consumes the converged Main task; exact task-to-Main closure and committed export permit retirement without a test-result prerequisite.
-- Export always uses atomic same-tag directory rotation, retains one tag-prev sibling, and commits that tag in private main without a release-completion receipt.
+- Export uses atomic whole-repository publication with PatchExport's bounded tag retention and commits the current tag plus tracked obsolete-tag deletions in private main without a release-completion receipt.
 - Export never creates, removes, or repairs a product worktree. Baseline prepares only its selected tag's missing roles; Git registration owns existing paths, and a failed creation never authorizes removing a pre-existing role.

@@ -1,0 +1,1087 @@
+decode-usage-from-rollout-records
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: decode-usage-from-rollout-records
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Read retained paginated rollout usage once and serve shared calendar, model-cost, approximate weekly-quota and actual credit-deduction reports to app-server clients.
+
+Requires: Unit:cross/materialize-model-catalog-from-local-file
+
+Provides: Count authoritative native completed and incomplete response records without waiting for deferred snapshots or billing delivery twice, apply ccusage-style changed-cumulative reported-last accounting and cumulative-only fallback to historical snapshots, and retain observed official spending-only increments when installed last usage stays unchanged. Read active and nested archived plain JSONL without duplicate discovery at observed lengths without decoding unrelated conversation bodies, use response thread ownership instead of subagent projection ordinals for copied records, preserve referenced-history suffixes and legacy parent replay exclusion, and retain unknown models and malformed-record diagnostics. Resolve preceding thread-owned applied model settings at native task starts while preserving an in-flight response context model and never relabeling earlier spending from later settings. Price exclusive cache buckets by inclusive model tiers, anchor paired quota and credit observations to response arrival rather than deferred snapshot delivery, aggregate calendar periods at response arrival with preceding-request boundaries, identify weekly cycles by reset time within a five-minute tolerance, estimate all retained Pro-family quota cycles from multiple local spans without amplifying missing-record gaps through global overlapping pairs, exclude ambiguous stale-cycle intervals without freezing later current-cycle measurements, close weekly cycles at credit decrease with exhausted quota, exclude credit-funded quota intervals without losing totals, retain continuous credit periods without delayed-balance duplication, cache exact per-model details from the once-priced retained timeline, derive whole-cycle Unrecorded spending from Estimated times Used divided by 100 minus Observed with a zero floor, and serve process-wide usage/read snapshots with explicit refresh, fresh-versus-cached evidence, latest usage time, complete build duration and scan errors. Report real build phases and completed candidate-file counts through bounded, latest-only usage/buildProgress notifications correlated to the incoming usage/read request and sent only to its connection.
+
+Boundary: Native rollout persistence and response identities remain the input owner; projection-only subagent ordinals do not prove billing ownership. Reports consume response records and unmatched token_count snapshots, retain the pricing document and native referenced-history semantics, make no network request, and invent neither missing usage nor prices or deductions across missing or conflicting balances. Native background-compaction budget charges without rollout usage remain outside reports. Used, Observed and Estimated are independent observations rather than an arithmetic identity. Quota observations and spending require Pro, ProLite or ProMax with a primary weekly window; other plans and unknown plans still retain ordinary usage and credit accounting. Period details retain unknown models, exclude the ending request and credit-funded quota gaps, and need no additional scan or pricing pass. Only a successful complete build replaces the shared snapshot and measured duration. Older server snapshots may lack duration and model details. TUI views, response recording and successful-output publication remain independent. Progress performs no second file scan or per-record notification, does not cancel an admitted shared build when its UI is hidden, and never substitutes request wait time for producer build duration.
+
+Verification: Reader and wire tests cover historical subagent projection headers, referenced suffixes, native response thread ownership, ccusage last-first and cumulative-only selection, context-only legacy snapshots, zero-context and resumed incomplete spending with and without response IDs, explicit model retention, preceding applied model settings, task-boundary model selection, foreign and absent model ownership, deferred snapshots, standalone compaction, repeated delivery, malformed input and large unrelated payloads. Aggregate, quota and credit tests retain per-response pricing, copied-record deduplication, calendar attribution, credit completion and exclusion, delayed recovery, continuous credit periods, preceding-request boundaries, mixed and unknown models, long-context partitions and older snapshot fields. Quota tests cover Pro-family admission, all retained cycles, whole-cycle Unrecorded spending and its zero floor, and compare complete and locally missing datasets across thousands of records, rounding phases and uneven sampling; measured complete-report build durations preserve the existing speed requirement. Service tests retain shared explicit-refresh snapshots, measured build duration including zero, serialization and scan-error recovery. Progress checks cover real stage transitions, candidate-file totals including skipped files, complete publication and error behavior, cached reads, request correlation, connection isolation and bounded notification cadence; paired measurements assess observer overhead without changing accounting results.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -167,6 +167,7 @@ mod thread_status;
+ mod transport;
+ mod turn_admission;
+ mod turn_cost_worker;
++mod usage;
+ mod user_verification;
+ mod user_verification_response;
+ 
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -0,0 +1,5 @@
++//! Local paginated-rollout accounting, with no external process or network dependency.
++mod types;
++mod wire;
++
++type Error = Box<dyn std::error::Error + Send + Sync>;
+diff --git a/codex-rs/app-server/src/usage/types.rs b/codex-rs/app-server/src/usage/types.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/types.rs
+@@ -0,0 +1,19 @@
++pub(super) use codex_app_server_protocol::UsageDiagnostics as Diagnostics;
++pub(super) use codex_app_server_protocol::UsageTokens as Tokens;
++
++#[derive(Debug)]
++pub(super) struct Observation {
++    pub(super) timestamp: String,
++    pub(super) credit_balance: Option<f64>,
++    pub(super) millis: i64,
++    pub(super) used_percent: f64,
++    pub(super) resets_at: i64,
++}
++
++#[derive(Debug)]
++pub(super) struct CreditObservation {
++    pub(super) timestamp: String,
++    pub(super) millis: i64,
++    pub(super) balance: Option<f64>,
++    pub(super) quota_exhausted: bool,
++}
+diff --git a/codex-rs/app-server/src/usage/wire.rs b/codex-rs/app-server/src/usage/wire.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/wire.rs
+@@ -0,0 +1,436 @@
++use super::types::CreditObservation;
++use super::types::Observation;
++use super::types::Tokens;
++use chrono::DateTime;
++use codex_protocol::account::PlanType;
++use serde::Deserialize;
++use std::borrow::Cow;
++use std::io::BufRead;
++
++#[derive(Debug)]
++pub(super) struct Event {
++    /// Response arrival owns accounting and paired quota/credit observation time.
++    /// Legacy snapshots without a response record retain their recorded time.
++    pub(super) millis: i64,
++    /// Only a paired Pro-family primary weekly window establishes quota spending ownership.
++    pub(super) primary_weekly: bool,
++    pub(super) model: usize,
++    pub(super) tokens: Tokens,
++    pub(super) response: Option<Box<(String, String)>>,
++}
++
++#[derive(Default)]
++pub(super) struct ParsedFile {
++    pub(super) events: Vec<Event>,
++    pub(super) models: Vec<String>,
++    pub(super) observations: Vec<(usize, Observation)>,
++    pub(super) credits: Vec<(usize, CreditObservation)>,
++    pub(super) first_usage_times: Vec<i64>,
++    pub(super) inherited_events: usize,
++    pub(super) malformed: usize,
++    pub(super) incomplete: usize,
++}
++
++enum PendingRecord {
++    Owned { index: usize, timestamp: String },
++    Inherited,
++}
++
++#[derive(Deserialize)]
++struct Entry<'a> {
++    #[serde(rename = "type")]
++    kind: &'a str,
++    timestamp: Option<&'a str>,
++    #[serde(borrow)]
++    payload: Payload<'a>,
++}
++
++#[derive(Deserialize)]
++struct Payload<'a> {
++    #[serde(rename = "type")]
++    kind: Option<&'a str>,
++    #[serde(borrow)]
++    model: Option<Cow<'a, str>>,
++    #[serde(borrow)]
++    thread_id: Option<Cow<'a, str>>,
++    #[serde(borrow)]
++    response_id: Option<Cow<'a, str>>,
++    usage: Option<WireTokens>,
++    info: Option<Info>,
++    #[serde(borrow)]
++    thread_settings: Option<Settings<'a>>,
++    rate_limits: Option<Limits>,
++}
++
++#[derive(Deserialize)]
++struct Settings<'a> {
++    #[serde(borrow)]
++    model: Option<Cow<'a, str>>,
++}
++
++#[derive(Deserialize)]
++struct Limits {
++    plan_type: Option<PlanType>,
++    primary: Option<Limit>,
++    secondary: Option<Limit>,
++    credits: Option<Credits>,
++}
++
++#[derive(Deserialize)]
++struct Credits {
++    balance: Option<String>,
++}
++
++#[derive(Deserialize)]
++struct Limit {
++    window_minutes: Option<i64>,
++    used_percent: f64,
++    resets_at: Option<i64>,
++}
++
++#[derive(Deserialize)]
++struct Info {
++    total_token_usage: Option<WireTokens>,
++    last_token_usage: Option<WireTokens>,
++}
++
++#[derive(Default, Deserialize)]
++#[serde(default)]
++struct WireTokens {
++    input_tokens: i64,
++    cached_input_tokens: i64,
++    cache_write_input_tokens: i64,
++    output_tokens: i64,
++    reasoning_output_tokens: i64,
++    total_tokens: i64,
++}
++
++impl WireTokens {
++    fn tokens(self) -> Tokens {
++        // Migrated canonical logs can preserve negative provider counters.
++        // Discard that field, not the remaining valid usage.
++        let input = self.input_tokens.max(0) as u64;
++        let output = self.output_tokens.max(0) as u64;
++        let cached = (self.cached_input_tokens.max(0) as u64).min(input);
++        Tokens {
++            input,
++            cached,
++            cache_write: (self.cache_write_input_tokens.max(0) as u64).min(input - cached),
++            output,
++            reasoning: self.reasoning_output_tokens.max(0) as u64,
++            total: if self.total_tokens <= 0 {
++                input.saturating_add(output)
++            } else {
++                self.total_tokens as u64
++            },
++        }
++    }
++}
++
++pub(super) fn timestamp(value: &str) -> Option<i64> {
++    Some(DateTime::parse_from_rfc3339(value).ok()?.timestamp_millis())
++}
++
++pub(super) fn intern_model(models: &mut Vec<String>, model: Cow<'_, str>) -> usize {
++    let text = model.trim();
++    if let Some(index) = models.iter().position(|known| known == text) {
++        return index;
++    }
++    let index = models.len();
++    models.push(if text.len() == model.len() {
++        model.into_owned()
++    } else {
++        text.to_owned()
++    });
++    index
++}
++
++/// Native rollout writers place their discriminants before the potentially large payload.
++/// Other JSON layouts retain the ordinary candidate filter and serde decoder below.
++fn native_accounting_record(line: &[u8]) -> Option<bool> {
++    let mut fields = line
++        .strip_prefix(b"{\"timestamp\":\"")?
++        .splitn(2, |byte| *byte == b',');
++    let timestamp = fields.next()?.strip_suffix(b"\"")?;
++    if timestamp.contains(&b'"') || timestamp.contains(&b'\\') {
++        return None;
++    }
++    let rest = fields.next()?;
++    let rest = if let Some(rest) = rest.strip_prefix(b"\"ordinal\":") {
++        rest.splitn(2, |byte| *byte == b',').nth(1)?
++    } else {
++        rest
++    };
++    let mut fields = rest
++        .strip_prefix(b"\"type\":\"")?
++        .splitn(2, |byte| *byte == b'"');
++    let kind = fields.next()?;
++    let payload = fields.next()?.strip_prefix(b",\"payload\":")?;
++    if kind.contains(&b'\\') {
++        return None;
++    }
++    match kind {
++        b"token_usage_record" | b"turn_context" => Some(true),
++        b"event_msg" => {
++            let mut fields = payload
++                .strip_prefix(b"{\"type\":\"")?
++                .splitn(2, |byte| *byte == b'"');
++            let kind = fields.next()?;
++            if kind.contains(&b'\\') || !matches!(fields.next()?.first(), Some(b',' | b'}')) {
++                return None;
++            }
++            Some(matches!(
++                kind,
++                b"token_count" | b"thread_settings_applied" | b"task_started"
++            ))
++        }
++        _ => Some(false),
++    }
++}
++
++pub(super) fn read_lines(
++    mut reader: impl BufRead,
++    owner_thread_id: &str,
++) -> Result<ParsedFile, super::Error> {
++    let mut line = Vec::new();
++    let mut parsed = ParsedFile::default();
++    let mut previous: Option<(Tokens, Option<Tokens>)> = None;
++    let mut pending_record = None;
++    let mut model = None;
++    let mut next_task_model = None;
++    loop {
++        line.clear();
++        if reader.read_until(b'\n', &mut line)? == 0 {
++            break;
++        }
++        if !line.ends_with(b"\n") {
++            parsed.incomplete += 1;
++            break;
++        }
++        // Most retained bytes are conversation payloads. Their native envelope
++        // can exclude them without decoding and validating that text as UTF-8.
++        let accounting = native_accounting_record(&line);
++        if accounting == Some(false) {
++            continue;
++        }
++        let line = std::str::from_utf8(&line)?;
++        if !accounting.unwrap_or_else(|| {
++            [
++                "token_count",
++                "token_usage_record",
++                "turn_context",
++                "thread_settings_applied",
++                "task_started",
++            ]
++            .iter()
++            .any(|kind| line.contains(kind))
++        }) {
++            continue;
++        }
++        let value: Entry<'_> = match serde_json::from_str(line) {
++            Ok(value) => value,
++            Err(_) => {
++                parsed.malformed += 1;
++                continue;
++            }
++        };
++        let payload = value.payload;
++        match value.kind {
++            "turn_context" => {
++                // A later request cannot associate an earlier standalone record with its quota.
++                pending_record = None;
++                if let Some(recorded) = payload.model.filter(|model| !model.trim().is_empty()) {
++                    model = Some(intern_model(&mut parsed.models, recorded));
++                }
++            }
++            "token_usage_record" => {
++                let (Some(thread_id), Some(response_id), Some(usage), Some((recorded, millis))) = (
++                    payload.thread_id,
++                    payload.response_id,
++                    payload.usage,
++                    value
++                        .timestamp
++                        .and_then(|text| timestamp(text).map(|millis| (text, millis))),
++                ) else {
++                    parsed.malformed += 1;
++                    continue;
++                };
++                let tokens = usage.tokens();
++                if tokens.is_empty() {
++                    continue;
++                }
++                if thread_id.as_ref() != owner_thread_id {
++                    parsed.inherited_events += 1;
++                    pending_record = Some(PendingRecord::Inherited);
++                    continue;
++                }
++                let model_id = model
++                    .unwrap_or_else(|| intern_model(&mut parsed.models, "unknown model".into()));
++                pending_record = Some(PendingRecord::Owned {
++                    index: parsed.events.len(),
++                    timestamp: recorded.to_owned(),
++                });
++                parsed.events.push(Event {
++                    millis,
++                    primary_weekly: false,
++                    model: model_id,
++                    tokens,
++                    response: Some(Box::new((thread_id.into_owned(), response_id.into_owned()))),
++                });
++            }
++            "event_msg" => match payload.kind {
++                Some("task_started") => {
++                    pending_record = None;
++                    model = next_task_model.or(model);
++                }
++                Some("thread_settings_applied") => {
++                    if let Some(settings) = payload.thread_settings {
++                        if payload.thread_id.as_deref() == Some(owner_thread_id)
++                            && let Some(recorded) =
++                                settings.model.filter(|model| !model.trim().is_empty())
++                        {
++                            next_task_model = Some(intern_model(&mut parsed.models, recorded));
++                        }
++                    }
++                }
++                Some("token_count") => {
++                    let Some((recorded, millis)) = value
++                        .timestamp
++                        .and_then(|text| timestamp(text).map(|millis| (text, millis)))
++                    else {
++                        parsed.malformed += 1;
++                        continue;
++                    };
++                    let Some(info) = payload.info else {
++                        continue;
++                    };
++                    let cumulative = info.total_token_usage.map(WireTokens::tokens);
++                    let last = info.last_token_usage.map(WireTokens::tokens);
++                    let advanced = cumulative
++                        .is_none_or(|current| previous.is_none_or(|(total, _)| current != total));
++                    let delta = cumulative.map(|current| {
++                        current.subtract(previous.map(|(total, _)| total).unwrap_or_default())
++                    });
++                    // Official incomplete responses add spending but leave installed last
++                    // usage unchanged. Legacy snapshots otherwise follow ccusage's last-first
++                    // accounting, including skipping context-only last usage after compaction.
++                    let spending_only = match (cumulative, last, previous) {
++                        (Some(current), Some(last), Some((total, previous_last))) => {
++                            current.total > total.total && previous_last == Some(last)
++                        }
++                        (Some(_), Some(last), None) => last.is_empty() && last.total == 0,
++                        _ => false,
++                    };
++                    let tokens = if spending_only {
++                        delta
++                    } else {
++                        last.filter(|_| advanced).or(delta)
++                    };
++                    if let Some(cumulative) = cumulative {
++                        previous = Some((cumulative, last));
++                    }
++                    if let Some(recorded) = payload.model.filter(|model| !model.trim().is_empty()) {
++                        model = Some(intern_model(&mut parsed.models, recorded));
++                    }
++                    let response_record = pending_record.take();
++                    if matches!(response_record, Some(PendingRecord::Inherited)) {
++                        continue;
++                    }
++                    let weekly = payload
++                        .rate_limits
++                        .as_ref()
++                        .filter(|limits| {
++                            matches!(
++                                limits.plan_type,
++                                Some(PlanType::Pro | PlanType::ProLite | PlanType::ProMax)
++                            )
++                        })
++                        .and_then(|limits| limits.primary.as_ref())
++                        .filter(|window| window.window_minutes == Some(10_080));
++                    let primary_weekly = weekly.is_some();
++                    if let Some(PendingRecord::Owned { index, .. }) = &response_record {
++                        parsed.events[*index].primary_weekly = primary_weekly;
++                    }
++                    if (cumulative.is_some() || last.is_some())
++                        && parsed.first_usage_times.len() < 2
++                    {
++                        parsed.first_usage_times.push(millis);
++                    }
++                    let Some(tokens) = tokens.filter(|tokens| !tokens.is_empty()) else {
++                        // Foreground compaction may retain a response record but only recompute
++                        // context here. Keep that charge without inventing a quota observation.
++                        continue;
++                    };
++                    let (event_index, observed_at) =
++                        if let Some(PendingRecord::Owned { index, timestamp }) = response_record {
++                            // Token counts wait for pending tools, but their quota and balance
++                            // were already observed with this response, possibly hours earlier.
++                            // Keep the observation and its carrying charge at the same boundary
++                            // so the measurement still excludes that response's own usage.
++                            (index, timestamp)
++                        } else {
++                            // Missing model metadata is not proof of a default or reviewer backend.
++                            let index = parsed.events.len();
++                            parsed.events.push(Event {
++                                millis,
++                                primary_weekly,
++                                model: model.unwrap_or_else(|| {
++                                    intern_model(&mut parsed.models, "unknown model".into())
++                                }),
++                                tokens,
++                                response: None,
++                            });
++                            (index, recorded.to_owned())
++                        };
++                    let observed_millis = parsed.events[event_index].millis;
++                    let credit_balance = payload
++                        .rate_limits
++                        .as_ref()
++                        .and_then(|limits| limits.credits.as_ref())
++                        .and_then(|credits| credits.balance.as_deref())
++                        .and_then(|balance| balance.parse::<f64>().ok())
++                        .filter(|balance| balance.is_finite());
++                    let quota_exhausted = payload.rate_limits.as_ref().is_some_and(|limits| {
++                        [limits.primary.as_ref(), limits.secondary.as_ref()]
++                            .into_iter()
++                            .flatten()
++                            .any(|window| window.used_percent == 100.0)
++                    });
++                    // Credit deductions are observable even without a weekly quota window.
++                    // Keep missing balances so the report cannot span an unknown interval.
++                    parsed.credits.push((
++                        event_index,
++                        CreditObservation {
++                            timestamp: observed_at.clone(),
++                            millis: observed_millis,
++                            balance: credit_balance,
++                            quota_exhausted,
++                        },
++                    ));
++                    if let Some(weekly) = weekly
++                        && (0.0..=100.0).contains(&weekly.used_percent)
++                        && let Some(resets_at) = weekly.resets_at
++                    {
++                        parsed.observations.push((
++                            event_index,
++                            Observation {
++                                timestamp: observed_at,
++                                millis: observed_millis,
++                                used_percent: weekly.used_percent,
++                                resets_at,
++                                credit_balance,
++                            },
++                        ));
++                    }
++                }
++                _ => {}
++            },
++            _ => {}
++        }
++    }
++    Ok(parsed)
++}
++
++#[cfg(test)]
++#[path = "wire_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/wire_tests.rs b/codex-rs/app-server/src/usage/wire_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/wire_tests.rs
+@@ -0,0 +1,571 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++
++fn parse_values(values: &[Value]) -> ParsedFile {
++    let text = values
++        .iter()
++        .map(|value| format!("{value}\n"))
++        .collect::<String>();
++    read_lines(std::io::Cursor::new(text), "thread").unwrap()
++}
++
++fn context() -> Value {
++    json!({"type":"turn_context", "payload":{"model":"gpt-5.4", "effort":"high"}})
++}
++fn usage() -> Value {
++    json!({"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":10,
++    "output_tokens":50,"reasoning_output_tokens":30,"total_tokens":150})
++}
++fn snapshot() -> Value {
++    json!({"type":"event_msg","timestamp":"2026-09-29T01:00:00.001Z",
++    "payload":{"type":"token_count","info":{"last_token_usage":usage(),"total_token_usage":usage()}}})
++}
++
++fn response_record(id: &str, usage: Value, at: &str) -> Value {
++    json!({"type":"token_usage_record","timestamp":at,
++        "payload":{"thread_id":"thread","response_id":id,"usage":usage}})
++}
++
++fn reported_usage(input: u64, output: u64) -> Value {
++    json!({"input_tokens":input,"output_tokens":output,"total_tokens":input+output})
++}
++
++fn incomplete_turn(previous_completion: bool, response_records: bool) -> Vec<Value> {
++    let mut values = vec![context()];
++    if previous_completion {
++        if response_records {
++            values.push(response_record(
++                "complete",
++                usage(),
++                "2026-09-29T01:00:00.000Z",
++            ));
++        }
++        values.push(snapshot());
++    }
++    let mut incomplete = snapshot();
++    incomplete["timestamp"] = json!("2026-09-29T01:01:00.001Z");
++    incomplete["payload"]["info"] = json!({
++        "total_token_usage": {
++            "input_tokens": if previous_completion { 120 } else { 20 },
++            "cached_input_tokens": if previous_completion { 20 } else { 0 },
++            "cache_write_input_tokens": if previous_completion { 10 } else { 0 },
++            "output_tokens": if previous_completion { 55 } else { 5 },
++            "total_tokens": if previous_completion { 175 } else { 25 },
++        },
++        "last_token_usage": if previous_completion { usage() } else { reported_usage(0, 0) },
++    });
++    if response_records {
++        values.push(response_record(
++            "incomplete",
++            reported_usage(20, 5),
++            "2026-09-29T01:01:00.000Z",
++        ));
++    }
++    values.extend([incomplete.clone(), incomplete]);
++    values
++}
++
++#[test]
++fn repeated_cumulative_snapshot_does_not_repeat_last_usage() {
++    let parsed = parse_values(&[context(), snapshot(), snapshot()]);
++    assert_eq!(parsed.events.len(), 1);
++    assert_eq!(parsed.events[0].tokens.total, 150);
++}
++
++#[test]
++fn response_record_and_snapshot_are_not_added_together() {
++    let response = response_record("response", usage(), "2026-09-29T01:00:00.000Z");
++    let parsed = parse_values(&[context(), response, snapshot()]);
++    assert_eq!(parsed.events.len(), 1);
++    assert_eq!(parsed.events[0].millis, 1_790_643_600_000);
++    assert!(!parsed.events[0].primary_weekly);
++    assert_eq!(parsed.credits[0].1.millis, 1_790_643_600_000);
++    assert_eq!(parsed.events[0].tokens.total, 150);
++    assert_eq!(
++        parsed.events[0].response.as_deref(),
++        Some(&("thread".to_string(), "response".to_string()))
++    );
++}
++
++#[test]
++fn incomplete_records_keep_reported_spending_when_context_usage_is_stale() {
++    for previous_completion in [false, true] {
++        let parsed = parse_values(&incomplete_turn(previous_completion, true));
++        assert_eq!(parsed.events.len(), if previous_completion { 2 } else { 1 });
++        assert_eq!(parsed.events.last().unwrap().tokens.total, 25);
++        assert_eq!(
++            parsed
++                .events
++                .iter()
++                .map(|event| event.tokens.total)
++                .sum::<u64>(),
++            if previous_completion { 175 } else { 25 },
++        );
++    }
++}
++
++#[test]
++fn cumulative_spending_without_response_id_does_not_repeat_context_usage() {
++    for previous_completion in [false, true] {
++        let parsed = parse_values(&incomplete_turn(previous_completion, false));
++        assert_eq!(parsed.events.len(), if previous_completion { 2 } else { 1 });
++        assert_eq!(parsed.events.last().unwrap().tokens.input, 20);
++        assert_eq!(parsed.events.last().unwrap().tokens.output, 5);
++        assert_eq!(parsed.events.last().unwrap().tokens.total, 25);
++        assert_eq!(parsed.malformed, 0);
++    }
++}
++
++#[test]
++fn initial_snapshot_uses_ccusage_last_or_cumulative_fallback_and_retains_model() {
++    for (last, later_last, increment) in [
++        (
++            Some(json!({"total_tokens":8763})),
++            Some(json!({"total_tokens":8763})),
++            25,
++        ),
++        (None, None, 25),
++        (
++            Some(json!({"total_tokens":8203})),
++            Some(json!({"total_tokens":12872})),
++            0,
++        ),
++    ] {
++        let initial_total = if last.is_none() { 163_701 } else { 0 };
++        let mut initial = snapshot();
++        initial["payload"]["info"] = json!({
++            "total_token_usage": reported_usage(161_874, 1_827),
++            "last_token_usage": last,
++        });
++        let mut later = initial.clone();
++        initial["payload"]["model"] = json!("recorded-model");
++        later["timestamp"] = json!("2026-09-29T01:01:00.001Z");
++        later["payload"]["info"]["total_token_usage"] = reported_usage(161_894, 1_832);
++        later["payload"]["info"]["last_token_usage"] = json!(later_last);
++        let parsed = parse_values(&[initial, later.clone(), later]);
++        assert_eq!(
++            parsed.events.len(),
++            usize::from(initial_total > 0) + usize::from(increment > 0)
++        );
++        assert_eq!(
++            parsed
++                .events
++                .iter()
++                .map(|event| event.tokens.total)
++                .sum::<u64>(),
++            initial_total + increment
++        );
++        if increment > 0 {
++            let latest = parsed.events.last().unwrap();
++            assert_eq!(latest.tokens.input, 20);
++            assert_eq!(latest.tokens.output, 5);
++            assert_eq!(parsed.models[latest.model], "recorded-model");
++        }
++        assert_eq!(parsed.credits.len(), parsed.events.len());
++        assert!(parsed.observations.is_empty());
++        assert_eq!(parsed.malformed, 0);
++    }
++}
++
++#[test]
++fn response_records_are_counted_before_deferred_snapshots() {
++    let record = response_record("waiting", usage(), "2026-09-29T01:00:00.000Z");
++    let text = format!("{}\n{record}\n{{\"type\":\"event_msg\"", context());
++    let parsed = read_lines(std::io::Cursor::new(text), "thread").unwrap();
++    assert_eq!(parsed.events.len(), 1);
++    assert_eq!(parsed.events[0].tokens.total, 150);
++    assert_eq!(parsed.events[0].millis, 1_790_643_600_000);
++    assert_eq!(parsed.incomplete, 1);
++    assert!(parsed.observations.is_empty());
++    assert!(parsed.credits.is_empty());
++}
++
++#[test]
++fn delayed_quota_and_credit_observations_use_response_arrival_when_available() {
++    for recorded_response in [false, true] {
++        let arrived = "2026-09-29T01:00:00.000Z";
++        let delivered = "2026-09-29T09:00:00.000Z";
++        let mut snapshot = snapshot();
++        snapshot["timestamp"] = json!(delivered);
++        snapshot["payload"]["rate_limits"] = json!({
++            "plan_type": "pro",
++            "primary": {"window_minutes":10080,"used_percent":20.0,"resets_at":1800000000},
++            "credits": {"balance":"99.5"}
++        });
++        let mut values = vec![context()];
++        if recorded_response {
++            values.push(response_record("waiting", usage(), arrived));
++        }
++        values.extend([snapshot.clone(), snapshot]);
++        let parsed = parse_values(&values);
++        let observed_at = if recorded_response {
++            arrived
++        } else {
++            delivered
++        };
++        let millis = timestamp(observed_at).unwrap();
++        assert_eq!(parsed.events.len(), 1);
++        assert_eq!(parsed.events[0].millis, millis);
++        assert_eq!(parsed.events[0].tokens.total, 150);
++        assert_eq!(parsed.observations.len(), 1);
++        assert_eq!(parsed.observations[0].1.timestamp, observed_at);
++        assert_eq!(parsed.observations[0].1.millis, millis);
++        assert_eq!(parsed.observations[0].1.resets_at, 1800000000);
++        assert_eq!(parsed.observations[0].1.used_percent, 20.0);
++        assert_eq!(parsed.credits.len(), 1);
++        assert_eq!(parsed.credits[0].1.timestamp, observed_at);
++        assert_eq!(parsed.credits[0].1.millis, millis);
++        assert_eq!(parsed.credits[0].1.balance, Some(99.5));
++    }
++}
++
++#[test]
++fn context_only_compaction_keeps_its_record_without_inventing_a_quota_observation() {
++    let mut recomputed = snapshot();
++    recomputed["timestamp"] = json!("2026-09-29T01:01:00.001Z");
++    recomputed["payload"]["info"]["last_token_usage"] = json!({"total_tokens":100});
++    recomputed["payload"]["rate_limits"] = json!({"plan_type":"pro","primary":{
++        "window_minutes":10080,"used_percent":20.0,"resets_at":1800000000
++    }});
++    let mut next = snapshot();
++    next["timestamp"] = json!("2026-09-29T01:02:00.001Z");
++    next["payload"]["info"] = json!({
++        "total_token_usage": reported_usage(140, 60),
++        "last_token_usage": reported_usage(40, 10),
++    });
++    let parsed = parse_values(&[
++        context(),
++        response_record("complete", usage(), "2026-09-29T01:00:00.000Z"),
++        snapshot(),
++        response_record(
++            "compact",
++            reported_usage(300, 30),
++            "2026-09-29T01:01:00.000Z",
++        ),
++        recomputed,
++        response_record("next", reported_usage(40, 10), "2026-09-29T01:02:00.000Z"),
++        next,
++    ]);
++    assert_eq!(parsed.events.len(), 3);
++    assert_eq!(
++        parsed
++            .events
++            .iter()
++            .map(|event| event.tokens.total)
++            .sum::<u64>(),
++        530
++    );
++    assert_eq!(parsed.events[1].millis, 1_790_643_660_000);
++    assert!(parsed.events[1].primary_weekly);
++    assert_eq!(parsed.credits.len(), 2);
++    assert_eq!(parsed.credits[0].0, 0);
++    assert_eq!(parsed.credits[1].0, 2);
++}
++
++#[test]
++fn unpaired_record_keeps_its_time_and_model_when_the_next_request_starts() {
++    let mut next_context = context();
++    next_context["payload"]["model"] = json!("next-model");
++    let mut next = snapshot();
++    next["timestamp"] = json!("2026-09-29T01:02:00.001Z");
++    let parsed = parse_values(&[
++        context(),
++        response_record("standalone", reported_usage(20, 5), "2026-09-29T01:00:00Z"),
++        next_context,
++        next,
++    ]);
++    assert_eq!(parsed.events.len(), 2);
++    assert_eq!(parsed.events[0].millis, 1_790_643_600_000);
++    assert_eq!(parsed.models[parsed.events[0].model], "gpt-5.4");
++    assert_eq!(parsed.models[parsed.events[1].model], "next-model");
++}
++
++#[test]
++fn canonical_usage_clamps_caches_and_derives_total_without_adding_reasoning() {
++    let tokens =
++        serde_json::from_value::<WireTokens>(json!({"input_tokens":100,"cached_input_tokens":80,
++        "cache_write_input_tokens":90,"output_tokens":30,"reasoning_output_tokens":20,
++        "total_tokens":0}))
++        .unwrap()
++        .tokens();
++    assert_eq!(
++        tokens,
++        Tokens {
++            input: 100,
++            cached: 80,
++            cache_write: 20,
++            output: 30,
++            reasoning: 20,
++            total: 130
++        }
++    );
++}
++
++#[test]
++fn negative_provider_counter_does_not_discard_the_other_token_fields() {
++    let tokens =
++        serde_json::from_value::<WireTokens>(json!({"input_tokens":100,"output_tokens":-12,
++        "total_tokens":88}))
++        .unwrap()
++        .tokens();
++    assert_eq!(
++        tokens,
++        Tokens {
++            input: 100,
++            total: 88,
++            ..Tokens::default()
++        }
++    );
++}
++
++#[test]
++fn unavailable_quota_reset_does_not_discard_valid_usage() {
++    let mut event = snapshot();
++    event["payload"]["rate_limits"] = json!({"plan_type":"pro","primary":{
++        "used_percent":50.0,"window_minutes":10_080,"resets_at":null
++    }});
++    let parsed = parse_values(&[context(), event]);
++    assert_eq!(parsed.events.len(), 1);
++    assert_eq!(parsed.malformed, 0);
++    assert!(parsed.observations.is_empty());
++}
++
++#[test]
++fn quota_observations_keep_numeric_credit_balances_without_changing_usage() {
++    for (balance, expected) in [
++        (json!("62500"), Some(62500.0)),
++        (json!("62500.0000"), Some(62500.0)),
++        (json!("62499.4179675000"), Some(62499.4179675)),
++        (Value::Null, None),
++        (json!("unknown"), None),
++    ] {
++        let mut event = snapshot();
++        event["payload"]["rate_limits"] = json!({
++            "plan_type": "pro",
++            "primary": {"used_percent":100.0,"window_minutes":10080,"resets_at":1800000000},
++            "credits": {"balance":balance}
++        });
++        let parsed = parse_values(&[context(), event]);
++        assert_eq!(parsed.observations[0].1.credit_balance, expected);
++        assert_eq!(parsed.events[0].tokens.total, 150);
++        assert_eq!(parsed.malformed, 0);
++    }
++}
++
++#[test]
++fn weekly_observations_and_spending_require_a_pro_family_primary_weekly_window() {
++    for (plan, primary_minutes, secondary_minutes, expected) in [
++        (Some("pro"), 300, 10_080, None),
++        (Some("pro"), 10_080, 300, Some(30.0)),
++        (Some("pro"), 10_080, 10_080, Some(30.0)),
++        (Some("pro"), 300, 1_440, None),
++        (Some("prolite"), 10_080, 300, Some(30.0)),
++        (Some("promax"), 10_080, 300, Some(30.0)),
++        (Some("plus"), 10_080, 300, None),
++        (Some("unrecognized"), 10_080, 300, None),
++        (None, 10_080, 300, None),
++    ] {
++        for response_recorded in [false, true] {
++            let mut event = snapshot();
++            event["payload"]["rate_limits"] = json!({
++                "primary":{"used_percent":30.0,"window_minutes":primary_minutes,
++                    "resets_at":1_800_000_000},
++                "secondary":{"used_percent":70.0,"window_minutes":secondary_minutes,
++                    "resets_at":1_800_000_100},
++                "credits":{"balance":"99.5"}
++            });
++            if let Some(plan) = plan {
++                event["payload"]["rate_limits"]["plan_type"] = json!(plan);
++            }
++            let mut values = vec![context()];
++            if response_recorded {
++                values.push(response_record("response", usage(), "2026-09-29T01:00:00Z"));
++            }
++            values.push(event);
++            let parsed = parse_values(&values);
++            assert_eq!(parsed.events.len(), 1);
++            assert_eq!(parsed.events[0].tokens.total, 150);
++            assert_eq!(parsed.events[0].primary_weekly, expected.is_some());
++            if let Some(expected) = expected {
++                assert_eq!(parsed.observations.len(), 1);
++                assert_eq!(parsed.observations[0].1.used_percent, expected);
++            } else {
++                assert!(parsed.observations.is_empty());
++            }
++            assert_eq!(parsed.credits.len(), 1);
++            assert_eq!(parsed.credits[0].1.balance, Some(99.5));
++            assert_eq!(parsed.malformed, 0);
++        }
++    }
++}
++
++#[test]
++fn missing_and_review_models_keep_their_recorded_uncertainty() {
++    let parsed = parse_values(&[snapshot()]);
++    assert_eq!(parsed.models, ["unknown model"]);
++    assert_eq!(parsed.events[0].tokens.total, 150);
++    for model in ["codex-auto-review", "custom \"model\""] {
++        let mut value = context();
++        value["payload"]["model"] = json!(model);
++        let parsed = parse_values(&[value, snapshot()]);
++        assert_eq!(parsed.models, [model]);
++        assert_eq!(parsed.events[0].tokens.total, 150);
++    }
++}
++
++#[test]
++fn credit_balances_do_not_require_a_weekly_window_and_preserve_unknown_intervals() {
++    for (balance, expected) in [
++        (json!("62500.0000"), Some(62500.0)),
++        (json!("62499.4179675000"), Some(62499.4179675)),
++        (Value::Null, None),
++        (json!("unknown"), None),
++        (json!("NaN"), None),
++    ] {
++        let mut event = snapshot();
++        event["payload"]["rate_limits"] = json!({"credits": {"balance": balance}});
++        let parsed = parse_values(&[context(), event.clone(), event]);
++        assert!(parsed.observations.is_empty());
++        assert_eq!(parsed.credits.len(), 1);
++        assert_eq!(parsed.credits[0].1.balance, expected);
++        assert!(!parsed.credits[0].1.quota_exhausted);
++        assert_eq!(parsed.credits[0].1.millis, parsed.events[0].millis);
++        assert_eq!(parsed.events[0].tokens.total, 150);
++    }
++}
++
++#[test]
++fn either_subscription_window_keeps_credit_usage_continuous() {
++    for (primary, secondary, exhausted) in [
++        (Some(100.0), None, true),
++        (Some(40.0), Some(100.0), true),
++        (Some(100.0), Some(20.0), true),
++        (None, Some(100.0), true),
++        (Some(40.0), Some(20.0), false),
++        (None, None, false),
++    ] {
++        let mut event = snapshot();
++        event["payload"]["rate_limits"] = json!({
++            "primary": primary.map(|used| json!({"used_percent":used,"window_minutes":300})),
++            "secondary": secondary.map(|used| json!({"used_percent":used,"window_minutes":10080})),
++            "credits": {"balance":"100.0"}
++        });
++        let parsed = parse_values(&[context(), event]);
++        assert_eq!(parsed.events.len(), 1);
++        assert_eq!(parsed.credits[0].1.quota_exhausted, exhausted);
++    }
++}
++
++#[test]
++fn large_unrelated_rollout_payloads_preserve_accounting() {
++    let body = "retained conversation content with quoted \"text\" and a newline\n".repeat(4096);
++    for (case, item) in [
++        (
++            "plain response",
++            json!({"type":"response_item","payload":{"type":"message","role":"assistant",
++                "content":[{"type":"output_text","text":body}]}}),
++        ),
++        (
++            "response with accounting words",
++            json!({"type":"response_item","payload":{"type":"message","role":"assistant",
++                "content":[{"type":"output_text","text":format!("{body} token_usage_record")}]}}),
++        ),
++        (
++            "compacted with accounting words",
++            json!({"type":"compacted","payload":{"message":format!("{body} token_usage_record")}}),
++        ),
++        (
++            "UTF-8 response with accounting words",
++            json!({"type":"response_item","payload":{"type":"message","role":"assistant",
++                "content":[{"type":"output_text","text":format!("{} token_usage_record",
++                    "保留的用户请求和模型回复包含双引号 \"内容\" 以及换行\n".repeat(16_384))}]}}),
++        ),
++    ] {
++        let line = codex_rollout::RolloutLine {
++            timestamp: "2026-09-29T01:00:00.000Z".into(),
++            ordinal: Some(1),
++            item: serde_json::from_value(item).unwrap(),
++        };
++        let line = format!("{}\n", serde_json::to_string(&line).unwrap());
++        let text = format!("{}\n{line}{}\n", context(), snapshot());
++        let parsed = read_lines(std::io::Cursor::new(&text), "thread").unwrap();
++        assert_eq!(parsed.events.len(), 1, "{case}");
++        assert_eq!(parsed.events[0].tokens.total, 150, "{case}");
++        assert_eq!(parsed.malformed, 0, "{case}");
++        assert_eq!(parsed.incomplete, 0, "{case}");
++    }
++}
++
++#[test]
++fn native_rollout_order_preserves_response_records_and_deferred_snapshots() {
++    let mut response = response_record("response", usage(), "2026-09-29T01:00:00.000Z");
++    let payload = &mut response["payload"];
++    payload["thread_id"] = json!("00000000-0000-0000-0000-000000000001");
++    payload["session_id"] = json!("00000000-0000-0000-0000-000000000002");
++    payload["turn_id"] = json!("turn");
++    payload["root_turn_id"] = json!("turn");
++    payload["turn_token_usage"] = usage();
++    payload["thread_token_usage"] = usage();
++    for ordinal in [None, Some(4)] {
++        for prefix in ["", " "] {
++            let mut text = format!("{}\n", context());
++            for value in [response.clone(), snapshot()] {
++                let line = codex_rollout::RolloutLine {
++                    timestamp: value["timestamp"].as_str().unwrap().to_owned(),
++                    ordinal,
++                    item: serde_json::from_value(value).unwrap(),
++                };
++                let line = serde_json::to_string(&line).unwrap();
++                assert_eq!(native_accounting_record(line.as_bytes()), Some(true));
++                text.push_str(&format!("{prefix}{line}\n"));
++            }
++            let parsed = read_lines(
++                std::io::Cursor::new(text),
++                "00000000-0000-0000-0000-000000000001",
++            )
++            .unwrap();
++            assert_eq!(parsed.events.len(), 1);
++            assert_eq!(parsed.events[0].tokens.total, 150);
++            assert_eq!(parsed.events[0].millis, 1_790_643_600_000);
++            assert_eq!(parsed.credits[0].1.millis, 1_790_643_600_000);
++            assert_eq!(parsed.malformed, 0);
++        }
++    }
++}
++
++#[test]
++fn native_accounting_selection_keeps_malformed_records_and_unfinished_tails_visible() {
++    let malformed = concat!(
++        "{\"timestamp\":\"2026-09-29T01:00:00Z\",\"ordinal\":4,",
++        "\"type\":\"token_usage_record\",\"payload\":{\"usage\":\"invalid\"}}\n",
++    );
++    let unfinished = "{\"timestamp\":\"2026-09-29T01:00:00Z\",\"type\":\"token_usage_record\"";
++    for prefix in ["", " "] {
++        let parsed = read_lines(
++            std::io::Cursor::new(format!("{prefix}{malformed}{unfinished}")),
++            "thread",
++        )
++        .unwrap();
++        assert!(parsed.events.is_empty());
++        assert_eq!(parsed.malformed, 1);
++        assert_eq!(parsed.incomplete, 1);
++    }
++}
++
++#[test]
++fn later_turn_context_does_not_attribute_earlier_unidentified_spending() {
++    let response = response_record("compaction", usage(), "2026-09-29T01:00:00.000Z");
++    let mut next_context = context();
++    next_context["payload"]["turn_id"] = json!("later-turn");
++    let mut next_snapshot = snapshot();
++    next_snapshot["timestamp"] = json!("2026-09-29T01:01:00.001Z");
++    next_snapshot["payload"]["info"]["total_token_usage"] = reported_usage(200, 100);
++    let parsed = parse_values(&[response, snapshot(), next_context, next_snapshot]);
++    assert_eq!(parsed.events.len(), 2);
++    assert_eq!(parsed.models[parsed.events[0].model], "unknown model");
++    assert_eq!(parsed.events[0].tokens.total, 150);
++    assert_eq!(parsed.models[parsed.events[1].model], "gpt-5.4");
++    assert_eq!(parsed.events[1].tokens.total, 150);
++}

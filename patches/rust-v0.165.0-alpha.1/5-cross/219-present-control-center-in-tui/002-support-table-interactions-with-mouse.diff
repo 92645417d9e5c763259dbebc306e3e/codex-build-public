@@ -1,0 +1,1403 @@
+support-table-interactions-with-mouse
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: support-table-interactions-with-mouse
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -81,7 +81,7 @@ pub(crate) struct ComposerRenderOptions<'a> {
+     pub(crate) command_popup_placement: CommandPopupPlacement,
+     pub(crate) footer: Option<&'a TranscriptFooter>,
+     /// Per-frame copy outcome; it never participates in composer height measurement.
+-    pub(crate) copy_feedback: Option<crate::transcript_view::CopyFeedback>,
++    pub(crate) copy_feedback: Option<crate::clipboard_copy::feedback::CopyMessage>,
+ }
+ 
+ impl super::ChatComposer {
+@@ -344,7 +344,7 @@ impl super::ChatComposer {
+ }
+ 
+ pub(super) fn copy_feedback_layout(
+-    feedback: Option<crate::transcript_view::CopyFeedback>,
++    feedback: Option<crate::clipboard_copy::feedback::CopyMessage>,
+     area: Rect,
+     left_width: usize,
+     occupied_right_width: usize,
+diff --git a/codex-rs/tui/src/clipboard_copy.rs b/codex-rs/tui/src/clipboard_copy.rs
+--- a/codex-rs/tui/src/clipboard_copy.rs
++++ b/codex-rs/tui/src/clipboard_copy.rs
+@@ -19,6 +19,7 @@
+ //! so callers must distinguish them from confirmed native clipboard writes.
+ //! Image paste lives in `clipboard_paste`.
+ 
++pub(crate) mod feedback;
+ pub(crate) mod primary;
+ mod tmux;
+ pub(crate) mod worker;
+diff --git a/codex-rs/tui/src/clipboard_copy/feedback.rs b/codex-rs/tui/src/clipboard_copy/feedback.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/clipboard_copy/feedback.rs
+@@ -0,0 +1,139 @@
++//! Transient, right-aligned feedback shared by transcript and control-center copies.
++
++use super::CopyStatus;
++use super::worker::CopyResult;
++use crate::footer_hint::first_fitting_line;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::widgets::Widget;
++use std::time::Duration;
++use std::time::Instant;
++
++#[derive(Default)]
++pub(crate) struct CopyFeedback {
++    message: Option<CopyMessage>,
++}
++
++#[derive(Clone, Copy)]
++pub(crate) struct CopyMessage {
++    pub(crate) result: Result<CopyStatus, ()>,
++    pub(crate) characters: usize,
++    expires_at: Option<Instant>,
++}
++
++impl CopyFeedback {
++    pub(crate) fn show(&mut self, result: &CopyResult, characters: usize) {
++        if result == &Ok(CopyStatus::Busy)
++            && self
++                .message
++                .as_ref()
++                .is_some_and(|message| matches!(message.result, Ok(CopyStatus::Pending(_))))
++        {
++            return;
++        }
++        self.message = Some(CopyMessage {
++            result: result.as_ref().copied().map_err(|_| ()),
++            characters,
++            expires_at: (!matches!(result, Ok(CopyStatus::Pending(_))))
++                .then(|| Instant::now() + Duration::from_secs(5)),
++        });
++    }
++
++    pub(crate) fn finish(&mut self, completion: &(u64, CopyResult)) {
++        if let Some(message) = &self.message
++            && let Ok(CopyStatus::Pending(id)) = message.result
++        {
++            if id == completion.0 {
++                self.show(&completion.1, message.characters);
++            } else if id < completion.0 {
++                // A hidden view can miss its result when another surface starts a copy.
++                self.message = None;
++            }
++        }
++    }
++
++    pub(crate) fn is_visible(&self, now: Instant) -> bool {
++        self.message
++            .as_ref()
++            .is_some_and(|message| message.expires_at.is_none_or(|expiry| expiry > now))
++    }
++
++    pub(crate) fn snapshot(&mut self, now: Instant) -> Option<CopyMessage> {
++        if self
++            .message
++            .as_ref()
++            .is_some_and(|message| message.expires_at.is_some_and(|expiry| expiry <= now))
++        {
++            self.message = None;
++        }
++        self.message
++    }
++
++    pub(crate) fn render(
++        &mut self,
++        area: Rect,
++        buffer: &mut Buffer,
++        now: Instant,
++    ) -> Option<Duration> {
++        let message = self.snapshot(now)?;
++        if area.is_empty() {
++            return None;
++        }
++        let line = message.line(area.width.saturating_sub(1));
++        let width = line.width().min(usize::from(area.width)) as u16;
++        let target = Rect::new(
++            area.right().saturating_sub(width + 1).max(area.x),
++            area.y,
++            width,
++            1,
++        );
++        line.render(target, buffer);
++        message.expiry_delay(now)
++    }
++}
++
++impl CopyMessage {
++    pub(crate) fn expiry_delay(&self, now: Instant) -> Option<Duration> {
++        self.expires_at
++            .map(|expiry| expiry.saturating_duration_since(now))
++    }
++
++    pub(crate) fn line(&self, width: u16) -> Line<'static> {
++        let characters = self.characters;
++        let labels = match self.result {
++            Ok(CopyStatus::Confirmed) => [
++                format!("Copied {characters} chars to host clipboard"),
++                format!("Copied {characters} chars"),
++                "Copied".into(),
++            ],
++            Ok(CopyStatus::Pending(_)) => [
++                format!("Copying {characters} chars…"),
++                "Copying…".into(),
++                "Copying…".into(),
++            ],
++            Ok(CopyStatus::Busy) => [
++                "Copy already in progress".into(),
++                "Copy in progress".into(),
++                "Copy busy".into(),
++            ],
++            Ok(CopyStatus::Unconfirmed) => [
++                "Copy sent to terminal · paste to verify".into(),
++                "Copy sent · verify paste".into(),
++                "Copy unconfirmed".into(),
++            ],
++            Err(()) => [
++                "Copy failed · try again".into(),
++                "Copy failed".into(),
++                "Copy failed".into(),
++            ],
++        };
++        let line = first_fitting_line(labels.map(Line::from), width);
++        if self.result.is_err() {
++            line.red()
++        } else {
++            line.fg(crate::style::accent_color())
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/control_center_table.rs b/codex-rs/tui/src/control_center_table.rs
+--- a/codex-rs/tui/src/control_center_table.rs
++++ b/codex-rs/tui/src/control_center_table.rs
+@@ -1,5 +1,7 @@
+ //! Shared control-center cells, numeric shading, and bounded tables with merged cells.
+ 
++pub(crate) mod interaction;
++
+ use crate::color::blend;
+ use crate::render::highlight::convert_syntect_color;
+ use crate::render::highlight::current_syntax_theme;
+@@ -21,6 +23,8 @@ use ratatui::text::Line;
+ use ratatui::text::Span;
+ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::Widget;
++use std::ops::Range;
++use std::sync::Arc;
+ use unicode_width::UnicodeWidthStr;
+ 
+ // Two interior padding cells and the next border belong to each physical column.
+@@ -96,6 +100,7 @@ impl Palette {
+ 
+ pub(crate) struct Cell {
+     pub(crate) lines: Vec<Line<'static>>,
++    pub(crate) copy_text: Arc<str>,
+     pub(crate) value: Option<f64>,
+     pub(crate) right: bool,
+     pub(crate) rows: usize,
+@@ -115,6 +120,7 @@ impl Cell {
+ 
+     pub(crate) fn lines(lines: Vec<Line<'static>>) -> Self {
+         Self {
++            copy_text: lines.iter().map(ToString::to_string).join("\n").into(),
+             lines,
+             value: None,
+             right: false,
+@@ -131,6 +137,16 @@ impl Cell {
+         }
+     }
+ 
++    pub(crate) fn tokens(value: Option<u64>) -> Self {
++        Self {
++            copy_text: value.map_or_else(|| "--".into(), |value| value.to_string().into()),
++            ..Self::value(
++                value.map(|value| value as f64),
++                value.map_or_else(|| "--".into(), compact_count),
++            )
++        }
++    }
++
+     pub(crate) fn spanning(mut self, rows: usize, columns: usize) -> Self {
+         self.rows = rows;
+         self.columns = columns;
+@@ -321,6 +337,13 @@ pub(crate) struct Table {
+     separator: Style,
+     // Physical row starts and their column edges preserve merged cells at viewport cuts.
+     row_edges: Vec<(usize, Vec<usize>)>,
++    cells: Vec<CellRegion>,
++}
++
++struct CellRegion {
++    columns: Range<usize>,
++    rows: Range<usize>,
++    text: Arc<str>,
+ }
+ 
+ impl Table {
+@@ -357,23 +380,36 @@ impl Renderable for Table {
+     }
+ 
+     fn render(&self, area: Rect, buf: &mut Buffer) {
+-        self.render_scrolled(area, buf, 0);
+-    }
+-
+-    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
+-        self.render_viewport(area, buf, scroll_offset, 0)
++        self.render_scrolled(area, buf, 0, 0);
+     }
+-}
+ 
+-impl Table {
+-    pub(crate) fn render_viewport(
++    fn render_scrolled(
+         &self,
+         area: Rect,
+         buf: &mut Buffer,
+         scroll_offset: u16,
+         horizontal_offset: u16,
+     ) -> bool {
+-        let offset = usize::from(scroll_offset);
++        self.render_viewport(area, buf, scroll_offset, horizontal_offset)
++    }
++
++    fn copyable_cells(
++        &self,
++        area: Rect,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> Vec<(Rect, Arc<str>)> {
++        self.visible_cells(area, scroll_offset, horizontal_offset)
++    }
++}
++
++impl Table {
++    /// First painted content line of a logical row, including merged-header geometry.
++    pub(crate) fn row_offset(&self, row: usize) -> usize {
++        self.row_edges[row].0 + 1
++    }
++
++    fn viewport_rows(&self, area: Rect, offset: usize) -> Range<usize> {
+         let mut height = usize::from(area.height).min(self.lines.len().saturating_sub(offset));
+         if offset + height < self.lines.len()
+             && height > 2
+@@ -388,9 +424,22 @@ impl Table {
+         }
+         // Borders without an interior row are not a useful table fragment.
+         if height < 3 {
+-            return true;
++            height = 0;
+         }
+-        for (row, line) in self.lines.iter().skip(offset).take(height).enumerate() {
++        offset..offset + height
++    }
++
++    pub(crate) fn render_viewport(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> bool {
++        let offset = usize::from(scroll_offset);
++        let rows = self.viewport_rows(area, offset);
++        let height = rows.len();
++        for (row, line) in self.lines.iter().skip(rows.start).take(height).enumerate() {
+             let cap = if height > 1 && row == 0 && offset > 0 {
+                 Some(self.cap(offset, false))
+             } else if row + 1 == height && offset + height < self.lines.len() {
+@@ -410,6 +459,45 @@ impl Table {
+         }
+         true
+     }
++
++    /// Preserve logical cell text while clipping its clickable interior to the painted frame.
++    pub(crate) fn visible_cells(
++        &self,
++        area: Rect,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> Vec<(Rect, Arc<str>)> {
++        let offset = usize::from(scroll_offset);
++        let rows = self.viewport_rows(area, offset);
++        if rows.is_empty() {
++            return Vec::new();
++        }
++        // A scrolled or clipped viewport paints caps in place of those source rows.
++        let top = rows.start + usize::from(rows.start > 0);
++        let bottom = rows.end - usize::from(rows.end < self.lines.len());
++        let left = usize::from(horizontal_offset);
++        let right = left + usize::from(area.width);
++        self.cells
++            .iter()
++            .filter_map(|cell| {
++                let x = cell.columns.start.max(left);
++                let end_x = cell.columns.end.min(right);
++                let y = cell.rows.start.max(top);
++                let end_y = cell.rows.end.min(bottom);
++                (x < end_x && y < end_y).then(|| {
++                    (
++                        Rect::new(
++                            area.x + (x - left) as u16,
++                            area.y + (y - offset) as u16,
++                            (end_x - x) as u16,
++                            (end_y - y) as u16,
++                        ),
++                        Arc::clone(&cell.text),
++                    )
++                })
++            })
++            .collect()
++    }
+ }
+ 
+ /// Every row supplies only cells that start there; spanned positions are omitted.
+@@ -419,6 +507,7 @@ pub(crate) fn render(widths: &[usize], rows: &[Vec<Cell>], palette: &Palette) ->
+             lines: Vec::new(),
+             separator: palette.separator,
+             row_edges: Vec::new(),
++            cells: Vec::new(),
+         };
+     }
+     let (placed, owners) = place_cells(widths.len(), rows);
+@@ -509,8 +598,16 @@ pub(crate) fn render(widths: &[usize], rows: &[Vec<Cell>], palette: &Palette) ->
+     }
+     let mut columns = vec![0];
+     for width in widths {
+-        columns.push(columns.last().unwrap() + width + 3);
++        columns.push(columns.last().unwrap() + width + COLUMN_SPACING);
+     }
++    let cells = placed
++        .iter()
++        .map(|entry| CellRegion {
++            columns: columns[entry.column] + 1..columns[entry.column + entry.cell.columns],
++            rows: boundaries[entry.row] + 1..boundaries[entry.row + entry.cell.rows],
++            text: Arc::clone(&entry.cell.copy_text),
++        })
++        .collect();
+     let row_edges = boundaries
+         .into_iter()
+         .take(rows.len())
+@@ -529,6 +626,7 @@ pub(crate) fn render(widths: &[usize], rows: &[Vec<Cell>], palette: &Palette) ->
+         lines,
+         separator,
+         row_edges,
++        cells,
+     }
+ }
+ 
+@@ -746,6 +844,174 @@ pub(crate) mod tests {
+             .collect()
+     }
+ 
++    #[test]
++    fn compact_tokens_copy_exact_integers_and_keep_unknown_distinct_from_zero() {
++        let palette = Palette::current();
++        for (value, displayed, copied) in [
++            (None, "--", "--"),
++            (Some(0), "0", "0"),
++            (Some(999), "999", "999"),
++            (Some(1_234), "1.23K", "1234"),
++            (Some(1_234_567), "1.23M", "1234567"),
++            (Some(1_234_567_890), "1.23B", "1234567890"),
++            (
++                Some(9_007_199_254_740_993),
++                "9007199.25B",
++                "9007199254740993",
++            ),
++        ] {
++            let cell = Cell::tokens(value);
++            assert_eq!(cell.lines[0].to_string(), displayed);
++            let table = render(&[14], &[vec![cell]], &palette);
++            let cells = table.visible_cells(Rect::new(0, 0, 18, 3), 0, 0);
++            assert_eq!(cells.len(), 1);
++            assert_eq!(cells[0].1.as_ref(), copied);
++        }
++    }
++
++    #[test]
++    fn narrow_tables_retain_columns_and_full_model_names_for_horizontal_access() {
++        let palette = Palette::current();
++        let model = "routed-model-long-rollout-identifier";
++        let rows = [vec![Cell::text(model), Cell::tokens(Some(1_234_567))]];
++        let widths = widths(
++            12,
++            &[
++                Column::new("Requested", 12, 16),
++                Column::new("Tokens", "0.00K".len(), 10),
++            ],
++            &rows,
++        );
++        let table = render(&widths, &rows, &palette);
++        assert!(table.desired_width() > 12);
++        let area = Rect::new(0, 0, 12, 3);
++        let mut buffer = Buffer::empty(area);
++        table.render_viewport(area, &mut buffer, 0, 0);
++        let text = buffer
++            .content
++            .iter()
++            .map(|cell| cell.symbol())
++            .collect::<String>();
++        assert!(text.contains("routed-"));
++        assert!(!text.contains(model));
++        assert_eq!(table.visible_cells(area, 0, 0)[0].1.as_ref(), model);
++        let second_column = (widths[0] + COLUMN_SPACING) as u16;
++        table.render_viewport(area, &mut buffer, 0, second_column);
++        let cells = table.visible_cells(area, 0, second_column);
++        assert_eq!(cells.len(), 1);
++        assert_eq!(cells[0].1.as_ref(), "1234567");
++    }
++
++    #[test]
++    fn column_maxima_truncate_display_but_preserve_complete_copy_values() {
++        let model = "routed-model-long-rollout-identifier";
++        let rows = [vec![Cell::text(model), Cell::tokens(Some(u64::MAX))]];
++        let columns = [
++            Column::new("Model", 12, 30),
++            Column::new("Tokens", "0.00K".len(), 10),
++        ];
++        assert_eq!(widths(1, &columns, &rows), [13, 6]);
++        let widths = widths(u16::MAX, &columns, &rows);
++        assert_eq!(widths, [31, 10]);
++        let table = render(&widths, &rows, &Palette::current());
++        assert_eq!(table.desired_width(), 48);
++        assert_eq!(table.lines[1].to_string().matches('…').count(), 2);
++        let cells = table.visible_cells(Rect::new(0, 0, 48, 3), 0, 0);
++        assert_eq!(cells[0].1.as_ref(), model);
++        assert_eq!(cells[1].1.as_ref(), u64::MAX.to_string());
++    }
++
++    #[test]
++    fn every_painted_cell_copies_full_text_with_merged_headers_padding_and_viewport_caps() {
++        let palette = Palette::current();
++        let rows = vec![
++            vec![palette.header("Group").spanning(1, 2)],
++            vec![palette.header("Model"), palette.header("Value")],
++            vec![
++                Cell::text("model").spanning(2, 1),
++                Cell::lines(vec!["first".yellow().into(), "second".yellow().into()]),
++            ],
++            vec![Cell::number("100")],
++            vec![Cell::text("last"), Cell::number("123456789")],
++        ];
++        let table = render(&[5, 7], &rows, &palette);
++        let source_cells = [
++            (Rect::new(1, 1, 17, 1), "Group"),
++            (Rect::new(1, 3, 7, 1), "Model"),
++            (Rect::new(9, 3, 9, 1), "Value"),
++            (Rect::new(1, 5, 7, 4), "model"),
++            (Rect::new(9, 5, 9, 2), "first\nsecond"),
++            (Rect::new(9, 8, 9, 1), "100"),
++            (Rect::new(1, 10, 7, 1), "last"),
++            (Rect::new(9, 10, 9, 1), "123456789"),
++        ];
++        for width in [0, 1, 7, 19, 24] {
++            for height in [0, 1, 2, 3, 4, 6, 9, 12, 14] {
++                for top in [0, 1, 2, 5, 7, 10, 12] {
++                    for left in [0, 1, 8, 17, 23] {
++                        let area = Rect::new(3, 2, width, height);
++                        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 18));
++                        for cell in &mut buffer.content {
++                            cell.set_symbol(".");
++                        }
++                        table.render_viewport(area, &mut buffer, top, left);
++                        let cells = table.visible_cells(area, top, left);
++                        for y in 0..18 {
++                            for x in 0..30 {
++                                let symbol = buffer[(x, y)].symbol();
++                                let expected = if area.contains((x, y).into())
++                                    && !matches!(
++                                        symbol,
++                                        "." | "─"
++                                            | "│"
++                                            | "┌"
++                                            | "┐"
++                                            | "└"
++                                            | "┘"
++                                            | "┬"
++                                            | "┴"
++                                            | "├"
++                                            | "┤"
++                                            | "┼"
++                                    ) {
++                                    let source = (x - area.x + left, y - area.y + top).into();
++                                    source_cells.iter().find_map(|(rect, text)| {
++                                        rect.contains(source).then_some(*text)
++                                    })
++                                } else {
++                                    None
++                                };
++                                let actual = cells.iter().find_map(|(rect, text)| {
++                                    rect.contains((x, y).into()).then_some(text.as_ref())
++                                });
++                                assert_eq!(
++                                    actual, expected,
++                                    "viewport {area:?}, offset ({left}, {top}), at ({x}, {y})"
++                                );
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn copying_preserves_text_before_alignment_padding_and_ellipsis() {
++        let palette = Palette::current();
++        let mut rows = vec![vec![Cell::text("one")], vec![Cell::text("a longer value")]];
++        center_left_column(&mut rows, 0, 7);
++        let table = render(&[7], &rows, &palette);
++        let cells = table.visible_cells(Rect::new(0, 0, 11, 5), 0, 0);
++        assert_eq!(
++            cells
++                .iter()
++                .map(|(_, text)| text.as_ref())
++                .collect::<Vec<_>>(),
++            ["one", "a longer value"]
++        );
++    }
++
+     #[test]
+     fn horizontal_viewport_preserves_merged_borders_values_and_styles() {
+         let palette = Palette::current();
+@@ -801,7 +1067,7 @@ pub(crate) mod tests {
+             for cell in &mut buffer.content {
+                 cell.set_symbol("~");
+             }
+-            assert!(table.render_scrolled(area, &mut buffer, offset));
++            assert!(table.render_scrolled(area, &mut buffer, offset, 0));
+             let line = |row| {
+                 (area.x..area.right())
+                     .map(|x| buffer[(x, row)].symbol())
+@@ -825,7 +1091,7 @@ pub(crate) mod tests {
+         for height in 0..=2 {
+             let area = Rect::new(4, 3, 19, height);
+             let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
+-            table.render_scrolled(area, &mut buffer, 5);
++            table.render_scrolled(area, &mut buffer, 5, 0);
+             assert!(buffer.content.iter().all(|cell| cell.symbol() == " "));
+         }
+     }
+@@ -854,7 +1120,7 @@ pub(crate) mod tests {
+             for height in 0..=full_height + 1 {
+                 let area = Rect::new(4, 3, 19, height);
+                 let mut buffer = Buffer::empty(Rect::new(0, 0, 30, full_height + 5));
+-                table.render_scrolled(area, &mut buffer, offset);
++                table.render_scrolled(area, &mut buffer, offset, 0);
+                 let visible = (area.y..area.bottom())
+                     .filter(|y| buffer[(area.x, *y)].symbol() != " ")
+                     .collect::<Vec<_>>();
+diff --git a/codex-rs/tui/src/control_center_table/interaction.rs b/codex-rs/tui/src/control_center_table/interaction.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/control_center_table/interaction.rs
+@@ -0,0 +1,183 @@
++//! Shared table copy and scrolling behavior; page owners retain their plain arrow-key actions.
++
++use crate::clipboard_copy::CopyFormat;
++use crate::clipboard_copy::feedback::CopyFeedback;
++use crate::clipboard_copy::worker::CopyResult;
++use crate::tui::FrameRequester;
++use crate::tui::Tui;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use crossterm::event::MouseButton;
++use crossterm::event::MouseEvent;
++use crossterm::event::MouseEventKind;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::widgets::Clear;
++use ratatui::widgets::Widget;
++use std::sync::Arc;
++use std::time::Instant;
++
++pub(crate) enum TableMouseAction {
++    Copy,
++    Scroll(isize),
++}
++
++pub(crate) struct TableInteraction {
++    pub(crate) cells: Vec<(Rect, Arc<str>)>,
++    pub(crate) column_offset: u16,
++    feedback: CopyFeedback,
++    frames: FrameRequester,
++    speed: f64,
++    pending_scroll: f64,
++}
++
++impl TableInteraction {
++    pub(crate) fn new(speed: f64, frames: FrameRequester) -> Self {
++        Self {
++            cells: Vec::new(),
++            column_offset: 0,
++            feedback: CopyFeedback::default(),
++            frames,
++            speed,
++            pending_scroll: 0.0,
++        }
++    }
++
++    pub(crate) fn horizontal_key(key: KeyEvent) -> bool {
++        key.kind != KeyEventKind::Release
++            && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
++            && matches!(key.code, KeyCode::Left | KeyCode::Right)
++    }
++
++    pub(crate) fn handle_horizontal(&mut self, key: KeyEvent) -> bool {
++        if !Self::horizontal_key(key) {
++            return false;
++        }
++        self.scroll_columns(key.code == KeyCode::Right);
++        true
++    }
++
++    pub(crate) fn scroll_columns(&mut self, right: bool) {
++        self.column_offset = if right {
++            self.column_offset.saturating_add(8)
++        } else {
++            self.column_offset.saturating_sub(8)
++        };
++    }
++
++    pub(crate) fn handle_mouse(
++        &mut self,
++        mouse: MouseEvent,
++        tui: &mut Tui,
++    ) -> Option<TableMouseAction> {
++        let direction = match mouse.kind {
++            MouseEventKind::ScrollUp => -1.0,
++            MouseEventKind::ScrollDown => 1.0,
++            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
++                let (_, text) = self
++                    .cells
++                    .iter()
++                    .find(|(area, _)| area.contains((mouse.column, mouse.row).into()))?;
++                let characters = text.chars().count();
++                let result = tui.clipboard.copy(
++                    Arc::clone(text),
++                    CopyFormat::PlainText,
++                    self.frames.clone(),
++                );
++                self.feedback.show(&result, characters);
++                self.frames.schedule_frame();
++                return Some(TableMouseAction::Copy);
++            }
++            _ => return None,
++        };
++        Some(TableMouseAction::Scroll(self.scroll_rows(direction)))
++    }
++
++    pub(crate) fn scroll_rows(&mut self, direction: f64) -> isize {
++        if self.pending_scroll.signum() != direction {
++            self.pending_scroll = 0.0;
++        }
++        self.pending_scroll += direction * self.speed;
++        // Match native transcript scrolling, including accumulated decimal speeds.
++        let rounded = self.pending_scroll.round();
++        if rounded != 0.0 && (self.pending_scroll - rounded).abs() < 1e-9 {
++            self.pending_scroll = rounded;
++        }
++        let rows = self.pending_scroll as isize;
++        self.pending_scroll = self.pending_scroll.fract();
++        rows
++    }
++
++    pub(crate) fn reset_scroll(&mut self) {
++        self.pending_scroll = 0.0;
++    }
++
++    pub(crate) fn finish_copy(&mut self, completion: &(u64, CopyResult)) {
++        self.feedback.finish(completion);
++    }
++
++    pub(crate) fn render_feedback(&mut self, area: Rect, buffer: &mut Buffer, now: Instant) {
++        if self.feedback.is_visible(now) {
++            Clear.render(area, buffer);
++        }
++        if let Some(delay) = self.feedback.render(area, buffer, now) {
++            self.frames.schedule_frame_in(delay);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn horizontal_keys_leave_plain_arrows_and_key_release_to_the_page() {
++        let mut interaction = TableInteraction::new(1.0, FrameRequester::test_dummy());
++        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
++            assert!(interaction.handle_horizontal(KeyEvent::new(KeyCode::Right, modifiers)));
++            assert_eq!(interaction.column_offset, 8);
++            assert!(interaction.handle_horizontal(KeyEvent::new(KeyCode::Left, modifiers)));
++            assert_eq!(interaction.column_offset, 0);
++            assert!(interaction.handle_horizontal(KeyEvent::new(KeyCode::Left, modifiers)));
++            assert_eq!(interaction.column_offset, 0);
++            assert!(!interaction.handle_horizontal(KeyEvent::new_with_kind(
++                KeyCode::Right,
++                modifiers,
++                KeyEventKind::Release,
++            )));
++        }
++        for modifiers in [
++            KeyModifiers::NONE,
++            KeyModifiers::ALT,
++            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
++        ] {
++            assert!(!interaction.handle_horizontal(KeyEvent::new(KeyCode::Right, modifiers)));
++        }
++        assert_eq!(interaction.column_offset, 0);
++    }
++
++    #[test]
++    fn wheel_accumulates_fractional_rows_and_discards_reversed_or_reset_remainders() {
++        for (speed, steps, rows) in [(0.1, 10, 1), (0.5, 2, 1), (1.5, 2, 3), (3.0, 2, 6)] {
++            let mut mouse = TableInteraction::new(speed, FrameRequester::test_dummy());
++            assert_eq!(
++                (0..steps).map(|_| mouse.scroll_rows(1.0)).sum::<isize>(),
++                rows
++            );
++            assert_eq!(
++                (0..steps).map(|_| mouse.scroll_rows(-1.0)).sum::<isize>(),
++                -rows
++            );
++        }
++        let mut mouse = TableInteraction::new(0.5, FrameRequester::test_dummy());
++        assert_eq!(mouse.scroll_rows(1.0), 0);
++        assert_eq!(mouse.scroll_rows(-1.0), 0);
++        assert_eq!(mouse.scroll_rows(-1.0), -1);
++        assert_eq!(mouse.scroll_rows(1.0), 0);
++        mouse.reset_scroll();
++        assert_eq!(mouse.scroll_rows(1.0), 0);
++        assert_eq!(mouse.scroll_rows(1.0), 1);
++    }
++}
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -210,7 +210,12 @@ impl PagerView {
+             .scroll_offset
+             .min(content_height.saturating_sub(content_area.height as usize));
+ 
+-        self.render_content(content_area, buf);
++        let (drawn_bottom, _) = self.render_content(content_area, buf, 0);
++        for y in drawn_bottom..content_area.bottom() {
++            if content_area.width > 0 {
++                buf[(content_area.x, y)] = Cell::from('~');
++            }
++        }
+ 
+         self.render_bottom_bar(area, content_area, buf, content_height);
+     }
+@@ -223,40 +228,55 @@ impl PagerView {
+         header.dim().render(area, buf);
+     }
+ 
+-    fn render_content(&self, area: Rect, buf: &mut Buffer) {
++    fn render_content(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        horizontal_offset: u16,
++    ) -> (u16, Vec<(Rect, Arc<str>)>) {
+         let mut y = -(self.scroll_offset as isize);
+         let mut drawn_bottom = area.y;
++        let mut cells = Vec::new();
+         for renderable in &self.renderables {
+             let top = y;
+             let height = renderable.desired_height(area.width) as isize;
+             y += height;
+             let bottom = y;
+-            if bottom < area.y as isize {
++            if bottom <= 0 {
+                 continue;
+             }
+-            if top > area.y as isize + area.height as isize {
++            if top >= area.height as isize {
+                 break;
+             }
+             if top < 0 {
+-                let drawn = render_offset_content(area, buf, &**renderable, (-top) as u16);
++                let drawn = render_offset_content(
++                    area,
++                    buf,
++                    &**renderable,
++                    (-top) as u16,
++                    horizontal_offset,
++                );
+                 drawn_bottom = drawn_bottom.max(area.y + drawn);
++                let visible_area = Rect::new(area.x, area.y, area.width, drawn);
++                cells.extend(renderable.copyable_cells(
++                    visible_area,
++                    (-top) as u16,
++                    horizontal_offset,
++                ));
+             } else {
+                 let draw_height = (height as u16).min(area.height.saturating_sub(top as u16));
+                 let draw_area = Rect::new(area.x, area.y + top as u16, area.width, draw_height);
+-                renderable.render(draw_area, buf);
++                if horizontal_offset == 0
++                    || !renderable.render_scrolled(draw_area, buf, 0, horizontal_offset)
++                {
++                    renderable.render(draw_area, buf);
++                }
++                cells.extend(renderable.copyable_cells(draw_area, 0, horizontal_offset));
+                 drawn_bottom = drawn_bottom.max(draw_area.y.saturating_add(draw_area.height));
+             }
+         }
+ 
+-        for y in drawn_bottom..area.bottom() {
+-            if area.width == 0 {
+-                break;
+-            }
+-            buf[(area.x, y)] = Cell::from('~');
+-            for x in area.x + 1..area.right() {
+-                buf[(x, y)] = Cell::from(' ');
+-            }
+-        }
++        (drawn_bottom, cells)
+     }
+ 
+     fn render_bottom_bar(
+@@ -380,8 +400,15 @@ impl Renderable for CachedRenderable {
+         self.renderable.render(area, buf);
+     }
+ 
+-    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
+-        self.renderable.render_scrolled(area, buf, scroll_offset)
++    fn render_scrolled(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> bool {
++        self.renderable
++            .render_scrolled(area, buf, scroll_offset, horizontal_offset)
+     }
+ 
+     fn desired_height(&self, width: u16) -> u16 {
+@@ -528,6 +555,98 @@ mod tests {
+         )
+     }
+ 
++    #[test]
++    fn pager_collects_only_painted_table_cells_and_retains_their_text_until_redraw() {
++        use crate::control_center_table as table;
++        let palette = table::Palette::current();
++        let mut view = pager_view(
++            vec![
++                table::render(
++                    &[5],
++                    &[
++                        vec![table::Cell::text("one")],
++                        vec![table::Cell::text("two")],
++                        vec![table::Cell::text("three")],
++                    ],
++                    &palette,
++                )
++                .into(),
++                Line::from("separator text").into(),
++                table::render(
++                    &[5],
++                    &[
++                        vec![table::Cell::text("four")],
++                        vec![table::Cell::text("five")],
++                    ],
++                    &palette,
++                )
++                .into(),
++            ],
++            "T",
++            4,
++        );
++        let area = Rect::new(4, 3, 12, 7);
++        let mut buffer = Buffer::empty(area);
++        let (_, cells) = view.render_content(area, &mut buffer, 0);
++        assert_eq!(
++            cells
++                .iter()
++                .map(|(rect, text)| (*rect, text.as_ref()))
++                .collect::<Vec<_>>(),
++            [
++                (Rect::new(5, 4, 7, 1), "three"),
++                (Rect::new(5, 8, 7, 1), "four")
++            ]
++        );
++        view.renderables = vec![Line::from("replacement without tables").into()];
++        assert_eq!(cells[0].1.as_ref(), "three");
++        assert_eq!(cells[1].1.as_ref(), "four");
++        view.scroll_offset = 0;
++        assert!(view.render_content(area, &mut buffer, 0).1.is_empty());
++    }
++
++    #[test]
++    fn pager_horizontal_scroll_keeps_table_paint_and_exact_copy_values_aligned() {
++        use crate::control_center_table as table;
++        let palette = table::Palette::current();
++        let mut view = pager_view(
++            vec![
++                table::render(
++                    &[8, 8],
++                    &[
++                        vec![
++                            table::Cell::text("first"),
++                            table::Cell::tokens(Some(1_234_567)),
++                        ],
++                        vec![
++                            table::Cell::text("second"),
++                            table::Cell::tokens(Some(2_345_678)),
++                        ],
++                    ],
++                    &palette,
++                )
++                .into(),
++            ],
++            "T",
++            0,
++        );
++        let area = Rect::new(4, 3, 12, 3);
++        for (offset, displayed, copied) in [(0, "1.23M", "1234567"), (2, "2.35M", "2345678")] {
++            view.scroll_offset = offset;
++            let mut buffer = Buffer::empty(area);
++            let (_, cells) = view.render_content(area, &mut buffer, 11);
++            let text = buffer
++                .content
++                .iter()
++                .map(|cell| cell.symbol())
++                .collect::<String>();
++            assert!(text.contains(displayed));
++            assert_eq!(cells.len(), 1);
++            assert_eq!(cells[0].1.as_ref(), copied);
++            assert_eq!(cells[0].0, Rect::new(5, 4, 10, 1));
++        }
++    }
++
+     #[test]
+     fn footer_hints_display_chords_without_internal_dispatch_keys() {
+         use codex_config::types::KeybindingSpec;
+diff --git a/codex-rs/tui/src/pager_overlay/scrolling.rs b/codex-rs/tui/src/pager_overlay/scrolling.rs
+--- a/codex-rs/tui/src/pager_overlay/scrolling.rs
++++ b/codex-rs/tui/src/pager_overlay/scrolling.rs
+@@ -10,6 +10,7 @@ pub(super) fn render_offset_content(
+     buf: &mut Buffer,
+     renderable: &dyn Renderable,
+     scroll_offset: u16,
++    horizontal_offset: u16,
+ ) -> u16 {
+     let height = renderable.desired_height(area.width);
+     let copy_height = area.height.min(height.saturating_sub(scroll_offset));
+@@ -18,7 +19,7 @@ pub(super) fn render_offset_content(
+     }
+ 
+     let visible_area = Rect::new(area.x, area.y, area.width, copy_height);
+-    if renderable.render_scrolled(visible_area, buf, scroll_offset) {
++    if renderable.render_scrolled(visible_area, buf, scroll_offset, horizontal_offset) {
+         return copy_height;
+     }
+ 
+diff --git a/codex-rs/tui/src/pager_overlay/scrolling_tests.rs b/codex-rs/tui/src/pager_overlay/scrolling_tests.rs
+--- a/codex-rs/tui/src/pager_overlay/scrolling_tests.rs
++++ b/codex-rs/tui/src/pager_overlay/scrolling_tests.rs
+@@ -56,7 +56,7 @@ fn scrolled_static_renderables_match_clipped_buffer_slices() {
+                         }
+                     }
+                     let actual_height =
+-                        render_offset_content(area, &mut actual, &*renderable, offset);
++                        render_offset_content(area, &mut actual, &*renderable, offset, 0);
+                     assert_eq!(
+                         (actual_height, actual),
+                         (expected_height, expected),
+@@ -89,7 +89,8 @@ fn fallback_handles_offsets_near_maximum_height() {
+     let mut actual = Buffer::empty(area);
+     let mut expected = Buffer::empty(area);
+     expected[(area.x, area.y)].set_symbol("x");
+-    let height = render_offset_content(area, &mut actual, &MaximumHeightRenderable, u16::MAX - 1);
++    let height =
++        render_offset_content(area, &mut actual, &MaximumHeightRenderable, u16::MAX - 1, 0);
+ 
+     assert_eq!((height, actual), (1, expected));
+ }
+diff --git a/codex-rs/tui/src/render/renderable.rs b/codex-rs/tui/src/render/renderable.rs
+--- a/codex-rs/tui/src/render/renderable.rs
++++ b/codex-rs/tui/src/render/renderable.rs
+@@ -20,13 +20,28 @@ pub trait Renderable {
+     fn desired_width(&self) -> u16 {
+         0
+     }
+-    /// Renders visible rows after `scroll_offset` when direct scrolling is supported.
++    /// Renders a viewport at the supplied row and column offsets when direct scrolling is supported.
+     ///
+     /// Implementations returning `false` must leave `buf` unchanged so callers can use their
+     /// existing full-height rendering fallback. Supporting wrappers must forward this method.
+-    fn render_scrolled(&self, _area: Rect, _buf: &mut Buffer, _scroll_offset: u16) -> bool {
++    fn render_scrolled(
++        &self,
++        _area: Rect,
++        _buf: &mut Buffer,
++        _scroll_offset: u16,
++        _horizontal_offset: u16,
++    ) -> bool {
+         false
+     }
++    /// Return cell interiors painted in this viewport and their full clipboard text.
++    fn copyable_cells(
++        &self,
++        _area: Rect,
++        _scroll_offset: u16,
++        _horizontal_offset: u16,
++    ) -> Vec<(Rect, Arc<str>)> {
++        Vec::new()
++    }
+     fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
+         None
+     }
+@@ -55,10 +70,20 @@ impl<'a> Renderable for RenderableItem<'a> {
+         }
+     }
+ 
+-    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
++    fn render_scrolled(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> bool {
+         match self {
+-            RenderableItem::Owned(child) => child.render_scrolled(area, buf, scroll_offset),
+-            RenderableItem::Borrowed(child) => child.render_scrolled(area, buf, scroll_offset),
++            RenderableItem::Owned(child) => {
++                child.render_scrolled(area, buf, scroll_offset, horizontal_offset)
++            }
++            RenderableItem::Borrowed(child) => {
++                child.render_scrolled(area, buf, scroll_offset, horizontal_offset)
++            }
+         }
+     }
+ 
+@@ -427,7 +452,13 @@ impl<'a> Renderable for InsetRenderable<'a> {
+     }
+ 
+     /// Preserve clipped inset padding while forwarding only visible child rows.
+-    fn render_scrolled(&self, area: Rect, buf: &mut Buffer, scroll_offset: u16) -> bool {
++    fn render_scrolled(
++        &self,
++        area: Rect,
++        buf: &mut Buffer,
++        scroll_offset: u16,
++        horizontal_offset: u16,
++    ) -> bool {
+         let top_padding = self.insets.top.saturating_sub(scroll_offset);
+         let child_width = area
+             .width
+@@ -457,11 +488,12 @@ impl<'a> Renderable for InsetRenderable<'a> {
+             child_width,
+             child_height,
+         );
+-        if child_offset == 0 {
++        if child_offset == 0 && horizontal_offset == 0 {
+             self.child.render(child_area, buf);
+             true
+         } else {
+-            self.child.render_scrolled(child_area, buf, child_offset)
++            self.child
++                .render_scrolled(child_area, buf, child_offset, horizontal_offset)
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/transcript_view.rs b/codex-rs/tui/src/transcript_view.rs
+--- a/codex-rs/tui/src/transcript_view.rs
++++ b/codex-rs/tui/src/transcript_view.rs
+@@ -46,7 +46,6 @@ use snapshot::ViewSnapshot;
+ use text::TextLayout;
+ 
+ pub(crate) use bookmark::TranscriptBookmark;
+-pub(crate) use composer_gap::CopyFeedback;
+ pub(crate) use input::JumpTarget;
+ pub(crate) use input::ViewAction;
+ pub(crate) use layout::ActivityTranscriptLines;
+@@ -98,7 +97,7 @@ pub(crate) struct TranscriptView {
+     pub(crate) primary_selection: bool,
+     position: Position,
+     follow_control: follow_control::FollowControl,
+-    copy_feedback: Option<composer_gap::CopyFeedback>,
++    copy_feedback: crate::clipboard_copy::feedback::CopyFeedback,
+     composer_tip: Option<(Rect, HyperlinkLine)>,
+     turn_tip_key: Option<EntryKey>,
+     cache: LayoutCache,
+@@ -139,7 +138,7 @@ impl Default for TranscriptView {
+             primary_selection: false,
+             position: Position::Latest,
+             follow_control: follow_control::FollowControl::default(),
+-            copy_feedback: None,
++            copy_feedback: crate::clipboard_copy::feedback::CopyFeedback::default(),
+             composer_tip: None,
+             turn_tip_key: None,
+             cache: LayoutCache::default(),
+diff --git a/codex-rs/tui/src/transcript_view/composer_gap.rs b/codex-rs/tui/src/transcript_view/composer_gap.rs
+--- a/codex-rs/tui/src/transcript_view/composer_gap.rs
++++ b/codex-rs/tui/src/transcript_view/composer_gap.rs
+@@ -1,21 +1,13 @@
+ //! Keep reading controls and linked tips in the composer gap.
+-//! Copy feedback retains its lifecycle here but is presented by the existing footer layout.
++//! Copy feedback uses the shared clipboard lifecycle and the existing footer layout.
+ 
+ use super::*;
+ use crate::clipboard_copy::CopyStatus;
+-use crate::footer_hint::first_fitting_line;
++use crate::clipboard_copy::feedback::CopyMessage;
+ use crate::terminal_hyperlinks::HyperlinkParagraph;
+ use ratatui::style::Style;
+-use std::time::Duration;
+ use std::time::Instant;
+ 
+-#[derive(Clone, Copy)]
+-pub(crate) struct CopyFeedback {
+-    pub(super) result: Result<CopyStatus, ()>,
+-    pub(super) characters: usize,
+-    expires_at: Option<Instant>,
+-}
+-
+ impl TranscriptView {
+     pub(crate) fn composer_gap_has_content(
+         &self,
+@@ -44,31 +36,11 @@ impl TranscriptView {
+         result: &Result<CopyStatus, String>,
+         characters: usize,
+     ) {
+-        if result == &Ok(CopyStatus::Busy)
+-            && self
+-                .copy_feedback
+-                .as_ref()
+-                .is_some_and(|feedback| matches!(feedback.result, Ok(CopyStatus::Pending(_))))
+-        {
+-            return;
+-        }
+-        self.copy_feedback = Some(CopyFeedback {
+-            result: result.as_ref().copied().map_err(|_| ()),
+-            characters,
+-            expires_at: (!matches!(result, Ok(CopyStatus::Pending(_))))
+-                .then(|| Instant::now() + Duration::from_secs(/*secs*/ 5)),
+-        });
++        self.copy_feedback.show(result, characters);
+     }
+ 
+-    pub(crate) fn copy_feedback(&mut self, now: Instant) -> Option<CopyFeedback> {
+-        if self
+-            .copy_feedback
+-            .as_ref()
+-            .is_some_and(|feedback| feedback.expires_at.is_some_and(|expiry| expiry <= now))
+-        {
+-            self.copy_feedback = None;
+-        }
+-        self.copy_feedback
++    pub(crate) fn copy_feedback(&mut self, now: Instant) -> Option<CopyMessage> {
++        self.copy_feedback.snapshot(now)
+     }
+ 
+     pub(crate) fn render_composer_gap(
+@@ -93,50 +65,6 @@ impl TranscriptView {
+     }
+ }
+ 
+-impl CopyFeedback {
+-    pub(crate) fn expiry_delay(&self, now: Instant) -> Option<Duration> {
+-        self.expires_at
+-            .map(|expiry| expiry.saturating_duration_since(now))
+-    }
+-
+-    pub(crate) fn line(&self, width: u16) -> Line<'static> {
+-        let characters = self.characters;
+-        let labels = match self.result {
+-            Ok(CopyStatus::Confirmed) => [
+-                format!("Copied {characters} chars to host clipboard"),
+-                format!("Copied {characters} chars"),
+-                "Copied".into(),
+-            ],
+-            Ok(CopyStatus::Pending(_)) => [
+-                format!("Copying {characters} chars…"),
+-                "Copying…".into(),
+-                "Copying…".into(),
+-            ],
+-            Ok(CopyStatus::Busy) => [
+-                "Copy already in progress".into(),
+-                "Copy in progress".into(),
+-                "Copy busy".into(),
+-            ],
+-            Ok(CopyStatus::Unconfirmed) => [
+-                "Copy sent to terminal · paste to verify".into(),
+-                "Copy sent · verify paste".into(),
+-                "Copy unconfirmed".into(),
+-            ],
+-            Err(()) => [
+-                "Copy failed · try again".into(),
+-                "Copy failed".into(),
+-                "Copy failed".into(),
+-            ],
+-        };
+-        let line = first_fitting_line(labels.map(Line::from), width);
+-        if self.result.is_err() {
+-            line.red()
+-        } else {
+-            line.fg(crate::style::accent_color())
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ #[path = "composer_gap_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/tui/src/transcript_view/composer_gap_tests.rs b/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
+--- a/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
++++ b/codex-rs/tui/src/transcript_view/composer_gap_tests.rs
+@@ -9,8 +9,9 @@ use crossterm::event::MouseButton;
+ use crossterm::event::MouseEvent;
+ use crossterm::event::MouseEventKind;
+ use pretty_assertions::assert_eq;
++use std::time::Duration;
+ 
+-fn render_feedback(feedback: Option<CopyFeedback>, width: u16) -> Buffer {
++fn render_feedback(feedback: Option<CopyMessage>, width: u16) -> Buffer {
+     let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+     let mut composer = crate::bottom_pane::ChatComposer::new(
+         true,
+@@ -83,13 +84,13 @@ fn pending_copy_feedback_survives_expiry_and_selection_replacement() {
+         None
+     );
+     assert_eq!(
+-        view.copy_feedback.as_ref().unwrap().result,
++        view.copy_feedback(Instant::now()).unwrap().result,
+         Ok(CopyStatus::Confirmed)
+     );
+     view.show_copy_feedback(&Ok(CopyStatus::Pending(3)), /*characters*/ 4);
+     view.finish_copy(&cells, &(2, Err("stale".into())), /*current*/ true);
+     assert_eq!(
+-        view.copy_feedback.as_ref().unwrap().result,
++        view.copy_feedback(Instant::now()).unwrap().result,
+         Ok(CopyStatus::Pending(3))
+     );
+     view.finish_copy(
+@@ -97,7 +98,7 @@ fn pending_copy_feedback_survives_expiry_and_selection_replacement() {
+         &(4, Ok(CopyStatus::Confirmed)),
+         /*current*/ true,
+     );
+-    assert!(view.copy_feedback.is_none());
++    assert!(view.copy_feedback(Instant::now()).is_none());
+ }
+ 
+ #[test]
+@@ -166,9 +167,11 @@ fn feedback_and_expiry_preserve_navigation_targets() {
+     view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer);
+     assert_eq!(buffer, before);
+     assert!(!view.is_following());
+-    view.copy_feedback.as_mut().unwrap().expires_at = Some(Instant::now());
+     buffer.reset();
+-    assert!(view.copy_feedback(Instant::now()).is_none());
++    assert!(
++        view.copy_feedback(Instant::now() + Duration::from_secs(10))
++            .is_none()
++    );
+     view.render_composer_gap(Some(area), /*hint*/ None, &mut buffer);
+     assert_eq!(buffer, before);
+     assert!(text(&buffer).contains("Back to bottom"));
+@@ -263,8 +266,10 @@ fn tip_links_follow_alignment_and_release_stale_targets() {
+         view.handle_mouse(click, &[]),
+         Some(ViewAction::OpenLink(_))
+     ));
+-    view.copy_feedback.as_mut().unwrap().expires_at = Some(Instant::now());
+-    assert!(view.copy_feedback(Instant::now()).is_none());
++    assert!(
++        view.copy_feedback(Instant::now() + Duration::from_secs(10))
++            .is_none()
++    );
+     view.render_composer_gap(Some(area), Some(&tip), &mut buffer);
+     assert!(matches!(
+         view.handle_mouse(click, &[]),
+diff --git a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs b/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
+--- a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
++++ b/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
+@@ -7,6 +7,7 @@ use crate::transcript_view::tests::text;
+ use crossterm::event::KeyModifiers;
+ use pretty_assertions::assert_eq;
+ use std::path::Path;
++use std::time::Instant;
+ 
+ fn payload(view: &mut TranscriptView, cells: &[Arc<dyn HistoryCell>]) -> String {
+     let selected = view.selected_text(cells).unwrap();
+@@ -322,7 +323,7 @@ fn copy_completion_keeps_payload_count_and_follow_intent() {
+             |_, _| Ok(result),
+         )
+         .unwrap();
+-        assert_eq!(view.copy_feedback.as_ref().unwrap().characters, 8);
++        assert_eq!(view.copy_feedback(Instant::now()).unwrap().characters, 8);
+         if matches!(result, CopyStatus::Pending(_)) {
+             assert_eq!(
+                 view.finish_copy(
+@@ -346,7 +347,7 @@ fn copy_completion_keeps_payload_count_and_follow_intent() {
+         insta::allow_duplicates! {
+             insta::assert_snapshot!(text(&buffer).trim(), @"Copied 8 chars to host clipboard");
+         }
+-        assert_eq!(view.copy_feedback.as_ref().unwrap().characters, 8);
++        assert_eq!(view.copy_feedback(Instant::now()).unwrap().characters, 8);
+     }
+ }
+ 
+diff --git a/codex-rs/tui/src/transcript_view/copy_on_select_tests.rs b/codex-rs/tui/src/transcript_view/copy_on_select_tests.rs
+--- a/codex-rs/tui/src/transcript_view/copy_on_select_tests.rs
++++ b/codex-rs/tui/src/transcript_view/copy_on_select_tests.rs
+@@ -109,8 +109,7 @@ fn copy_on_select_waits_for_release_and_confirmed_delivery() {
+                         .then_some(copied.as_str())
+                 );
+                 assert_eq!(
+-                    view.copy_feedback
+-                        .as_ref()
++                    view.copy_feedback(Instant::now())
+                         .map(|feedback| (feedback.result, feedback.characters)),
+                     Some((result.map_err(|_| ()), copied.chars().count()))
+                 );
+diff --git a/codex-rs/tui/src/transcript_view/selection.rs b/codex-rs/tui/src/transcript_view/selection.rs
+--- a/codex-rs/tui/src/transcript_view/selection.rs
++++ b/codex-rs/tui/src/transcript_view/selection.rs
+@@ -503,17 +503,7 @@ impl TranscriptView {
+     ) -> Option<bool> {
+         // Feedback also belongs to composer copies and survives selection changes. Complete
+         // its matching ticket even when the selection can no longer consume the result.
+-        if let Some(feedback) = &self.copy_feedback
+-            && let Ok(crate::clipboard_copy::CopyStatus::Pending(id)) = feedback.result
+-        {
+-            if id == completion.0 {
+-                self.show_copy_feedback(&completion.1, feedback.characters);
+-            } else if id < completion.0 {
+-                // A picker can consume this result and start another copy while the view
+-                // is hidden. A newer completion proves the older request is no longer pending.
+-                self.copy_feedback = None;
+-            }
+-        }
++        self.copy_feedback.finish(completion);
+         let selection = self.selection.as_mut()?;
+         if selection.pending_copy.as_ref()?.id != completion.0 {
+             return None;

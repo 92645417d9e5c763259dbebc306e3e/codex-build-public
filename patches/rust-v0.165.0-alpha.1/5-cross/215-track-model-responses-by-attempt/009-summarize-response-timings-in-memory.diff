@@ -1,0 +1,1084 @@
+summarize-response-timings-in-memory
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: summarize-response-timings-in-memory
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -914,6 +914,11 @@ client_request_definitions! {
+         serialization: None,
+         response: v2::ResponseAttemptsReadResponse,
+     },
++    ResponseTimingRead => "modelResponse/timing/read" {
++        params: v2::ResponseTimingReadParams,
++        serialization: None,
++        response: v2::ResponseTimingReadResponse,
++    },
+     ThreadTurnsList => "thread/turns/list" {
+         params: v2::ThreadTurnsListParams,
+         // Explicitly concurrent: this primarily reads append-only rollout storage.
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/model.rs b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/model.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/model.rs
+@@ -246,6 +246,13 @@ pub struct ResponseAttemptsReadResponse {
+     pub last_persistence_error: Option<codex_protocol::response_metrics::ResponsePersistenceError>,
+ }
+ 
++pub use codex_protocol::response_metrics::ResponseTimingReadResponse;
++
++#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ResponseTimingReadParams {}
++
+ /// Browse model response attempts across loaded and unloaded sessions.
+ #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1688,6 +1688,13 @@ impl MessageProcessor {
+                 .response_attempts_read(params)
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::ResponseTimingRead { .. } => Ok(Some(
++                self.thread_processor
++                    .response_history()
++                    .timing_summary()
++                    .await
++                    .into(),
++            )),
+             ClientRequest::ThreadTurnsList { params, .. } => {
+                 self.thread_processor.thread_turns_list(params).await
+             }
+diff --git a/codex-rs/app-server/tests/suite/v2/response_metrics.rs b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+--- a/codex-rs/app-server/tests/suite/v2/response_metrics.rs
++++ b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+@@ -8,6 +8,8 @@ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
+ use codex_app_server_protocol::ResponseAttemptsReadParams;
+ use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_app_server_protocol::ResponseTimingReadParams;
++use codex_app_server_protocol::ResponseTimingReadResponse;
+ use codex_app_server_protocol::ThreadStartParams;
+ use codex_app_server_protocol::ThreadUnsubscribeParams;
+ use codex_app_server_protocol::ThreadUnsubscribeResponse;
+@@ -168,6 +170,33 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+         .await??;
+     }
+     let request_count = server.connections().iter().map(Vec::len).sum::<usize>();
++    let timings: ResponseTimingReadResponse = app
++        .request(|request_id| ClientRequest::ResponseTimingRead {
++            request_id,
++            params: ResponseTimingReadParams::default(),
++        })
++        .await?;
++    assert!(timings.persistence_error.is_none());
++    assert_eq!(timings.models.len(), 1);
++    assert_eq!(
++        (timings.successful_attempts, timings.total_attempts),
++        (2, 2)
++    );
++    let model = &timings.models[0];
++    assert_eq!((model.successful_attempts, model.total_attempts), (2, 2));
++    assert_eq!(model.requested_model, records[0].requested_model);
++    assert_eq!(model.last_tps, records[0].tps);
++    assert_eq!(model.last_ttfc_ms, records[0].ttfc_ms);
++    for summary in [&model.tps, &model.ttfc_ms] {
++        let summary = summary.as_ref().expect("completed generation metric");
++        assert_eq!(summary.sample_count, 2);
++        assert!(summary.p50 >= 0.0);
++        assert!(summary.slow >= 0.0);
++    }
++    let tps = model.tps.as_ref().unwrap();
++    assert!(tps.slow <= tps.p50);
++    let ttfc = model.ttfc_ms.as_ref().unwrap();
++    assert!(ttfc.slow >= ttfc.p50);
+     for _ in 0..2 {
+         let snapshot: ResponseAttemptsReadResponse = app
+             .request(|request_id| ClientRequest::ResponseAttemptsRead {
+@@ -292,6 +321,13 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+     assert_eq!(persisted.data, records);
+     assert!(sqlite_home.path().join("logs_2.sqlite").is_file());
+     assert!(!home.path().join("logs_2.sqlite").exists());
++    let restored_timings: ResponseTimingReadResponse = reopened
++        .request(|request_id| ClientRequest::ResponseTimingRead {
++            request_id,
++            params: ResponseTimingReadParams::default(),
++        })
++        .await?;
++    assert_eq!(restored_timings, timings);
+     assert!(persisted.persistence_error.is_none());
+     assert!(persisted.active_attempt_ids.is_empty());
+     assert_eq!(
+diff --git a/codex-rs/core/src/response_history.rs b/codex-rs/core/src/response_history.rs
+--- a/codex-rs/core/src/response_history.rs
++++ b/codex-rs/core/src/response_history.rs
+@@ -1,6 +1,7 @@
+ //! Retained response observations, independent of transport and live trackers.
+ 
+ mod backup;
++mod timings;
+ 
+ use backup::Backup;
+ use codex_app_server_protocol::ResponseAttemptsReadResponse;
+@@ -8,14 +9,17 @@ use codex_protocol::ThreadId;
+ use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_protocol::response_metrics::ResponseAttemptStatus;
+ use codex_protocol::response_metrics::ResponsePerformance;
++use codex_protocol::response_metrics::ResponseTimingReadResponse;
+ use codex_state::DIAGNOSTIC_RETENTION_SECONDS;
+ use codex_state::ResponseHistoryPage;
+ use codex_state::ResponseHistoryStore;
++use codex_state::ResponseTimingSample;
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::OnceLock;
++use timings::TimingWindow;
+ use tokio::time::Instant;
+ use uuid::Uuid;
+ 
+@@ -34,6 +38,7 @@ struct HistoryState {
+     has_older: bool,
+     models: BTreeMap<String, i64>,
+     last_generations: HashMap<Option<ThreadId>, (i64, ResponsePerformance)>,
++    timings: TimingWindow,
+ }
+ 
+ #[derive(Debug)]
+@@ -66,8 +71,22 @@ impl ResponseHistory {
+         let backup = self.backup();
+         let mut history = self.state.lock().expect("response history lock");
+         history.record_model(record.requested_model.clone(), record.started_at);
+-        if record.end_reason.is_some() && record.request_kind == "generation" {
+-            history.record_generation(record.started_at, ResponsePerformance::from(&record));
++        if record.request_kind == "generation" {
++            if record.end_reason.is_some() {
++                history.record_generation(record.started_at, ResponsePerformance::from(&record));
++            }
++            history.timings.insert(
++                ResponseTimingSample {
++                    attempt_id: record.attempt_id,
++                    revision: record.revision,
++                    requested_model: record.requested_model.clone(),
++                    started_at: record.started_at,
++                    end_reason: record.end_reason,
++                    tps: record.tps,
++                    ttfc_ms: record.ttfc_ms,
++                },
++                chrono::Utc::now().timestamp(),
++            );
+         }
+         let observed_at = (record.end_reason.is_none()
+             && record.terminal_observed_offset_ms.is_none())
+@@ -130,6 +149,17 @@ impl ResponseHistory {
+         page
+     }
+ 
++    /// After the one-time restore, reads and rolling-window expiry use memory only.
++    pub async fn timing_summary(self: &Arc<Self>) -> ResponseTimingReadResponse {
++        let backup = self.backup();
++        let persistence_error = backup.ready().await.err().or_else(|| backup.error());
++        let mut history = self.state.lock().expect("response history lock");
++        let mut summary = history.timings.summary(chrono::Utc::now().timestamp());
++        summary.persistence_error = persistence_error;
++        summary.last_persistence_error = backup.last_error();
++        summary
++    }
++
+     fn recent_page(
+         &self,
+         thread_id: Option<ThreadId>,
+@@ -226,8 +256,12 @@ impl ResponseHistory {
+         page: ResponseHistoryPage,
+         models: Vec<(String, i64)>,
+         last_generations: Vec<(i64, ResponsePerformance)>,
++        timings: Vec<ResponseTimingSample>,
+     ) {
+         let mut history = self.state.lock().expect("response history lock");
++        history
++            .timings
++            .restore(timings, chrono::Utc::now().timestamp());
+         history.has_older |= page.next_cursor.is_some();
+         for (model, started_at) in models {
+             history.record_model(model, started_at);
+diff --git a/codex-rs/core/src/response_history/backup.rs b/codex-rs/core/src/response_history/backup.rs
+--- a/codex-rs/core/src/response_history/backup.rs
++++ b/codex-rs/core/src/response_history/backup.rs
+@@ -2,6 +2,7 @@
+ 
+ use super::RECENT_RESPONSE_LIMIT;
+ use super::ResponseHistory;
++use super::timings::TIMING_WINDOW_SECONDS;
+ use codex_protocol::response_metrics::ResponseAttempt;
+ use codex_protocol::response_metrics::ResponsePersistenceError;
+ use codex_state::ResponseHistoryStore;
+@@ -69,8 +70,11 @@ impl Backup {
+                     .await?;
+                 let models = store.models().await?;
+                 let last_generations = store.last_generations().await?;
++                let timings = store
++                    .timing_samples(chrono::Utc::now().timestamp() - TIMING_WINDOW_SECONDS)
++                    .await?;
+                 if let Some(history) = history.upgrade() {
+-                    history.restore(page, models, last_generations);
++                    history.restore(page, models, last_generations, timings);
+                 }
+                 anyhow::Ok(store)
+             }
+@@ -264,12 +268,14 @@ mod tests {
+         assert!(pending.persistence_error.is_some());
+         assert!(pending.last_persistence_error.is_some());
+         assert_eq!(pending.data.len(), RECENT_RESPONSE_LIMIT);
++        assert!(history.timing_summary().await.persistence_error.is_some());
+         writer.rollback().await.unwrap();
+         history.flush().await.unwrap();
+         assert_eq!(backup.error(), None);
+         let recent = history
+             .page(None, None, None, None, RECENT_RESPONSE_LIMIT)
+             .await;
++        assert_eq!(history.timing_summary().await.persistence_error, None);
+         assert_eq!(recent.persistence_error, None);
+         assert!(recent.last_persistence_error.is_some());
+         let before = recent.next_cursor.unwrap().parse().unwrap();
+@@ -311,6 +317,12 @@ mod tests {
+             (started_at_ms..=chrono::Utc::now().timestamp_millis())
+                 .contains(&occurrence.occurred_at_ms)
+         );
++        let pending_timings = history.timing_summary().await;
++        assert_eq!(pending_timings.persistence_error, Some(error));
++        assert_eq!(
++            pending_timings.last_persistence_error,
++            Some(occurrence.clone())
++        );
+         writer.rollback().await.unwrap();
+         let mut later = unsaved.clone();
+         if unrelated {
+@@ -324,7 +336,10 @@ mod tests {
+         backup.ready().await.unwrap();
+         let page = history.page(None, None, None, None, 10).await;
+         assert_eq!(page.persistence_error, None);
+-        assert_eq!(page.last_persistence_error, Some(occurrence));
++        assert_eq!(page.last_persistence_error, Some(occurrence.clone()));
++        let recovered_timings = history.timing_summary().await;
++        assert_eq!(recovered_timings.persistence_error, None);
++        assert_eq!(recovered_timings.last_persistence_error, Some(occurrence));
+         let saved = runtime
+             .response_history()
+             .page(None, None, None, None, 10)
+diff --git a/codex-rs/core/src/response_history/backup_tests.rs b/codex-rs/core/src/response_history/backup_tests.rs
+--- a/codex-rs/core/src/response_history/backup_tests.rs
++++ b/codex-rs/core/src/response_history/backup_tests.rs
+@@ -4,6 +4,8 @@ use super::*;
+ use codex_api::ResponseObservation;
+ use codex_api::ResponseObserver;
+ use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseModelTiming;
++use codex_protocol::response_metrics::ResponseTimingSummary;
+ use codex_state::SqliteConfig;
+ use codex_utils_absolute_path::test_support::PathExt;
+ use pretty_assertions::assert_eq;
+@@ -39,6 +41,10 @@ async fn live_and_restored_history_exclude_expired_records_before_maintenance()
+             expected[0].attempt_id
+         );
+         assert_eq!(source.notification_snapshot(), expected);
++        let timings = source.timing_summary().await;
++        assert_eq!(timings.persistence_error, None);
++        assert_eq!(timings.models.len(), 1);
++        assert_eq!(timings.models[0].requested_model, "model");
+     }
+ }
+ 
+@@ -160,14 +166,227 @@ async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
+     reopened.flush().await.unwrap();
+ }
+ 
++#[tokio::test]
++async fn rolling_timings_restore_beyond_recent_records_then_update_only_from_live_observations() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, runtime) = recording(home.path()).await;
++    let started_at = chrono::Utc::now().timestamp();
++    for output in 0..=RECENT_RESPONSE_LIMIT {
++        let sent = Instant::now();
++        let attempt = metrics.start(context(), sent, started_at);
++        attempt.sent(sent);
++        attempt.received(
++            ResponseObservation {
++                usage: Some(json!({"output_tokens": output})),
++                terminal: Some(ResponseAttemptEnd::Failed),
++                ..Default::default()
++            },
++            sent + Duration::from_secs(1),
++        );
++    }
++    assert_eq!(history.notification_snapshot().len(), 250);
++    let expected = ResponseTimingReadResponse {
++        models: vec![ResponseModelTiming {
++            requested_model: "model".into(),
++            successful_attempts: 0,
++            total_attempts: 251,
++            last_tps: Some(250.0),
++            last_ttfc_ms: None,
++            tps: Some(ResponseTimingSummary {
++                sample_count: 251,
++                p50: 125.0,
++                slow: 12.5,
++            }),
++            ttfc_ms: None,
++        }],
++        total_attempts: 251,
++        ..Default::default()
++    };
++    assert_eq!(history.timing_summary().await, expected);
++    history.flush().await.unwrap();
++    history.shutdown().await.unwrap();
++    runtime.close().await;
++    let (restored_metrics, reopened, restored_runtime) = recording(home.path()).await;
++    assert_eq!(reopened.timing_summary().await, expected);
++    let mut disk_only = history.notification_snapshot()[0].clone();
++    disk_only.attempt_id = Uuid::now_v7();
++    disk_only.tps = Some(1_000_000.0);
++    restored_runtime
++        .response_history()
++        .write(&disk_only)
++        .await
++        .unwrap();
++    // Refreshes cannot pull a second copy of the database window.
++    assert_eq!(reopened.timing_summary().await, expected);
++    let sent = Instant::now();
++    let attempt = restored_metrics.start(context(), sent, started_at);
++    attempt.sent(sent);
++    attempt.received(
++        ResponseObservation {
++            usage: Some(json!({"output_tokens": 251})),
++            terminal: Some(ResponseAttemptEnd::Failed),
++            ..Default::default()
++        },
++        sent + Duration::from_secs(1),
++    );
++    let updated = reopened.timing_summary().await;
++    assert_eq!(
++        updated.models[0].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 252,
++            p50: 125.5,
++            slow: 12.55,
++        })
++    );
++    assert_eq!(updated.models[0].last_tps, Some(251.0));
++    assert_eq!(
++        (updated.successful_attempts, updated.total_attempts),
++        (0, 252)
++    );
++    reopened.flush().await.unwrap();
++}
++
++#[tokio::test]
++async fn restored_outcomes_count_unfinished_generations_without_counting_probes() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, runtime) = recording(home.path()).await;
++    let now = chrono::Utc::now().timestamp();
++    let attempt = metrics.start(context(), Instant::now(), now);
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let mut unfinished = history.notification_snapshot()[0].clone();
++    unfinished.attempt_id = Uuid::now_v7();
++    unfinished.end_reason = None;
++    history.record(unfinished);
++    let mut other = context();
++    other.requested_model = "other-model".into();
++    let failed = metrics.start(other, Instant::now(), now);
++    failed.ended(ResponseAttemptEnd::Incomplete, Instant::now());
++    let mut probe_context = context();
++    probe_context.request_kind = "probe".into();
++    let probe = metrics.start(probe_context, Instant::now(), now);
++    probe.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let expected = history.timing_summary().await;
++    assert_eq!(
++        (expected.successful_attempts, expected.total_attempts),
++        (1, 3)
++    );
++    assert_eq!(expected.models.len(), 2);
++    assert_eq!(
++        (
++            expected.models[0].successful_attempts,
++            expected.models[0].total_attempts
++        ),
++        (1, 2)
++    );
++    assert_eq!(
++        (
++            expected.models[1].successful_attempts,
++            expected.models[1].total_attempts
++        ),
++        (0, 1)
++    );
++    history.shutdown().await.unwrap();
++    runtime.close().await;
++    let (metrics, reopened, runtime) = recording(home.path()).await;
++    assert_eq!(reopened.timing_summary().await, expected);
++    assert!(
++        reopened
++            .page(None, None, None, None, 100)
++            .await
++            .active_attempt_ids
++            .is_empty()
++    );
++    let ongoing = metrics.start(context(), Instant::now(), now);
++    let working = reopened.timing_summary().await;
++    assert_eq!(
++        (working.successful_attempts, working.total_attempts),
++        (1, 4)
++    );
++    ongoing.ended(ResponseAttemptEnd::Canceled, Instant::now());
++    let canceled = reopened.timing_summary().await;
++    assert_eq!(
++        (canceled.successful_attempts, canceled.total_attempts),
++        (1, 4)
++    );
++    reopened.shutdown().await.unwrap();
++    runtime.close().await;
++}
++
++#[tokio::test]
++async fn model_latest_metrics_restore_outside_the_rolling_window() {
++    let home = tempfile::tempdir().unwrap();
++    let (metrics, history, runtime) = recording(home.path()).await;
++    let now = chrono::Utc::now().timestamp();
++    for (model, started_at, output) in [
++        ("Model-X", now - timings::TIMING_WINDOW_SECONDS - 1, 10),
++        ("model-x", now, 100),
++    ] {
++        let mut context = context();
++        context.requested_model = model.into();
++        let sent = Instant::now();
++        let attempt = metrics.start(context, sent, started_at);
++        attempt.sent(sent);
++        attempt.received(
++            ResponseObservation {
++                has_content: true,
++                usage: Some(json!({"output_tokens": output})),
++                terminal: Some(ResponseAttemptEnd::Completed),
++                ..Default::default()
++            },
++            sent + Duration::from_secs(1),
++        );
++    }
++    let expected = history.timing_summary().await;
++    assert_eq!(expected.models.len(), 2);
++    assert_eq!(expected.models[0].requested_model, "Model-X");
++    assert_eq!(expected.models[0].last_tps, Some(10.0));
++    assert_eq!(expected.models[0].last_ttfc_ms, Some(1000));
++    assert_eq!(expected.models[0].tps, None);
++    assert_eq!(expected.models[0].ttfc_ms, None);
++    assert_eq!(expected.models[1].requested_model, "model-x");
++    assert_eq!(expected.models[1].last_tps, Some(100.0));
++    assert_eq!(
++        expected.models[1].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 1,
++            p50: 100.0,
++            slow: 100.0
++        })
++    );
++    history.flush().await.unwrap();
++    history.shutdown().await.unwrap();
++    runtime.close().await;
++    let (_, reopened, _reopened_runtime) = recording(home.path()).await;
++    assert_eq!(reopened.timing_summary().await, expected);
++}
++
+ #[tokio::test]
+ async fn storage_failure_is_visible_without_losing_live_records() {
+     let home = tempfile::tempdir().unwrap();
+     let (metrics, history, runtime) = recording(home.path()).await;
+     runtime.close().await;
+-    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
+-    attempt.ended(ResponseAttemptEnd::Canceled, Instant::now());
++    let sent = Instant::now();
++    let attempt = metrics.start(context(), sent, chrono::Utc::now().timestamp());
++    attempt.sent(sent);
++    attempt.received(
++        ResponseObservation {
++            has_content: true,
++            ..Default::default()
++        },
++        sent + Duration::from_millis(100),
++    );
++    attempt.ended(ResponseAttemptEnd::Canceled, sent + Duration::from_secs(1));
+     assert!(history.flush().await.is_err());
++    let timings = history.timing_summary().await;
++    assert_eq!(
++        timings.models[0].ttfc_ms,
++        Some(ResponseTimingSummary {
++            sample_count: 1,
++            p50: 100.0,
++            slow: 100.0
++        })
++    );
++    assert!(timings.persistence_error.unwrap().contains("closed"));
+     let page = history.page(None, None, None, None, 100).await;
+     assert_eq!(page.data, history.notification_snapshot());
+     assert!(page.persistence_error.unwrap().contains("closed"));
+diff --git a/codex-rs/core/src/response_history/timing_tests.rs b/codex-rs/core/src/response_history/timing_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history/timing_tests.rs
+@@ -0,0 +1,278 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn sample(started_at: i64, tps: Option<f64>, ttfc_ms: Option<u64>) -> ResponseTimingSample {
++    ResponseTimingSample {
++        attempt_id: Uuid::now_v7(),
++        revision: 1,
++        requested_model: "model".into(),
++        started_at,
++        end_reason: Some(ResponseAttemptEnd::Completed),
++        tps,
++        ttfc_ms,
++    }
++}
++
++#[test]
++fn last_generation_expires_at_the_shared_diagnostic_retention_boundary() {
++    let mut window = TimingWindow::default();
++    let now = 100_000;
++    window.insert(sample(now, Some(20.0), Some(200)), now);
++    let boundary = window.summary(now + DIAGNOSTIC_RETENTION_SECONDS);
++    assert_eq!(boundary.models.len(), 1);
++    assert_eq!(boundary.models[0].last_tps, Some(20.0));
++    assert_eq!(boundary.models[0].last_ttfc_ms, Some(200));
++    assert_eq!(boundary.models[0].tps, None);
++    assert_eq!(boundary.models[0].ttfc_ms, None);
++    assert!(
++        window
++            .summary(now + DIAGNOSTIC_RETENTION_SECONDS + 1)
++            .models
++            .is_empty()
++    );
++}
++
++#[test]
++fn late_arrivals_preserve_unknown_zero_and_time_window_boundaries() {
++    let mut window = TimingWindow::default();
++    let now = 100_000;
++    let since = now - TIMING_WINDOW_SECONDS;
++    assert_eq!(window.summary(now), ResponseTimingReadResponse::default());
++    window.insert(sample(now, Some(20.0), Some(200)), now);
++    window.insert(sample(now - 1, None, Some(0)), now);
++    window.insert(sample(now - 2, None, Some(400)), now);
++    window.insert(sample(since, Some(0.0), None), now);
++    window.insert(sample(since - 1, Some(1_000_000.0), Some(1_000_000)), now);
++    window.insert(sample(now + 1, Some(1_000_000.0), Some(1_000_000)), now);
++    let summary = window.summary(now);
++    assert_eq!(summary.models.len(), 1);
++    assert_eq!(
++        summary.models[0].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 2,
++            p50: 10.0,
++            slow: 1.0
++        })
++    );
++    assert_eq!(
++        summary.models[0].ttfc_ms,
++        Some(ResponseTimingSummary {
++            sample_count: 3,
++            p50: 200.0,
++            slow: 380.0
++        })
++    );
++    // No new response is needed to expire the oldest sample.
++    assert_eq!(
++        window.summary(now + 1).models[0].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 1,
++            p50: 20.0,
++            slow: 20.0,
++        })
++    );
++    let expired = window.summary(now + TIMING_WINDOW_SECONDS + 1);
++    assert_eq!(expired.models[0].tps, None);
++    assert_eq!(expired.models[0].ttfc_ms, None);
++}
++
++#[test]
++fn startup_restore_merges_live_samples_once_and_expires_equal_values_independently() {
++    let mut window = TimingWindow::default();
++    let now = 100_000;
++    let live = sample(now - 1, Some(10.0), Some(100));
++    let live_id = live.attempt_id;
++    window.insert(live, now);
++    window.restore(
++        vec![
++            sample(now, Some(20.0), Some(200)),
++            ResponseTimingSample {
++                attempt_id: live_id,
++                revision: 1,
++                requested_model: "model".into(),
++                started_at: now - 1,
++                end_reason: Some(ResponseAttemptEnd::Completed),
++                tps: Some(10.0),
++                ttfc_ms: Some(100),
++            },
++            sample(now - TIMING_WINDOW_SECONDS, Some(10.0), Some(100)),
++        ],
++        now,
++    );
++    assert_eq!(
++        window.summary(now).models[0].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 3,
++            p50: 10.0,
++            slow: 10.0,
++        })
++    );
++    let summary = window.summary(now + 1);
++    assert_eq!(
++        summary.models[0].tps,
++        Some(ResponseTimingSummary {
++            sample_count: 2,
++            p50: 15.0,
++            slow: 10.5
++        })
++    );
++    assert_eq!(
++        summary.models[0].ttfc_ms,
++        Some(ResponseTimingSummary {
++            sample_count: 2,
++            p50: 150.0,
++            slow: 195.0
++        })
++    );
++}
++
++#[test]
++fn models_keep_separate_distributions_and_latest_metrics_after_window_expiry() {
++    let mut window = TimingWindow::default();
++    let now = 100_000;
++    let mut older = sample(now - 1, Some(10.0), Some(100));
++    older.requested_model = "Model-X".into();
++    let mut outside = sample(now - TIMING_WINDOW_SECONDS - 1, Some(5.0), Some(500));
++    outside.requested_model = "model-x".into();
++    let mut latest = sample(now, Some(30.0), Some(300));
++    latest.requested_model = "Model-X".into();
++    window.insert(latest, now);
++    window.insert(older, now);
++    window.restore(vec![outside], now);
++    assert_eq!(
++        window.summary(now).models,
++        vec![
++            ResponseModelTiming {
++                requested_model: "Model-X".into(),
++                successful_attempts: 2,
++                total_attempts: 2,
++                last_tps: Some(30.0),
++                last_ttfc_ms: Some(300),
++                tps: Some(ResponseTimingSummary {
++                    sample_count: 2,
++                    p50: 20.0,
++                    slow: 11.0
++                }),
++                ttfc_ms: Some(ResponseTimingSummary {
++                    sample_count: 2,
++                    p50: 200.0,
++                    slow: 290.0
++                }),
++            },
++            ResponseModelTiming {
++                requested_model: "model-x".into(),
++                successful_attempts: 0,
++                total_attempts: 0,
++                last_tps: Some(5.0),
++                last_ttfc_ms: Some(500),
++                tps: None,
++                ttfc_ms: None,
++            },
++        ]
++    );
++    let mut unknown = sample(now, None, Some(0));
++    unknown.requested_model = "Model-X".into();
++    window.insert(unknown, now);
++    let expired = window.summary(now + TIMING_WINDOW_SECONDS + 1);
++    assert_eq!(expired.models.len(), 1);
++    assert_eq!(expired.models[0].requested_model, "Model-X");
++    assert_eq!(expired.models[0].last_tps, None);
++    assert_eq!(expired.models[0].last_ttfc_ms, Some(0));
++    assert_eq!(expired.models[0].tps, None);
++    assert_eq!(expired.models[0].ttfc_ms, None);
++}
++
++#[test]
++fn outcome_counts_follow_revisions_and_expire_without_new_requests() {
++    let mut window = TimingWindow::default();
++    let now = 100_000;
++    window.insert(
++        sample(now - TIMING_WINDOW_SECONDS, Some(10.0), Some(100)),
++        now,
++    );
++    let mut incomplete = sample(now, Some(50.0), Some(500));
++    incomplete.requested_model = "other-model".into();
++    incomplete.end_reason = Some(ResponseAttemptEnd::Incomplete);
++    window.insert(incomplete, now);
++    let attempt_id = Uuid::now_v7();
++    let update = |revision, end_reason| ResponseTimingSample {
++        attempt_id,
++        revision,
++        requested_model: "model".into(),
++        started_at: now,
++        end_reason,
++        tps: Some(20.0),
++        ttfc_ms: Some(200),
++    };
++    window.insert(update(1, None), now);
++    window.insert(update(1, None), now);
++    let working = window.summary(now);
++    assert_eq!(
++        (working.successful_attempts, working.total_attempts),
++        (1, 3)
++    );
++    assert_eq!(
++        (
++            working.models[0].successful_attempts,
++            working.models[0].total_attempts
++        ),
++        (1, 2)
++    );
++    assert_eq!(working.models[0].last_tps, Some(10.0));
++    assert_eq!(working.models[0].tps.as_ref().unwrap().sample_count, 1);
++    window.insert(update(3, Some(ResponseAttemptEnd::Completed)), now);
++    let completed = window.summary(now);
++    assert_eq!(
++        (completed.successful_attempts, completed.total_attempts),
++        (2, 3)
++    );
++    assert_eq!(
++        (
++            completed.models[0].successful_attempts,
++            completed.models[0].total_attempts
++        ),
++        (2, 2)
++    );
++    assert_eq!(completed.models[0].last_tps, Some(20.0));
++    assert_eq!(completed.models[0].tps.as_ref().unwrap().sample_count, 2);
++    window.restore(
++        vec![
++            update(2, None),
++            update(3, Some(ResponseAttemptEnd::Completed)),
++        ],
++        now,
++    );
++    window.insert(update(1, None), now);
++    assert_eq!(window.summary(now), completed);
++    let expired_boundary = window.summary(now + 1);
++    assert_eq!(
++        (
++            expired_boundary.successful_attempts,
++            expired_boundary.total_attempts
++        ),
++        (1, 2)
++    );
++    assert_eq!(
++        expired_boundary.models[0]
++            .tps
++            .as_ref()
++            .unwrap()
++            .sample_count,
++        1
++    );
++    let expired_window = window.summary(now + TIMING_WINDOW_SECONDS + 1);
++    assert_eq!(
++        (
++            expired_window.successful_attempts,
++            expired_window.total_attempts
++        ),
++        (0, 0)
++    );
++    assert!(
++        expired_window
++            .models
++            .iter()
++            .all(|model| model.tps.is_none() && model.ttfc_ms.is_none())
++    );
++    assert_eq!(expired_window.models[0].last_tps, Some(20.0));
++}
+diff --git a/codex-rs/core/src/response_history/timings.rs b/codex-rs/core/src/response_history/timings.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/response_history/timings.rs
+@@ -0,0 +1,252 @@
++//! Compact rolling samples and sorted metric values, independent of full-record retention.
++
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use codex_protocol::response_metrics::ResponseModelTiming;
++use codex_protocol::response_metrics::ResponseTimingReadResponse;
++use codex_protocol::response_metrics::ResponseTimingSummary;
++use codex_state::DIAGNOSTIC_RETENTION_SECONDS;
++use codex_state::ResponseTimingSample;
++use std::collections::BTreeMap;
++use std::collections::btree_map::Entry;
++use uuid::Uuid;
++
++pub(super) const TIMING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
++
++#[derive(Debug, Default)]
++pub(super) struct TimingWindow {
++    models: BTreeMap<String, ModelTimings>,
++}
++
++#[derive(Debug, Default)]
++struct ModelTimings {
++    last: Option<ResponseTimingSample>,
++    samples: BTreeMap<(i64, Uuid), WindowSample>,
++    successful_attempts: u64,
++    tps: Distribution,
++    ttfc_ms: Distribution,
++}
++
++/// The map owns identity and start time; only ended attempts contribute timing values.
++#[derive(Debug, Clone, Copy)]
++struct WindowSample {
++    revision: u64,
++    successful: bool,
++    tps: Option<f64>,
++    ttfc_ms: Option<u64>,
++}
++
++impl From<&ResponseTimingSample> for WindowSample {
++    fn from(sample: &ResponseTimingSample) -> Self {
++        Self {
++            revision: sample.revision,
++            successful: sample.end_reason == Some(ResponseAttemptEnd::Completed),
++            tps: sample.end_reason.and(sample.tps),
++            ttfc_ms: sample.end_reason.and(sample.ttfc_ms),
++        }
++    }
++}
++
++impl TimingWindow {
++    pub(super) fn insert(&mut self, sample: ResponseTimingSample, now: i64) {
++        self.models
++            .entry(sample.requested_model.clone())
++            .or_default()
++            .insert(sample, now);
++    }
++
++    pub(super) fn restore(&mut self, samples: Vec<ResponseTimingSample>, now: i64) {
++        for sample in samples {
++            self.models
++                .entry(sample.requested_model.clone())
++                .or_default()
++                .retain(sample, now);
++        }
++        for model in self.models.values_mut() {
++            model
++                .samples
++                .retain(|(started_at, _), _| *started_at >= now - TIMING_WINDOW_SECONDS);
++            model.sort();
++        }
++    }
++
++    pub(super) fn summary(&mut self, now: i64) -> ResponseTimingReadResponse {
++        self.models.retain(|_, model| {
++            model.expire(now);
++            model.last.is_some() || !model.samples.is_empty()
++        });
++        ResponseTimingReadResponse {
++            models: self
++                .models
++                .iter()
++                .map(|(name, model)| ResponseModelTiming {
++                    requested_model: name.clone(),
++                    successful_attempts: model.successful_attempts,
++                    total_attempts: model.samples.len() as u64,
++                    last_tps: model.last.as_ref().and_then(|last| last.tps),
++                    last_ttfc_ms: model.last.as_ref().and_then(|last| last.ttfc_ms),
++                    tps: model.tps.summary(0.05),
++                    ttfc_ms: model.ttfc_ms.summary(0.95),
++                })
++                .collect(),
++            successful_attempts: self
++                .models
++                .values()
++                .map(|model| model.successful_attempts)
++                .sum(),
++            total_attempts: self
++                .models
++                .values()
++                .map(|model| model.samples.len() as u64)
++                .sum(),
++            persistence_error: None,
++            last_persistence_error: None,
++        }
++    }
++}
++
++impl ModelTimings {
++    fn retain(&mut self, sample: ResponseTimingSample, now: i64) {
++        if (now - TIMING_WINDOW_SECONDS..=now).contains(&sample.started_at) {
++            let values = WindowSample::from(&sample);
++            self.samples
++                .entry((sample.started_at, sample.attempt_id))
++                .and_modify(|current| {
++                    if values.revision > current.revision {
++                        *current = values;
++                    }
++                })
++                .or_insert(values);
++        }
++        self.update_last(sample);
++    }
++
++    fn insert(&mut self, sample: ResponseTimingSample, now: i64) {
++        self.expire(now);
++        if (now - TIMING_WINDOW_SECONDS..=now).contains(&sample.started_at) {
++            let values = WindowSample::from(&sample);
++            let previous = match self.samples.entry((sample.started_at, sample.attempt_id)) {
++                Entry::Vacant(entry) => {
++                    entry.insert(values);
++                    None
++                }
++                Entry::Occupied(mut entry) => {
++                    if entry.get().revision >= values.revision {
++                        return;
++                    }
++                    Some(entry.insert(values))
++                }
++            };
++            if let Some(previous) = previous {
++                self.remove_values(previous);
++            }
++            self.successful_attempts += u64::from(values.successful);
++            self.tps.insert(values.tps);
++            self.ttfc_ms.insert(values.ttfc_ms.map(|ms| ms as f64));
++        }
++        self.update_last(sample);
++    }
++
++    fn update_last(&mut self, sample: ResponseTimingSample) {
++        if sample.end_reason.is_some()
++            && self.last.as_ref().is_none_or(|last| {
++                (sample.attempt_id, sample.revision) > (last.attempt_id, last.revision)
++            })
++        {
++            self.last = Some(sample);
++        }
++    }
++
++    fn sort(&mut self) {
++        // Bulk restore sorts once; live arrivals only insert their individual values.
++        self.successful_attempts = self
++            .samples
++            .values()
++            .filter(|sample| sample.successful)
++            .count() as u64;
++        self.tps.values = self
++            .samples
++            .values()
++            .filter_map(|sample| sample.tps)
++            .collect();
++        self.ttfc_ms.values = self
++            .samples
++            .values()
++            .filter_map(|sample| sample.ttfc_ms.map(|ms| ms as f64))
++            .collect();
++        self.tps.values.sort_unstable_by(f64::total_cmp);
++        self.ttfc_ms.values.sort_unstable_by(f64::total_cmp);
++    }
++
++    fn expire(&mut self, now: i64) {
++        if self
++            .last
++            .as_ref()
++            .is_some_and(|last| last.started_at < now - DIAGNOSTIC_RETENTION_SECONDS)
++        {
++            self.last = None;
++        }
++        let since = now - TIMING_WINDOW_SECONDS;
++        while self
++            .samples
++            .first_key_value()
++            .is_some_and(|((started_at, _), _)| *started_at < since)
++        {
++            let (_, sample) = self.samples.pop_first().expect("expired timing sample");
++            self.remove_values(sample);
++        }
++    }
++
++    fn remove_values(&mut self, sample: WindowSample) {
++        self.successful_attempts -= u64::from(sample.successful);
++        self.tps.remove(sample.tps);
++        self.ttfc_ms.remove(sample.ttfc_ms.map(|ms| ms as f64));
++    }
++}
++
++#[derive(Debug, Default)]
++struct Distribution {
++    values: Vec<f64>,
++}
++
++impl Distribution {
++    fn insert(&mut self, value: Option<f64>) {
++        if let Some(value) = value {
++            let index = self
++                .values
++                .binary_search_by(|probe| probe.total_cmp(&value))
++                .unwrap_or_else(|index| index);
++            self.values.insert(index, value);
++        }
++    }
++
++    fn remove(&mut self, value: Option<f64>) {
++        if let Some(value) = value {
++            let index = self
++                .values
++                .binary_search_by(|probe| probe.total_cmp(&value))
++                .expect("retained timing value");
++            self.values.remove(index);
++        }
++    }
++
++    fn summary(&self, slow_fraction: f64) -> Option<ResponseTimingSummary> {
++        if self.values.is_empty() {
++            return None;
++        }
++        let percentile = |fraction: f64| {
++            let position = (self.values.len() - 1) as f64 * fraction;
++            let lower = position.floor() as usize;
++            let upper = position.ceil() as usize;
++            self.values[lower] + (self.values[upper] - self.values[lower]) * position.fract()
++        };
++        Some(ResponseTimingSummary {
++            sample_count: self.values.len() as u64,
++            p50: percentile(0.50),
++            slow: percentile(slow_fraction),
++        })
++    }
++}
++
++#[cfg(test)]
++#[path = "timing_tests.rs"]
++mod tests;
+diff --git a/codex-rs/protocol/src/response_metrics.rs b/codex-rs/protocol/src/response_metrics.rs
+--- a/codex-rs/protocol/src/response_metrics.rs
++++ b/codex-rs/protocol/src/response_metrics.rs
+@@ -225,6 +225,8 @@ pub struct ResponseTimingReadResponse {
+     pub total_attempts: u64,
+     /// Live samples remain available when the historical backup is unavailable.
+     pub persistence_error: Option<String>,
++    /// Latest storage error occurrence, retained after a later write succeeds.
++    pub last_persistence_error: Option<ResponsePersistenceError>,
+ }
+ 
+ impl From<&ResponseAttempt> for ResponsePerformance {

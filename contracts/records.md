@@ -54,3 +54,6 @@ RecordLifecycles
 
 - SourceSelection remains the exact physical source path relative to ProjectScratchRoot. New attempts use only the canonical global role paths; current records describe their selected execution and never authorize path fallback, relocation, or simultaneous release topology.
 - Stage.ElapsedMilliseconds still equals native Observation.DurationMilliseconds. Plan excludes the operational suite budget and complete-call benchmark so calibration changes preserve the comparison policy.
+- Baseline selection and Plan retain nonempty BugfixDiff as exact native patch bytes for their actual shared upstream repair source; omission means no bugfix delta.
+- Plan's optional RequiredTests contains exact package-qualified regression identities that must be selected and pass rather than enter Established non-pass outcomes.
+- Source-bound pending execution remains in the existing Plan, Stage and Result, while Established remains unchanged until Pass.

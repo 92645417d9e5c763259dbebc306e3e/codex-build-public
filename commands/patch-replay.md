@@ -139,7 +139,7 @@ DeclaredPrefixPatchSetOwner
 - For a Flat Patch, use `--start-flat-patch <Lane>/<FlatPatch>`.
 - Initial normalization uses `--start-transform normalization/normalize-terminal-chrome-for-powerline` matching OpenTransform and `--target` matching registered CurrentWorktree.
 - Initial normalization forbids `--source` and every `--end-*` selector.
-- It generates only on the clean official-parent target before GitDiffs, without reading a predecessor worktree or export.
+- It generates on the clean official-parent target plus its complete standalone bugfix prefix, before every other ordinary Lane, without reading a predecessor worktree or export.
 - Exported-prefix Apply forbids `--lane` and every `--end-*`.
 - Retained-worktree Apply selects a Unit, Flat Patch or generated tail with exactly one `--start-*` and an optional matching `--end-*`.
 - The end selector is inclusive and bounds the unchanged source range within the user's Roll scope before the next planned rewrite or selected stop.
@@ -164,7 +164,7 @@ DeclaredPrefixPatchSetOwner
 - Export resolves registered Main, validates its own complete canonical history, and projects that ordered prefix without reading a fork Current terminal or deciding whether future Patches exist.
 - Prefix List and Apply validate `.diff` artifact syntax, modes, Lane order, and structure; a shorter source is never final-release evidence.
 - Exported GitDiff metadata uses the same parser as native commit metadata and must match the artifact's Lane, structure, and Patch identity.
-- Prefix root and lane notes.md files follow PatchExport's format and exact source preimage. Both constrain Roll and review, never Patch rows, sequence, or source to apply. Historical absence remains readable; new exports require both levels.
+- Each prefix's root notes.md follows PatchExport's format and exact source preimage, constraining Roll and review without becoming Patch rows, sequence, or source to apply.
 - Revise selects the terminal Flat Patch or a committed Child Patch in the terminal Unit.
 - Revise measures the complete formatted staged Patch against its parent before amendment; later replayed children use their current parent.
 - Earlier Units and Flat Patches require Fork; children in the terminal Unit do not.
@@ -188,7 +188,7 @@ DeclaredPrefixPatchSetOwner
 - Apply, Revise and Commit restore incomplete work on conflict or interruption, preserving ignored files. Normalization and schema Finalize keep their existing order.
 - Apply and Commit retain file-local `rustfmt` only to normalize each transported Rust Patch commit; this does not replace the repository-level `just fmt` gate owned by RepositoryFormatting.
 - Terminal-chrome Apply instead consumes the public RepositoryFormatting terminal inside each generation before its stable comparison and single commit. The formatter receives the exact admitted endpoint and roots; ordinary GitDiff transport and schema Finalize retain their existing consumers. Apply reserves nested formatter cleanup before restoring a failed generation.
-- Apply, Commit, and Revise consume the rendered-symbol check before closing. Unknown symbols return bounded Conflict and restore exact input.
+- Apply, Commit, and Revise consume the rendered-symbol check after normalization, not on the standalone bugfix prefix. Unknown symbols return bounded Conflict and restore exact input.
 
 ## Generated Tail
 

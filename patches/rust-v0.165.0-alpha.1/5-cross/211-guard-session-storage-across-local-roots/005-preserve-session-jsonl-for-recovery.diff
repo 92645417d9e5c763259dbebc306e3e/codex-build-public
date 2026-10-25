@@ -1,0 +1,1318 @@
+preserve-session-jsonl-for-recovery
+
+Lane: cross
+
+Unit: guard-session-storage-across-local-roots
+
+ChildPatch: preserve-session-jsonl-for-recovery
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -2119,6 +2119,7 @@ server_notification_definitions! {
+     TurnModerationMetadata => "turn/moderationMetadata" (v2::TurnModerationMetadataNotification),
+     ModelSafetyBufferingUpdated => "model/safetyBuffering/updated" (v2::ModelSafetyBufferingUpdatedNotification),
+     Warning => "warning" (v2::WarningNotification),
++    SessionStorageRecovery => "thread/storageRecovery" (v2::SessionStorageRecoveryNotification),
+     ContextManagementNotice => "contextManagement/notice" (v2::ContextManagementNoticeNotification),
+     GuardianWarning => "guardianWarning" (v2::GuardianWarningNotification),
+     DeprecationNotice => "deprecationNotice" (v2::DeprecationNoticeNotification),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+@@ -43,6 +43,47 @@ pub struct WarningNotification {
+     pub message: String,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct SessionStorageRecoveryNotification {
++    pub thread_id: String,
++    pub recovery: codex_protocol::protocol::SessionStorageRecoveryEvent,
++}
++
++#[cfg(test)]
++mod storage_recovery_tests {
++    use super::*;
++    use crate::ServerNotification;
++    use codex_protocol::protocol::SessionStorageRecoveryEvent;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn raw_jsonl_survives_notification_serialization_without_a_second_format() {
++        let jsonl = "{\"timestamp\":\"2026-10-24T00:00:00.000Z\",\"ordinal\":9,\"type\":\"event_msg\",\"payload\":{\"text\":\"a\\nb\"}}\n";
++        let notification =
++            ServerNotification::SessionStorageRecovery(SessionStorageRecoveryNotification {
++                thread_id: "thread".into(),
++                recovery: SessionStorageRecoveryEvent {
++                    original_path: "/home/sessions/original.jsonl".into(),
++                    saved_path: None,
++                    write_errors: vec!["home unavailable".into(), "harness unavailable".into()],
++                    jsonl: jsonl.into(),
++                },
++            });
++        let wire = serde_json::to_value(&notification).unwrap();
++        assert_eq!(wire["method"], "thread/storageRecovery");
++        assert_eq!(wire["params"]["recovery"]["jsonl"], jsonl);
++        let decoded: ServerNotification = serde_json::from_value(wire).unwrap();
++        let ServerNotification::SessionStorageRecovery(decoded) = decoded else {
++            panic!("storage recovery notification");
++        };
++        assert_eq!(decoded.recovery.jsonl, jsonl);
++        assert_eq!(decoded.thread_id, "thread");
++        assert_eq!(decoded.recovery.write_errors.len(), 2);
++    }
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -297,6 +297,16 @@ pub(crate) async fn apply_bespoke_event_handling(
+                 .send_server_notification(ServerNotification::Warning(notification))
+                 .await;
+         }
++        EventMsg::SessionStorageRecovery(recovery) => {
++            outgoing
++                .send_server_notification(ServerNotification::SessionStorageRecovery(
++                    codex_app_server_protocol::SessionStorageRecoveryNotification {
++                        thread_id: conversation_id.to_string(),
++                        recovery,
++                    },
++                ))
++                .await;
++        }
+         EventMsg::GuardianWarning(warning_event) => {
+             let notification = GuardianWarningNotification {
+                 thread_id: conversation_id.to_string(),
+diff --git a/codex-rs/app-server/src/notification_media.rs b/codex-rs/app-server/src/notification_media.rs
+--- a/codex-rs/app-server/src/notification_media.rs
++++ b/codex-rs/app-server/src/notification_media.rs
+@@ -122,6 +122,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
+         | ServerNotification::TurnModerationMetadata(_)
+         | ServerNotification::ModelSafetyBufferingUpdated(_)
+         | ServerNotification::Warning(_)
++        | ServerNotification::SessionStorageRecovery(_)
+         | ServerNotification::ContextManagementNotice(_)
+         | ServerNotification::GuardianWarning(_)
+         | ServerNotification::DeprecationNotice(_)
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -393,6 +393,16 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
+         }
+     }
+ 
++    if let Some(recovery) = sess
++        .live_thread()
++        .and_then(|thread| thread.persistence_recovery())
++    {
++        sess.deliver_event_raw(Event {
++            id: sub_id.clone(),
++            msg: EventMsg::SessionStorageRecovery((*recovery).clone()),
++        })
++        .await;
++    }
+     let event = Event {
+         id: sub_id,
+         msg: EventMsg::ShutdownComplete,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -2756,10 +2756,6 @@ impl Session {
+     }
+ 
+     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+-        if self.rollout_failure().is_some() {
+-            self.deliver_event_raw(event).await;
+-            return;
+-        }
+         let flush_guardian_completion = persist
+             && matches!(event.msg, EventMsg::TurnComplete(_))
+             && self.is_private_guardian_reviewer().await;
+@@ -2818,7 +2814,10 @@ impl Session {
+                     complete.error = Some(error);
+                 }
+                 EventMsg::TurnAborted(aborted) => aborted.error = Some(error),
+-                EventMsg::Error(_) | EventMsg::Warning(_) | EventMsg::ShutdownComplete => {}
++                EventMsg::Error(_)
++                | EventMsg::Warning(_)
++                | EventMsg::SessionStorageRecovery(_)
++                | EventMsg::ShutdownComplete => {}
+                 _ if self.storage_guard.has_active_responses() => {}
+                 _ => return,
+             }
+diff --git a/codex-rs/core/src/session/storage_guard_tests.rs b/codex-rs/core/src/session/storage_guard_tests.rs
+--- a/codex-rs/core/src/session/storage_guard_tests.rs
++++ b/codex-rs/core/src/session/storage_guard_tests.rs
+@@ -147,6 +147,7 @@ async fn storage_failures_finish_the_response_unless_the_user_interrupts() {
+             .await
+             .expect("first response item");
+ 
++            let original_prefix = tokio::fs::read_to_string(&rollout).await.unwrap();
+             if failure == "writer" {
+                 tokio::fs::remove_file(&rollout).await.unwrap();
+                 assert!(session.flush_rollout().await.is_err());
+@@ -217,6 +218,7 @@ async fn storage_failures_finish_the_response_unless_the_user_interrupts() {
+             let mut errors = Vec::new();
+             let mut aborted = Vec::new();
+             let mut saw_after = false;
++            let mut recovery = None;
+             tokio::time::timeout(Duration::from_secs(10), async {
+                 loop {
+                     match events.recv().await.unwrap().msg {
+@@ -227,6 +229,7 @@ async fn storage_failures_finish_the_response_unless_the_user_interrupts() {
+                         }
+                         EventMsg::Error(error) => errors.push(error),
+                         EventMsg::TurnAborted(event) => aborted.push(event),
++                        EventMsg::SessionStorageRecovery(event) => recovery = Some(event),
+                         EventMsg::TurnComplete(_) => {
+                             panic!("failed storage must not complete the turn")
+                         }
+@@ -247,7 +250,32 @@ async fn storage_failures_finish_the_response_unless_the_user_interrupts() {
+             assert_eq!(server.single_connection().len(), 1);
+             if failure == "writer" {
+                 assert!(!rollout.exists());
++                let recovery =
++                    recovery.expect("failed writer retains the completed response and abort");
++                assert_eq!(recovery.original_path, rollout);
++                assert!(recovery.jsonl.contains("turn_aborted"));
++                assert_eq!(recovery.jsonl.contains("after storage failure"), !interrupt);
++                assert_eq!(
++                    tokio::fs::read_to_string(recovery.saved_path.unwrap())
++                        .await
++                        .unwrap(),
++                    recovery.jsonl
++                );
++                let combined = home.path().join("rescued.jsonl");
++                tokio::fs::write(&combined, format!("{original_prefix}{}", recovery.jsonl))
++                    .await
++                    .unwrap();
++                let (_, thread_id, errors) =
++                    codex_rollout::RolloutRecorder::load_rollout_items(&combined)
++                        .await
++                        .unwrap();
++                assert_eq!(thread_id, Some(session.thread_id));
++                assert_eq!(errors, 0);
+             } else if !interrupt {
++                assert!(
++                    recovery.is_none(),
++                    "low capacity alone did not lose any records"
++                );
+                 assert!(
+                     tokio::fs::read_to_string(&rollout)
+                         .await
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2240,6 +2240,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<RealtimeEventTex
+         }
+         EventMsg::Error(_)
+         | EventMsg::Warning(_)
++        | EventMsg::SessionStorageRecovery(_)
+         | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -1474,6 +1474,9 @@ pub enum EventMsg {
+     /// indicates the turn continued but the user should still be notified.
+     Warning(WarningEvent),
+ 
++    /// Complete original-session JSONL retained after its primary writer failed.
++    SessionStorageRecovery(SessionStorageRecoveryEvent),
++
+     /// A context-management note operation completed successfully.
+     ContextManagementNotice(ContextManagementNoticeEvent),
+ 
+@@ -2242,6 +2245,17 @@ pub struct WarningEvent {
+     pub message: String,
+ }
+ 
++/// An appendable fragment of the original session, not a separate session or a new file format.
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++pub struct SessionStorageRecoveryEvent {
++    pub original_path: PathBuf,
++    pub saved_path: Option<PathBuf>,
++    pub write_errors: Vec<String>,
++    /// Canonical JSONL bytes, including original record fields and final newlines.
++    pub jsonl: String,
++}
++
+ /// Prefix for note-operation outcomes that clients keep visible in the conversation.
+ pub const CONTEXT_MANAGEMENT_MESSAGE_PREFIX: &str = "Context management: ";
+ 
+diff --git a/codex-rs/rollout-trace/src/protocol_event.rs b/codex-rs/rollout-trace/src/protocol_event.rs
+--- a/codex-rs/rollout-trace/src/protocol_event.rs
++++ b/codex-rs/rollout-trace/src/protocol_event.rs
+@@ -364,6 +364,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
+         EventMsg::SubAgentActivity(_) => None,
+         EventMsg::Error(_)
+         | EventMsg::Warning(_)
++        | EventMsg::SessionStorageRecovery(_)
+         | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+@@ -450,6 +451,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
+         EventMsg::ShutdownComplete => Some("shutdown_complete"),
+         EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
++        | EventMsg::SessionStorageRecovery(_)
+         | EventMsg::ContextManagementNotice(_)
+         | EventMsg::GuardianWarning(_)
+         | EventMsg::SafetyBuffering(_)
+diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
+--- a/codex-rs/rollout/src/lib.rs
++++ b/codex-rs/rollout/src/lib.rs
+@@ -17,6 +17,7 @@ mod ordinal;
+ mod persistence_metrics;
+ pub(crate) mod policy;
+ pub(crate) mod recorder;
++mod recovery;
+ mod reverse_jsonl_scanner;
+ mod rollout_file_name;
+ mod rollout_reference_index;
+@@ -165,6 +166,7 @@ pub use policy::should_persist_response_item;
+ pub use policy::should_persist_response_item_for_memories;
+ pub use recorder::RolloutRecorder;
+ pub use recorder::RolloutRecorderParams;
++pub use recorder::RolloutWriterStatus;
+ pub use recorder::append_rollout_item_to_path;
+ pub use reverse_jsonl_scanner::ReverseJsonlScanner;
+ pub use reverse_jsonl_scanner::ScanOutcome;
+diff --git a/codex-rs/rollout/src/policy.rs b/codex-rs/rollout/src/policy.rs
+--- a/codex-rs/rollout/src/policy.rs
++++ b/codex-rs/rollout/src/policy.rs
+@@ -171,6 +171,7 @@ fn persisted_event_msg(
+         | EventMsg::DynamicToolCallRequest(_)
+         | EventMsg::DynamicToolCallResponse(_)
+         | EventMsg::Warning(_)
++        | EventMsg::SessionStorageRecovery(_)
+         | EventMsg::ContextManagementNotice(_)
+         | EventMsg::AuthRecoveryStarted(_)
+         | EventMsg::AuthRecoveryCompleted(_)
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -1,6 +1,7 @@
+ //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
+ 
+ use std::collections::HashSet;
++use std::collections::VecDeque;
+ use std::fs;
+ use std::fs::File;
+ use std::io::Error as IoError;
+@@ -71,6 +72,7 @@ use codex_protocol::protocol::SessionContextWindow;
+ use codex_protocol::protocol::SessionMeta;
+ use codex_protocol::protocol::SessionMetaLine;
+ use codex_protocol::protocol::SessionSource;
++use codex_protocol::protocol::SessionStorageRecoveryEvent;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_protocol::protocol::ThreadSource;
+ use codex_state::StateRuntime;
+@@ -148,12 +150,19 @@ enum RolloutCmd {
+     },
+ }
+ 
++/// The primary failure is immediate; the complete rescue payload is published on writer drain.
++#[derive(Clone, Default)]
++pub struct RolloutWriterStatus {
++    pub failure: Option<Arc<IoError>>,
++    pub recovery: Option<Arc<SessionStorageRecoveryEvent>>,
++}
++
+ /// Observable state for the background rollout writer task.
+ struct RolloutWriterTask {
+     // The task, not just its caller, owns the lock until queued file writes finish.
+     _writer_lock: Option<Arc<crate::WriterLockGuard>>,
+     handle: Mutex<Option<JoinHandle<()>>>,
+-    terminal_failure: watch::Sender<Option<Arc<IoError>>>,
++    status: watch::Sender<RolloutWriterStatus>,
+ }
+ 
+ impl RolloutWriterTask {
+@@ -162,7 +171,7 @@ impl RolloutWriterTask {
+         Self {
+             _writer_lock: writer_lock,
+             handle: Mutex::new(None),
+-            terminal_failure: watch::channel(None).0,
++            status: watch::channel(RolloutWriterStatus::default()).0,
+         }
+     }
+ 
+@@ -175,16 +184,22 @@ impl RolloutWriterTask {
+         *guard = Some(handle);
+     }
+ 
+-    /// Remember a terminal task failure for future recorder API calls.
++    /// Close primary-write admission while retaining the first cause for every later barrier.
+     fn mark_failed(&self, err: &IoError) {
+-        self.terminal_failure
+-            .send_replace(Some(Arc::new(clone_io_error(err))));
++        self.status.send_if_modified(|status| {
++            if status.failure.is_some() {
++                return false;
++            }
++            status.failure = Some(Arc::new(clone_io_error(err)));
++            true
++        });
+     }
+ 
+-    /// Return the terminal writer-task failure, if the task exited with an error.
++    /// Return the primary writer failure even while its recovery collector is still running.
+     fn terminal_failure(&self) -> Option<IoError> {
+-        self.terminal_failure
++        self.status
+             .borrow()
++            .failure
+             .as_ref()
+             .map(|err| clone_io_error(err.as_ref()))
+     }
+@@ -999,7 +1014,12 @@ impl RolloutRecorder {
+                 RolloutWriterState {
+                     writer: None,
+                     deferred_creation: true,
+-                    pending_items: Vec::new(),
++                    pending_items: VecDeque::new(),
++                    recovery: None,
++                    recovery_roots: [
++                        config.codex_home().to_path_buf(),
++                        config.codex_harness().to_path_buf(),
++                    ],
+                     meta: Some(session_meta),
+                     cwd: cwd.clone(),
+                     rollout_path: path,
+@@ -1012,7 +1032,12 @@ impl RolloutRecorder {
+                 RolloutWriterState {
+                     writer: Some(JsonlWriter::new(file, path.clone()).await?),
+                     deferred_creation: false,
+-                    pending_items: Vec::new(),
++                    pending_items: VecDeque::new(),
++                    recovery: None,
++                    recovery_roots: [
++                        config.codex_home().to_path_buf(),
++                        config.codex_harness().to_path_buf(),
++                    ],
+                     meta: None,
+                     cwd: cwd.clone(),
+                     rollout_path: path,
+@@ -1056,9 +1081,9 @@ impl RolloutRecorder {
+         self.rollout_path.as_path()
+     }
+ 
+-    /// Observes the first terminal write failure without issuing another filesystem operation.
+-    pub fn failure_receiver(&self) -> watch::Receiver<Option<Arc<IoError>>> {
+-        self.writer_task.terminal_failure.subscribe()
++    /// Observes the primary write failure and the rescue payload retained after shutdown.
++    pub fn status_receiver(&self) -> watch::Receiver<RolloutWriterStatus> {
++        self.writer_task.status.subscribe()
+     }
+ 
+     /// Reads the creation metadata while this writer still defers its rollout file.
+@@ -1090,8 +1115,8 @@ impl RolloutRecorder {
+ 
+     /// Materialize the rollout file and persist all buffered items.
+     ///
+-    /// This is idempotent until a write fails. A failed writer is terminal and never reopens the
+-    /// file, because an interrupted append or an externally changed stream cannot be retried safely.
++    /// This is idempotent until a write fails. Primary writes then remain terminal, while later
++    /// records are collected for recovery. A partial or externally changed file is never reopened.
+     pub async fn persist(&self) -> std::io::Result<()> {
+         let (tx, rx) = oneshot::channel();
+         self.tx
+@@ -1111,7 +1136,7 @@ impl RolloutRecorder {
+ 
+     /// Flush all queued writes and wait until they are committed by the writer task.
+     ///
+-    /// The first write failure stops this writer and is retained for subsequent calls.
++    /// The first write failure stops primary writes; later records are retained for recovery.
+     pub async fn flush(&self) -> std::io::Result<()> {
+         let (tx, rx) = oneshot::channel();
+         self.tx
+@@ -1217,21 +1242,21 @@ impl RolloutRecorder {
+ 
+     /// Drain pending items before stopping the writer task.
+     ///
+-    /// A failed drain stops the writer and returns its original error.
++    /// A failed primary writer drains recovery before returning its original error.
+     pub async fn shutdown(&self) -> std::io::Result<()> {
+         let (tx_done, rx_done) = oneshot::channel();
+-        match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
++        let result = match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
+             Ok(_) => rx_done.await.map_err(|e| {
+                 self.writer_task.terminal_failure().unwrap_or_else(|| {
+                     IoError::other(format!("failed waiting for rollout shutdown: {e}"))
+                 })
+-            })??,
++            })?,
+             Err(e) => {
+                 if let Some(err) = self.writer_task.terminal_failure() {
+                     warn!(
+                         "failed to send rollout shutdown command because writer task failed: {err}"
+                     );
+-                    return Err(err);
++                    return self.wait_for_exit().await.and(Err(err));
+                 }
+                 warn!("failed to send rollout shutdown command: {e}");
+                 return Err(IoError::other(format!(
+@@ -1239,7 +1264,8 @@ impl RolloutRecorder {
+                 )));
+             }
+         };
+-        self.wait_for_exit().await
++        self.wait_for_exit().await?;
++        result
+     }
+ 
+     /// Stops the writer without materializing deferred items, after already-running IO completes.
+@@ -1815,14 +1841,15 @@ fn refresh_rollout_modified_time(file: &File) -> std::io::Result<()> {
+ 
+ /// Mutable state owned by the background rollout writer.
+ ///
+-/// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
+-/// queue only after it is written successfully. The first I/O failure terminates the writer;
+-/// neither a partial append nor a file changed outside writer ownership is retried.
++/// Each item is serialized once before its primary append. A failed complete line and every later
++/// line move to recovery in the same ordinal order; the original file is never reopened or retried.
+ struct RolloutWriterState {
+     writer: Option<JsonlWriter>,
+     /// True until a newly created rollout is first materialized.
+     deferred_creation: bool,
+-    pending_items: Vec<RolloutItem>,
++    pending_items: VecDeque<RolloutItem>,
++    recovery: Option<String>,
++    recovery_roots: [PathBuf; 2],
+     meta: Option<SessionMeta>,
+     cwd: PathBuf,
+     rollout_path: PathBuf,
+@@ -1860,7 +1887,7 @@ impl RolloutWriterState {
+     }
+ 
+     fn is_deferred(&self) -> bool {
+-        self.writer.is_none() && self.deferred_creation
++        self.writer.is_none() && self.deferred_creation && self.recovery.is_none()
+     }
+ 
+     async fn ensure_writer_open(&mut self) -> std::io::Result<()> {
+@@ -1876,62 +1903,49 @@ impl RolloutWriterState {
+         Ok(())
+     }
+ 
+-    async fn write_session_meta_if_needed(&mut self) -> std::io::Result<()> {
+-        let Some(session_meta) = self.meta.as_ref().cloned() else {
+-            return Ok(());
+-        };
+-        write_session_meta(
+-            self.writer.as_mut(),
+-            &mut self.ordinal_state,
+-            session_meta,
+-            &self.cwd,
+-        )
+-        .await?;
+-        self.meta = None;
+-        Ok(())
+-    }
+-
+     async fn write_pending_once(&mut self) -> std::io::Result<()> {
+-        self.ensure_writer_open().await?;
+-        self.write_session_meta_if_needed().await?;
+-
++        if let Some(meta) = self.meta.take() {
++            self.pending_items
++                .push_front(session_meta_item(meta, &self.cwd).await);
++        }
+         self.write_pending_items_once().await?;
+ 
+         if let Some(writer) = self.writer.as_mut() {
+-            writer.flush().await?;
++            if let Err(error) = writer.flush().await {
++                self.writer = None;
++                self.recovery = Some(String::new());
++                return Err(error);
++            }
+         }
+         Ok(())
+     }
+ 
+     async fn write_pending_items_once(&mut self) -> std::io::Result<()> {
+-        let Some(writer) = self.writer.as_mut() else {
+-            return Err(IoError::other("rollout writer is not open"));
+-        };
+-
+-        let mut written_count = 0usize;
+-        let mut write_result = Ok(());
+-        for item in &self.pending_items {
+-            match self.ordinal_state.current() {
+-                Ok(ordinal) => match writer.write_rollout_item(item, ordinal).await {
+-                    Ok(()) => self.ordinal_state.advance(),
+-                    Err(err) => {
+-                        write_result = Err(err);
+-                        break;
+-                    }
+-                },
+-                Err(err) => {
+-                    write_result = Err(err);
+-                    break;
++        while let Some(item) = self.pending_items.front() {
++            let line = serialize_rollout_item(item, self.ordinal_state.current()?)?;
++            self.pending_items.pop_front();
++            self.ordinal_state.advance();
++            if let Some(recovery) = self.recovery.as_mut() {
++                recovery.push_str(&line);
++                continue;
++            }
++            let result = match self.ensure_writer_open().await {
++                Ok(()) => {
++                    self.writer
++                        .as_mut()
++                        .expect("writer opened")
++                        .write_line(&line)
++                        .await
+                 }
++                Err(error) => Err(error),
++            };
++            if let Err(error) = result {
++                self.writer = None;
++                self.recovery = Some(line);
++                return Err(error);
+             }
+-            written_count += 1;
+         }
+-
+-        if written_count > 0 {
+-            self.pending_items.drain(..written_count);
+-        }
+-
+-        write_result
++        Ok(())
+     }
+ }
+ 
+@@ -1940,53 +1954,65 @@ async fn rollout_writer(
+     rx: &mut mpsc::Receiver<RolloutCmd>,
+     task: &RolloutWriterTask,
+ ) -> std::io::Result<()> {
+-    // Process rollout commands
+-    while let Some(cmd) = rx.recv().await {
+-        let (result, ack, shutdown) = match cmd {
+-            RolloutCmd::ReadUnpersistedSessionMeta { ack } => {
+-                let metadata = if state.is_deferred() {
+-                    state.meta.clone()
+-                } else {
+-                    None
+-                };
+-                let _ = ack.send(metadata);
+-                continue;
++    let result = async {
++        // Process rollout commands
++        while let Some(cmd) = rx.recv().await {
++            let (result, ack, shutdown) = match cmd {
++                RolloutCmd::ReadUnpersistedSessionMeta { ack } => {
++                    let metadata = if state.is_deferred() {
++                        state.meta.clone()
++                    } else {
++                        None
++                    };
++                    let _ = ack.send(metadata);
++                    continue;
++                }
++                RolloutCmd::AddItems(items) => {
++                    state.add_items(items);
++                    (state.flush_if_materialized().await, None, false)
++                }
++                RolloutCmd::Persist { ack } => (state.persist().await, Some(ack), false),
++                RolloutCmd::Flush { ack } => (state.flush().await, Some(ack), false),
++                RolloutCmd::Discard { ack } => {
++                    let _ = ack.send(());
++                    break;
++                }
++                RolloutCmd::Shutdown { ack } => (state.shutdown().await, Some(ack), true),
++            };
++            // Publish failure before replying or closing the queue. No caller can mistake the
++            // failed barrier for a recoverable queue error or start more work after its reply.
++            if let Err(err) = &result {
++                task.mark_failed(err);
++                if state.recovery.is_some() {
++                    state.write_pending_items_once().await?;
++                }
+             }
+-            RolloutCmd::AddItems(items) => {
+-                state.add_items(items);
+-                (state.flush_if_materialized().await, None, false)
++            let result = task.terminal_failure().map_or(result, Err);
++            if let Some(ack) = ack {
++                let _ = ack.send(result.as_ref().map(|()| ()).map_err(clone_io_error));
+             }
+-            RolloutCmd::Persist { ack } => (state.persist().await, Some(ack), false),
+-            RolloutCmd::Flush { ack } => (state.flush().await, Some(ack), false),
+-            RolloutCmd::Discard { ack } => {
+-                let _ = ack.send(());
++            if shutdown {
+                 break;
+             }
+-            RolloutCmd::Shutdown { ack } => (state.shutdown().await, Some(ack), true),
+-        };
+-        // Publish failure before replying or closing the queue. No caller can mistake the
+-        // failed barrier for a recoverable queue error or start more work after its reply.
+-        if let Err(err) = &result {
+-            task.mark_failed(err);
+-        }
+-        if let Some(ack) = ack {
+-            let _ = ack.send(result.as_ref().map(|()| ()).map_err(clone_io_error));
+-        }
+-        result?;
+-        if shutdown {
+-            break;
+         }
++        task.terminal_failure().map_or(Ok(()), Err)
++    }
++    .await;
++    if let Some(jsonl) = state.recovery.take().filter(|jsonl| !jsonl.is_empty()) {
++        let recovery = crate::recovery::save(
++            &state.rollout_path,
++            jsonl,
++            &state.recovery_roots[0],
++            &state.recovery_roots[1],
++        )
++        .await;
++        task.status
++            .send_modify(|status| status.recovery = Some(Arc::new(recovery)));
+     }
+-
+-    Ok(())
++    result
+ }
+ 
+-async fn write_session_meta(
+-    mut writer: Option<&mut JsonlWriter>,
+-    ordinal_state: &mut RolloutOrdinalState,
+-    session_meta: SessionMeta,
+-    cwd: &Path,
+-) -> std::io::Result<()> {
++async fn session_meta_item(session_meta: SessionMeta, cwd: &Path) -> RolloutItem {
+     let git_info = if get_git_repo_root(cwd).is_some() {
+         collect_git_info(cwd).await.map(|info| ProtocolGitInfo {
+             commit_hash: info.commit_hash,
+@@ -2001,13 +2027,7 @@ async fn write_session_meta(
+         git: git_info,
+     };
+ 
+-    let rollout_item = RolloutItem::SessionMeta(Box::new(session_meta_line));
+-    if let Some(writer) = writer.as_mut() {
+-        let ordinal = ordinal_state.current()?;
+-        writer.write_rollout_item(&rollout_item, ordinal).await?;
+-        ordinal_state.advance();
+-    }
+-    Ok(())
++    RolloutItem::SessionMeta(Box::new(session_meta_line))
+ }
+ 
+ /// Append one already-filtered rollout item to an existing rollout JSONL file.
+@@ -2023,7 +2043,9 @@ pub async fn append_rollout_item_to_path(
+         open_rollout_for_append(rollout_path, /*writer_lock*/ None).await?;
+     let ordinal = ordinal_state.current()?;
+     let mut writer = JsonlWriter::new(file, rollout_path).await?;
+-    writer.write_rollout_item(item, ordinal).await
++    writer
++        .write_line(&serialize_rollout_item(item, ordinal)?)
++        .await
+ }
+ 
+ async fn open_rollout_for_append(
+@@ -2131,28 +2153,7 @@ impl JsonlWriter {
+         self.verify_unchanged().await
+     }
+ 
+-    async fn write_rollout_item(
+-        &mut self,
+-        rollout_item: &RolloutItem,
+-        ordinal: Option<u64>,
+-    ) -> std::io::Result<()> {
+-        let timestamp_format: &[FormatItem] = format_description!(
+-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+-        );
+-        let timestamp = OffsetDateTime::now_utc()
+-            .format(timestamp_format)
+-            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+-
+-        let line = RolloutLineRef {
+-            timestamp,
+-            ordinal,
+-            item: rollout_item,
+-        };
+-        self.write_line(&line).await
+-    }
+-    async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
+-        let mut json = serde_json::to_string(item)?;
+-        json.push('\n');
++    async fn write_line(&mut self, json: &str) -> std::io::Result<()> {
+         self.verify_unchanged().await?;
+         let expected_len = self.metadata.len() + json.len() as u64;
+         self.file.write_all(json.as_bytes()).await?;
+@@ -2162,6 +2163,26 @@ impl JsonlWriter {
+     }
+ }
+ 
++fn serialize_rollout_item(
++    rollout_item: &RolloutItem,
++    ordinal: Option<u64>,
++) -> std::io::Result<String> {
++    let timestamp_format: &[FormatItem] =
++        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
++    let timestamp = OffsetDateTime::now_utc()
++        .format(timestamp_format)
++        .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
++
++    let line = RolloutLineRef {
++        timestamp,
++        ordinal,
++        item: rollout_item,
++    };
++    let mut json = serde_json::to_string(&line)?;
++    json.push('\n');
++    Ok(json)
++}
++
+ impl From<codex_state::ThreadsPage> for ThreadsPage {
+     fn from(db_page: codex_state::ThreadsPage) -> Self {
+         let codex_state::ThreadsPage {
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -1050,7 +1050,9 @@ async fn writer_does_not_reopen_after_a_write_error() -> std::io::Result<()> {
+             .await?,
+         ),
+         deferred_creation: false,
+-        pending_items: Vec::new(),
++        pending_items: VecDeque::new(),
++        recovery: None,
++        recovery_roots: [home.path().to_path_buf(), home.path().to_path_buf()],
+         meta: None,
+         cwd: home.path().to_path_buf(),
+         rollout_path: rollout_path.clone(),
+@@ -1071,12 +1073,22 @@ async fn writer_does_not_reopen_after_a_write_error() -> std::io::Result<()> {
+         .await
+         .expect_err("read-only descriptor must fail without reopening");
+     assert!(std::fs::read(&rollout_path)?.is_empty());
+-    assert_eq!(state.pending_items.len(), 1);
++    let recovery = state
++        .recovery
++        .as_ref()
++        .expect("complete failed line retained");
++    let record = crate::parse_rollout_line(recovery.trim_end())?;
++    assert_eq!(
++        serde_json::to_value(record.item)?,
++        serde_json::to_value(agent_message_item("queued-after-writer-error"))?
++    );
++    assert!(state.pending_items.is_empty());
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn storage_full_stops_writer_and_reports_first_error() -> std::io::Result<()> {
++async fn storage_full_stops_primary_writes_and_retains_recovery() -> std::io::Result<()> {
++    let home = TempDir::new()?;
+     let rollout_path = PathBuf::from("/dev/full");
+     let file = tokio::fs::OpenOptions::new()
+         .write(true)
+@@ -1085,19 +1097,25 @@ async fn storage_full_stops_writer_and_reports_first_error() -> std::io::Result<
+     let state = RolloutWriterState {
+         writer: Some(JsonlWriter::new(file, rollout_path.clone()).await?),
+         deferred_creation: false,
+-        pending_items: vec![agent_message_item("cannot-be-saved")],
++        pending_items: vec![agent_message_item("cannot-be-saved")].into(),
++        recovery: None,
++        recovery_roots: [home.path().to_path_buf(), home.path().to_path_buf()],
+         meta: None,
+         cwd: PathBuf::from("/"),
+         rollout_path,
+         ordinal_state: RolloutOrdinalState::Legacy,
+     };
+     let task = RolloutWriterTask::new(None);
+-    let mut failure = task.terminal_failure.subscribe();
+-    let (tx, mut rx) = mpsc::channel(2);
++    let mut status = task.status.subscribe();
++    let (tx, mut rx) = mpsc::channel(3);
+     let (ack, first) = oneshot::channel();
+     let (next_ack, next) = oneshot::channel();
+     tx.send(RolloutCmd::Flush { ack }).await.unwrap();
+     tx.send(RolloutCmd::Flush { ack: next_ack }).await.unwrap();
++    let (shutdown_ack, shutdown) = oneshot::channel();
++    tx.send(RolloutCmd::Shutdown { ack: shutdown_ack })
++        .await
++        .unwrap();
+ 
+     let error = rollout_writer(state, &mut rx, &task)
+         .await
+@@ -1110,13 +1128,29 @@ async fn storage_full_stops_writer_and_reports_first_error() -> std::io::Result<
+     assert_eq!(reported.kind(), std::io::ErrorKind::StorageFull);
+     assert_eq!(reported.to_string(), error.to_string());
+     assert_eq!(
+-        failure.borrow_and_update().as_ref().unwrap().kind(),
++        status.borrow_and_update().failure.as_ref().unwrap().kind(),
+         std::io::ErrorKind::StorageFull
+     );
+-    drop(rx);
+-    assert!(
+-        next.await.is_err(),
+-        "writer must stop rather than process the next barrier"
++    assert_eq!(
++        next.await.unwrap().unwrap_err().kind(),
++        std::io::ErrorKind::StorageFull
++    );
++    assert_eq!(
++        shutdown.await.unwrap().unwrap_err().kind(),
++        std::io::ErrorKind::StorageFull
++    );
++    let recovery = status
++        .borrow()
++        .recovery
++        .clone()
++        .expect("recovery after drain");
++    assert_eq!(
++        fs::read_to_string(recovery.saved_path.as_ref().unwrap())?,
++        recovery.jsonl
++    );
++    assert_eq!(
++        serde_json::to_value(crate::parse_rollout_line(recovery.jsonl.trim_end())?.item)?,
++        serde_json::to_value(agent_message_item("cannot-be-saved"))?
+     );
+     Ok(())
+ }
+@@ -1132,7 +1166,7 @@ async fn external_rollout_changes_stop_writes_without_reopening() -> std::io::Re
+         let recorder =
+             RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone()))
+                 .await?;
+-        let mut failure = recorder.failure_receiver();
++        let mut status = recorder.status_receiver();
+ 
+         match change {
+             "replace" => {
+@@ -1166,7 +1200,7 @@ async fn external_rollout_changes_stop_writes_without_reopening() -> std::io::Re
+             .record_canonical_items(&[agent_message_item("must-not-append")])
+             .await?;
+         let error = recorder.flush().await.expect_err(change);
+-        assert!(failure.borrow_and_update().is_some(), "{change}");
++        assert!(status.borrow_and_update().failure.is_some(), "{change}");
+         assert_eq!(fs::read(&rollout_path).ok(), externally_changed, "{change}");
+ 
+         fs::write(&rollout_path, &original)?;
+@@ -1195,6 +1229,200 @@ async fn flush_detects_external_changes_without_new_items() -> std::io::Result<(
+     recorder.discard().await
+ }
+ 
++#[tokio::test]
++async fn recovery_is_the_original_sessions_complete_appendable_suffix() -> std::io::Result<()> {
++    for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
++        for partial_tail in [false, true] {
++            let home = TempDir::new()?;
++            let config = test_config(home.path());
++            let thread_id = ThreadId::new();
++            let recorder = RolloutRecorder::new(
++                &config,
++                RolloutRecorderParams::new(
++                    thread_id,
++                    None,
++                    None,
++                    SessionSource::Exec,
++                    None,
++                    "test".into(),
++                    BaseInstructions::default(),
++                    Vec::new(),
++                )
++                .with_history_mode(mode),
++            )
++            .await?;
++            let path = recorder.rollout_path().to_path_buf();
++            let status = recorder.status_receiver();
++            recorder
++                .record_canonical_items(&[agent_message_item("original prefix")])
++                .await?;
++            recorder.flush().await?;
++            let prefix = fs::read_to_string(&path)?;
++            if partial_tail {
++                File::options()
++                    .append(true)
++                    .open(&path)?
++                    .write_all(b"{\"unfinished\":")?;
++            } else {
++                let replacement = home.path().join("replacement.jsonl");
++                fs::write(&replacement, &prefix)?;
++                fs::rename(replacement, &path)?;
++            }
++            let original_after_failure = fs::read(&path)?;
++            let suffix = [
++                agent_message_item("first missing record"),
++                agent_message_item("second missing record"),
++                agent_message_item("response completed after failure"),
++            ];
++            recorder.record_canonical_items(&suffix[..2]).await?;
++            let first_error = recorder.flush().await.unwrap_err();
++            recorder.record_canonical_items(&suffix[2..]).await?;
++            assert_eq!(
++                recorder.shutdown().await.unwrap_err().to_string(),
++                first_error.to_string()
++            );
++            let recovery = status
++                .borrow()
++                .recovery
++                .clone()
++                .expect("complete shutdown recovery");
++            assert_eq!(
++                fs::read(&path)?,
++                original_after_failure,
++                "never repair the original"
++            );
++            assert_eq!(
++                fs::read_to_string(recovery.saved_path.as_ref().unwrap())?,
++                recovery.jsonl
++            );
++            assert!(recovery.jsonl.ends_with('\n'));
++            let rescued = recovery
++                .jsonl
++                .lines()
++                .map(crate::parse_rollout_line)
++                .collect::<Result<Vec<_>, _>>()?;
++            assert_eq!(
++                serde_json::to_value(
++                    rescued
++                        .iter()
++                        .map(|record| &record.item)
++                        .collect::<Vec<_>>()
++                )?,
++                serde_json::to_value(&suffix)?
++            );
++            if mode == ThreadHistoryMode::Paginated {
++                assert_eq!(
++                    rescued
++                        .iter()
++                        .map(|record| record.ordinal)
++                        .collect::<Vec<_>>(),
++                    [Some(2), Some(3), Some(4)]
++                );
++            } else {
++                assert!(rescued.iter().all(|record| record.ordinal.is_none()));
++            }
++
++            // Repair, when necessary, belongs to the user. This separate test file uses the
++            // known intact prefix and the exact rescue bytes without transforming either.
++            let combined = home.path().join("combined.jsonl");
++            fs::write(&combined, format!("{prefix}{}", recovery.jsonl))?;
++            let (items, recovered_id, errors) =
++                RolloutRecorder::load_rollout_items(&combined).await?;
++            assert_eq!(recovered_id, Some(thread_id));
++            assert_eq!(errors, 0);
++            assert_eq!(
++                serde_json::to_value(&items[2..])?,
++                serde_json::to_value(&suffix)?
++            );
++            assert!(matches!(
++                RolloutRecorder::get_rollout_history(&combined).await?,
++                InitialHistory::Resumed(_)
++            ));
++            let resumed =
++                RolloutRecorder::new(&config, RolloutRecorderParams::resume(combined.clone()))
++                    .await?;
++            resumed
++                .record_canonical_items(&[agent_message_item("resumed after rescue")])
++                .await?;
++            resumed.shutdown().await?;
++            let text = fs::read_to_string(combined)?;
++            assert!(text.starts_with(&format!("{prefix}{}", recovery.jsonl)));
++            let last = crate::parse_rollout_line(text.lines().last().unwrap())?;
++            assert_eq!(
++                serde_json::to_value(last.item)?,
++                serde_json::to_value(agent_message_item("resumed after rescue"))?
++            );
++            assert_eq!(
++                last.ordinal,
++                (mode == ThreadHistoryMode::Paginated).then_some(5)
++            );
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn failed_materialization_retains_the_original_session_header_and_later_records()
++-> std::io::Result<()> {
++    let home = TempDir::new()?;
++    let harness = TempDir::new()?;
++    let mut config = test_config(home.path());
++    config.codex_harness = harness.path().to_path_buf();
++    let thread_id = ThreadId::new();
++    let recorder = RolloutRecorder::new(
++        &config,
++        RolloutRecorderParams::new(
++            thread_id,
++            None,
++            None,
++            SessionSource::Exec,
++            None,
++            "test".into(),
++            BaseInstructions::default(),
++            Vec::new(),
++        )
++        .with_history_mode(ThreadHistoryMode::Paginated),
++    )
++    .await?;
++    let status = recorder.status_receiver();
++    recorder
++        .record_canonical_items(&[agent_message_item("before materialization")])
++        .await?;
++    fs::write(home.path().join(SESSIONS_SUBDIR), b"blocked")?;
++    assert!(recorder.persist().await.is_err());
++    recorder
++        .record_canonical_items(&[agent_message_item("after materialization failure")])
++        .await?;
++    assert!(recorder.shutdown().await.is_err());
++    let recovery = status.borrow().recovery.clone().unwrap();
++    let saved = recovery.saved_path.as_ref().unwrap();
++    assert!(saved.starts_with(harness.path().join(SESSIONS_SUBDIR)));
++    assert!(!recorder.rollout_path().exists());
++    let (items, recovered_id, errors) = RolloutRecorder::load_rollout_items(saved).await?;
++    assert_eq!(recovered_id, Some(thread_id));
++    assert_eq!(errors, 0);
++    assert_eq!(items.len(), 3);
++    assert!(matches!(&items[0], RolloutItem::SessionMeta(meta) if meta.meta.id == thread_id));
++    assert_eq!(
++        serde_json::to_value(&items[1])?,
++        serde_json::to_value(agent_message_item("before materialization"))?
++    );
++    assert_eq!(
++        serde_json::to_value(&items[2])?,
++        serde_json::to_value(agent_message_item("after materialization failure"))?
++    );
++    let lines = recovery
++        .jsonl
++        .lines()
++        .map(crate::parse_rollout_line)
++        .collect::<Result<Vec<_>, _>>()?;
++    assert_eq!(
++        lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
++        [Some(0), Some(1), Some(2)]
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Result<()> {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/rollout/src/recovery.rs b/codex-rs/rollout/src/recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/rollout/src/recovery.rs
+@@ -0,0 +1,52 @@
++use crate::SESSIONS_SUBDIR;
++use codex_protocol::protocol::SessionStorageRecoveryEvent;
++use std::path::Path;
++use tokio::io::AsyncWriteExt;
++
++/// Rescue remains independent of the failed file and of the normal rollout discovery format.
++pub(crate) async fn save(
++    original_path: &Path,
++    jsonl: String,
++    home: &Path,
++    harness: &Path,
++) -> SessionStorageRecoveryEvent {
++    let mut recovery = SessionStorageRecoveryEvent {
++        original_path: original_path.to_path_buf(),
++        saved_path: None,
++        write_errors: Vec::new(),
++        jsonl,
++    };
++    // A fragment must not be scanned as another billable or resumable session. The bytes
++    // remain plain JSONL; only its filename distinguishes it from a complete rollout.
++    let name = format!("recovery-{}.jsonl.recovery", uuid::Uuid::new_v4());
++    for root in [home, harness] {
++        let directory = root.join(SESSIONS_SUBDIR);
++        let path = directory.join(&name);
++        let result: std::io::Result<()> = async {
++            tokio::fs::create_dir_all(&directory).await?;
++            let mut file = tokio::fs::OpenOptions::new()
++                .create_new(true)
++                .write(true)
++                .open(&path)
++                .await?;
++            file.write_all(recovery.jsonl.as_bytes()).await?;
++            file.flush().await?;
++            file.sync_all().await
++        }
++        .await;
++        match result {
++            Ok(()) => {
++                recovery.saved_path = Some(path);
++                break;
++            }
++            Err(error) => recovery
++                .write_errors
++                .push(format!("{}: {error}", path.display())),
++        }
++    }
++    recovery
++}
++
++#[cfg(test)]
++#[path = "recovery_tests.rs"]
++mod tests;
+diff --git a/codex-rs/rollout/src/recovery_tests.rs b/codex-rs/rollout/src/recovery_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/rollout/src/recovery_tests.rs
+@@ -0,0 +1,39 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn rescue_uses_home_then_harness_and_keeps_payload_when_both_fail() {
++    let jsonl = "{\"timestamp\":\"2026-10-24T00:00:00.000Z\",\"ordinal\":7,\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"reason\":\"interrupted\"}}\n";
++    for blocked in [0, 1, 2] {
++        let home = tempfile::tempdir().unwrap();
++        let harness = tempfile::tempdir().unwrap();
++        for root in [home.path(), harness.path()].into_iter().take(blocked) {
++            std::fs::write(root.join(SESSIONS_SUBDIR), b"occupied").unwrap();
++        }
++        let original = home.path().join("original.jsonl");
++        std::fs::write(&original, b"original bytes").unwrap();
++        let recovery = save(&original, jsonl.into(), home.path(), harness.path()).await;
++        assert_eq!(recovery.jsonl, jsonl);
++        assert_eq!(recovery.original_path, original);
++        assert_eq!(recovery.write_errors.len(), blocked);
++        assert_eq!(std::fs::read(&original).unwrap(), b"original bytes");
++        if blocked < 2 {
++            let path = recovery.saved_path.unwrap();
++            let root = if blocked == 0 {
++                home.path()
++            } else {
++                harness.path()
++            };
++            assert_eq!(path.parent(), Some(root.join(SESSIONS_SUBDIR).as_path()));
++            assert_eq!(std::fs::read_to_string(&path).unwrap(), jsonl);
++            assert_ne!(path.extension(), Some(std::ffi::OsStr::new("jsonl")));
++            if blocked == 0 {
++                assert!(!harness.path().join(SESSIONS_SUBDIR).exists());
++            }
++        } else {
++            assert!(recovery.saved_path.is_none());
++            assert!(recovery.write_errors[0].contains(home.path().to_str().unwrap()));
++            assert!(recovery.write_errors[1].contains(harness.path().to_str().unwrap()));
++        }
++    }
++}
+diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
+--- a/codex-rs/thread-store/src/live_thread.rs
++++ b/codex-rs/thread-store/src/live_thread.rs
+@@ -43,7 +43,7 @@ pub struct LiveThread {
+     thread_store: Arc<dyn ThreadStore>,
+     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+     persistence_telemetry: RolloutPersistenceTelemetry,
+-    writer_failure: Option<watch::Receiver<Option<Arc<std::io::Error>>>>,
++    writer_status: Option<watch::Receiver<codex_rollout::RolloutWriterStatus>>,
+ }
+ 
+ /// Owns persistence acquisition and its live thread while initialization is still fallible.
+@@ -142,14 +142,14 @@ impl LiveThread {
+         let history_mode = params.history_mode;
+         let metadata_sync = ThreadMetadataSync::for_create(&params).await;
+         thread_store.create_thread(params).await?;
+-        let writer_failure = Self::local_writer_failure_receiver(&thread_store, thread_id).await?;
++        let writer_status = Self::local_writer_status_receiver(&thread_store, thread_id).await?;
+         Ok(Self {
+             thread_id,
+             history_mode,
+             thread_store,
+             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+-            writer_failure,
++            writer_status,
+         })
+     }
+ 
+@@ -213,7 +213,7 @@ impl LiveThread {
+         };
+         params.history = Some(Arc::clone(&history));
+         let metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
+-        let writer_failure = Self::local_writer_failure_receiver(&thread_store, thread_id).await?;
++        let writer_status = Self::local_writer_status_receiver(&thread_store, thread_id).await?;
+         Ok((
+             Self {
+                 thread_id,
+@@ -221,7 +221,7 @@ impl LiveThread {
+                 thread_store,
+                 metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+                 persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
+-                writer_failure,
++                writer_status,
+             },
+             history,
+         ))
+@@ -258,26 +258,33 @@ impl LiveThread {
+         Ok(())
+     }
+ 
+-    async fn local_writer_failure_receiver(
++    async fn local_writer_status_receiver(
+         thread_store: &Arc<dyn ThreadStore>,
+         thread_id: ThreadId,
+-    ) -> ThreadStoreResult<Option<watch::Receiver<Option<Arc<std::io::Error>>>>> {
++    ) -> ThreadStoreResult<Option<watch::Receiver<codex_rollout::RolloutWriterStatus>>> {
+         match thread_store.as_any().downcast_ref::<LocalThreadStore>() {
+-            Some(store) => store.writer_failure_receiver(thread_id).await.map(Some),
++            Some(store) => store.writer_status_receiver(thread_id).await.map(Some),
+             None => Ok(None),
+         }
+     }
+ 
+     /// Returns the terminal local JSONL writer error, independently of SQLite projection errors.
+     pub fn persistence_failure(&self) -> Option<Arc<std::io::Error>> {
+-        self.writer_failure.as_ref()?.borrow().clone()
++        self.writer_status.as_ref()?.borrow().failure.clone()
++    }
++
++    /// The same ordered writer publishes recovery after its shutdown drain, even on failure.
++    pub fn persistence_recovery(
++        &self,
++    ) -> Option<Arc<codex_protocol::protocol::SessionStorageRecoveryEvent>> {
++        self.writer_status.as_ref()?.borrow().recovery.clone()
+     }
+ 
+     /// Waits for a local JSONL write failure. Normal closure and non-local stores do not signal one.
+     pub async fn wait_for_persistence_failure(&self) -> Arc<std::io::Error> {
+-        if let Some(mut failure) = self.writer_failure.clone()
+-            && let Ok(value) = failure.wait_for(Option::is_some).await
+-            && let Some(error) = value.as_ref()
++        if let Some(mut status) = self.writer_status.clone()
++            && let Ok(value) = status.wait_for(|status| status.failure.is_some()).await
++            && let Some(error) = value.failure.as_ref()
+         {
+             return Arc::clone(error);
+         }
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -271,12 +271,12 @@ impl std::fmt::Debug for LocalThreadStore {
+ }
+ 
+ impl LocalThreadStore {
+-    pub(crate) async fn writer_failure_receiver(
++    pub(crate) async fn writer_status_receiver(
+         &self,
+         thread_id: ThreadId,
+-    ) -> ThreadStoreResult<tokio::sync::watch::Receiver<Option<Arc<std::io::Error>>>> {
++    ) -> ThreadStoreResult<tokio::sync::watch::Receiver<codex_rollout::RolloutWriterStatus>> {
+         let (recorder, _, _) = live_writer::live_writer_parts(self, thread_id).await?;
+-        Ok(recorder.failure_receiver())
++        Ok(recorder.status_receiver())
+     }
+ 
+     /// Create a local store using an already initialized state DB handle.

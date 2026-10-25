@@ -1,0 +1,149 @@
+define-github-release-query-interface
+
+Lane: cross
+
+Unit: monitor-codex-releases-through-github
+
+ChildPatch: define-github-release-query-interface
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Query and monitor Codex releases independently of Telegram while exposing current GitHub observations to app-server clients and notification subscribers.
+
+Requires: Unit:cross/configure-integrations-through-shared-file, Unit:cross/configure-application-proxy-at-runtime
+
+Provides: Read GitHub settings from the shared integrations document, independently query the ten newest unfiltered release records and the latest stable release through the shared HTTP routing owner, retain successful-check time and remaining GraphQL points, publish nonblocking cached github/read and throttled github/check interfaces, and provide process-scoped observation subscriptions.
+
+Boundary: GitHub owns network queries, current observations and check scheduling without requiring Telegram credentials or delivery. Failed checks clear current observations. Notification consumers own silent initial baselines, selection and successful delivery tracking. Preserve private credentials, bounded response bodies, disabled redirects and request logging, configured cadence, manual throttling and cancellation. No legacy Telegram configuration reader or credential-setting UI is introduced.
+
+Verification: Focused protocol and app-server tests verify independent cached reads, stable and prerelease selection, field-selected bounded queries, redacted errors, failed-check clearing, manual throttling, shared observation subscriptions and worker shutdown without contacting real services.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1480,6 +1480,16 @@ client_request_definitions! {
+         serialization: global("proxy"),
+         response: v2::ProxyWriteResponse,
+     },
++    GithubRead => "github/read" {
++        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
++        serialization: None,
++        response: v2::GithubReadResponse,
++    },
++    GithubCheck => "github/check" {
++        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
++        serialization: global("github"),
++        response: v2::GithubCheckResponse,
++    },
+     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
+         params: v2::ExternalAgentConfigDetectParams,
+         serialization: global("external-agent-detect"),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/github.rs b/codex-rs/app-server-protocol/src/protocol/v2/github.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/github.rs
+@@ -0,0 +1,80 @@
++use crate::JsonSchema;
++use crate::TS;
++use serde::Deserialize;
++use serde::Serialize;
++
++#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct GithubRelease {
++    pub version: String,
++    pub url: String,
++}
++
++/// The latest successful observation from the bounded Codex release query.
++#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct GithubStatus {
++    pub latest_release: Option<GithubRelease>,
++    pub latest_prerelease: Option<GithubRelease>,
++    /// Time of the successful GitHub response, in Unix seconds.
++    #[ts(type = "number")]
++    pub checked_at: i64,
++    /// Remaining GraphQL points from the response header, when supplied.
++    #[ts(type = "number | null")]
++    pub remaining: Option<u64>,
++}
++
++/// Cached observations, without waiting for a network check or exposing credentials.
++#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct GithubReadResponse {
++    pub configured: bool,
++    /// Cleared after a failed check; absent before the first successful check.
++    pub status: Option<GithubStatus>,
++}
++
++#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct GithubCheckResponse {
++    /// False when the thirty-second manual-check throttle reused cached observations.
++    pub performed: bool,
++    pub status: Option<GithubStatus>,
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::ClientRequest;
++    use crate::ClientRequestSerializationScope;
++    use crate::RequestId;
++    use pretty_assertions::assert_eq;
++    use serde_json::json;
++
++    #[test]
++    fn github_reads_are_independent_of_serialized_network_checks() {
++        let read = ClientRequest::GithubRead {
++            request_id: RequestId::Integer(1),
++            params: None,
++        };
++        assert_eq!(read.serialization_scope(), None);
++        assert_eq!(
++            serde_json::to_value(read).unwrap(),
++            json!({"id": 1, "method": "github/read"})
++        );
++        let check = ClientRequest::GithubCheck {
++            request_id: RequestId::Integer(2),
++            params: None,
++        };
++        assert_eq!(
++            check.serialization_scope(),
++            Some(ClientRequestSerializationScope::Global("github"))
++        );
++        assert_eq!(
++            serde_json::to_value(check).unwrap(),
++            json!({"id": 2, "method": "github/check"})
++        );
++    }
++}
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -17,6 +17,7 @@ mod environment;
+ mod experimental_feature;
+ mod feedback;
+ mod fs;
++mod github;
+ mod hook;
+ mod integrations;
+ mod item;
+@@ -61,6 +62,7 @@ pub use environment::*;
+ pub use experimental_feature::*;
+ pub use feedback::*;
+ pub use fs::*;
++pub use github::*;
+ pub use hook::*;
+ pub use integrations::*;
+ pub use item::*;

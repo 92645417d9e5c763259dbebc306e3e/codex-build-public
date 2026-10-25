@@ -1,0 +1,112 @@
+bypass-hook-trust-through-runtime-policy
+
+Lane: mixed
+
+Unit: configure-trust-bypasses-at-server-start
+
+ChildPatch: bypass-hook-trust-through-runtime-policy
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/hooks_list.rs b/codex-rs/app-server/tests/suite/v2/hooks_list.rs
+--- a/codex-rs/app-server/tests/suite/v2/hooks_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/hooks_list.rs
+@@ -357,6 +357,7 @@ async fn plugin_upgrade_refreshes_hook_runtime_for_loaded_session() -> Result<()
+ 
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_args(&["--dangerously-bypass-hook-trust"])
+         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+         .await?;
+     let marketplace_path =
+@@ -815,6 +816,7 @@ source = "{}"
+         .with_codex_home(codex_home.path())
+         .with_plugin_startup_tasks()
+         .with_env_overrides(&[("PATH", Some(path_with_wrapper.as_str()))])
++        .with_args(&["--dangerously-bypass-hook-trust"])
+         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+         .await?;
+     let thread_start_id = mcp
+diff --git a/codex-rs/app-server/tests/suite/v2/session_end.rs b/codex-rs/app-server/tests/suite/v2/session_end.rs
+--- a/codex-rs/app-server/tests/suite/v2/session_end.rs
++++ b/codex-rs/app-server/tests/suite/v2/session_end.rs
+@@ -42,6 +42,7 @@ async fn run_removal_session_end_test(operation: &str) -> Result<()> {
+     let log_path = write_config_and_hook(codex_home.path(), &server.uri())?;
+     let mut app_server = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_args(&["--dangerously-bypass-hook-trust"])
+         .build_initialized_with_timeout(READ_TIMEOUT)
+         .await?;
+     let thread_id = start_thread(&mut app_server).await?;
+@@ -112,6 +113,7 @@ async fn app_server_shutdown_runs_session_end_for_all_loaded_threads(
+     let log_path = write_config_and_hook(codex_home.path(), &server.uri())?;
+     let mut app_server = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
++        .with_args(&["--dangerously-bypass-hook-trust"])
+         .build_initialized_with_timeout(READ_TIMEOUT)
+         .await?;
+     let first = start_thread(&mut app_server).await?;
+diff --git a/codex-rs/hooks/src/engine/discovery.rs b/codex-rs/hooks/src/engine/discovery.rs
+--- a/codex-rs/hooks/src/engine/discovery.rs
++++ b/codex-rs/hooks/src/engine/discovery.rs
+@@ -842,7 +842,7 @@ fn append_matcher_groups(
+             let enabled = hook_enabled(source.is_managed, builtin, state);
+             let trusted_hash = hook_trusted_hash(source.is_managed, state);
+             let plugin_trust = if !builtin
+-                && (!source.bypass_hook_trust || source.plugin_content_hash.is_some())
++                && !source.bypass_hook_trust
+                 && let Some(root) = source.plugin_root
+                 && let Some(plugin_id) = source.plugin_id.as_deref()
+                 && let Some(trusted_hash) = trusted_hash
+@@ -1754,6 +1754,36 @@ mod tests {
+         assert_eq!(hook_entries[0].enabled, false);
+     }
+ 
++    #[test]
++    fn bypass_hook_trust_does_not_retain_stale_plugin_runtime_review() {
++        let path = source_path();
++        let states = std::collections::HashMap::from([(
++            format!("{}:pre_tool_use:0:0", path.display()),
++            HookStateToml {
++                enabled: Some(true),
++                trusted_hash: Some("previous-review".to_string()),
++                trusted_content_hash: None,
++            },
++        )]);
++        let contents = Ok("current-plugin-contents".to_string());
++        let mut source = unmanaged_hook_handler_source(&path, &states, true);
++        source.plugin_id = Some("sample@test".to_string());
++        source.plugin_root = Some(&path);
++        source.plugin_content_hash = Some(&contents);
++        let mut handlers = Vec::new();
++        append_matcher_groups(
++            &mut handlers,
++            &mut Vec::new(),
++            &mut Vec::new(),
++            &mut 0,
++            &mut source,
++            HookEventName::PreToolUse,
++            vec![command_group(Some("Bash"))],
++        );
++        assert_eq!(handlers.len(), 1);
++        assert!(handlers[0].plugin_trust.is_none());
++    }
++
+     #[test]
+     fn pre_tool_use_treats_star_matcher_as_match_all() {
+         let mut handlers = Vec::new();
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -544,7 +544,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
+ fn bypass_hook_trust_startup_warning_snapshot() {
+     let rendered = lines_to_single_string(
+         &history_cell::new_warning_event(
+-            "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."
++            "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this app server's lifetime."
+                 .to_string(),
+         )
+         .transcript_lines(/*width*/ 80),

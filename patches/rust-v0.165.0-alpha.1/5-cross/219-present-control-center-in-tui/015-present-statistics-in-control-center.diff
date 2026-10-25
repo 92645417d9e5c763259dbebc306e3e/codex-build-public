@@ -1,0 +1,1364 @@
+present-statistics-in-control-center
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: present-statistics-in-control-center
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -224,6 +224,7 @@ mod config_persistence;
+ mod connector_mentions;
+ mod control_center_data;
+ mod control_center_observations;
++mod control_center_statistics;
+ mod daemon_control;
+ mod daemon_menu;
+ mod daybreak;
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -15,6 +15,7 @@ use crate::app_event::WindowsSandboxEnableMode;
+ use crate::app_info::app_info_from_api;
+ use crate::app_server_session::AppServerSession;
+ use crate::app_server_session::status_account_display_from_auth_mode;
++use crate::pager_overlay::Overlay;
+ use codex_app_server_client::AppServerEvent;
+ use codex_app_server_client::TypedRequestError;
+ use codex_app_server_protocol::AuthMode;
+@@ -153,6 +154,11 @@ impl App {
+                 self.storage_capacity = None;
+                 self.remote_control_connection_status = None;
+                 self.chat_widget.clear_responses_stream_connection_status();
++                if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
++                    view.timing = None;
++                    view.timing_request = None;
++                    view.timing_read_at = None;
++                }
+                 // The request result distinguishes a refused start from a lost reply.
+                 if self.pending_startup_thread_start
+                     && !matches!(self.app_server_target, crate::AppServerTarget::Embedded)
+@@ -179,7 +185,12 @@ impl App {
+             return;
+         }
+         if let ServerNotification::ResponseAttemptUpdated(update) = notification {
++            let ended_generation =
++                update.attempt.request_kind == "generation" && update.attempt.end_reason.is_some();
+             self.chat_widget.on_response_attempt_updated(update.attempt);
++            if ended_generation {
++                self.refresh_control_center_timing(app_server_client, true);
++            }
+             return;
+         }
+         if let ServerNotification::ConnectedClientCountChanged(notification) = &notification {
+diff --git a/codex-rs/tui/src/app/control_center_observations.rs b/codex-rs/tui/src/app/control_center_observations.rs
+--- a/codex-rs/tui/src/app/control_center_observations.rs
++++ b/codex-rs/tui/src/app/control_center_observations.rs
+@@ -32,10 +32,15 @@ impl App {
+             event,
+             TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::FocusGained | TuiEvent::Resume
+         ) {
++            self.refresh_control_center_timing(app_server, false);
+             self.refresh_control_center_github(app_server);
+             let details = self.control_center_details();
++            let responses = self.control_center_response_statistics();
++            let quotas = self.control_center_quota_statistics();
+             if let Some(Overlay::ControlCenter(view)) = &mut self.overlay {
+                 view.details = details;
++                view.response_statistics.send_replace(responses);
++                view.quota_statistics.send_replace(quotas);
+                 view.responses.catalog = Arc::clone(&self.model_catalog);
+             }
+         }
+diff --git a/codex-rs/tui/src/app/control_center_observations_tests.rs b/codex-rs/tui/src/app/control_center_observations_tests.rs
+--- a/codex-rs/tui/src/app/control_center_observations_tests.rs
++++ b/codex-rs/tui/src/app/control_center_observations_tests.rs
+@@ -94,6 +94,10 @@ async fn github_status_refreshes_independently_and_rejects_stale_results() -> cr
+     );
+     let mut tui = crate::tui::test_support::make_test_tui()?;
+     app.open_control_center(&mut tui);
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.timing = Some(Err("Timing unavailable".into()));
+     let blank = app.control_center_details().iter().join("\n");
+     for label in ["Release", "Pre-release", "Last checked", "Remaining points"] {
+         assert!(
+diff --git a/codex-rs/tui/src/app/control_center_statistics.rs b/codex-rs/tui/src/app/control_center_statistics.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_statistics.rs
+@@ -0,0 +1,237 @@
++//! Present shared response timing and quota estimates without reloading usage.
++use super::App;
++use super::control_center_observations::metric;
++use crate::app_event::AppEvent;
++use crate::app_server_session::AppServerSession;
++use crate::control_center_table::Palette;
++use crate::pager_overlay::CenterScreen;
++use crate::pager_overlay::Overlay;
++use crate::response_timing::seconds;
++use crate::response_timing::tps;
++use crate::tui;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ResponseTimingReadParams;
++use codex_app_server_protocol::ResponseTimingReadResponse;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use std::time::Duration;
++use std::time::Instant;
++use uuid::Uuid;
++
++impl App {
++    pub(super) fn refresh_control_center_timing(
++        &mut self,
++        app_server: &AppServerSession,
++        force: bool,
++    ) {
++        if self.reconnect.offline {
++            return;
++        }
++        let Some(Overlay::ControlCenter(view)) = &mut self.overlay else {
++            return;
++        };
++        if view.screen != CenterScreen::Responses || view.timing_request.is_some() {
++            return;
++        }
++        let now = Instant::now();
++        if !force
++            && (view.timing.as_ref().is_some_and(Result::is_err)
++                || view
++                    .timing_read_at
++                    .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1)))
++        {
++            return;
++        }
++        // Persistence can fail and recover between reads, even with the popup closed.
++        // The shared in-memory summary supplies its last occurrence without scanning storage.
++        let request_id = Uuid::new_v4();
++        view.timing_request = Some(request_id);
++        view.timing_read_at = Some(now);
++        let handle = app_server.request_handle();
++        let events = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let result = handle
++                .request_typed(ClientRequest::ResponseTimingRead {
++                    request_id: RequestId::String(request_id.to_string()),
++                    params: ResponseTimingReadParams::default(),
++                })
++                .await
++                .map_err(|error| error.to_string());
++            events.send(AppEvent::ControlCenterTimingLoaded { request_id, result });
++        });
++    }
++
++    pub(super) fn finish_control_center_timing(
++        &mut self,
++        tui: &mut tui::Tui,
++        request_id: Uuid,
++        result: Result<ResponseTimingReadResponse, String>,
++    ) {
++        if let Some(Overlay::ControlCenter(view)) = &mut self.overlay
++            && view.timing_request == Some(request_id)
++        {
++            view.timing_request = None;
++            if let Ok(summary) = &result {
++                view.responses.history.persistence_error = summary.persistence_error.clone();
++                view.responses.history.last_persistence_error =
++                    summary.last_persistence_error.clone();
++            }
++            view.timing = Some(result);
++            tui.frame_requester().schedule_frame();
++        }
++    }
++
++    pub(super) fn control_center_response_statistics(&self) -> Vec<Line<'static>> {
++        let timing = match &self.overlay {
++            Some(Overlay::ControlCenter(view)) => view.timing.as_ref(),
++            _ => None,
++        };
++        let summary = timing.and_then(|result| result.as_ref().ok());
++        let palette = Palette::current();
++        let heading = |text: &str, index| Line::styled(text.to_owned(), palette.model(index));
++        let metric = |label, value| metric(&palette, label, value);
++        let mut lines = vec![heading("Responses", 1)];
++        if let Some(error) = timing
++            .and_then(|result| result.as_ref().err())
++            .or_else(|| summary.and_then(|summary| summary.persistence_error.as_ref()))
++        {
++            lines.push(format!("Timing history: {error}").yellow().into());
++        }
++        lines.push(metric(
++            "24H total success",
++            summary.and_then(|summary| {
++                success_rate(summary.successful_attempts, summary.total_attempts)
++            }),
++        ));
++        if let Some(summary) = summary {
++            if !summary.models.is_empty() {
++                lines.push(Line::default());
++            }
++            for (index, model) in summary.models.iter().enumerate() {
++                let tps_samples = model.tps.as_ref().map_or(0, |values| values.sample_count);
++                let ttfc_samples = model
++                    .ttfc_ms
++                    .as_ref()
++                    .map_or(0, |values| values.sample_count);
++                lines.push(heading(
++                    self.model_catalog.display_name(&model.requested_model),
++                    index,
++                ));
++                lines.extend([
++                    metric(
++                        "24H success",
++                        success_rate(model.successful_attempts, model.total_attempts),
++                    ),
++                    metric("Last TPS", model.last_tps.map(tps)),
++                    metric("Last TTFC", model.last_ttfc_ms.map(seconds)),
++                    metric(
++                        "24H TPS P50 (typical)",
++                        model.tps.as_ref().map(|values| tps(values.p50)),
++                    ),
++                    metric(
++                        "24H TPS P05 (slow)",
++                        model.tps.as_ref().map(|values| tps(values.slow)),
++                    ),
++                    metric("24H TPS samples", Some(tps_samples.to_string())),
++                    metric(
++                        "24H TTFC P50 (typical)",
++                        model
++                            .ttfc_ms
++                            .as_ref()
++                            .map(|values| format!("{:.2}s", values.p50 / 1000.0)),
++                    ),
++                    metric(
++                        "24H TTFC P95 (slow)",
++                        model
++                            .ttfc_ms
++                            .as_ref()
++                            .map(|values| format!("{:.2}s", values.slow / 1000.0)),
++                    ),
++                    metric("24H TTFC samples", Some(ttfc_samples.to_string())),
++                    Line::default(),
++                ]);
++            }
++        }
++        lines
++    }
++
++    pub(super) fn control_center_quota_statistics(&self) -> Vec<Line<'static>> {
++        let report = match &self.overlay {
++            Some(Overlay::ControlCenter(view)) => view.report(),
++            _ => None,
++        };
++        let weekly = report
++            .map(|report| &report.quota)
++            .filter(|values| !values.is_empty())
++            .map(|values| {
++                let count = values.len() as f64;
++                (
++                    values
++                        .iter()
++                        .map(|value| value.estimated_weekly_cost_usd)
++                        .sum::<f64>()
++                        / count,
++                    values
++                        .iter()
++                        .map(|value| value.used_percent_end)
++                        .sum::<f64>()
++                        / count,
++                    values
++                        .iter()
++                        .map(|value| value.unrecorded_cost_usd())
++                        .sum::<f64>(),
++                )
++            });
++        let ratio = report.and_then(|report| {
++            // Match both sums to whole observed deduction intervals. A partially
++            // priced interval cannot account for the credits spent in that interval.
++            let (credits, cost) = report
++                .credits
++                .iter()
++                .filter(|period| {
++                    period.model_usage.as_ref().is_some_and(|models| {
++                        !models.is_empty()
++                            && models
++                                .keys()
++                                .all(|model| !report.missing_prices.contains(model))
++                    })
++                })
++                .fold((0.0, 0.0), |(credits, cost), period| {
++                    (
++                        credits + period.used_credits,
++                        cost + period.observed_cost_usd,
++                    )
++                });
++            (cost > 0.0).then(|| format!("{:.2}", credits / cost))
++        });
++        let palette = Palette::current();
++        let metric = |label, value| metric(&palette, label, value);
++        vec![
++            Line::styled("Quotas", palette.model(3)),
++            metric("Credits / $1 API", ratio),
++            Line::default(),
++            Line::styled("Weekly", palette.model(3)),
++            metric(
++                "Average estimated",
++                weekly.map(|(cost, _, _)| format!("${cost:.2}")),
++            ),
++            metric(
++                "Average utilization",
++                weekly.map(|(_, percent, _)| format!("{percent:.1}%")),
++            ),
++            metric(
++                "Total unrecorded",
++                weekly.map(|(_, _, cost)| format!("${cost:.2}")),
++            ),
++        ]
++    }
++}
++
++fn success_rate(successful: u64, total: u64) -> Option<String> {
++    (total > 0).then(|| format!("{:.2}%", successful as f64 * 100.0 / total as f64))
++}
++
++#[cfg(test)]
++#[path = "control_center_statistics_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/app/control_center_statistics_tests.rs b/codex-rs/tui/src/app/control_center_statistics_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/control_center_statistics_tests.rs
+@@ -0,0 +1,934 @@
++use super::*;
++use crate::tui::TuiEvent;
++use codex_app_server_protocol::RemoteControlConnectionStatus;
++use codex_app_server_protocol::UsageReadResponse;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyModifiers;
++use itertools::Itertools;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++
++#[tokio::test]
++async fn quota_loads_every_retained_billing_cycle_through_app_server() {
++    use chrono::Duration;
++    use chrono::Utc;
++    use itertools::Itertools;
++
++    let mut app = crate::app::test_support::make_test_app().await;
++    let home = app.config.codex_home.as_path();
++    std::fs::create_dir_all(home.join("sessions")).unwrap();
++    std::fs::write(
++        home.join("models.json"),
++        serde_json::json!({"models": [], "prices": {"summary-model": {"0": {
++            "input": 1.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0
++        }}}})
++        .to_string(),
++    )
++    .unwrap();
++    let now = Utc::now();
++    let mut records = vec![
++        serde_json::json!({"type": "session_meta", "payload": {"id": "summary-history", "history_mode": "paginated"}}),
++        serde_json::json!({"type": "turn_context", "payload": {"model": "summary-model"}}),
++    ];
++    let mut total = 0;
++    for cycle in 0..15 {
++        let start = now - Duration::days(99 - cycle * 7);
++        let reset = (start + Duration::days(7)).timestamp();
++        // Each quota sample excludes its response's own usage.
++        for (offset, percent, tokens) in [(0, 0, 1_000_000), (12, 100, 1)] {
++            total += tokens;
++            records.push(serde_json::json!({
++                "type": "event_msg",
++                "timestamp": (start + Duration::hours(offset)).to_rfc3339(),
++                "payload": {
++                    "type": "token_count",
++                    "info": {
++                        "last_token_usage": {"input_tokens": tokens, "total_tokens": tokens},
++                        "total_token_usage": {"input_tokens": total, "total_tokens": total}
++                    },
++                    "rate_limits": {"plan_type":"pro","primary": {
++                        "used_percent": percent, "window_minutes": 10080, "resets_at": reset
++                    }}
++                }
++            }));
++        }
++    }
++    std::fs::write(
++        home.join("sessions/history.jsonl"),
++        records.iter().map(ToString::to_string).join("\n") + "\n",
++    )
++    .unwrap();
++    let mut server = crate::start_embedded_app_server_for_picker(&app.config)
++        .await
++        .unwrap();
++    let request_id = server.next_request_id();
++    let report = server
++        .request_handle()
++        .request_typed::<codex_app_server_protocol::UsageReadResponse>(
++            codex_app_server_protocol::ClientRequest::UsageRead {
++                request_id,
++                params: codex_app_server_protocol::UsageReadParams::default(),
++            },
++        )
++        .await
++        .unwrap();
++    assert!(report.refreshed);
++    assert!(report.report.build_duration_ms.is_some());
++    for cycle in &report.report.quota {
++        let models = cycle.model_usage.as_ref().unwrap();
++        assert_eq!(models["summary-model"].tokens.input, 1_000_000);
++        assert!((models["summary-model"].cost - cycle.observed_cost_usd).abs() < 1e-12);
++    }
++    let text = crate::control_center_table::tests::render_lines(
++        crate::usage::render_quotas(&report.report, 0, 200).0,
++        200,
++    )
++    .iter()
++    .join("\n");
++    assert!(!text.contains("Average"));
++    assert!(!text.contains("last 90 days"));
++    let cycles = text
++        .lines()
++        .filter(|line| line.contains("Completed") || line.contains("Provisional"))
++        .collect::<Vec<_>>();
++    assert_eq!(cycles.len(), 15);
++    for line in &cycles {
++        let cells = line.split('│').map(str::trim).collect::<Vec<_>>();
++        // The previous cycle's last request precedes the new seven-day window.
++        // Each displayed estimate therefore starts at its own zero sample.
++        assert_eq!(
++            [cells[4], cells[6], cells[7], cells[8], cells[10]],
++            ["0d 12:00:00", "$1.00", "--", "$1.00", "2"],
++            "{line}"
++        );
++    }
++    assert_eq!(text.matches("Completed").count(), 14);
++    assert_eq!(text.matches("Provisional").count(), 1);
++    assert!(!text.contains("cycles"));
++    let mut tui = crate::tui::test_support::make_test_tui().unwrap();
++    app.open_control_center(&mut tui);
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(&mut tui, request_id, Ok(report));
++    let details = app.control_center_quota_statistics().iter().join("\n");
++    assert!(details.contains("Weekly\nAverage estimated: $1.00\nAverage utilization: 100.0%"));
++    assert!(details.contains("Total unrecorded: $0.00"));
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(
++            &mut tui,
++            TuiEvent::Key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT)),
++        )
++        .unwrap();
++    app.refresh_usage(&mut tui);
++    let request_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        panic!("same quota page after refresh")
++    };
++    assert_eq!(view.screen, CenterScreen::Quotas);
++    let area = ratatui::layout::Rect::new(0, 0, 200, 40);
++    view.render(area, &mut ratatui::buffer::Buffer::empty(area));
++    let started_x = view
++        .table_interaction
++        .cells
++        .iter()
++        .find(|(_, text)| text.as_ref() == "Started")
++        .unwrap()
++        .0
++        .x;
++    let starts = view
++        .table_interaction
++        .cells
++        .iter()
++        .filter(|(rect, text)| rect.x == started_x && text.starts_with("2026-"))
++        .map(|(_, text)| text.as_ref())
++        .collect::<Vec<_>>();
++    assert_eq!(
++        starts,
++        ["2026-09-29 08:00", "2026-09-22 08:00", "2026-09-10 08:00"]
++    );
++    server.shutdown().await.unwrap();
++}
++
++#[tokio::test]
++async fn refreshing_usage_preserves_the_center_and_its_response_pages() -> anyhow::Result<()> {
++    let (mut app, mut events, _ops) = crate::app::tests::make_test_app_with_channels().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let request = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        request,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
++    app.overlay.as_mut().unwrap().handle_event(
++        &mut tui,
++        TuiEvent::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT)),
++    )?;
++    let response_request = std::iter::from_fn(|| events.try_recv().ok())
++        .find_map(|event| match event {
++            AppEvent::ReadResponseAttempts { request_id, .. } => Some(request_id),
++            _ => None,
++        })
++        .unwrap();
++    while events.try_recv().is_ok() {}
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.responses.history.finish(
++        response_request,
++        Ok(crate::response_timing::tests::page(vec![
++            crate::response_timing::tests::attempt(7, None),
++        ])),
++        Ok(codex_models_manager::model_pricing::Prices::new()),
++        Instant::now(),
++    );
++    let timing_request = Uuid::new_v4();
++    let timing_read_at = Instant::now();
++    view.timing_request = Some(timing_request);
++    view.timing_read_at = Some(timing_read_at);
++    assert!(view.report().is_some());
++    app.refresh_usage(&mut tui);
++    app.refresh_usage(&mut tui);
++    let AppEvent::LoadUsage {
++        request_id,
++        refresh,
++    } = events.try_recv().unwrap()
++    else {
++        panic!("refresh shared usage")
++    };
++    assert!(refresh);
++    assert_ne!(request_id, request);
++    assert!(events.try_recv().is_err());
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert_eq!(view.request_id, Some(request_id));
++    assert!(view.report().is_none());
++    assert_eq!(
++        view.screen,
++        CenterScreen::Usage(crate::usage::UsageRange::Monthly)
++    );
++    assert_eq!(view.responses.history.count(), 1);
++    assert_eq!(view.timing_request, Some(timing_request));
++    assert_eq!(view.timing_read_at, Some(timing_read_at));
++    let area = ratatui::layout::Rect::new(0, 0, 200, 32);
++    let mut buffer = ratatui::buffer::Buffer::empty(area);
++    view.render(area, &mut buffer);
++    let text = buffer
++        .content
++        .iter()
++        .map(|cell| cell.symbol())
++        .collect::<String>();
++    assert!(text.contains("Loading usage..."), "{text}");
++
++    app.finish_usage(
++        &mut tui,
++        request_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(&mut tui, TuiEvent::Key(KeyCode::Esc.into()))?;
++    // The responsive Summary can place its runtime details below the selected-day tables.
++    app.overlay
++        .as_mut()
++        .unwrap()
++        .handle_event(&mut tui, TuiEvent::Key(KeyCode::End.into()))?;
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(view.report().is_some());
++    assert_eq!(view.responses.history.count(), 1);
++    assert_eq!(view.timing_request, Some(timing_request));
++    assert_eq!(view.screen, CenterScreen::Summary);
++    view.render(area, &mut buffer);
++    let duration = buffer
++        .content
++        .chunks_exact(usize::from(area.width))
++        .find_map(|row| {
++            let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
++            text.split_once("Build duration: ")
++                .map(|(_, value)| value.trim().to_owned())
++        })
++        .expect("producer build duration is visible");
++    assert_eq!(duration, "1.23s");
++    assert!(events.try_recv().is_err());
++    Ok(())
++}
++
++#[tokio::test]
++async fn statistics_and_summary_preserve_unknowns_zero_and_independent_sources()
++-> crate::app::Result<()> {
++    use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
++    use codex_app_server_protocol::ServerNotification;
++    use codex_protocol::account::PlanType;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++    use codex_protocol::response_metrics::ResponseModelTiming;
++    use codex_protocol::response_metrics::ResponseTimingSummary;
++
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let unknown = [
++        app.control_center_response_statistics(),
++        app.control_center_quota_statistics(),
++        app.control_center_details(),
++    ]
++    .concat()
++    .iter()
++    .join("\n");
++    for label in [
++        "24H total success",
++        "Responses",
++        "Remote",
++        "Home",
++        "Harness",
++        "Average estimated",
++        "Average utilization",
++        "Total unrecorded",
++    ] {
++        assert!(
++            unknown.lines().any(|line| line == format!("{label}: ")),
++            "{unknown}"
++        );
++    }
++    let mut response =
++        crate::response_timing::tests::attempt(1, Some(ResponseAttemptEnd::Completed));
++    let thread_id = response.thread_id.unwrap();
++    app.chat_widget
++        .handle_thread_session(crate::app::tests::test_thread_session(
++            thread_id,
++            app.config.cwd.to_path_buf(),
++        ));
++    app.chat_widget
++        .update_account_state(None, Some(PlanType::Plus), true, true);
++    response.ttfc_ms = Some(999_999);
++    response.tps = Some(1234.0);
++    app.chat_widget.on_response_attempt_updated(response);
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected: true,
++                rtt_ms: Some(0),
++            },
++        ),
++        None,
++    );
++    app.remote_control_connection_status = Some(
++        codex_app_server_protocol::RemoteControlStatusChangedNotification {
++            status: RemoteControlConnectionStatus::Connected,
++            server_name: "test".into(),
++            installation_id: "test".into(),
++            environment_id: None,
++            rtt_ms: Some(42),
++        },
++    );
++    app.storage_capacity = Some(codex_app_server_protocol::GetStorageCapacityResponse {
++        home_available_bytes: 0,
++        harness_available_bytes: 5 * 1024 * 1024 * 1024,
++    });
++    app.proxy_alias = Some("local".into());
++    app.proxy_address = Some("127.0.0.1:7890".into());
++    app.connected_client_count = Some(2);
++    let mut preset = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    preset.model = "Alpha/Case".into();
++    preset.display_name = "Friendly Alpha".into();
++    app.model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(vec![preset]));
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.set_report(Ok(Arc::new(crate::usage::test_report())));
++    view.timing = Some(Ok(ResponseTimingReadResponse {
++        models: vec![
++            ResponseModelTiming {
++                requested_model: "Alpha/Case".into(),
++                successful_attempts: 4,
++                total_attempts: 10,
++                last_tps: Some(0.0),
++                last_ttfc_ms: Some(0),
++                tps: Some(ResponseTimingSummary {
++                    sample_count: 5,
++                    p50: 80.25,
++                    slow: 0.0,
++                }),
++                ttfc_ms: Some(ResponseTimingSummary {
++                    sample_count: 3,
++                    p50: 400.0,
++                    slow: 1234.5,
++                }),
++            },
++            ResponseModelTiming {
++                requested_model: "model-B".into(),
++                successful_attempts: 0,
++                total_attempts: 3,
++                last_tps: None,
++                last_ttfc_ms: None,
++                tps: Some(ResponseTimingSummary {
++                    sample_count: 2,
++                    p50: 12.0,
++                    slow: 3.0,
++                }),
++                ttfc_ms: None,
++            },
++            ResponseModelTiming {
++                requested_model: "previous-day".into(),
++                successful_attempts: 0,
++                total_attempts: 0,
++                last_tps: Some(20.0),
++                last_ttfc_ms: Some(0),
++                tps: None,
++                ttfc_ms: None,
++            },
++        ],
++        successful_attempts: 4,
++        total_attempts: 13,
++        persistence_error: Some("Backup unavailable".into()),
++        last_persistence_error: None,
++    }));
++    let responses = app.control_center_response_statistics();
++    let quotas = app.control_center_quota_statistics();
++    let summary = app.control_center_details();
++    let text = responses.iter().chain(&quotas).chain(&summary).join("\n");
++    for value in [
++        "24H total success: 30.77%",
++        "Last TTFC: 0.00s",
++        "Last TPS: 0.0",
++        "24H TPS P50 (typical): 80.2",
++        "24H TPS P05 (slow): 0.0",
++        "24H TPS samples: 5",
++        "24H TTFC P50 (typical): 0.40s",
++        "24H TTFC P95 (slow): 1.23s",
++        "24H TTFC samples: 3",
++        "Responses: 0ms",
++        "Remote: 42ms",
++        "Home: 0.00B",
++        "Harness: 5.00GiB",
++        "Name: local",
++        "Address: 127.0.0.1:7890",
++        "Clients: 2",
++        "Timing history: Backup unavailable",
++        "Average estimated: $533.33",
++        "Average utilization: 60.0%",
++        "Total unrecorded: $50.00",
++    ] {
++        assert!(text.contains(value), "{text}");
++    }
++    assert!(text.contains(
++        "24H total success: 30.77%\n\nFriendly Alpha\n24H success: 40.00%\nLast TPS: 0.0"
++    ));
++    assert!(!text.contains("Alpha/Case"));
++    assert!(text.contains("model-B\n24H success: 0.00%\nLast TPS: \nLast TTFC: \n24H TPS P50 (typical): 12.0\n24H TPS P05 (slow): 3.0\n24H TPS samples: 2\n24H TTFC P50 (typical): \n24H TTFC P95 (slow): \n24H TTFC samples: 0"));
++    assert!(text.contains("previous-day\n24H success: \nLast TPS: 20.0"));
++    assert!(!text.contains("1234.0"));
++    let sidebar = summary.iter().join("\n");
++    for moved in [
++        "24H total success",
++        "Last TPS",
++        "Latest estimated",
++        "Average utilization",
++        "Telegram",
++    ] {
++        assert!(!sidebar.contains(moved), "{sidebar}");
++    }
++    assert!(sidebar.find("WebSocket RTT\n").unwrap() < sidebar.find("Storage free\n").unwrap());
++    assert!(sidebar.find("Storage free\n").unwrap() < sidebar.find("Proxy\n").unwrap());
++    assert!(sidebar.find("Proxy\n").unwrap() < sidebar.find("Miscellaneous\n").unwrap());
++    let palette = Palette::current();
++    let details = responses
++        .iter()
++        .chain(&quotas)
++        .chain(&summary)
++        .collect::<Vec<_>>();
++    assert_eq!(details[0].style, palette.model(1));
++    for (label, index) in [
++        ("Friendly Alpha", 0),
++        ("model-B", 1),
++        ("WebSocket RTT", 2),
++        ("Quotas", 3),
++        ("Weekly", 3),
++        ("Storage free", 4),
++        ("Proxy", 5),
++        ("Miscellaneous", 6),
++    ] {
++        assert_eq!(
++            details
++                .iter()
++                .find(|line| line.to_string() == label)
++                .unwrap()
++                .style,
++            palette.model(index)
++        );
++    }
++    assert_eq!(
++        details
++            .iter()
++            .find(|line| line.to_string() == "Last TPS: 0.0")
++            .unwrap()
++            .spans[1]
++            .style,
++        palette.intensity(16)
++    );
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected: false,
++                rtt_ms: None,
++            },
++        ),
++        None,
++    );
++    let text = app.control_center_details().iter().join("\n");
++    assert!(text.contains("Responses: Disconnected"));
++    assert!(text.contains("Remote: 42ms"));
++    Ok(())
++}
++
++#[tokio::test]
++async fn timing_refreshes_on_new_generation_and_expiry_without_reloading_usage_or_accepting_stale_results()
++-> crate::app::Result<()> {
++    use codex_app_server_client::AppServerEvent;
++    use codex_app_server_protocol::JSONRPCMessage;
++    use codex_app_server_protocol::ResponseAttemptUpdatedNotification;
++    use codex_app_server_protocol::ServerNotification;
++    use codex_protocol::response_metrics::ResponseAttemptEnd;
++    use futures::SinkExt;
++    use futures::StreamExt;
++    use tokio_tungstenite::tungstenite::Message;
++
++    let (mut app, mut events, _ops) = crate::app::tests::make_test_app_with_channels().await;
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++    let url = format!("ws://{}", listener.local_addr()?);
++    let home = app.config.codex_home.display().to_string();
++    let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel();
++    let server: tokio::task::JoinHandle<crate::app::Result<()>> = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await?;
++        let mut socket = tokio_tungstenite::accept_async(stream).await?;
++        let mut reads = 0;
++        while let Some(Ok(Message::Text(text))) = socket.next().await {
++            let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
++                continue;
++            };
++            let response = match request.method.as_str() {
++                "initialize" => {
++                    serde_json::json!({"id": request.id, "result": {"userAgent": "test", "codexHome": home,
++                        "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
++                }
++                "modelResponse/timing/read" => {
++                    reads += 1;
++                    read_tx.send(reads).unwrap();
++                    if reads == 2 {
++                        serde_json::json!({"id": request.id, "error": {"code": -32600, "message": "Timing unavailable"}})
++                    } else {
++                        serde_json::json!({"id": request.id, "result": {
++                            "successfulAttempts": 8, "totalAttempts": 12,
++                            "models": [{"requestedModel": "Model/Case", "successfulAttempts": 8,
++                                "totalAttempts": 12, "lastTps": null, "lastTtfcMs": null,
++                                "tps": {"sampleCount": 10, "p50": reads as f64, "slow": 0.5},
++                                "ttfcMs": {"sampleCount": 3, "p50": 400.0, "slow": 1200.0}}],
++                            "persistenceError": (reads == 6).then_some("database is locked"),
++                            "lastPersistenceError": (reads >= 6).then(|| serde_json::json!({
++                                "message": "database is locked",
++                                "occurredAtMs": if reads == 8 { 1_792_637_337_123_i64 } else { 1_792_637_336_123_i64 }
++                            }))
++                        }})
++                    }
++                }
++                method => panic!("statistics must not reload usage or response pages: {method}"),
++            };
++            socket
++                .send(Message::Text(response.to_string().into()))
++                .await?;
++        }
++        assert_eq!(reads, 8);
++        Ok(())
++    });
++    let client = crate::connect_remote_app_server(crate::RemoteAppServerEndpoint::WebSocket {
++        websocket_url: url,
++        auth_token: None,
++    })
++    .await?;
++    let mut session = AppServerSession::new(
++        crate::backend_id::BackendId::new(),
++        client,
++        crate::app_server_session::ThreadParamsMode::Remote,
++    );
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.open_control_center(&mut tui);
++    let report_id = app.usage_request.as_ref().unwrap().id;
++    app.finish_usage(
++        &mut tui,
++        report_id,
++        Ok(UsageReadResponse {
++            report: Arc::new(crate::usage::test_report()),
++            refreshed: true,
++        }),
++    );
++    while events.try_recv().is_ok() {}
++    let mut preset = crate::test_support::TEST_MODEL_PRESETS[0].clone();
++    preset.model = "Model/Case".into();
++    preset.display_name = "Friendly live model".into();
++    app.model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(vec![preset]));
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.screen = CenterScreen::Responses;
++    view.show_statistics(1.0, tui.frame_requester());
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    assert!(
++        !app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("Status: Loading")
++    );
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        panic!("responses")
++    };
++    let area = ratatui::layout::Rect::new(0, 0, 200, 32);
++    let mut buffer = ratatui::buffer::Buffer::empty(area);
++    view.render(area, &mut buffer);
++    assert!(view.has_statistics());
++    assert!(view.timing_request.is_some());
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if Arc::ptr_eq(&view.responses.catalog, &app.model_catalog))
++    );
++    app.refresh_control_center_timing(&session, false);
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    assert!(
++        app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("Friendly live model\n")
++    );
++    assert!(
++        app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("TPS P50 (typical): 1.0")
++    );
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(view.timing_request.is_none());
++    view.timing_read_at = Some(Instant::now() - Duration::from_secs(2));
++    app.refresh_control_center_timing(&session, false);
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    assert!(
++        app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("Timing unavailable")
++    );
++    app.refresh_control_center_timing(&session, false);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.timing_request.is_none())
++    );
++    for (kind, ended) in [
++        ("generation", false),
++        ("warmup", true),
++        ("generation", true),
++    ] {
++        let mut attempt = crate::response_timing::tests::attempt(
++            50,
++            ended.then_some(ResponseAttemptEnd::Completed),
++        );
++        attempt.request_kind = kind.into();
++        app.handle_backend_event(
++            &session,
++            crate::app_server_session::AppServerSessionEvent {
++                backend_id: session.backend_id(),
++                event: AppServerEvent::ServerNotification(Box::new(
++                    ServerNotification::ResponseAttemptUpdated(
++                        ResponseAttemptUpdatedNotification {
++                            thread_id: attempt.thread_id.map(|id| id.to_string()),
++                            attempt,
++                        },
++                    ),
++                )),
++            },
++        )
++        .await;
++        assert!(
++            matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.timing_request.is_some() == (kind == "generation" && ended))
++        );
++    }
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    assert!(
++        app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("TPS P50 (typical): 3.0")
++    );
++    app.refresh_control_center_timing(&session, true);
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while read_rx.recv().await.expect("summary read") != 4 {}
++    })
++    .await?;
++    app.close_transcript_overlay(&mut tui);
++    app.open_control_center(&mut tui);
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.screen = CenterScreen::Responses;
++    view.show_statistics(1.0, tui.frame_requester());
++    app.refresh_control_center_timing(&session, false);
++    for _ in 0..2 {
++        consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    }
++    assert!(
++        app.control_center_response_statistics()
++            .iter()
++            .join("\n")
++            .contains("TPS P50 (typical): 5.0")
++    );
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.request_id == app.usage_request.as_ref().map(|request| request.id))
++    );
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.dialogs.on_ctrl_c();
++    assert!(!view.has_statistics());
++    assert!(view.responses.history.persistence_error.is_none());
++    view.timing_read_at = Some(Instant::now() - Duration::from_secs(2));
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert_eq!(
++        view.responses.history.persistence_error.as_deref(),
++        Some("database is locked")
++    );
++    let occurrence = view
++        .responses
++        .history
++        .last_persistence_error
++        .clone()
++        .unwrap();
++    assert_eq!(occurrence.occurred_at_ms, 1_792_637_336_123);
++    view.timing_read_at = Some(Instant::now() - Duration::from_secs(2));
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(view.responses.history.persistence_error.is_none());
++    assert_eq!(
++        view.responses.history.last_persistence_error,
++        Some(occurrence)
++    );
++    assert_eq!(view.screen, CenterScreen::Responses);
++    app.refresh_control_center_timing(&session, false);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.timing_request.is_none())
++    );
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.timing_read_at = Some(Instant::now() - Duration::from_secs(2));
++    app.refresh_control_center_details(&session, &TuiEvent::Draw);
++    consume_timing_result(&mut app, &mut tui, &mut session, &mut events).await?;
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    assert!(view.responses.history.persistence_error.is_none());
++    assert_eq!(
++        view.responses
++            .history
++            .last_persistence_error
++            .as_ref()
++            .unwrap()
++            .occurred_at_ms,
++        1_792_637_337_123
++    );
++    view.screen = CenterScreen::Summary;
++    app.refresh_control_center_timing(&session, true);
++    assert!(
++        matches!(&app.overlay, Some(Overlay::ControlCenter(view)) if view.timing_request.is_none())
++    );
++    session.shutdown().await?;
++    server.await??;
++    Ok(())
++}
++
++#[tokio::test]
++async fn quota_statistics_sum_unrecorded_spending_and_preserve_averages() {
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui().unwrap();
++    app.open_control_center(&mut tui);
++    let mut report = crate::usage::test_report();
++    report.quota.truncate(2);
++    report.quota[0].estimated_weekly_cost_usd = 123.0;
++    report.quota[0].used_percent_end = 40.0;
++    report.quota[0].observed_cost_usd = 10.0;
++    report.quota[1].estimated_weekly_cost_usd = 0.0;
++    report.quota[1].used_percent_end = 80.0;
++    let page = crate::control_center_table::tests::render_lines(
++        crate::usage::render_quotas(&report, 0, 200).0,
++        200,
++    )
++    .iter()
++    .join("\n");
++    assert!(page.contains("$123.00"), "{page}");
++    let zero_row = page.lines().find(|row| row.contains("80.0%")).unwrap();
++    assert_eq!(zero_row.split('│').nth(8).unwrap().trim(), "--");
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.set_report(Ok(Arc::new(report.clone())));
++    let statistics = app.control_center_quota_statistics().iter().join("\n");
++    assert!(!statistics.contains("Latest estimated"), "{statistics}");
++    assert!(statistics.contains("Credits / $1 API: "), "{statistics}");
++    assert!(
++        statistics.contains("Average estimated: $61.50"),
++        "{statistics}"
++    );
++    assert!(
++        statistics.contains("Average utilization: 60.0%"),
++        "{statistics}"
++    );
++    assert!(
++        statistics.contains("Total unrecorded: $39.20"),
++        "{statistics}"
++    );
++    report.quota.clear();
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.set_report(Ok(Arc::new(report)));
++    let statistics = app.control_center_quota_statistics().iter().join("\n");
++    assert!(!statistics.contains("Latest estimated"), "{statistics}");
++    for label in [
++        "Average estimated",
++        "Average utilization",
++        "Total unrecorded",
++    ] {
++        assert!(statistics.lines().any(|line| line == format!("{label}: ")));
++    }
++}
++
++#[tokio::test]
++async fn credit_api_ratio_uses_matching_fully_priced_periods_and_keeps_unknowns_blank() {
++    use codex_app_server_protocol::UsageCreditPeriod;
++    use codex_app_server_protocol::UsageTotals;
++    use std::collections::BTreeMap;
++
++    let mut app = crate::app::test_support::make_test_app().await;
++    let mut tui = crate::tui::test_support::make_test_tui().unwrap();
++    app.open_control_center(&mut tui);
++    let mut report = crate::usage::test_report();
++    report
++        .prices
++        .get_mut("gpt-5.4")
++        .unwrap()
++        .get_mut(&0)
++        .unwrap()
++        .cache_read = 0.0;
++    let period = |day, credits, cost: f64| UsageCreditPeriod {
++        started_at: format!("2026-09-{day:02}T00:00:00Z"),
++        ended_at: format!("2026-09-{day:02}T01:00:00Z"),
++        used_credits: credits,
++        observed_cost_usd: cost,
++        model_usage: Some(BTreeMap::from([(
++            "gpt-5.4".into(),
++            UsageTotals {
++                cost,
++                tokens: codex_app_server_protocol::UsageTokens {
++                    input: 10_000,
++                    cached: 10_000,
++                    output: (cost * 100_000.0) as u64,
++                    total: 10_000 + (cost * 100_000.0) as u64,
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++        )])),
++        sample_count: 2,
++    };
++    let mut partial = period(3, 100.0, 1.0);
++    partial.model_usage.as_mut().unwrap().insert(
++        "unpriced".into(),
++        UsageTotals {
++            tokens: codex_app_server_protocol::UsageTokens {
++                input: 1,
++                total: 1,
++                ..Default::default()
++            },
++            ..Default::default()
++        },
++    );
++    let mut missing = period(4, 200.0, 2.0);
++    missing.model_usage = None;
++    report.missing_prices.insert("unpriced".into());
++    report.credits = vec![period(1, 20.0, 1.0), period(2, 60.0, 2.0), partial, missing];
++    let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++        unreachable!()
++    };
++    view.set_report(Ok(Arc::new(report.clone())));
++    let text = app.control_center_quota_statistics().iter().join("\n");
++    assert!(text.contains("Credits / $1 API: 26.67"), "{text}");
++    assert!(
++        !app.control_center_details()
++            .iter()
++            .join("\n")
++            .contains("Credits / $1 API")
++    );
++
++    for periods in [
++        vec![],
++        vec![period(1, 20.0, 0.0)],
++        report.credits[2..].to_vec(),
++    ] {
++        report.credits = periods;
++        let Some(Overlay::ControlCenter(view)) = &mut app.overlay else {
++            unreachable!()
++        };
++        view.set_report(Ok(Arc::new(report.clone())));
++        let lines = app.control_center_quota_statistics();
++        assert!(
++            lines
++                .iter()
++                .any(|line| line.to_string() == "Credits / $1 API: ")
++        );
++        assert!(!lines.iter().join("\n").contains("NaN"));
++    }
++}
++
++async fn consume_timing_result(
++    app: &mut App,
++    tui: &mut tui::Tui,
++    session: &mut AppServerSession,
++    events: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++) -> crate::app::Result<()> {
++    let event = tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            let event = events.recv().await.expect("timing result");
++            if matches!(event, AppEvent::ControlCenterTimingLoaded { .. }) {
++                break event;
++            }
++        }
++    })
++    .await?;
++    app.handle_event(tui, session, event).await?;
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2134,6 +2134,9 @@ impl App {
+             AppEvent::ControlCenterGithubLoaded { request_id, result } => {
+                 self.finish_control_center_github(tui, request_id, result);
+             }
++            AppEvent::ControlCenterTimingLoaded { request_id, result } => {
++                self.finish_control_center_timing(tui, request_id, result);
++            }
+             AppEvent::RefreshResponseTiming { thread_id } => self.refresh_response_timing(app_server, thread_id),
+             AppEvent::ResponseTimingLoaded { thread_id, requested_at, result } => {
+                 if self.current_displayed_thread_id() == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -870,6 +870,11 @@ pub(crate) enum AppEvent {
+         result: Result<codex_app_server_protocol::GithubReadResponse, String>,
+     },
+ 
++    ControlCenterTimingLoaded {
++        request_id: Uuid,
++        result: Result<codex_app_server_protocol::ResponseTimingReadResponse, String>,
++    },
++
+     /// Restore response timing when the displayed thread changes.
+     RefreshResponseTiming {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/pager_overlay/control_center.rs b/codex-rs/tui/src/pager_overlay/control_center.rs
+--- a/codex-rs/tui/src/pager_overlay/control_center.rs
++++ b/codex-rs/tui/src/pager_overlay/control_center.rs
+@@ -2,6 +2,7 @@
+ 
+ use super::PagerView;
+ use super::response_tab::ResponseTab;
++use super::statistics::StatisticsView;
+ use crate::app_event_sender::AppEventSender;
+ use crate::bottom_pane::render_filled_tab_bar;
+ use crate::control_center_table::Cell;
+@@ -37,9 +38,12 @@ use ratatui::text::Line;
+ use ratatui::text::Span;
+ use ratatui::widgets::Clear;
+ use ratatui::widgets::Widget;
++use std::cell::RefCell;
+ use std::io::Result;
++use std::rc::Weak;
+ use std::sync::Arc;
+ use std::time::Instant;
++use tokio::sync::watch;
+ use uuid::Uuid;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -80,6 +84,13 @@ pub(crate) struct ControlCenter {
+     theme_revision: u64,
+     pub(crate) table_interaction: TableInteraction,
+     pub(crate) details: Vec<Line<'static>>,
++    pub(crate) response_statistics: watch::Sender<Vec<Line<'static>>>,
++    pub(crate) quota_statistics: watch::Sender<Vec<Line<'static>>>,
++    statistics: Weak<RefCell<StatisticsView>>,
++    pub(crate) timing:
++        Option<std::result::Result<codex_app_server_protocol::ResponseTimingReadResponse, String>>,
++    pub(crate) timing_request: Option<Uuid>,
++    pub(crate) timing_read_at: Option<Instant>,
+     pub(crate) github: Option<codex_app_server_protocol::GithubStatus>,
+     pub(crate) github_request: Option<Uuid>,
+     pub(crate) github_read_at: Option<Instant>,
+@@ -110,6 +121,12 @@ impl ControlCenter {
+             theme_revision: syntax_theme_revision(),
+             table_interaction: TableInteraction::new(mouse_scroll_speed, frames),
+             details: Vec::new(),
++            response_statistics: watch::channel(Vec::new()).0,
++            quota_statistics: watch::channel(Vec::new()).0,
++            statistics: Weak::new(),
++            timing: None,
++            timing_request: None,
++            timing_read_at: None,
+             github: None,
+             github_request: None,
+             github_read_at: None,
+@@ -146,6 +163,10 @@ impl ControlCenter {
+         self.is_done
+     }
+ 
++    pub(crate) fn has_statistics(&self) -> bool {
++        self.statistics.strong_count() > 0
++    }
++
+     fn content_width(&self) -> u16 {
+         self.content_width
+     }

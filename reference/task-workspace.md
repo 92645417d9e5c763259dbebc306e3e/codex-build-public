@@ -8,9 +8,11 @@
 - `$SKILLS_SCRATCH_ROOT/<skill>/topics` is target-owned.
 - `$CODEX_HOME` owns product state.
 - Attached cleanup owns only tracked source restoration and the exact ordinary non-ignored untracked inventory at the supplied repository root. Root classification never makes ignored descendants or another supplied root disposable.
-- Editable notes live under <ProjectScratchRoot>/lane-notes/<Tag>: notes.md holds shared product constraints and <LaneDirectory>/notes.md holds only lane-specific additions. Read the root before the selected lane; lane notes do not override shared guards. Platform, account, and transport scope belong here, not in skill defaults or repeated lane entries.
-- Notes hold exact current-user-approved critical cross-Patch guards. Self-contained behavior, identity, topology, and history stay with task, Git, source, and routes. The whole set survives Current, Fork, reset, promotion, and export rotation. Every entry mutation needs separate exact approval; private export only copies it.
-- The cross diagram's editable owner is `<ProjectScratchRoot>/lane-notes/<Tag>/5-cross/relationships.txt`, beside the lane's notes rather than inside Markdown or a task record.
+- Editable notes occupy one file at <ProjectScratchRoot>/lane-notes/<Tag>/notes.md.
+- Platform, account, transport scope, and other approved cross-Patch guards belong there, not in skill defaults or Patch summaries.
+- The file survives Current, Fork, reset, promotion, and export rotation.
+- PatchExport owns exact entry approval and read-only publication.
+- The cross diagram's editable owner is `<ProjectScratchRoot>/lane-notes/<Tag>/5-cross/relationships.txt`, separate from Markdown and task records.
 - Its published copy is `<ProjectWorkingRoot>/build/patches/private/<Tag>/5-cross/relationships.txt`; inheritance and authorized relationship changes update the working file before export.
 - PatchExport owns the diagram contract and exact publication. The same working-set lifetime preserves it across Fork, promotion and partial exports, and retires only an exactly published copy during selected cleanup.
 
@@ -123,7 +125,7 @@ ClosedPatchTaskReductionOwner
 - Any missing or unexplained entry forbids lane crossing, a completion claim or removal of its pending work.
 - A shorter closed prefix may still be exported without closing its unfinished lane.
 - Clean Git, matching Patch names, passing checks and artifact publication cannot discharge a different pending requirement or select a completion handoff.
-- A question cannot reorder topology or establish an accident. Only actual topology mismatch requires renumbering and approval; otherwise answer and continue the reconciled successor. Task reduction grants no changed responsibility and does not edit separately approved lane-note guards.
+- A question cannot reorder topology or establish an accident. Only actual topology mismatch requires renumbering and approval; otherwise answer and continue the reconciled successor. Task reduction grants no changed responsibility and does not edit separately approved version-note guards.
 - A requested recap consumes the task, Git, available Apply diagnostics and selected check terminals; it creates no recap file or copied progress state.
 - Explain rejected Apply inputs and the reason for reconstruction, followed by the committed Child Patch rewrite order and observed outcomes.
 - Distinguish verified results, missing historical evidence and remaining work with its next action; final Git alone cannot prove failed attempts or test outcomes.
@@ -147,7 +149,7 @@ ClosedPatchTaskReductionOwner
 - Roll implementation remains linear in the product agent.
 - A direct material finding uses actual Git and the existing Unit or Flat Patch correction boundary. Preserve later work and never restore saved task bytes or falsify its frontier.
 - The task has no completed list, archive, event log, checkpoint, cursor, helper progress, test verdict, reviewer state, Roll mode or second representation.
-- Explicit Cleanup removes drained execution records and logs, preserving tasks/rust-suite-baselines.json as baseline comparison facts. Selected release retirement also removes the closed task and published lane-note working set while retaining Main and UpstreamBaseline. Next-tag Baseline cleanup retires its primary predecessor's published working notes. Source restoration and temporary cleanup leave final patches, binaries and reusable build inputs untouched.
+- Explicit Cleanup removes drained execution records and logs, preserving tasks/rust-suite-baselines.json as baseline comparison facts. Selected release retirement also removes the closed task and published working release documents while retaining Main and UpstreamBaseline. Next-tag Baseline cleanup retires its primary predecessor's published working notes. Source restoration and temporary cleanup leave final patches, binaries and reusable build inputs untouched.
 - EditNamedTask publishes the sole release-roll-<Tag>.md before baseline, at Fork adoption and through reconciliation above.
 - Temporary Main fixup retains its focused-tested fold plan until absorbed.
 - PatchReplay synchronizes retained-range fields and generated-tail terminals through their declared exact-preimage owners.
@@ -155,7 +157,7 @@ ClosedPatchTaskReductionOwner
 - ActiveTask contains zero or one release task. OtherTasks is always empty and OverallTask keeps its independent existing role. The task survives each selected roll stop until explicit retirement. No semantic-version ordering or next-task selector exists.
 - Each task declares SourcePrefixes as one or more unique release tags joined by comma-space. The first is the primary predecessor and differs from the task tag. Further entries may name older, newer completed, or same-tag retained canonical prefixes. They provide read-only purpose evidence and exact unchanged transport input for the declared next Patch; they do not authorize changing its responsibility.
 - Before replacing the sole task for a user-selected newer tag, report pending work and carry every unresolved obligation, approved deferral and controlling user boundary into the replacement.
-- Preserve source-prefix and lane-note custody across that replacement.
+- Preserve source-prefix and version-note custody across that replacement.
 - Reread the replacement through EOF before Baseline retires predecessor roles.
 - ReleaseBaseline consumes the sole selected task and index unchanged. It admits either that tag's canonical global roles for same-tag continuation or its primary predecessor's canonical global roles after product work replaced the sole task without losing unresolved custody. A predecessor with private history requires the exact exported primary prefix; an absent prefix is admitted only when Established exists and clean Main equals the official tag parent.
 - The predecessor roles are retired and replaced at the same paths before selected-tag preparation returns; no completion receipt or invented empty export is required. Failure after preparation resumes the same tag and chain. Tag-scoped, mixed, duplicate, or unvalidated predecessor topology blocks.

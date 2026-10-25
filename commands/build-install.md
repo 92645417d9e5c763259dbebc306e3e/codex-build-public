@@ -11,6 +11,10 @@
 - Caller-home release links are user-owned; the helper's dist selection does not depend on them.
 - Dist selection neither reads nor writes caller-home release links.
 - Package-only leaves `build/dist/current` unchanged.
+- After successful source admission and under CargoLock, the existing native build selection asset removes exactly `<effective working root>/build/patches/private/<Tag>-prev` before tool preparation, completed-package reuse or compilation.
+- An absent private root or current tag-prev is already clean; a symlinked root, malformed previous directory or tracked tag-prev blocks without broader removal.
+- This cleanup applies to ordinary and draft builds, including package-only; it leaves the current export, primary predecessor, every package and reusable build cache unchanged.
+- The ignored previous generation remains untracked, so its filesystem removal creates no synthetic commit.
 
 ## Build And Package
 
@@ -94,4 +98,13 @@ BuildInstallPublicationOwner
 - This host-side check resolves paths only; consume package admission's isolated startup proof without executing the launch entry again in the caller environment.
 - Existing entries go directly to verification without repeating setup.
 - A mismatch waits for user correction and subsequent verification of the changed entry.
-- Stop only after the launch-entry path verifies; helper Pass alone proves only dist selection.
+- After the launch-entry path verifies, perform one patch private sync from `<effective working root>/build/patches/private` before reporting installation complete.
+- Package-only and failed compilation, package selection or launch-entry verification select no private push.
+- Resolve the private repository's established push destination and main branch from its existing upstream or sole configured remote; an absent or ambiguous destination blocks this sync without changing remotes.
+- Use `gh repo view` on that exact GitHub destination to confirm `isPrivate` before sending source; a non-private or unverifiable destination blocks this private-only effect.
+- Require private main with no staged changes or sequencer and no uncommitted tracked or ordinary untracked content before pushing.
+- Export already owns the current tag and tracked obsolete-tag deletion commit; do not create a second commit or include unrelated edits to make private sync pass.
+- Use existing gh authentication through a command-scoped Git credential helper for one ordinary push of local main to the established remote main; do not change credentials or configuration.
+- Do not force, fetch, merge, rebase or retry a rejected push; retain the successful installed package and report the exact sync blocker.
+- Public snapshot sync remains a separate explicit user request and is never selected by this private sync.
+- Installation completes only after launch-entry verification and successful private sync; helper Pass alone proves only dist selection.

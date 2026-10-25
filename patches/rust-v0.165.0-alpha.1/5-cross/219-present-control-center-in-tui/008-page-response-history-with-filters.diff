@@ -1,0 +1,870 @@
+page-response-history-with-filters
+
+Lane: cross
+
+Unit: present-control-center-in-tui
+
+ChildPatch: page-response-history-with-filters
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -204,6 +204,7 @@ mod proxy_dialogs;
+ pub(crate) mod public_widgets;
+ mod render;
+ mod resize_reflow_cap;
++mod response_history;
+ mod response_table;
+ mod response_timing;
+ mod resume_permissions;
+diff --git a/codex-rs/tui/src/response_history.rs b/codex-rs/tui/src/response_history.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_history.rs
+@@ -0,0 +1,364 @@
++//! Retained response pages and live observations share one ordered row owner.
++
++use crate::keymap::ListAction;
++use crate::response_table::ROW_HEIGHT;
++use crate::response_timing::ObservedResponse;
++use crate::resume_picker::LOAD_NEAR_THRESHOLD;
++use codex_app_server_protocol::ResponseAttemptsReadParams;
++use codex_app_server_protocol::ResponseAttemptsReadResponse;
++use codex_models_manager::model_pricing::Prices;
++use codex_protocol::response_metrics::ResponseAttempt;
++use codex_protocol::response_metrics::ResponseAttemptStatus;
++use codex_protocol::response_metrics::ResponsePersistenceError;
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::time::Instant;
++use uuid::Uuid;
++
++pub(crate) struct ResponsePageRequest {
++    pub(crate) id: Uuid,
++    pub(crate) params: ResponseAttemptsReadParams,
++}
++
++struct PendingPage {
++    id: Uuid,
++    requested_at: Instant,
++    older: bool,
++}
++
++pub(crate) struct ResponseHistory {
++    query: ResponseAttemptsReadParams,
++    records: BTreeMap<Uuid, ObservedResponse>,
++    pub(crate) models: BTreeSet<String>,
++    pub(crate) prices: Result<Prices, String>,
++    pub(crate) error: Option<String>,
++    pub(crate) persistence_error: Option<String>,
++    pub(crate) last_persistence_error: Option<ResponsePersistenceError>,
++    next_cursor: Option<String>,
++    loaded: bool,
++    pending: Option<PendingPage>,
++    pub(crate) scroll_top: usize,
++    viewport_height: usize,
++    pending_scroll_top: Option<usize>,
++}
++
++impl ResponseHistory {
++    pub(crate) fn new() -> Self {
++        Self {
++            query: ResponseAttemptsReadParams::default(),
++            records: BTreeMap::new(),
++            models: BTreeSet::new(),
++            prices: Ok(Prices::new()),
++            error: None,
++            persistence_error: None,
++            last_persistence_error: None,
++            next_cursor: None,
++            loaded: false,
++            pending: None,
++            scroll_top: 0,
++            viewport_height: 0,
++            pending_scroll_top: None,
++        }
++    }
++
++    pub(crate) fn model(&self) -> Option<&str> {
++        self.query.model.as_deref()
++    }
++
++    pub(crate) fn status(&self) -> Option<ResponseAttemptStatus> {
++        self.query.status
++    }
++
++    pub(crate) fn thread_id(&self) -> Option<&str> {
++        self.query.thread_id.as_deref()
++    }
++
++    pub(crate) fn rows(&self) -> impl Iterator<Item = &ObservedResponse> {
++        self.records.values().rev().filter(|row| self.matches(row))
++    }
++
++    pub(crate) fn count(&self) -> usize {
++        self.rows().count()
++    }
++
++    pub(crate) fn is_loading(&self) -> bool {
++        self.pending.is_some()
++    }
++
++    pub(crate) fn accepts(&self, id: Uuid) -> bool {
++        self.pending.as_ref().is_some_and(|page| page.id == id)
++    }
++
++    pub(crate) fn load_recent(&mut self, now: Instant) -> Option<ResponsePageRequest> {
++        self.request(None, now)
++    }
++
++    fn request(&mut self, cursor: Option<String>, now: Instant) -> Option<ResponsePageRequest> {
++        if self.pending.is_some() {
++            return None;
++        }
++        let id = Uuid::new_v4();
++        self.pending = Some(PendingPage {
++            id,
++            requested_at: now,
++            older: cursor.is_some(),
++        });
++        let mut params = self.query.clone();
++        params.cursor = cursor;
++        self.error = None;
++        Some(ResponsePageRequest { id, params })
++    }
++
++    pub(crate) fn finish(
++        &mut self,
++        id: Uuid,
++        response: Result<ResponseAttemptsReadResponse, String>,
++        prices: Result<Prices, String>,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        if !self.accepts(id) {
++            return None;
++        }
++        let pending = self.pending.take().expect("matching response page");
++        self.prices = prices;
++        let page = match response {
++            Ok(page) => page,
++            Err(error) => {
++                self.error = Some(error);
++                self.pending_scroll_top = None;
++                return None;
++            }
++        };
++        let top = self.top_anchor();
++        for row in page.data {
++            if self.records.get(&row.attempt_id).is_some_and(|current| {
++                current.snapshot_is_stale(row.revision, pending.requested_at)
++            }) {
++                continue;
++            }
++            let active = page.active_attempt_ids.contains(&row.attempt_id);
++            self.store(ObservedResponse::new(row, active, now));
++        }
++        self.models.extend(page.models);
++        // Refreshing recent observations cannot rewind a cursor already advanced
++        // through older history. The server alone interprets cursor contents.
++        if !self.loaded || pending.older {
++            self.next_cursor = page.next_cursor;
++        }
++        self.loaded = true;
++        self.persistence_error = page.persistence_error;
++        self.last_persistence_error = page.last_persistence_error;
++        self.restore_scroll(top);
++        if let Some(target) = self.pending_scroll_top {
++            if target > self.max_scroll_top() && self.next_cursor.is_some() {
++                return self.load_more(now);
++            }
++            self.scroll_top = target.min(self.max_scroll_top());
++            self.pending_scroll_top = None;
++        }
++        self.fill_viewport(now)
++    }
++
++    pub(crate) fn update(&mut self, row: ResponseAttempt, now: Instant) {
++        let top = self.top_anchor();
++        self.store(ObservedResponse::new(row, true, now));
++        self.restore_scroll(top);
++    }
++
++    fn store(&mut self, incoming: ObservedResponse) {
++        let row = &incoming.row;
++        if self
++            .records
++            .get(&row.attempt_id)
++            .is_some_and(|current| current.row.revision > row.revision)
++        {
++            return;
++        }
++        self.models.insert(row.requested_model.clone());
++        if let Some(current) = self.records.get_mut(&row.attempt_id) {
++            current.update(incoming);
++        } else {
++            // A completion outside the filter can arrive before its older page.
++            // Retain its revision so that page cannot resurrect the working row.
++            self.records.insert(row.attempt_id, incoming);
++        }
++    }
++
++    fn matches(&self, row: &ObservedResponse) -> bool {
++        self.thread_id().is_none_or(|thread_id| {
++            row.row
++                .thread_id
++                .is_some_and(|id| id.to_string() == thread_id)
++        }) && self
++            .model()
++            .is_none_or(|model| model == row.row.requested_model)
++            && self
++                .status()
++                .is_none_or(|status| status == row.row.status(row.is_running()))
++    }
++
++    pub(crate) fn set_model(
++        &mut self,
++        model: Option<String>,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        if model == self.query.model {
++            return None;
++        }
++        self.query.model = model;
++        self.reset_filter(now)
++    }
++
++    pub(crate) fn set_status(
++        &mut self,
++        status: Option<ResponseAttemptStatus>,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        if status == self.query.status {
++            return None;
++        }
++        self.query.status = status;
++        self.reset_filter(now)
++    }
++
++    pub(crate) fn set_thread(
++        &mut self,
++        thread_id: Option<String>,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        if thread_id == self.query.thread_id {
++            return None;
++        }
++        self.query.thread_id = thread_id;
++        self.reset_filter(now)
++    }
++
++    fn reset_filter(&mut self, now: Instant) -> Option<ResponsePageRequest> {
++        self.records.clear();
++        self.loaded = false;
++        self.next_cursor = None;
++        self.pending = None;
++        self.scroll_top = 0;
++        self.pending_scroll_top = None;
++        self.request(None, now)
++    }
++
++    fn top_anchor(&self) -> Option<Uuid> {
++        self.rows()
++            .nth(self.scroll_top)
++            .map(|row| row.row.attempt_id)
++    }
++
++    fn restore_scroll(&mut self, top: Option<Uuid>) {
++        // The newest row follows live arrivals. A pending scroll already
++        // means the user is reading older history, even before it has arrived.
++        if self.scroll_top == 0 && self.pending_scroll_top.is_none() {
++            return;
++        }
++        let previous = self.scroll_top;
++        if let Some(index) = top.and_then(|id| self.rows().position(|row| row.row.attempt_id == id))
++        {
++            self.scroll_top = index;
++        }
++        self.scroll_top = self.scroll_top.min(if self.pending_scroll_top.is_some() {
++            self.count().saturating_sub(1)
++        } else {
++            self.max_scroll_top()
++        });
++        if let Some(target) = &mut self.pending_scroll_top {
++            *target = target
++                .saturating_add(self.scroll_top)
++                .saturating_sub(previous);
++        }
++    }
++
++    fn max_scroll_top(&self) -> usize {
++        self.count().saturating_sub(self.visible_rows())
++    }
++
++    pub(crate) fn visible_rows(&self) -> usize {
++        (self.viewport_height / ROW_HEIGHT).max(1)
++    }
++
++    pub(crate) fn update_viewport(
++        &mut self,
++        height: usize,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        self.viewport_height = height;
++        if self.pending_scroll_top.is_none() {
++            self.scroll_top = self.scroll_top.min(self.max_scroll_top());
++        }
++        self.fill_viewport(now)
++    }
++
++    fn fill_viewport(&mut self, now: Instant) -> Option<ResponsePageRequest> {
++        if self.error.is_none() && self.count() < self.scroll_top + self.visible_rows() {
++            self.load_more(now)
++        } else {
++            None
++        }
++    }
++
++    fn load_more(&mut self, now: Instant) -> Option<ResponsePageRequest> {
++        self.request(Some(self.next_cursor.clone()?), now)
++    }
++
++    pub(crate) fn cancel_scroll(&mut self) {
++        self.pending_scroll_top = None;
++    }
++
++    pub(crate) fn scroll_by(&mut self, rows: isize, now: Instant) -> Option<ResponsePageRequest> {
++        if rows == 0 {
++            return None;
++        }
++        let start = if rows > 0 {
++            self.pending_scroll_top.unwrap_or(self.scroll_top)
++        } else {
++            self.scroll_top
++        };
++        self.scroll_to(start.saturating_add_signed(rows), rows > 0, now)
++    }
++
++    fn scroll_to(
++        &mut self,
++        target: usize,
++        older: bool,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        self.scroll_top = target.min(self.max_scroll_top());
++        self.pending_scroll_top =
++            (target > self.max_scroll_top() && self.next_cursor.is_some()).then_some(target);
++        if older
++            && (self.pending_scroll_top.is_some()
++                || self
++                    .count()
++                    .saturating_sub(self.scroll_top + self.visible_rows())
++                    <= LOAD_NEAR_THRESHOLD)
++        {
++            self.load_more(now)
++        } else {
++            None
++        }
++    }
++
++    pub(crate) fn navigate(
++        &mut self,
++        action: ListAction,
++        now: Instant,
++    ) -> Option<ResponsePageRequest> {
++        match action {
++            ListAction::MoveUp => self.scroll_by(-1, now),
++            ListAction::MoveDown => self.scroll_by(1, now),
++            ListAction::PageUp => self.scroll_by(-(self.visible_rows() as isize), now),
++            ListAction::PageDown => self.scroll_by(self.visible_rows() as isize, now),
++            ListAction::JumpTop => self.scroll_to(0, false, now),
++            ListAction::JumpBottom => self.scroll_to(self.max_scroll_top(), true, now),
++            _ => None,
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "response_history_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/response_history_tests.rs b/codex-rs/tui/src/response_history_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/response_history_tests.rs
+@@ -0,0 +1,472 @@
++use super::*;
++use crate::response_timing::tests::attempt;
++use crate::response_timing::tests::page;
++use codex_protocol::ThreadId;
++use codex_protocol::response_metrics::ResponseAttemptEnd;
++use pretty_assertions::assert_eq;
++use std::time::Duration;
++
++fn completed(first: u64, last: u64) -> Vec<ResponseAttempt> {
++    (first..=last)
++        .map(|id| attempt(id, Some(ResponseAttemptEnd::Completed)))
++        .collect()
++}
++
++fn finish(
++    history: &mut ResponseHistory,
++    request: ResponsePageRequest,
++    rows: Vec<ResponseAttempt>,
++    now: Instant,
++) {
++    assert!(
++        history
++            .finish(request.id, Ok(page(rows)), Ok(Prices::new()), now)
++            .is_none()
++    );
++}
++
++#[test]
++fn model_filter_keeps_sessionless_records_and_all_sessions_and_ignores_superseded_requests() {
++    let now = Instant::now();
++    let mut rows = completed(1, 4);
++    let other = ThreadId::new();
++    for (index, row) in rows.iter_mut().enumerate() {
++        row.requested_model = if index % 2 == 0 { "model-a" } else { "model-b" }.into();
++        row.served_model = Some("served".into());
++        if index >= 2 {
++            row.thread_id = Some(other);
++        } else if index == 0 {
++            row.thread_id = None;
++        }
++    }
++    let mut history = ResponseHistory::new();
++    let initial = history.load_recent(now).unwrap();
++    assert_eq!(initial.params.thread_id, None);
++    let stale_id = initial.id;
++    finish(&mut history, initial, rows.clone(), now);
++    assert_eq!(history.count(), 4);
++    let model = history.set_model(Some("model-a".into()), now).unwrap();
++    assert_eq!(model.params.model.as_deref(), Some("model-a"));
++    assert_eq!(model.params.thread_id, None);
++    assert!(
++        history
++            .finish(
++                stale_id,
++                Err("stale failure".into()),
++                Err("stale prices".into()),
++                now
++            )
++            .is_none()
++    );
++    assert!(history.accepts(model.id));
++    assert!(history.set_model(Some("model-a".into()), now).is_none());
++    assert!(history.accepts(model.id));
++    assert!(history.error.is_none());
++    assert!(history.prices.is_ok());
++    finish(&mut history, model, rows.clone(), now);
++    assert_eq!(history.count(), 2);
++    assert!(history.rows().any(|row| row.row.thread_id.is_none()));
++    let all_models = history.set_model(None, now).unwrap();
++    assert_eq!(all_models.params.model, None);
++    finish(&mut history, all_models, rows, now);
++    assert_eq!(history.count(), 4);
++}
++
++#[test]
++fn current_session_filter_combines_with_model_and_status_and_rejects_old_pages() {
++    let now = Instant::now();
++    let mut rows = completed(1, 4);
++    let current = rows[0].thread_id.unwrap();
++    let other = ThreadId::new();
++    rows[1].thread_id = Some(other);
++    rows[2].thread_id = None;
++    rows[3].requested_model = "other-model".into();
++    let mut history = ResponseHistory::new();
++    history.set_model(Some("gpt-5.4".into()), now);
++    let old_page = history
++        .set_status(Some(ResponseAttemptStatus::Completed), now)
++        .unwrap();
++    let scoped = history.set_thread(Some(current.to_string()), now).unwrap();
++    assert!(!history.accepts(old_page.id));
++    assert_eq!(
++        scoped.params.thread_id.as_deref(),
++        Some(current.to_string().as_str())
++    );
++    assert_eq!(scoped.params.model.as_deref(), Some("gpt-5.4"));
++    assert_eq!(scoped.params.status, Some(ResponseAttemptStatus::Completed));
++    assert_eq!(scoped.params.cursor, None);
++    assert!(history.set_thread(Some(current.to_string()), now).is_none());
++    assert!(history.accepts(scoped.id));
++    finish(&mut history, scoped, rows.clone(), now);
++    assert_eq!(history.count(), 1);
++    assert_eq!(
++        history.rows().next().unwrap().row.attempt_id,
++        rows[0].attempt_id
++    );
++
++    let local = attempt(5, Some(ResponseAttemptEnd::Completed));
++    let mut foreign = attempt(6, Some(ResponseAttemptEnd::Completed));
++    foreign.thread_id = Some(other);
++    let mut unscoped = attempt(7, Some(ResponseAttemptEnd::Completed));
++    unscoped.thread_id = None;
++    for row in [&local, &foreign, &unscoped] {
++        history.update(row.clone(), now);
++    }
++    assert_eq!(history.count(), 2);
++    assert!(history.rows().all(|row| row.row.thread_id == Some(current)));
++    finish(&mut history, old_page, rows.clone(), now);
++    assert_eq!(history.count(), 2);
++
++    let all_sessions = history.set_thread(None, now).unwrap();
++    assert_eq!(history.count(), 0);
++    assert_eq!(all_sessions.params.thread_id, None);
++    assert_eq!(all_sessions.params.model.as_deref(), Some("gpt-5.4"));
++    assert_eq!(
++        all_sessions.params.status,
++        Some(ResponseAttemptStatus::Completed)
++    );
++    assert_eq!(all_sessions.params.cursor, None);
++    rows.extend([local, foreign, unscoped]);
++    finish(&mut history, all_sessions, rows, now);
++    assert_eq!(history.count(), 6);
++    assert!(history.rows().any(|row| row.row.thread_id == Some(other)));
++    assert!(history.rows().any(|row| row.row.thread_id.is_none()));
++}
++
++#[test]
++fn paging_and_refresh_preserve_history_viewport_revisions_and_error_visibility() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    let first = history.load_recent(now).unwrap();
++    history.update(attempt(21, None), now);
++    let mut response = page(completed(11, 20));
++    response.next_cursor = Some("older-boundary".into());
++    assert!(
++        history
++            .finish(first.id, Ok(response), Ok(Prices::new()), now)
++            .is_none()
++    );
++    history.update_viewport(5, now);
++    let older = history.navigate(ListAction::JumpBottom, now).unwrap();
++    let top = history.top_anchor();
++    assert_eq!(older.params.cursor.as_deref(), Some("older-boundary"));
++    let mut ended = attempt(21, Some(ResponseAttemptEnd::Completed));
++    ended.revision += 1;
++    history.update(ended.clone(), now);
++    history.update(attempt(21, None), now);
++    assert_eq!(history.records[&ended.attempt_id].row, ended);
++    assert_eq!(history.top_anchor(), top);
++    finish(&mut history, older, completed(1, 10), now);
++    assert_eq!(history.count(), 21);
++    assert_eq!(history.top_anchor(), top);
++    let refresh = history.load_recent(now).unwrap();
++    let mut response = page(vec![attempt(22, None), attempt(21, None)]);
++    response.next_cursor = Some("recent-boundary".into());
++    history.finish(refresh.id, Ok(response), Ok(Prices::new()), now);
++    assert_eq!(history.next_cursor, None);
++    assert_eq!(history.count(), 22);
++    assert_eq!(history.top_anchor(), top);
++    assert_eq!(history.records[&ended.attempt_id].row, ended);
++    let failed = history.load_recent(now).unwrap();
++    assert!(
++        history
++            .finish(
++                failed.id,
++                Err("backup read failed".into()),
++                Err("bad prices".into()),
++                now
++            )
++            .is_none()
++    );
++    assert_eq!(history.count(), 22);
++    assert_eq!(history.top_anchor(), top);
++    assert_eq!(history.error.as_deref(), Some("backup read failed"));
++    assert_eq!(history.prices.as_ref().unwrap_err(), "bad prices");
++    assert!(!history.is_loading());
++    assert!(
++        history.update_viewport(100, now).is_none(),
++        "rendering must not retry a failed read"
++    );
++}
++
++#[test]
++fn page_down_waits_across_batches_and_tracks_viewport_when_new_rows_arrive() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    let first = history.load_recent(now).unwrap();
++    let mut response = page(completed(9, 10));
++    response.next_cursor = Some("older".into());
++    history.finish(first.id, Ok(response), Ok(Prices::new()), now);
++    let older = history.update_viewport(11, now).unwrap();
++    assert!(
++        history.navigate(ListAction::PageDown, now).is_none(),
++        "one in-flight request"
++    );
++    assert_eq!(history.pending_scroll_top, Some(5));
++    history.update(attempt(11, None), now);
++    assert_eq!(history.pending_scroll_top, Some(6));
++    assert_eq!(history.top_anchor(), Some(Uuid::from_u128(10)));
++    let mut response = page(completed(7, 8));
++    response.next_cursor = Some("oldest".into());
++    let oldest = history
++        .finish(older.id, Ok(response), Ok(Prices::new()), now)
++        .unwrap();
++    assert_eq!(oldest.params.cursor.as_deref(), Some("oldest"));
++    finish(&mut history, oldest, completed(1, 6), now);
++    assert_eq!(history.scroll_top, 6);
++    assert_eq!(history.top_anchor(), Some(Uuid::from_u128(5)));
++    assert!(history.pending_scroll_top.is_none());
++    assert_eq!(history.count() - history.scroll_top, history.visible_rows());
++}
++
++#[test]
++fn stale_pages_cannot_reanimate_restored_rows_or_replace_live_clocks_and_models() {
++    let now = Instant::now();
++    let later = now + Duration::from_secs(5);
++    let mut history = ResponseHistory::new();
++    let first = history.load_recent(now).unwrap();
++    let mut response = page(vec![attempt(1, None)]);
++    response.active_attempt_ids.clear();
++    history.finish(first.id, Ok(response.clone()), Ok(Prices::new()), now);
++    assert_eq!(history.rows().next().unwrap().elapsed_ms(later), 2100);
++    let refresh = history.load_recent(now).unwrap();
++    history.update(attempt(1, None), later);
++    history.finish(refresh.id, Ok(response), Ok(Prices::new()), later);
++    assert!(history.rows().next().unwrap().is_running());
++    assert_eq!(
++        history
++            .rows()
++            .next()
++            .unwrap()
++            .elapsed_ms(later + Duration::from_secs(5)),
++        7100
++    );
++    let model = history.set_model(Some("gpt-5.4".into()), later).unwrap();
++    assert_eq!(model.params.model.as_deref(), Some("gpt-5.4"));
++    history.update(attempt(1, None), later);
++    let mut changed = attempt(1, None);
++    changed.served_model = Some("served-other".into());
++    changed.revision += 1;
++    history.update(changed.clone(), later);
++    assert_eq!(history.count(), 1);
++    finish(&mut history, model, vec![attempt(1, None)], later);
++    assert_eq!(history.count(), 1);
++    assert_eq!(
++        history.rows().next().unwrap().row.served_model.as_deref(),
++        Some("served-other")
++    );
++    assert!(!history.models.contains("served-other"));
++    changed.requested_model = "requested-other".into();
++    changed.revision += 1;
++    history.update(changed, later);
++    assert_eq!(history.count(), 0);
++    let refresh = history.load_recent(later).unwrap();
++    finish(&mut history, refresh, vec![attempt(1, None)], later);
++    assert_eq!(
++        history.count(),
++        0,
++        "an older requested-model page cannot resurrect a filtered-out revision"
++    );
++    assert!(history.models.contains("requested-other"));
++}
++
++#[test]
++fn newest_follows_notifications_and_refresh_but_older_viewport_stays_anchored() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    let initial = history.load_recent(now).unwrap();
++    finish(&mut history, initial, completed(1, 10), now);
++    history.update_viewport(6, now);
++    history.update(attempt(11, None), now);
++    assert_eq!(history.scroll_top, 0);
++    assert_eq!(history.top_anchor(), Some(Uuid::from_u128(11)));
++    let refresh = history.load_recent(now).unwrap();
++    finish(&mut history, refresh, vec![attempt(12, None)], now);
++    assert_eq!(history.scroll_top, 0);
++    assert_eq!(history.top_anchor(), Some(Uuid::from_u128(12)));
++    history.navigate(ListAction::MoveDown, now);
++    assert_eq!(history.scroll_top, 1);
++    let top = history.top_anchor();
++    history.update(attempt(13, None), now);
++    assert_eq!(history.top_anchor(), top);
++    history.navigate(ListAction::JumpTop, now);
++    history.update(attempt(14, None), now);
++    assert_eq!(history.scroll_top, 0);
++    assert_eq!(history.top_anchor(), Some(Uuid::from_u128(14)));
++}
++
++#[test]
++fn empty_filtered_pages_continue_with_storage_and_local_pricing_errors() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    assert!(history.update_viewport(20, now).is_none());
++    let first = history.load_recent(now).unwrap();
++    let mut response = page(Vec::new());
++    response.next_cursor = Some("history-after-empty-memory".into());
++    response.persistence_error = Some("storage unavailable".into());
++    let occurrence = ResponsePersistenceError {
++        message: "storage unavailable".into(),
++        occurred_at_ms: 1_792_637_336_123,
++    };
++    response.last_persistence_error = Some(occurrence.clone());
++    let older = history
++        .finish(
++            first.id,
++            Ok(response),
++            Err("pricing unavailable".into()),
++            now,
++        )
++        .unwrap();
++    assert_eq!(
++        older.params.cursor.as_deref(),
++        Some("history-after-empty-memory")
++    );
++    assert_eq!(
++        history.persistence_error.as_deref(),
++        Some("storage unavailable")
++    );
++    assert_eq!(history.prices.as_ref().unwrap_err(), "pricing unavailable");
++    assert_eq!(history.last_persistence_error, Some(occurrence.clone()));
++    let mut other = attempt(2, None);
++    other.thread_id = Some(ThreadId::new());
++    history.update(other, now);
++    assert_eq!(history.count(), 1);
++    let mut recovered = page(completed(1, 1));
++    recovered.last_persistence_error = Some(occurrence.clone());
++    history.finish(older.id, Ok(recovered), Ok(Prices::new()), now);
++    assert_eq!(history.count(), 2);
++    assert!(history.persistence_error.is_none());
++    assert_eq!(history.last_persistence_error, Some(occurrence));
++}
++
++#[test]
++fn failed_older_page_waits_for_navigation_instead_of_retrying_on_each_frame() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    let first = history.load_recent(now).unwrap();
++    let mut response = page(completed(9, 10));
++    response.next_cursor = Some("older".into());
++    history.finish(first.id, Ok(response), Ok(Prices::new()), now);
++    let older = history.update_viewport(20, now).unwrap();
++    assert!(
++        history
++            .finish(older.id, Err("read failed".into()), Ok(Prices::new()), now)
++            .is_none()
++    );
++    assert!(history.update_viewport(20, now).is_none());
++    assert!(history.update_viewport(40, now).is_none());
++    assert_eq!(history.count(), 2);
++    let retry = history.navigate(ListAction::MoveDown, now).unwrap();
++    assert_eq!(retry.params.cursor.as_deref(), Some("older"));
++    assert!(history.error.is_none());
++}
++
++#[test]
++fn combined_filters_reject_superseded_pages_and_fill_from_matching_older_history() {
++    let now = Instant::now();
++    let mut history = ResponseHistory::new();
++    history.update_viewport(4, now);
++    let model = history.set_model(Some("gpt-5.4".into()), now).unwrap();
++    let working = history
++        .set_status(Some(ResponseAttemptStatus::Working), now)
++        .unwrap();
++    assert!(!history.accepts(model.id));
++    assert_eq!(working.params.model.as_deref(), Some("gpt-5.4"));
++    assert_eq!(working.params.status, Some(ResponseAttemptStatus::Working));
++    assert_eq!(working.params.thread_id, None);
++    assert!(
++        history
++            .set_status(Some(ResponseAttemptStatus::Working), now)
++            .is_none()
++    );
++    finish(&mut history, working, vec![attempt(8, None)], now);
++    assert_eq!(history.count(), 1);
++
++    let done = history
++        .set_status(Some(ResponseAttemptStatus::Completed), now)
++        .unwrap();
++    assert_eq!(history.count(), 0);
++    assert!(!history.accepts(model.id));
++    finish(&mut history, model, completed(1, 2), now);
++    assert!(history.accepts(done.id));
++    let mut response = page(completed(7, 8));
++    response.next_cursor = Some("older-completed".into());
++    let mut ended = attempt(8, Some(ResponseAttemptEnd::Failed));
++    ended.revision += 1;
++    history.update(ended, now);
++    let older = history
++        .finish(done.id, Ok(response), Ok(Prices::new()), now)
++        .unwrap();
++    assert_eq!(older.params.model.as_deref(), Some("gpt-5.4"));
++    assert_eq!(older.params.status, Some(ResponseAttemptStatus::Completed));
++    assert_eq!(older.params.cursor.as_deref(), Some("older-completed"));
++    assert_eq!(history.count(), 1);
++    finish(&mut history, older, completed(5, 6), now);
++    assert_eq!(history.count(), 3);
++    let all_models = history.set_model(None, now).unwrap();
++    assert_eq!(all_models.params.model, None);
++    assert_eq!(
++        all_models.params.status,
++        Some(ResponseAttemptStatus::Completed)
++    );
++    let all_statuses = history.set_status(None, now).unwrap();
++    assert!(!history.accepts(all_models.id));
++    assert_eq!(all_statuses.params.model, None);
++    assert_eq!(all_statuses.params.status, None);
++    assert_eq!(all_statuses.params.cursor, None);
++}
++
++#[test]
++fn live_status_changes_cannot_be_reversed_by_late_filtered_pages() {
++    let now = Instant::now();
++    let later = now + Duration::from_secs(1);
++    let mut history = ResponseHistory::new();
++    history.set_model(Some("gpt-5.4".into()), now);
++    let working = history
++        .set_status(Some(ResponseAttemptStatus::Working), now)
++        .unwrap();
++    let mut completed = attempt(2, Some(ResponseAttemptEnd::Completed));
++    completed.revision += 1;
++    history.update(completed, later);
++    let mut other = attempt(3, None);
++    other.requested_model = "another-model".into();
++    other.revision += 1;
++    history.update(other, later);
++    finish(
++        &mut history,
++        working,
++        vec![attempt(1, None), attempt(2, None), attempt(3, None)],
++        later,
++    );
++    assert_eq!(
++        history
++            .rows()
++            .map(|row| row.row.attempt_id)
++            .collect::<Vec<_>>(),
++        vec![Uuid::from_u128(1)]
++    );
++    let mut received = attempt(1, None);
++    received.terminal_observed_offset_ms = Some(1500);
++    received.revision += 1;
++    history.update(received.clone(), later);
++    assert_eq!(history.count(), 0);
++    let received_page = history
++        .set_status(Some(ResponseAttemptStatus::Received), later)
++        .unwrap();
++    finish(&mut history, received_page, vec![received], later);
++    assert_eq!(history.count(), 1);
++    assert!(!history.rows().next().unwrap().is_running());
++    let unfinished = history
++        .set_status(Some(ResponseAttemptStatus::Unfinished), later)
++        .unwrap();
++    let mut response = page(vec![attempt(4, None), attempt(5, None)]);
++    response.active_attempt_ids = vec![Uuid::from_u128(5)];
++    history.finish(unfinished.id, Ok(response), Ok(Prices::new()), later);
++    assert_eq!(
++        history
++            .rows()
++            .map(|row| row.row.attempt_id)
++            .collect::<Vec<_>>(),
++        vec![Uuid::from_u128(4)]
++    );
++}

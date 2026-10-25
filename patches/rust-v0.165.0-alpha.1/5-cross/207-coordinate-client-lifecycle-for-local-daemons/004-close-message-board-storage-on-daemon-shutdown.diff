@@ -1,0 +1,759 @@
+close-message-board-storage-on-daemon-shutdown
+
+Lane: cross
+
+Unit: coordinate-client-lifecycle-for-local-daemons
+
+ChildPatch: close-message-board-storage-on-daemon-shutdown
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2066,6 +2066,7 @@ dependencies = [
+  "chrono",
+  "clap",
+  "codex-agent-extension",
++ "codex-agent-message-board-extension",
+  "codex-analytics",
+  "codex-app-server-daemon",
+  "codex-app-server-protocol",
+@@ -2102,6 +2103,7 @@ dependencies = [
+  "codex-mcp-extension",
+  "codex-memories-extension",
+  "codex-memories-write",
++ "codex-message-board",
+  "codex-model-provider",
+  "codex-model-provider-info",
+  "codex-models-manager",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -37,6 +37,7 @@ axum = { workspace = true, default-features = false, features = [
+ codex-analytics = { workspace = true }
+ codex-app-server-daemon = { workspace = true }
+ codex-agent-extension = { workspace = true }
++codex-agent-message-board-extension = { workspace = true }
+ codex-arg0 = { workspace = true }
+ codex-aws-auth = { workspace = true }
+ codex-cloud-config = { workspace = true }
+@@ -75,6 +76,7 @@ codex-chatgpt = { workspace = true }
+ codex-login = { workspace = true }
+ codex-image-generation-extension = { workspace = true }
+ codex-memories-extension = { workspace = true }
++codex-message-board = { workspace = true }
+ codex-web-search-extension = { workspace = true }
+ codex-websocket-auth = { workspace = true }
+ codex-memories-write = { workspace = true }
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1457,6 +1457,11 @@ impl ThreadRequestProcessor {
+     }
+ 
+     pub(crate) async fn shutdown_threads(&self) {
++        let board_pool = codex_message_board::local_message_board_pool_for_shutdown(
++            self.config.sqlite_config(),
++            &codex_agent_message_board_extension::local_board_options(),
++        )
++        .await;
+         let report = self
+             .thread_manager
+             .shutdown_all_threads_bounded(Duration::from_secs(10))
+@@ -1467,6 +1472,11 @@ impl ThreadRequestProcessor {
+         for thread_id in report.timed_out {
+             warn!("timed out waiting for thread {thread_id} to shut down");
+         }
++        match board_pool {
++            Ok(Some(pool)) => pool.close().await,
++            Ok(None) => {}
++            Err(error) => warn!("failed to capture message-board pool for shutdown: {error}"),
++        }
+         if let Some(store) = self
+             .thread_store
+             .as_any()
+diff --git a/codex-rs/app-server/tests/suite/v2/daemon_update_recovery.rs b/codex-rs/app-server/tests/suite/v2/daemon_update_recovery.rs
+--- a/codex-rs/app-server/tests/suite/v2/daemon_update_recovery.rs
++++ b/codex-rs/app-server/tests/suite/v2/daemon_update_recovery.rs
+@@ -91,7 +91,17 @@ async fn manual_idle_shutdown_requires_the_requesting_client_to_be_last() -> Res
+         request(&mut tui, 20, "daemon/shutdown", json!({"checkOnly": true})).await?["status"],
+         "accepted"
+     );
+-    start_thread(&mut tui, 21, json!({})).await?;
++    start_thread(
++        &mut tui,
++        21,
++        json!({"config": {
++            "features.agent_message_board": true,
++            "features.multi_agent_v2.enabled": true
++        }}),
++    )
++    .await?;
++    let board_database = home.path().join("agent_message_board_1.sqlite");
++    assert!(board_database.is_file());
+     let mut phone = connect_initialized(
+         &socket_path,
+         InitializeCapabilities::default(),
+@@ -130,6 +140,13 @@ async fn manual_idle_shutdown_requires_the_requesting_client_to_be_last() -> Res
+             assert!(!sidecar.exists(), "unclosed SQLite sidecar: {sidecar:?}");
+         }
+     }
++    for suffix in ["-wal", "-shm"] {
++        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", board_database.display()));
++        assert!(
++            !sidecar.exists(),
++            "unclosed message-board sidecar: {sidecar:?}"
++        );
++    }
+     // Reopen only the main file: the final producer log must not require a WAL.
+     let standalone = TempDir::new()?;
+     let logs_copy = standalone.path().join("logs.sqlite");
+diff --git a/codex-rs/message-board/src/lib.rs b/codex-rs/message-board/src/lib.rs
+--- a/codex-rs/message-board/src/lib.rs
++++ b/codex-rs/message-board/src/lib.rs
+@@ -35,6 +35,7 @@ pub use in_memory::InMemoryMessageBoards;
+ pub use local::LocalAgentMessageBoard;
+ pub use local::connection::LocalBoard;
+ pub use local::connection::LocalBoardConnection;
++pub use local::local_message_board_pool_for_shutdown;
+ pub use local::options::LocalBoardOptions;
+ pub use local::setup::LocalBoardSetup;
+ pub use local::setup::configure_local_board;
+diff --git a/codex-rs/message-board/src/local.rs b/codex-rs/message-board/src/local.rs
+--- a/codex-rs/message-board/src/local.rs
++++ b/codex-rs/message-board/src/local.rs
+@@ -35,12 +35,16 @@ use codex_protocol::ThreadId;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::Result;
+ use codex_state::SqliteConfig;
++use codex_state::sqlite_busy_retry_delay;
+ use futures::StreamExt;
+ use serde::Deserialize;
+ use serde::Serialize;
++use sqlx::Connection;
+ use sqlx::Row;
++use sqlx::Sqlite;
+ use sqlx::SqliteConnection;
+ use sqlx::SqlitePool;
++use sqlx::pool::PoolConnection;
+ use std::collections::HashSet;
+ use std::sync::Arc;
+ use uuid::Uuid;
+@@ -50,6 +54,7 @@ mod lifecycle;
+ pub(crate) mod options;
+ mod paging;
+ mod pool;
++pub use pool::local_message_board_pool_for_shutdown;
+ mod queries;
+ pub(crate) mod setup;
+ 
+@@ -167,14 +172,18 @@ impl LocalAgentMessageBoard {
+                 },
+             )?;
+         }
++        // A detached accepted write keeps one acquired connection until commit,
++        // so native pool closure waits even while it resolves host metadata.
++        let conn = self.pool.acquire().await.map_err(storage_error)?;
+         let board = self.clone();
+-        tokio::spawn(async move { board.post_inner(caller, request, behavior).await })
++        tokio::spawn(async move { board.post_inner(conn, caller, request, behavior).await })
+             .await
+             .map_err(storage_error)?
+     }
+ 
+     async fn post_inner(
+         &self,
++        mut conn: PoolConnection<Sqlite>,
+         caller: ThreadId,
+         request: PostRequest,
+         behavior: PostBehavior,
+@@ -197,14 +206,12 @@ impl LocalAgentMessageBoard {
+             PostBehavior::SilentAppend => serde_json::to_string(&("append", &request)),
+         }
+         .map_err(storage_error)?;
+-        let mut conn = self.pool.acquire().await.map_err(storage_error)?;
+         if let Some(post) = self
+             .existing_post(&mut conn, &request_id, &request_json)
+             .await?
+         {
+             return Ok(post.metadata);
+         }
+-        drop(conn);
+         let mut recipients = HashSet::new();
+         if let PostBehavior::Discussion = behavior {
+             for path in &request.agents_to_notify {
+@@ -212,109 +219,125 @@ impl LocalAgentMessageBoard {
+             }
+         }
+         let now = self.host.current_time(caller).await?;
+-        let mut tx = self.begin_write().await?;
+-        if let Some(post) = self
+-            .existing_post(&mut tx, &request_id, &request_json)
+-            .await?
+-        {
+-            return Ok(post.metadata);
+-        }
+-        let id = Uuid::now_v7();
+-        let (channel, root, target) = match &request.destination {
+-            PostDestination::Channel(channel) => {
+-                let exists: bool = sqlx::query_scalar(
+-                    "SELECT EXISTS(SELECT 1 FROM channels WHERE board=? AND name=?)",
+-                )
+-                .bind(self.identity.to_string())
+-                .bind(channel)
+-                .fetch_one(&mut *tx)
+-                .await
+-                .map_err(storage_error)?;
+-                if !exists {
+-                    return Err(invalid("channel not found in this board"));
++        let mut retry_index = 0;
++        let post = loop {
++            let mut tx = match conn.begin_with("BEGIN IMMEDIATE").await {
++                Ok(tx) => tx,
++                Err(error) => {
++                    let Some(delay) = sqlite_busy_retry_delay(&error, retry_index) else {
++                        return Err(storage_error(error));
++                    };
++                    retry_index += 1;
++                    tokio::time::sleep(delay).await;
++                    continue;
+                 }
+-                (
+-                    channel.clone(),
+-                    id,
+-                    SubscriptionTarget::Channel(channel.clone()),
+-                )
++            };
++            self.ensure_live_root(&mut tx).await?;
++            if let Some(post) = self
++                .existing_post(&mut tx, &request_id, &request_json)
++                .await?
++            {
++                return Ok(post.metadata);
+             }
+-            PostDestination::NewChannel(channel) => {
+-                validate_channel(channel)?;
+-                insert_channel(
+-                    &mut tx,
+-                    self.identity,
+-                    channel,
+-                    /*description*/ None,
+-                    &author,
+-                    now,
+-                )
+-                .await?;
+-                if let PostBehavior::Discussion = behavior {
+-                    self.subscribe(
++            let id = Uuid::now_v7();
++            let (channel, root, target) = match &request.destination {
++                PostDestination::Channel(channel) => {
++                    let exists: bool = sqlx::query_scalar(
++                        "SELECT EXISTS(SELECT 1 FROM channels WHERE board=? AND name=?)",
++                    )
++                    .bind(self.identity.to_string())
++                    .bind(channel)
++                    .fetch_one(&mut *tx)
++                    .await
++                    .map_err(storage_error)?;
++                    if !exists {
++                        return Err(invalid("channel not found in this board"));
++                    }
++                    (
++                        channel.clone(),
++                        id,
++                        SubscriptionTarget::Channel(channel.clone()),
++                    )
++                }
++                PostDestination::NewChannel(channel) => {
++                    validate_channel(channel)?;
++                    insert_channel(
+                         &mut tx,
+-                        &SubscriptionTarget::Channel(channel.clone()),
+-                        caller,
++                        self.identity,
++                        channel,
++                        /*description*/ None,
++                        &author,
++                        now,
+                     )
+                     .await?;
++                    if let PostBehavior::Discussion = behavior {
++                        self.subscribe(
++                            &mut tx,
++                            &SubscriptionTarget::Channel(channel.clone()),
++                            caller,
++                        )
++                        .await?;
++                    }
++                    (
++                        channel.clone(),
++                        id,
++                        SubscriptionTarget::Channel(channel.clone()),
++                    )
+                 }
+-                (
+-                    channel.clone(),
+-                    id,
+-                    SubscriptionTarget::Channel(channel.clone()),
+-                )
+-            }
+-            PostDestination::Thread(root) => {
+-                let post = self.load_post(&mut tx, *root).await?;
+-                if post.metadata.thread_id != *root {
+-                    return Err(invalid("thread_id must identify a top-level post"));
++                PostDestination::Thread(root) => {
++                    let post = self.load_post(&mut tx, *root).await?;
++                    if post.metadata.thread_id != *root {
++                        return Err(invalid("thread_id must identify a top-level post"));
++                    }
++                    (
++                        post.metadata.channel_name,
++                        *root,
++                        SubscriptionTarget::Thread(*root),
++                    )
+                 }
+-                (
+-                    post.metadata.channel_name,
+-                    *root,
+-                    SubscriptionTarget::Thread(*root),
++            };
++            // Return one JSON array to avoid handing each subscriber row across
++            // SQLite's worker thread while the write transaction is held.
++            if let PostBehavior::Discussion = behavior {
++                let subscribed = sqlx::query_scalar::<_, String>(
++                    "SELECT json_group_array(agent) FROM subscriptions WHERE board=? AND target=?",
+                 )
++                .bind(self.identity.to_string())
++                .bind(target_key(&target)?)
++                .fetch_one(&mut *tx)
++                .await
++                .map_err(storage_error)?;
++                let subscribed: Vec<String> =
++                    serde_json::from_str(&subscribed).map_err(storage_error)?;
++                for recipient in subscribed {
++                    recipients.insert(ThreadId::from_string(&recipient).map_err(storage_error)?);
++                }
+             }
+-        };
+-        // Return one JSON array to avoid handing each subscriber row across
+-        // SQLite's worker thread while the write transaction is held.
+-        if let PostBehavior::Discussion = behavior {
+-            let subscribed = sqlx::query_scalar::<_, String>(
+-                "SELECT json_group_array(agent) FROM subscriptions WHERE board=? AND target=?",
+-            )
+-            .bind(self.identity.to_string())
+-            .bind(target_key(&target)?)
+-            .fetch_one(&mut *tx)
+-            .await
+-            .map_err(storage_error)?;
+-            let subscribed: Vec<String> =
+-                serde_json::from_str(&subscribed).map_err(storage_error)?;
+-            for recipient in subscribed {
+-                recipients.insert(ThreadId::from_string(&recipient).map_err(storage_error)?);
+-            }
+-        }
+-        recipients.remove(&caller);
+-        let post = StoredPost {
+-            metadata: PostMetadata {
+-                message_id: id,
+-                channel_name: channel.clone(),
+-                author: author.clone(),
+-                thread_id: root,
+-                created_at: now,
+-            },
+-            text: request.text,
+-        };
+-        sqlx::query("INSERT INTO posts(board,id,channel,root,author,timestamp,body_search,payload,request_id,request) VALUES(?,?,?,?,?,?,?,?,?,?)")
++            recipients.remove(&caller);
++            let post = StoredPost {
++                metadata: PostMetadata {
++                    message_id: id,
++                    channel_name: channel.clone(),
++                    author: author.clone(),
++                    thread_id: root,
++                    created_at: now,
++                },
++                text: request.text,
++            };
++            sqlx::query("INSERT INTO posts(board,id,channel,root,author,timestamp,body_search,payload,request_id,request) VALUES(?,?,?,?,?,?,?,?,?,?)")
+             .bind(self.identity.to_string()).bind(id.to_string()).bind(channel).bind(root.to_string())
+             .bind(author.to_string()).bind(now.timestamp_micros()).bind(default_case_fold_str(&post.text))
+             .bind(serde_json::to_string(&post).map_err(storage_error)?).bind(request_id).bind(request_json)
+             .execute(&mut *tx).await.map_err(storage_error)?;
+-        // Participation subscribes by default, without overriding an explicit opt-out.
+-        if let PostBehavior::Discussion = behavior {
+-            self.subscribe(&mut tx, &SubscriptionTarget::Thread(root), caller)
+-                .await?;
+-        }
+-        tx.commit().await.map_err(storage_error)?;
++            // Participation subscribes by default, without overriding an explicit opt-out.
++            if let PostBehavior::Discussion = behavior {
++                self.subscribe(&mut tx, &SubscriptionTarget::Thread(root), caller)
++                    .await?;
++            }
++            tx.commit().await.map_err(storage_error)?;
++            break post;
++        };
++        drop(conn);
+ 
+         if let PostBehavior::SilentAppend = behavior {
+             return Ok(post.metadata);
+diff --git a/codex-rs/message-board/src/local/lifecycle.rs b/codex-rs/message-board/src/local/lifecycle.rs
+--- a/codex-rs/message-board/src/local/lifecycle.rs
++++ b/codex-rs/message-board/src/local/lifecycle.rs
+@@ -15,6 +15,7 @@ use codex_protocol::error::Result;
+ use codex_state::SqliteConfig;
+ use codex_state::SqlitePoolWriteExt;
+ use sqlx::Sqlite;
++use sqlx::SqliteConnection;
+ use sqlx::Transaction;
+ use std::sync::Weak;
+ 
+@@ -94,10 +95,15 @@ impl LocalAgentMessageBoard {
+ 
+     pub(super) async fn begin_write(&self) -> Result<Transaction<'_, Sqlite>> {
+         let mut tx = self.pool.begin_immediate().await.map_err(storage_error)?;
++        self.ensure_live_root(&mut tx).await?;
++        Ok(tx)
++    }
++
++    pub(super) async fn ensure_live_root(&self, conn: &mut SqliteConnection) -> Result<()> {
+         let deleted: bool =
+             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deleted_boards WHERE board=?)")
+                 .bind(self.identity.to_string())
+-                .fetch_one(&mut *tx)
++                .fetch_one(conn)
+                 .await
+                 .map_err(storage_error)?;
+         if deleted {
+@@ -105,6 +111,6 @@ impl LocalAgentMessageBoard {
+                 "the message board's root has been permanently deleted",
+             ));
+         }
+-        Ok(tx)
++        Ok(())
+     }
+ }
+diff --git a/codex-rs/message-board/src/local/pool.rs b/codex-rs/message-board/src/local/pool.rs
+--- a/codex-rs/message-board/src/local/pool.rs
++++ b/codex-rs/message-board/src/local/pool.rs
+@@ -19,6 +19,26 @@ use tokio::sync::Mutex;
+ pub(super) static POOLS: LazyLock<Mutex<HashMap<PathBuf, Weak<SqlitePool>>>> =
+     LazyLock::new(Mutex::default);
+ 
++/// Retain the initialized namespace's pool before the host releases its board handles.
++/// After stopping board producers, the host must await `close` on this pool.
++/// This does not open a database or change other homes' or namespaces' pools.
++pub async fn local_message_board_pool_for_shutdown(
++    sqlite: &SqliteConfig,
++    options: &LocalBoardOptions,
++) -> Result<Option<Arc<SqlitePool>>> {
++    let filename = options.database_file()?;
++    let home = match tokio::fs::canonicalize(sqlite.home()).await {
++        Ok(home) => home,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(error) => return Err(error.into()),
++    };
++    Ok(POOLS
++        .lock()
++        .await
++        .get(&home.join(filename))
++        .and_then(Weak::upgrade))
++}
++
+ pub(super) const SCHEMA: &str = "
+ CREATE TABLE IF NOT EXISTS board_templates (board TEXT PRIMARY KEY NOT NULL, template TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS deleted_boards (board TEXT PRIMARY KEY NOT NULL);
+diff --git a/codex-rs/message-board/src/local/pools_tests.rs b/codex-rs/message-board/src/local/pools_tests.rs
+--- a/codex-rs/message-board/src/local/pools_tests.rs
++++ b/codex-rs/message-board/src/local/pools_tests.rs
+@@ -4,7 +4,9 @@ use super::*;
+ use crate::NotificationDelivery;
+ use crate::PostPreview;
+ use futures::future::BoxFuture;
++use pretty_assertions::assert_eq;
+ use pretty_assertions::assert_ne;
++use tokio::sync::Notify;
+ 
+ struct UnusedHost;
+ 
+@@ -55,3 +57,151 @@ async fn concurrent_handles_share_and_release_the_pool() {
+     assert_ne!(original.as_ptr(), Arc::as_ptr(&reopened.pool));
+     reopened.pool.close().await;
+ }
++
++struct PendingPostHost {
++    entered: Notify,
++    release: Notify,
++}
++
++impl MessageBoardHost for PendingPostHost {
++    fn agent_path(&self, _caller: ThreadId) -> BoxFuture<'_, Result<AgentPath>> {
++        Box::pin(async {
++            self.entered.notify_one();
++            self.release.notified().await;
++            Ok(AgentPath::root())
++        })
++    }
++
++    fn resolve_agent(&self, _path: AgentPath) -> BoxFuture<'_, Result<ThreadId>> {
++        unreachable!("the post has no explicit recipients")
++    }
++
++    fn current_time(&self, _caller: ThreadId) -> BoxFuture<'_, Result<DateTime<Utc>>> {
++        Box::pin(async { Ok(Utc::now()) })
++    }
++
++    fn notify(
++        &self,
++        _recipient: ThreadId,
++        _post: PostPreview,
++    ) -> BoxFuture<'_, Result<NotificationDelivery>> {
++        unreachable!("the post has no other subscribers")
++    }
++}
++
++#[tokio::test]
++async fn shutdown_waits_for_detached_writes_and_checkpoints_the_main_file() {
++    for append in [false, true] {
++        let dir = tempfile::tempdir().unwrap();
++        let sqlite = SqliteConfig::new_for_testing(dir.path().to_path_buf().try_into().unwrap());
++        let options = LocalBoardOptions::default();
++        let host = Arc::new(PendingPostHost {
++            entered: Notify::new(),
++            release: Notify::new(),
++        });
++        let board = LocalAgentMessageBoard::open(&sqlite, &options, SessionId::new(), host.clone())
++            .await
++            .unwrap();
++        let other_home = tempfile::tempdir().unwrap();
++        let other_sqlite =
++            SqliteConfig::new_for_testing(other_home.path().to_path_buf().try_into().unwrap());
++        let other = LocalAgentMessageBoard::open(
++            &other_sqlite,
++            &options,
++            SessionId::new(),
++            Arc::new(UnusedHost),
++        )
++        .await
++        .unwrap();
++        let other_namespace = LocalAgentMessageBoard::open(
++            &sqlite,
++            &LocalBoardOptions {
++                storage_namespace: "other_board".into(),
++            },
++            SessionId::new(),
++            Arc::new(UnusedHost),
++        )
++        .await
++        .unwrap();
++        let caller = tokio::spawn(async move {
++            if append {
++                board
++                    .append(
++                        ThreadId::new(),
++                        AppendRequest {
++                            destination: PostDestination::NewChannel("work".into()),
++                            text: "final accepted post".into(),
++                            request_id: "final-post".into(),
++                        },
++                    )
++                    .await
++            } else {
++                board
++                    .post(
++                        ThreadId::new(),
++                        PostRequest {
++                            destination: PostDestination::NewChannel("work".into()),
++                            text: "final accepted post".into(),
++                            request_id: "final-post".into(),
++                            agents_to_notify: Vec::new(),
++                        },
++                    )
++                    .await
++            }
++        });
++        host.entered.notified().await;
++        let pool = local_message_board_pool_for_shutdown(&sqlite, &options)
++            .await
++            .unwrap()
++            .unwrap();
++        caller.abort();
++        assert!(caller.await.unwrap_err().is_cancelled());
++
++        let close = pool.close();
++        tokio::pin!(close);
++        assert!(futures::poll!(&mut close).is_pending());
++        assert!(pool.is_closed());
++        host.release.notify_one();
++        tokio::time::timeout(std::time::Duration::from_secs(5), close)
++            .await
++            .unwrap();
++        assert!(!other.pool.is_closed());
++        assert!(!other_namespace.pool.is_closed());
++        other.pool.close().await;
++        other_namespace.pool.close().await;
++
++        let database = dir.path().join(options.database_file().unwrap());
++        for suffix in ["-wal", "-shm"] {
++            assert!(!std::path::PathBuf::from(format!("{}{suffix}", database.display())).exists());
++        }
++        let standalone = tempfile::tempdir().unwrap();
++        let copy = standalone.path().join(options.database_file().unwrap());
++        tokio::fs::copy(database, &copy).await.unwrap();
++        let reader = sqlite.open_read_only_pool(&copy, None).await.unwrap();
++        let posts: Vec<String> = sqlx::query_scalar("SELECT body_search FROM posts")
++            .fetch_all(&reader)
++            .await
++            .unwrap();
++        assert_eq!(posts, vec!["final accepted post"]);
++        let subscriptions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
++            .fetch_one(&reader)
++            .await
++            .unwrap();
++        assert_eq!(subscriptions, if append { 0 } else { 2 });
++        reader.close().await;
++    }
++}
++
++#[tokio::test]
++async fn shutdown_capture_does_not_initialize_unused_storage() {
++    let dir = tempfile::tempdir().unwrap();
++    let home = dir.path().join("unused");
++    let sqlite = SqliteConfig::new_for_testing(home.clone().try_into().unwrap());
++    assert!(
++        local_message_board_pool_for_shutdown(&sqlite, &LocalBoardOptions::default())
++            .await
++            .unwrap()
++            .is_none()
++    );
++    assert!(!home.exists());
++}
+diff --git a/codex-rs/state/src/lib.rs b/codex-rs/state/src/lib.rs
+--- a/codex-rs/state/src/lib.rs
++++ b/codex-rs/state/src/lib.rs
+@@ -42,6 +42,7 @@ pub use runtime::MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD;
+ pub use runtime::StateRuntime;
+ pub use sqlite::SqliteConfig;
+ pub use sqlite::SqlitePoolWriteExt;
++pub use sqlite::sqlite_busy_retry_delay;
+ 
+ pub use audit::ThreadStateAuditRow;
+ pub use audit::read_thread_state_audit_rows;
+diff --git a/codex-rs/state/src/sqlite.rs b/codex-rs/state/src/sqlite.rs
+--- a/codex-rs/state/src/sqlite.rs
++++ b/codex-rs/state/src/sqlite.rs
+@@ -36,6 +36,7 @@ mod validation;
+ pub use busy_retry::SqlitePoolWriteExt;
+ pub(crate) use busy_retry::SqliteWriteQueryExt;
+ pub(crate) use busy_retry::retry_on_busy;
++pub use busy_retry::sqlite_busy_retry_delay;
+ use validation::SqliteQuickCheckManager;
+ 
+ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+diff --git a/codex-rs/state/src/sqlite/busy_retry.rs b/codex-rs/state/src/sqlite/busy_retry.rs
+--- a/codex-rs/state/src/sqlite/busy_retry.rs
++++ b/codex-rs/state/src/sqlite/busy_retry.rs
+@@ -20,6 +20,18 @@ use sqlx::sqlite::SqliteError;
+ use sqlx::sqlite::SqliteQueryResult;
+ use sqlx::sqlite::SqliteRow;
+ 
++const BUSY_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(200)];
++
++/// Apply the shared admission retry budget to an already-acquired connection.
++/// The zero-based retry index advances only after a received BUSY error. Retry
++/// only BEGIN IMMEDIATE, before any transaction body or external effects.
++pub fn sqlite_busy_retry_delay(error: &sqlx::Error, retry_index: usize) -> Option<Duration> {
++    BUSY_RETRY_DELAYS
++        .get(retry_index)
++        .copied()
++        .filter(|_| is_busy(error))
++}
++
+ /// SQLite writer admission for pools shared by the state and thread stores.
+ /// Implementations must acquire the writer slot before any read snapshot and
+ /// retry only admission, never an already-started transaction or external effects.
+@@ -148,7 +160,7 @@ where
+     F: FnMut() -> Fut,
+     Fut: Future<Output = Result<T, E>>,
+ {
+-    let mut delays = [Duration::from_millis(100), Duration::from_millis(200)].into_iter();
++    let mut delays = BUSY_RETRY_DELAYS.into_iter();
+     loop {
+         match operation().await {
+             Ok(value) => return Ok(value),
+diff --git a/codex-rs/state/src/sqlite/retry_tests.rs b/codex-rs/state/src/sqlite/retry_tests.rs
+--- a/codex-rs/state/src/sqlite/retry_tests.rs
++++ b/codex-rs/state/src/sqlite/retry_tests.rs
+@@ -1,6 +1,7 @@
+ //! Tests safe retries against real SQLite writer contention.
+ 
+ use super::retry_on_busy;
++use super::sqlite_busy_retry_delay;
+ use crate::SqliteConfig;
+ use crate::SqliteQueueStore;
+ use crate::migrations::runtime_logs_migrator;
+@@ -10,12 +11,59 @@ use anyhow::Context;
+ use codex_protocol::ThreadId;
+ use codex_utils_absolute_path::test_support::PathExt;
+ use pretty_assertions::assert_eq;
++use sqlx::Connection;
+ use sqlx::sqlite::SqlitePoolOptions;
+ use std::sync::Arc;
+ use std::time::Duration;
+ use tokio::sync::Mutex;
+ use tokio::sync::mpsc;
+ 
++#[tokio::test]
++async fn held_connection_retries_received_busy_before_starting_the_transaction()
++-> anyhow::Result<()> {
++    let sqlite_home = unique_temp_dir();
++    tokio::fs::create_dir_all(&sqlite_home).await?;
++    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
++        let _ = std::fs::remove_dir_all(sqlite_home);
++    });
++    let sqlite = SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
++    let pool = sqlite
++        .open_logs_db(&runtime_logs_migrator(), /*telemetry_override*/ None)
++        .await?;
++    let mut competing_writer = pool.acquire().await?;
++    let mut writer = pool.acquire().await?;
++    sqlx::query("PRAGMA busy_timeout=0")
++        .execute(&mut *writer)
++        .await?;
++    let competing_tx = competing_writer.begin_with("BEGIN IMMEDIATE").await?;
++    let error = match writer.begin_with("BEGIN IMMEDIATE").await {
++        Ok(_) => anyhow::bail!("the competing writer must reject the first admission"),
++        Err(error) => error,
++    };
++    let delay = sqlite_busy_retry_delay(&error, /*retry_index*/ 0)
++        .context("received SQLite BUSY must admit a bounded retry")?;
++    assert!(sqlite_busy_retry_delay(&error, /*retry_index*/ 2).is_none());
++    assert!(sqlite_busy_retry_delay(&sqlx::Error::PoolClosed, /*retry_index*/ 0).is_none());
++    competing_tx.rollback().await?;
++    tokio::time::sleep(delay).await;
++    let mut tx = writer.begin_with("BEGIN IMMEDIATE").await?;
++    sqlx::query(
++        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) \
++         VALUES (1, 0, 'INFO', 'retry-test', 'saved after admission')",
++    )
++    .execute(&mut *tx)
++    .await?;
++    tx.commit().await?;
++    let rows = sqlx::query_scalar::<_, String>("SELECT feedback_log_body FROM logs ORDER BY id")
++        .fetch_all(&mut *writer)
++        .await?;
++    assert_eq!(rows, vec!["saved after admission".to_string()]);
++    drop(writer);
++    drop(competing_writer);
++    pool.close().await;
++    Ok(())
++}
++
+ #[tokio::test]
+ #[expect(
+     clippy::await_holding_invalid_type,

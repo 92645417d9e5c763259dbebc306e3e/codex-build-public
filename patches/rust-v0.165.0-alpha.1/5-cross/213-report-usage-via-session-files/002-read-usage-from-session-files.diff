@@ -1,0 +1,497 @@
+read-usage-from-session-files
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: read-usage-from-session-files
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+--- a/codex-rs/app-server/src/usage/mod.rs
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -1,4 +1,5 @@
+ //! Local paginated-rollout accounting, with no external process or network dependency.
++mod reader;
+ mod types;
+ mod wire;
+ 
+diff --git a/codex-rs/app-server/src/usage/reader.rs b/codex-rs/app-server/src/usage/reader.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/reader.rs
+@@ -0,0 +1,274 @@
++use super::types::CreditObservation;
++use super::types::Diagnostics;
++use super::types::Observation;
++use super::wire::Event;
++use super::wire::ParsedFile;
++use super::wire::intern_model;
++use super::wire::read_lines;
++use super::wire::timestamp;
++use serde_json::Value;
++use std::collections::BTreeMap;
++use std::fs;
++use std::io::BufRead;
++use std::io::BufReader;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Mutex;
++use std::thread;
++
++pub(super) struct Events {
++    pub(super) events: Vec<Event>,
++    pub(super) models: Vec<String>,
++    pub(super) observations: Vec<Observation>,
++    pub(super) credits: Vec<CreditObservation>,
++    pub(super) diagnostics: Diagnostics,
++}
++
++struct Rollout {
++    id: String,
++    parent: Option<String>,
++    referenced_history: bool,
++    forked_at: Option<i64>,
++    parsed: ParsedFile,
++}
++
++fn collect_files(
++    entries: fs::ReadDir,
++    base: &Path,
++    archive_root: &Path,
++    files: &mut BTreeMap<PathBuf, PathBuf>,
++) -> std::io::Result<()> {
++    for entry in entries {
++        let entry = entry?;
++        let path = entry.path();
++        let kind = entry.file_type()?;
++        if kind.is_dir() {
++            // The archive is nested inside sessions but has its own relative-path namespace.
++            if path != archive_root {
++                collect_files(fs::read_dir(&path)?, base, archive_root, files)?;
++            }
++        } else if kind.is_file()
++            && path
++                .extension()
++                .is_some_and(|extension| extension == "jsonl")
++        {
++            let relative = path
++                .strip_prefix(base)
++                .expect("discovered under session root");
++            files.entry(relative.to_path_buf()).or_insert(path);
++        }
++    }
++    Ok(())
++}
++
++fn read_rollout(
++    mut reader: impl BufRead,
++    diagnostics: &mut Diagnostics,
++) -> Result<Option<Rollout>, super::Error> {
++    let mut header = String::new();
++    reader.read_line(&mut header)?;
++    let value: Value = match serde_json::from_str(&header) {
++        Ok(value) => value,
++        Err(_) => {
++            diagnostics.malformed_records += 1;
++            return Ok(None);
++        }
++    };
++    let payload = &value["payload"];
++    if value["type"] != "session_meta" || payload["history_mode"] != "paginated" {
++        diagnostics.skipped_non_paginated += 1;
++        return Ok(None);
++    }
++    let parent = ["forked_from_id", "parent_thread_id"]
++        .into_iter()
++        .filter_map(|key| payload.get(key))
++        .chain(payload.pointer("/source/subagent/thread_spawn/parent_thread_id"))
++        .find_map(Value::as_str)
++        .filter(|id| !id.is_empty())
++        .map(str::to_owned);
++    let id = payload["id"].as_str().unwrap_or("").to_owned();
++    let mut parsed = read_lines(reader, &id)?;
++    parsed.incomplete += usize::from(!header.ends_with('\n'));
++    Ok(Some(Rollout {
++        id,
++        parent,
++        // Referenced forks store only their own suffix. Subagent projection boundaries
++        // in migrated logs can extend past real spending and are not billing evidence.
++        referenced_history: payload
++            .pointer("/history_base/end_ordinal_exclusive")
++            .and_then(Value::as_u64)
++            .is_some(),
++        forked_at: value["timestamp"].as_str().and_then(timestamp),
++        parsed,
++    }))
++}
++
++/// Read each file once for all report dimensions, bounded to its observed byte length.
++/// Compact records keep copied-prefix comparison off the filesystem and UI thread.
++pub(super) fn load(home: &Path) -> Result<Events, super::Error> {
++    // A relative-path collision prefers active over archived records.
++    let mut paths = BTreeMap::new();
++    let archive_root = home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
++    for name in [
++        codex_rollout::SESSIONS_SUBDIR,
++        codex_rollout::ARCHIVED_SESSIONS_SUBDIR,
++    ] {
++        let root = home.join(name);
++        match fs::read_dir(&root) {
++            Ok(entries) => collect_files(entries, &root, &archive_root, &mut paths)?,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++            Err(error) => return Err(error.into()),
++        }
++    }
++    let mut diagnostics = Diagnostics::default();
++    let workers = thread::available_parallelism()
++        .map_or(1, usize::from)
++        .min(16)
++        .min(paths.len().max(1));
++    // Hold the shared iterator only while assigning a file, never during I/O or parsing.
++    let pending = Mutex::new(paths.into_iter());
++    let files = thread::scope(|scope| -> Result<_, super::Error> {
++        let mut handles = Vec::with_capacity(workers);
++        for _ in 0..workers {
++            handles.push(scope.spawn(|| -> Result<_, super::Error> {
++                let mut diagnostics = Diagnostics::default();
++                let mut files = Vec::new();
++                loop {
++                    let next = pending
++                        .lock()
++                        .map_err(|_| "usage reader work queue poisoned")?
++                        .next();
++                    let Some((relative, path)) = next else { break };
++                    let file = fs::File::open(path)?;
++                    let bytes = file.metadata()?.len();
++                    let reader =
++                        BufReader::with_capacity(128 * 1024, std::io::Read::take(file, bytes));
++                    if let Some(rollout) = read_rollout(reader, &mut diagnostics)? {
++                        files.push((relative, rollout));
++                    }
++                }
++                Ok((files, diagnostics))
++            }));
++        }
++        let mut files = BTreeMap::new();
++        for handle in handles {
++            let (loaded, local) = handle
++                .join()
++                .map_err(|_| "usage reader worker panicked")??;
++            files.extend(loaded);
++            diagnostics.malformed_records += local.malformed_records;
++            diagnostics.skipped_non_paginated += local.skipped_non_paginated;
++        }
++        Ok(files.into_values().collect::<Vec<_>>())
++    })?;
++    diagnostics.files = files.len();
++    let mut by_id = BTreeMap::new();
++    for (index, file) in files.iter().enumerate() {
++        by_id.entry(file.id.as_str()).or_insert(index);
++    }
++    let cuts: Vec<_> = files
++        .iter()
++        .enumerate()
++        .map(|(index, file)| {
++            if file.referenced_history {
++                return 0;
++            }
++            let parent = file
++                .parent
++                .as_deref()
++                .and_then(|id| by_id.get(id))
++                .filter(|&&parent| parent != index)
++                .map(|&parent| files[parent].parsed.events.as_slice())
++                .unwrap_or(&[]);
++            let limit = file.forked_at.map_or(parent.len(), |forked| {
++                parent
++                    .iter()
++                    .position(|event| event.millis > forked)
++                    .unwrap_or(parent.len())
++            });
++            replayed_prefix_length(file.parent.is_some(), &parent[..limit], &file.parsed)
++        })
++        .collect();
++    let capacity = files
++        .iter()
++        .zip(&cuts)
++        .map(|(file, cut)| file.parsed.events.len() - cut)
++        .sum();
++    let mut events = Vec::with_capacity(capacity);
++    let mut models = Vec::new();
++    let mut observations = Vec::new();
++    let mut credits = Vec::new();
++    for (rollout, cut) in files.into_iter().zip(cuts) {
++        let file = rollout.parsed;
++        diagnostics.malformed_records += file.malformed;
++        diagnostics.incomplete_tails += file.incomplete;
++        diagnostics.replayed_events += cut + file.inherited_events;
++        let model_ids: Vec<_> = file
++            .models
++            .into_iter()
++            .map(|model| intern_model(&mut models, model.into()))
++            .collect();
++        events.extend(file.events.into_iter().skip(cut).map(|mut event| {
++            event.model = model_ids[event.model];
++            event
++        }));
++        observations.extend(
++            file.observations
++                .into_iter()
++                .filter_map(|(index, sample)| (index >= cut).then_some(sample)),
++        );
++        credits.extend(
++            file.credits
++                .into_iter()
++                .filter_map(|(index, sample)| (index >= cut).then_some(sample)),
++        );
++    }
++    Ok(Events {
++        events,
++        models,
++        observations,
++        credits,
++        diagnostics,
++    })
++}
++
++fn replayed_prefix_length(has_parent: bool, parent: &[Event], child: &ParsedFile) -> usize {
++    if !has_parent {
++        return 0;
++    }
++    // Native response records already identify the owning thread. Only the leading
++    // unidentified legacy snapshots need parent matching or rewritten-burst inference.
++    let legacy_end = child
++        .events
++        .iter()
++        .position(|event| event.response.is_some())
++        .unwrap_or(child.events.len());
++    let events = &child.events[..legacy_end];
++    let matched = parent
++        .iter()
++        .zip(events)
++        .take_while(|(parent, child)| parent.tokens == child.tokens)
++        .count();
++    if matched > 0 {
++        return matched;
++    }
++    let [first, second] = child.first_usage_times.as_slice() else {
++        return 0;
++    };
++    if !(0..=1_000).contains(&(second - first)) {
++        return 0;
++    }
++    let mut previous = *first;
++    events
++        .iter()
++        .take_while(|event| {
++            let copied = (0..=1_000).contains(&(event.millis - previous));
++            previous = event.millis;
++            copied
++        })
++        .count()
++}
++
++#[cfg(test)]
++#[path = "reader_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/reader_tests.rs b/codex-rs/app-server/src/usage/reader_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/reader_tests.rs
+@@ -0,0 +1,191 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++
++#[test]
++fn a_header_without_its_line_ending_remains_an_incomplete_tail() {
++    let directory = tempfile::tempdir().unwrap();
++    let sessions = directory.path().join("sessions");
++    fs::create_dir(&sessions).unwrap();
++    let header = json!({"type":"session_meta","payload":{
++        "id":"thread","history_mode":"paginated"}});
++    fs::write(sessions.join("header.jsonl"), header.to_string()).unwrap();
++    let events = load(directory.path()).unwrap();
++    assert_eq!(events.diagnostics.files, 1);
++    assert_eq!(events.diagnostics.incomplete_tails, 1);
++    assert_eq!(events.diagnostics.malformed_records, 0);
++    assert!(events.events.is_empty());
++}
++
++#[test]
++fn native_billing_preserves_historical_subagent_usage_and_referenced_suffixes() {
++    for (own_start, reference, count, expected) in
++        [(Some(13), None, 1, 28_819), (None, Some(2), 2, 57_638)]
++    {
++        let directory = tempfile::tempdir().unwrap();
++        let root = directory.path().join("sessions");
++        fs::create_dir(&root).unwrap();
++        let header = json!({"type":"session_meta","timestamp":"2026-09-29T00:00:00Z",
++            "payload":{"id":"child","forked_from_id":"unavailable","history_mode":"paginated",
++            "subagent_history_start_ordinal":own_start,
++            "history_base":reference.map(|start| json!({"end_ordinal_exclusive":start}))}});
++        let context = json!({"type":"turn_context","ordinal":4,"payload":{"model":"gpt-5.4-mini"}});
++        let mut text = format!("{header}\n{context}\n");
++        for index in 0..count {
++            let event = json!({"type":"event_msg","ordinal":11+index,"timestamp":"2026-06-22T23:10:14.352Z",
++                "payload":{"type":"token_count","info":{
++                    "last_token_usage":{"input_tokens":28629,"output_tokens":190,"total_tokens":28819},
++                    "total_token_usage":{"input_tokens":28629*(index+1),"output_tokens":190*(index+1),"total_tokens":28819*(index+1)}
++                },"rate_limits":{"plan_type":"pro","primary":{"window_minutes":10080,"used_percent":20.0,"resets_at":1800000000}}}});
++            text.push_str(&format!("{event}\n"));
++        }
++        fs::write(root.join("child.jsonl"), text).unwrap();
++        let events = load(directory.path()).unwrap();
++        assert_eq!(
++            events
++                .events
++                .iter()
++                .map(|event| event.tokens.total)
++                .sum::<u64>(),
++            expected
++        );
++        assert_eq!(events.diagnostics.replayed_events, 0);
++        assert_eq!(events.observations.len(), count);
++        assert_eq!(events.credits.len(), count);
++        assert!(
++            events
++                .events
++                .iter()
++                .all(|event| events.models[event.model] == "gpt-5.4-mini")
++        );
++    }
++}
++
++#[test]
++fn missing_roots_are_empty_but_a_file_in_place_of_a_root_is_an_error() {
++    let directory = tempfile::tempdir().unwrap();
++    assert!(load(directory.path()).unwrap().events.is_empty());
++    fs::write(directory.path().join("sessions"), "").unwrap();
++    assert!(load(directory.path()).is_err());
++}
++
++#[test]
++fn nested_archives_are_read_once_and_active_relative_paths_take_precedence() {
++    let directory = tempfile::tempdir().unwrap();
++    for (relative, id, input) in [
++        ("sessions/2026/09/29/active.jsonl", "active", 10),
++        ("sessions/archives/2026/09/29/active.jsonl", "active", 999),
++        (
++            "sessions/archives/2026/09/29/archived.jsonl",
++            "archived",
++            20,
++        ),
++    ] {
++        let path = directory.path().join(relative);
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        let header = json!({"type":"session_meta","payload":{
++            "id":id,"history_mode":"paginated"}});
++        let record = json!({"type":"token_usage_record","timestamp":"2026-09-29T01:00:00Z",
++            "payload":{"thread_id":id,"response_id":"response",
++                "usage":{"input_tokens":input,"total_tokens":input}}});
++        fs::write(path, format!("{header}\n{record}\n")).unwrap();
++    }
++    let events = load(directory.path()).unwrap();
++    assert_eq!(events.diagnostics.files, 2);
++    assert_eq!(events.events.len(), 2);
++    assert_eq!(
++        events
++            .events
++            .iter()
++            .map(|event| event.tokens.input)
++            .sum::<u64>(),
++        30
++    );
++}
++
++#[test]
++fn response_records_use_native_ownership_without_recounting_inherited_totals() {
++    for copied in [false, true] {
++        let directory = tempfile::tempdir().unwrap();
++        let root = directory.path().join("sessions");
++        fs::create_dir(&root).unwrap();
++        let header = json!({"type":"session_meta","timestamp":"2026-09-29T00:00:00Z",
++            "payload":{"id":"child","forked_from_id":"parent","history_mode":"paginated",
++            "subagent_history_start_ordinal":copied.then_some(5),
++            "history_base":(!copied).then(|| json!({"end_ordinal_exclusive":2}))}});
++        let context = json!({"type":"turn_context","ordinal":2,"payload":{"model":"model"}});
++        let mut text = format!("{header}\n{context}\n");
++        for (ordinal, id, input, total) in [(3, "inherited", 100, 100), (5, "owned", 20, 120)] {
++            if !copied && ordinal == 3 {
++                continue;
++            }
++            let record = json!({"type":"token_usage_record","ordinal":ordinal,
++            "timestamp":"2026-09-29T00:00:00Z","payload":{
++                "thread_id":if ordinal == 3 { "parent" } else { "child" },
++                "response_id":id,"usage":{"input_tokens":input,"total_tokens":input}
++            }});
++            let snapshot = json!({"type":"event_msg","ordinal":ordinal+1,
++            "timestamp":"2026-09-29T00:00:00.001Z","payload":{"type":"token_count",
++                "info":{"last_token_usage":{"input_tokens":100,"total_tokens":100},
++                    "total_token_usage":{"input_tokens":total,"total_tokens":total}},
++                "rate_limits":{"plan_type":"pro","primary":{"window_minutes":10080,
++                    "used_percent":20.0,"resets_at":1800000000}}
++            }});
++            text.push_str(&format!("{record}\n{snapshot}\n"));
++        }
++        fs::write(root.join("child.jsonl"), text).unwrap();
++        let events = load(directory.path()).unwrap();
++        assert_eq!(events.events.len(), 1);
++        assert_eq!(events.events[0].tokens.input, 20);
++        assert_eq!(events.diagnostics.replayed_events, usize::from(copied));
++        assert_eq!(events.observations.len(), 1);
++        assert_eq!(events.credits.len(), 1);
++    }
++}
++
++#[test]
++fn old_session_header_does_not_hide_new_incomplete_spending_after_the_baseline() {
++    let directory = tempfile::tempdir().unwrap();
++    let root = directory.path().join("sessions");
++    fs::create_dir(&root).unwrap();
++    let header = json!({"type":"session_meta","ordinal":0,
++    "timestamp":"2026-04-10T06:28:07.717Z","payload":{
++        "id":"resumed","cli_version":"0.119.0-alpha.25","history_mode":"paginated"
++    }});
++    let initial = json!({"type":"event_msg","ordinal":1,
++    "timestamp":"2026-04-10T06:47:05.955Z","payload":{
++        "type":"token_count","info":{
++            "last_token_usage":{"total_tokens":8763},
++            "total_token_usage":{"input_tokens":161874,"output_tokens":1827,"total_tokens":163701}
++        },"rate_limits":{"credits":{"balance":"100.0"}}
++    }});
++    let path = root.join("resumed.jsonl");
++    fs::write(&path, format!("{header}\n{initial}\n")).unwrap();
++    let events = load(directory.path()).unwrap();
++    assert!(events.events.is_empty());
++    assert!(events.credits.is_empty());
++
++    let context = json!({"type":"turn_context","ordinal":2,
++        "timestamp":"2026-10-15T01:00:00Z","payload":{"model":"gpt-5.4"}});
++    let incomplete = json!({"type":"event_msg","ordinal":3,
++    "timestamp":"2026-10-15T01:01:00Z","payload":{
++        "type":"token_count","info":{
++            "last_token_usage":{"total_tokens":8763},
++            "total_token_usage":{"input_tokens":161894,"output_tokens":1832,"total_tokens":163726}
++        },"rate_limits":{"credits":{"balance":"100.0"}}
++    }});
++    fs::write(
++        &path,
++        format!("{header}\n{initial}\n{context}\n{incomplete}\n{incomplete}\n"),
++    )
++    .unwrap();
++    let events = load(directory.path()).unwrap();
++    assert_eq!(events.events.len(), 1);
++    assert_eq!(events.events[0].tokens.input, 20);
++    assert_eq!(events.events[0].tokens.output, 5);
++    assert_eq!(events.events[0].tokens.total, 25);
++    assert_eq!(events.models[events.events[0].model], "gpt-5.4");
++    assert_eq!(events.credits.len(), 1);
++    assert_eq!(events.diagnostics.malformed_records, 0);
++    assert_eq!(events.diagnostics.replayed_events, 0);
++}

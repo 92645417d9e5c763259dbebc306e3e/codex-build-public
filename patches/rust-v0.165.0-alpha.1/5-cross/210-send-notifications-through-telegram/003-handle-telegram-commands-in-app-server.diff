@@ -1,0 +1,1173 @@
+handle-telegram-commands-in-app-server
+
+Lane: cross
+
+Unit: send-notifications-through-telegram
+
+ChildPatch: handle-telegram-commands-in-app-server
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -47,6 +47,7 @@ use crate::request_processors::ProjectRequestProcessor;
+ use crate::request_processors::ProxyProcessor;
+ use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
++use crate::request_processors::TelegramProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+ use crate::request_processors::ThreadQueueRequestProcessor;
+ use crate::request_processors::ThreadRequestProcessor;
+@@ -171,6 +172,7 @@ pub(crate) struct MessageProcessor {
+     project_processor: ProjectRequestProcessor,
+     pub(super) remote_control_processor: RemoteControlRequestProcessor,
+     search_processor: SearchRequestProcessor,
++    telegram_processor: TelegramProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+     thread_queue_processor: ThreadQueueRequestProcessor,
+     thread_processor: ThreadRequestProcessor,
+@@ -506,6 +508,12 @@ impl MessageProcessor {
+         );
+         let github_processor =
+             GithubProcessor::new(integrations.github(), config.http_client_factory());
++        let telegram_processor = TelegramProcessor::new(
++            Arc::clone(&integrations),
++            config.http_client_factory(),
++            models_refresh_worker.subscribe(),
++            github_processor.subscribe(),
++        );
+         let proxy_processor = ProxyProcessor::new(integrations, outgoing.clone());
+         let plugin_processor = PluginRequestProcessor::new(
+             auth_manager.clone(),
+@@ -643,6 +651,7 @@ impl MessageProcessor {
+             project_processor,
+             remote_control_processor,
+             search_processor,
++            telegram_processor,
+             thread_goal_processor,
+             thread_queue_processor,
+             thread_processor,
+@@ -656,6 +665,7 @@ impl MessageProcessor {
+         self.account_processor.clear_external_auth();
+         self.apps_processor.shutdown();
+         self.github_processor.shutdown();
++        self.telegram_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         self.skills_watcher.shutdown();
+     }
+@@ -881,6 +891,7 @@ impl MessageProcessor {
+ 
+     pub(crate) async fn drain_background_tasks(&self) {
+         self.github_processor.shutdown();
++        self.telegram_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         if let Some(worker) = &self.turn_cost_worker {
+             worker.shutdown();
+@@ -1243,6 +1254,11 @@ impl MessageProcessor {
+                 .check()
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::TelegramCommand { params, .. } => self
++                .telegram_processor
++                .command(params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ExperimentalFeatureEnablementSet { params, .. } => {
+                 self.config_processor
+                     .experimental_feature_enablement_set(request_id.clone(), params)
+@@ -2033,6 +2049,10 @@ mod gateway_oauth_tests;
+ #[path = "message_processor_github_tests.rs"]
+ mod github_tests;
+ 
++#[cfg(test)]
++#[path = "message_processor_telegram_tests.rs"]
++mod telegram_tests;
++
+ #[cfg(test)]
+ #[path = "message_processor_thread_lifecycle_tests.rs"]
+ mod thread_lifecycle_tests;
+diff --git a/codex-rs/app-server/src/message_processor_telegram_tests.rs b/codex-rs/app-server/src/message_processor_telegram_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/message_processor_telegram_tests.rs
+@@ -0,0 +1,123 @@
++use super::ConnectionSessionState;
++use super::message_processor_tracing_tests::TEST_CONNECTION_ID;
++use super::message_processor_tracing_tests::build_test_processor;
++use super::message_processor_tracing_tests::read_response;
++use crate::request_serialization::RequestSerializationQueueKey;
++use crate::transport::AppServerTransport;
++use crate::transport::ConnectionOrigin;
++use anyhow::Result;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::InitializeResponse;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use codex_config::LoaderOverrides;
++use codex_core::config::ConfigBuilder;
++use codex_login::AuthManager;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::time::Duration;
++use tokio::sync::oneshot;
++use tokio::time::timeout;
++use tokio_util::sync::CancellationToken;
++
++#[tokio::test]
++async fn setting_reads_bypass_busy_telegram_rpc_queue_and_mutations_still_wait() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    let config = Arc::new(
++        ConfigBuilder::default()
++            .codex_home(home.path().to_path_buf())
++            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
++            .build()
++            .await?,
++    );
++    let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
++    let (processor, mut outgoing) = build_test_processor(config, auth).await;
++    let session = Arc::new(ConnectionSessionState::new(ConnectionOrigin::Stdio));
++    processor
++        .process_request(
++            TEST_CONNECTION_ID,
++            serde_json::from_value(json!({
++                "id": 1, "method": "initialize", "params": {
++                    "clientInfo": {"name": "telegram-settings-test", "version": "1"}
++                }
++            }))?,
++            &AppServerTransport::Stdio,
++            Arc::clone(&session),
++        )
++        .await;
++    let _: InitializeResponse = read_response(&mut outgoing, 1).await;
++
++    let command = ClientRequest::TelegramCommand {
++        request_id: RequestId::Integer(10),
++        params: TelegramCommandParams::Disable {},
++    };
++    let (key, access) = RequestSerializationQueueKey::from_scope(
++        TEST_CONNECTION_ID,
++        command.serialization_scope().expect("serialized mutations"),
++    );
++    let (started_tx, started_rx) = oneshot::channel();
++    let (release_tx, release_rx) = oneshot::channel();
++    processor
++        .request_serialization_queues
++        .enqueue_background(key, access, async move {
++            started_tx.send(()).unwrap();
++            release_rx.await.unwrap();
++        })
++        .await;
++    timeout(Duration::from_secs(1), started_rx).await??;
++    processor
++        .process_request(
++            TEST_CONNECTION_ID,
++            serde_json::from_value(json!({
++                "id": 2, "method": "telegram/command", "params": {"kind": "read"}
++            }))?,
++            &AppServerTransport::Stdio,
++            Arc::clone(&session),
++        )
++        .await;
++    let read: TelegramCommandResponse =
++        timeout(Duration::from_secs(1), read_response(&mut outgoing, 2)).await?;
++    assert_eq!(read, TelegramCommandResponse::default());
++    processor
++        .process_client_request(
++            TEST_CONNECTION_ID,
++            ClientRequest::TelegramCommand {
++                request_id: RequestId::Integer(3),
++                params: TelegramCommandParams::Read {},
++            },
++            Arc::clone(&session),
++            &AtomicBool::new(true),
++            CancellationToken::new(),
++        )
++        .await;
++    let read: TelegramCommandResponse =
++        timeout(Duration::from_secs(1), read_response(&mut outgoing, 3)).await?;
++    assert_eq!(read, TelegramCommandResponse::default());
++    processor
++        .process_request(
++            TEST_CONNECTION_ID,
++            serde_json::from_value(json!({
++                "id": 4, "method": "telegram/command", "params": {"kind": "disable"}
++            }))?,
++            &AppServerTransport::Stdio,
++            session,
++        )
++        .await;
++    assert!(
++        timeout(
++            Duration::from_millis(50),
++            read_response::<TelegramCommandResponse>(&mut outgoing, 4)
++        )
++        .await
++        .is_err()
++    );
++    release_tx.send(()).unwrap();
++    let disabled: TelegramCommandResponse = read_response(&mut outgoing, 4).await;
++    assert_eq!(disabled, TelegramCommandResponse::default());
++    processor.shutdown_threads().await;
++    processor.drain_background_tasks().await;
++    Ok(())
++}
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -568,6 +568,7 @@ mod proxy_processor;
+ mod remote_control_processor;
+ mod rollout;
+ mod search;
++mod telegram_processor;
+ mod thread_attachments;
+ mod thread_enrichment;
+ mod thread_fork_goal;
+@@ -605,6 +606,7 @@ pub(crate) use proxy_processor::ProxyProcessor;
+ pub(crate) use proxy_processor::initialize_runtime_proxy;
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
++pub(crate) use telegram_processor::TelegramProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+ pub(crate) use thread_processor::ThreadRequestProcessor;
+ pub(crate) use thread_processor::ThreadResumeTarget;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_processor.rs b/codex-rs/app-server/src/request_processors/telegram_processor.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_processor.rs
+@@ -0,0 +1,386 @@
++use codex_app_server_protocol::GithubRelease;
++use codex_app_server_protocol::GithubStatus;
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::ModelChange;
++use codex_app_server_protocol::ModelChangedNotification;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use codex_app_server_protocol::TelegramNotificationKind;
++use codex_http_client::HttpClientFactory;
++use semver::Version;
++use std::collections::VecDeque;
++use std::sync::Arc;
++use tokio::sync::Mutex;
++use tokio::sync::broadcast;
++use tokio::sync::watch;
++use tokio::task::JoinHandle;
++use tokio_util::sync::CancellationToken;
++
++use crate::error_code::internal_error;
++use crate::error_code::invalid_params;
++use crate::integrations::IntegrationsStore;
++use crate::integrations::TelegramConfig;
++use crate::integrations::default_completion_min_duration_ms;
++use crate::telegram_http::Destination;
++use crate::telegram_http::TelegramHttp;
++
++pub(crate) struct TelegramProcessor {
++    inner: Arc<Inner>,
++    cancel: CancellationToken,
++    _task: JoinHandle<()>,
++}
++
++struct Inner {
++    store: Arc<IntegrationsStore>,
++    http: TelegramHttp,
++    recent: Mutex<VecDeque<String>>,
++    releases: Mutex<ReleaseBaselines>,
++    github: watch::Receiver<Option<GithubStatus>>,
++}
++
++#[derive(Default)]
++struct ReleaseBaselines {
++    stable: Option<Version>,
++    prerelease: Option<Version>,
++}
++
++impl ReleaseBaselines {
++    fn from_status(status: Option<&GithubStatus>) -> Self {
++        Self {
++            stable: status
++                .and_then(|status| status.latest_release.as_ref())
++                .map(release_version),
++            prerelease: status
++                .and_then(|status| status.latest_prerelease.as_ref())
++                .map(release_version),
++        }
++    }
++}
++
++impl TelegramProcessor {
++    pub(crate) fn new(
++        store: Arc<IntegrationsStore>,
++        factory: HttpClientFactory,
++        models: broadcast::Receiver<ModelChangedNotification>,
++        github: watch::Receiver<Option<GithubStatus>>,
++    ) -> Self {
++        Self::with_http(store, TelegramHttp::new(factory), models, github)
++    }
++
++    fn with_http(
++        store: Arc<IntegrationsStore>,
++        http: TelegramHttp,
++        mut models: broadcast::Receiver<ModelChangedNotification>,
++        mut github: watch::Receiver<Option<GithubStatus>>,
++    ) -> Self {
++        let baselines = ReleaseBaselines::from_status(github.borrow().as_ref());
++        let inner = Arc::new(Inner {
++            store,
++            http,
++            recent: Mutex::new(VecDeque::new()),
++            releases: Mutex::new(baselines),
++            github: github.clone(),
++        });
++        let cancel = CancellationToken::new();
++        let worker_inner = Arc::clone(&inner);
++        let worker_cancel = cancel.clone();
++        let task = tokio::spawn(async move {
++            tokio::select! {
++                _ = worker_cancel.cancelled() => {},
++                _ = async {
++                    loop {
++                        tokio::select! {
++                            change = models.recv() => match change {
++                                Ok(change) => {
++                                    if worker_inner.notify_models(&change).await.is_err() {
++                                        tracing::warn!("Telegram model notification failed");
++                                    }
++                                }
++                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
++                                    tracing::warn!(skipped, "Telegram model subscription lagged");
++                                }
++                                Err(broadcast::error::RecvError::Closed) => break,
++                            },
++                            changed = github.changed() => {
++                                if changed.is_err() {
++                                    break;
++                                }
++                                let status = github.borrow_and_update().clone();
++                                if let Some(status) = status
++                                    && worker_inner.notify_releases(&status).await.is_err()
++                                {
++                                    tracing::warn!("Telegram release notification failed");
++                                }
++                            },
++                        }
++                    }
++                } => {},
++            }
++        });
++        Self {
++            inner,
++            cancel,
++            _task: task,
++        }
++    }
++
++    pub(crate) fn shutdown(&self) {
++        self.cancel.cancel();
++    }
++
++    pub(crate) async fn command(
++        &self,
++        params: TelegramCommandParams,
++    ) -> Result<TelegramCommandResponse, JSONRPCErrorError> {
++        let mut message = None;
++        match params {
++            TelegramCommandParams::Read {} => {}
++            TelegramCommandParams::Configure { setup } => {
++                if self.inner.store.telegram().is_some() {
++                    return Err(invalid_params("configuration already exists"));
++                }
++                let config = TelegramConfig {
++                    bot_token: setup.bot_token.trim().to_owned(),
++                    chat_id: setup.chat_id.trim().to_owned(),
++                    notifications: setup.notifications,
++                    completion_min_duration_ms: default_completion_min_duration_ms(),
++                };
++                config
++                    .validate()
++                    .map_err(|error| invalid_params(error.to_string()))?;
++                self.inner
++                    .send(&config, "Codex notifications are connected.")
++                    .await
++                    .map_err(|_| internal_error("Bot delivery test failed"))?;
++                let mut releases = self.inner.releases.lock().await;
++                self.inner
++                    .store
++                    .set_telegram(Some(config))
++                    .await
++                    .map_err(storage_error)?;
++                *releases = ReleaseBaselines::from_status(self.inner.github.borrow().as_ref());
++                message = Some("Bot delivery passed; configuration saved.".to_owned());
++            }
++            TelegramCommandParams::SetNotification {
++                notification,
++                enabled,
++            } => {
++                let mut releases = self.inner.releases.lock().await;
++                let mut config = self.inner.store.telegram().ok_or_else(disabled)?;
++                let newly_enabled = if enabled {
++                    config.notifications.insert(notification)
++                } else {
++                    config.notifications.remove(&notification);
++                    false
++                };
++                self.inner
++                    .store
++                    .set_telegram(Some(config))
++                    .await
++                    .map_err(storage_error)?;
++                if newly_enabled {
++                    let current =
++                        ReleaseBaselines::from_status(self.inner.github.borrow().as_ref());
++                    match notification {
++                        TelegramNotificationKind::CodexRelease => releases.stable = current.stable,
++                        TelegramNotificationKind::CodexPrerelease => {
++                            releases.prerelease = current.prerelease
++                        }
++                        TelegramNotificationKind::TurnCompletion
++                        | TelegramNotificationKind::NeedsInput
++                        | TelegramNotificationKind::ModelChanges => {}
++                    }
++                }
++            }
++            TelegramCommandParams::Disable {} => {
++                let mut releases = self.inner.releases.lock().await;
++                self.inner
++                    .store
++                    .set_telegram(None)
++                    .await
++                    .map_err(storage_error)?;
++                *releases = ReleaseBaselines::from_status(self.inner.github.borrow().as_ref());
++            }
++            TelegramCommandParams::NeedsInput {
++                text,
++                notification_id,
++            } => {
++                let text = notification_message(text)?;
++                let config = self.inner.store.telegram().ok_or_else(disabled)?;
++                if config
++                    .notifications
++                    .contains(&TelegramNotificationKind::NeedsInput)
++                {
++                    self.inner.deliver(&config, notification_id, text).await?;
++                }
++            }
++            TelegramCommandParams::Completion { text, duration_ms } => {
++                let text = notification_message(text)?;
++                let config = self.inner.store.telegram().ok_or_else(disabled)?;
++                if config
++                    .notifications
++                    .contains(&TelegramNotificationKind::TurnCompletion)
++                    && duration_ms >= config.completion_min_duration_ms
++                {
++                    self.inner.deliver(&config, text.clone(), text).await?;
++                }
++            }
++        }
++        let mut result = response(self.inner.store.telegram());
++        result.message = message;
++        Ok(result)
++    }
++}
++
++impl Drop for TelegramProcessor {
++    fn drop(&mut self) {
++        self.shutdown();
++    }
++}
++
++impl Inner {
++    async fn deliver(
++        &self,
++        config: &TelegramConfig,
++        key: String,
++        text: String,
++    ) -> Result<(), JSONRPCErrorError> {
++        let mut recent = self.recent.lock().await;
++        if recent.contains(&key) {
++            return Ok(());
++        }
++        self.send(config, &text)
++            .await
++            .map_err(|_| internal_error("Telegram delivery failed"))?;
++        recent.push_back(key);
++        if recent.len() > 128 {
++            recent.pop_front();
++        }
++        Ok(())
++    }
++
++    async fn send(&self, config: &TelegramConfig, text: &str) -> Result<(), ()> {
++        self.http
++            .send(Destination(&config.bot_token, &config.chat_id), text)
++            .await
++    }
++
++    async fn notify_models(&self, notification: &ModelChangedNotification) -> Result<(), ()> {
++        let Some(config) = self.store.telegram().filter(|config| {
++            config
++                .notifications
++                .contains(&TelegramNotificationKind::ModelChanges)
++        }) else {
++            return Ok(());
++        };
++        let mut text = String::from("Codex model changes");
++        for change in &notification.changes {
++            let (label, slug) = match change {
++                ModelChange::Added { slug } => ("Added: ", slug),
++                ModelChange::Removed { slug } => ("Removed: ", slug),
++            };
++            text.push('\n');
++            text.push_str(label);
++            text.push_str(slug);
++        }
++        self.send(&config, &text).await
++    }
++
++    async fn notify_releases(&self, status: &GithubStatus) -> Result<(), ()> {
++        let mut releases = self.releases.lock().await;
++        let config = self.store.telegram();
++        let stable = self
++            .notify_release(
++                config.as_ref().filter(|config| {
++                    config
++                        .notifications
++                        .contains(&TelegramNotificationKind::CodexRelease)
++                }),
++                &mut releases.stable,
++                status.latest_release.as_ref(),
++                "stable",
++            )
++            .await;
++        let prerelease = self
++            .notify_release(
++                config.as_ref().filter(|config| {
++                    config
++                        .notifications
++                        .contains(&TelegramNotificationKind::CodexPrerelease)
++                }),
++                &mut releases.prerelease,
++                status.latest_prerelease.as_ref(),
++                "prerelease",
++            )
++            .await;
++        stable.and(prerelease)
++    }
++
++    async fn notify_release(
++        &self,
++        config: Option<&TelegramConfig>,
++        baseline: &mut Option<Version>,
++        release: Option<&GithubRelease>,
++        channel: &str,
++    ) -> Result<(), ()> {
++        let Some(release) = release else {
++            return Ok(());
++        };
++        let version = release_version(release);
++        if baseline
++            .as_ref()
++            .is_some_and(|previous| version <= *previous)
++        {
++            return Ok(());
++        }
++        if let (Some(config), Some(previous)) = (config, baseline.as_ref()) {
++            self.send(
++                config,
++                &format!(
++                    "Codex update available\nPrevious: {previous}\nLatest: {version}\nChannel: {channel}\n{}",
++                    release.url,
++                ),
++            )
++            .await?;
++        }
++        *baseline = Some(version);
++        Ok(())
++    }
++}
++
++fn release_version(release: &GithubRelease) -> Version {
++    release
++        .version
++        .parse()
++        .expect("GitHub publishes semantic versions")
++}
++
++fn response(config: Option<TelegramConfig>) -> TelegramCommandResponse {
++    match config {
++        Some(config) => TelegramCommandResponse {
++            configured: true,
++            notifications: config.notifications,
++            message: None,
++        },
++        None => TelegramCommandResponse::default(),
++    }
++}
++
++fn notification_message(value: String) -> Result<String, JSONRPCErrorError> {
++    if value.trim().is_empty() || value.len() > 4096 {
++        return Err(invalid_params("invalid Telegram message"));
++    }
++    Ok(value)
++}
++
++fn disabled() -> JSONRPCErrorError {
++    invalid_params("Telegram is not configured")
++}
++
++fn storage_error(_: std::io::Error) -> JSONRPCErrorError {
++    internal_error("Telegram configuration operation failed")
++}
++
++#[cfg(test)]
++#[path = "telegram_processor_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs b/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/telegram_processor_tests.rs
+@@ -0,0 +1,432 @@
++use super::*;
++use codex_app_server_protocol::TelegramSetup;
++use codex_http_client::OutboundProxyPolicy;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use std::collections::BTreeSet;
++use std::path::Path;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++use url::Url;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::Respond;
++use wiremock::ResponseTemplate;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++
++fn config(notifications: &[TelegramNotificationKind]) -> TelegramConfig {
++    TelegramConfig {
++        bot_token: "123:secret".into(),
++        chat_id: "chat".into(),
++        notifications: notifications.iter().copied().collect(),
++        completion_min_duration_ms: 30_000,
++    }
++}
++
++fn processor(
++    server: &MockServer,
++    home: &Path,
++    status: Option<GithubStatus>,
++) -> (
++    TelegramProcessor,
++    broadcast::Sender<ModelChangedNotification>,
++    watch::Sender<Option<GithubStatus>>,
++) {
++    let store = Arc::new(IntegrationsStore::load(home).unwrap());
++    let (models, model_events) = broadcast::channel(16);
++    let (github, github_events) = watch::channel(status);
++    let processor = TelegramProcessor::with_http(
++        store,
++        TelegramHttp::with_url(
++            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++            Url::parse(&server.uri()).unwrap(),
++        ),
++        model_events,
++        github_events,
++    );
++    (processor, models, github)
++}
++
++async fn save(home: &Path, notifications: &[TelegramNotificationKind]) {
++    Arc::new(IntegrationsStore::load(home).unwrap())
++        .set_telegram(Some(config(notifications)))
++        .await
++        .unwrap();
++}
++
++fn status(stable: &str, prerelease: &str) -> GithubStatus {
++    let release = |version: &str| GithubRelease {
++        version: version.into(),
++        url: format!("https://example.invalid/{version}"),
++    };
++    GithubStatus {
++        latest_release: Some(release(stable)),
++        latest_prerelease: Some(release(prerelease)),
++        checked_at: 1,
++        remaining: Some(4999),
++    }
++}
++
++async fn wait_for_requests(server: &MockServer, count: usize) {
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while server.received_requests().await.unwrap().len() < count {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("Telegram requests arrived");
++}
++
++#[tokio::test]
++async fn setup_selection_duration_and_deduplication_preserve_shared_settings() {
++    let home = tempfile::tempdir().unwrap();
++    std::fs::write(
++        home.path().join("integrations.json"),
++        r#"{"github":{"token":"retained-github","check_interval_hours":20}}"#,
++    )
++    .unwrap();
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
++        .expect(3)
++        .mount(&server)
++        .await;
++    let (processor, _models, _github) = processor(&server, home.path(), None);
++    let notifications = BTreeSet::from([
++        TelegramNotificationKind::TurnCompletion,
++        TelegramNotificationKind::NeedsInput,
++    ]);
++    let configured = processor
++        .command(TelegramCommandParams::Configure {
++            setup: TelegramSetup {
++                bot_token: "123:secret".into(),
++                chat_id: "chat".into(),
++                notifications: notifications.clone(),
++            },
++        })
++        .await
++        .unwrap();
++    assert!(configured.configured);
++    assert_eq!(configured.notifications, notifications);
++    assert!(
++        !serde_json::to_string(&configured)
++            .unwrap()
++            .contains("secret")
++    );
++    for duration_ms in [29_999, 30_000] {
++        processor
++            .command(TelegramCommandParams::Completion {
++                text: "turn complete".into(),
++                duration_ms,
++            })
++            .await
++            .unwrap();
++    }
++    let input = TelegramCommandParams::NeedsInput {
++        text: "approval required".into(),
++        notification_id: "approval-1".into(),
++    };
++    processor.command(input.clone()).await.unwrap();
++    processor.command(input).await.unwrap();
++    for notification in notifications {
++        processor
++            .command(TelegramCommandParams::SetNotification {
++                notification,
++                enabled: false,
++            })
++            .await
++            .unwrap();
++    }
++    processor
++        .command(TelegramCommandParams::NeedsInput {
++            text: "unselected question".into(),
++            notification_id: "question-2".into(),
++        })
++        .await
++        .unwrap();
++    processor
++        .command(TelegramCommandParams::Completion {
++            text: "unselected completion".into(),
++            duration_ms: 30_000,
++        })
++        .await
++        .unwrap();
++    processor
++        .command(TelegramCommandParams::Disable {})
++        .await
++        .unwrap();
++    assert_eq!(
++        processor
++            .command(TelegramCommandParams::Read {})
++            .await
++            .unwrap(),
++        TelegramCommandResponse::default()
++    );
++    let saved = IntegrationsStore::load(home.path()).unwrap();
++    assert!(saved.telegram().is_none());
++    assert_eq!(saved.github().unwrap().token, "retained-github");
++}
++
++#[tokio::test]
++async fn failed_bot_probe_preserves_the_complete_shared_file() {
++    let home = tempfile::tempdir().unwrap();
++    let settings_path = home.path().join("integrations.json");
++    let original = r#"{"github":{"token":"retained-github","check_interval_hours":20}}"#;
++    std::fs::write(&settings_path, original).unwrap();
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(403))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let (processor, _models, _github) = processor(&server, home.path(), None);
++    assert!(
++        processor
++            .command(TelegramCommandParams::Configure {
++                setup: TelegramSetup {
++                    bot_token: "123:secret".into(),
++                    chat_id: "chat".into(),
++                    notifications: BTreeSet::from([TelegramNotificationKind::NeedsInput]),
++                },
++            })
++            .await
++            .is_err()
++    );
++    assert_eq!(std::fs::read_to_string(settings_path).unwrap(), original);
++    assert!(
++        !processor
++            .command(TelegramCommandParams::Read {})
++            .await
++            .unwrap()
++            .configured
++    );
++}
++
++struct DeliverySequence(AtomicUsize);
++
++impl Respond for DeliverySequence {
++    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
++        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
++            ResponseTemplate::new(503)
++        } else {
++            ResponseTemplate::new(200).set_body_json(json!({"ok": true}))
++        }
++    }
++}
++
++#[tokio::test]
++async fn failed_delivery_does_not_consume_the_notification_key() {
++    let home = tempfile::tempdir().unwrap();
++    save(home.path(), &[TelegramNotificationKind::NeedsInput]).await;
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(DeliverySequence(AtomicUsize::new(0)))
++        .expect(2)
++        .mount(&server)
++        .await;
++    let (processor, _models, _github) = processor(&server, home.path(), None);
++    let params = TelegramCommandParams::NeedsInput {
++        text: "approval required".into(),
++        notification_id: "approval-1".into(),
++    };
++    assert!(processor.command(params.clone()).await.is_err());
++    processor.command(params.clone()).await.unwrap();
++    processor.command(params).await.unwrap();
++}
++
++#[tokio::test]
++async fn release_channels_are_silent_initially_and_retry_failures_independently() {
++    let home = tempfile::tempdir().unwrap();
++    let selected = [
++        TelegramNotificationKind::CodexRelease,
++        TelegramNotificationKind::CodexPrerelease,
++    ];
++    save(home.path(), &selected).await;
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(DeliverySequence(AtomicUsize::new(0)))
++        .expect(3)
++        .mount(&server)
++        .await;
++    let (processor, _models, github) =
++        processor(&server, home.path(), Some(status("1.0.0", "1.1.0-alpha.1")));
++    assert!(server.received_requests().await.unwrap().is_empty());
++    let updated = status("1.1.0", "1.2.0-alpha.1");
++    github.send_replace(Some(updated.clone()));
++    wait_for_requests(&server, 2).await;
++    {
++        let releases = processor.inner.releases.lock().await;
++        assert_eq!(releases.stable, Some(Version::new(1, 0, 0)));
++        assert_eq!(releases.prerelease, Some("1.2.0-alpha.1".parse().unwrap()));
++    }
++    github.send_replace(None);
++    processor
++        .command(TelegramCommandParams::SetNotification {
++            notification: TelegramNotificationKind::ModelChanges,
++            enabled: true,
++        })
++        .await
++        .unwrap();
++    github.send_replace(Some(updated));
++    wait_for_requests(&server, 3).await;
++    assert_eq!(
++        processor.inner.releases.lock().await.stable,
++        Some(Version::new(1, 1, 0))
++    );
++    let requests = server.received_requests().await.unwrap();
++    let messages: Vec<Value> = requests
++        .iter()
++        .map(|request| serde_json::from_slice(&request.body).unwrap())
++        .collect();
++    assert!(
++        messages[0]["text"]
++            .as_str()
++            .unwrap()
++            .contains("Channel: stable")
++    );
++    assert!(
++        messages[1]["text"]
++            .as_str()
++            .unwrap()
++            .contains("Channel: prerelease")
++    );
++    assert!(
++        messages[2]["text"]
++            .as_str()
++            .unwrap()
++            .contains("Channel: stable")
++    );
++}
++
++#[tokio::test]
++async fn enabling_a_release_channel_seeds_its_current_observation() {
++    let home = tempfile::tempdir().unwrap();
++    save(home.path(), &[TelegramNotificationKind::CodexRelease]).await;
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
++        .expect(2)
++        .mount(&server)
++        .await;
++    let (processor, _models, github) =
++        processor(&server, home.path(), Some(status("1.0.0", "1.1.0-alpha.1")));
++    github.send_replace(Some(status("1.0.0", "1.2.0-alpha.1")));
++    processor
++        .command(TelegramCommandParams::SetNotification {
++            notification: TelegramNotificationKind::CodexPrerelease,
++            enabled: true,
++        })
++        .await
++        .unwrap();
++    assert!(server.received_requests().await.unwrap().is_empty());
++    github.send_replace(Some(status("1.1.0", "1.3.0-alpha.1")));
++    wait_for_requests(&server, 2).await;
++    let releases = processor.inner.releases.lock().await;
++    assert_eq!(releases.stable, Some(Version::new(1, 1, 0)));
++    assert_eq!(releases.prerelease, Some("1.3.0-alpha.1".parse().unwrap()));
++}
++
++#[tokio::test]
++async fn model_subscription_delivers_only_selected_changes() {
++    let home = tempfile::tempdir().unwrap();
++    save(home.path(), &[TelegramNotificationKind::ModelChanges]).await;
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
++        .expect(1)
++        .mount(&server)
++        .await;
++    let (processor, models, _github) = processor(&server, home.path(), None);
++    let change = ModelChangedNotification {
++        changes: vec![
++            ModelChange::Added {
++                slug: "new-model".into(),
++            },
++            ModelChange::Removed {
++                slug: "old-model".into(),
++            },
++        ],
++    };
++    models.send(change.clone()).unwrap();
++    wait_for_requests(&server, 1).await;
++    let requests = server.received_requests().await.unwrap();
++    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
++    assert_eq!(
++        body["text"],
++        "Codex model changes\nAdded: new-model\nRemoved: old-model"
++    );
++    processor
++        .command(TelegramCommandParams::SetNotification {
++            notification: TelegramNotificationKind::ModelChanges,
++            enabled: false,
++        })
++        .await
++        .unwrap();
++    processor.inner.notify_models(&change).await.unwrap();
++}
++
++#[tokio::test]
++async fn shutdown_cancels_background_delivery_without_blocking_reads() {
++    let home = tempfile::tempdir().unwrap();
++    save(home.path(), &[TelegramNotificationKind::ModelChanges]).await;
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/bot123:secret/sendMessage"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .set_body_json(json!({"ok": true}))
++                .set_delay(Duration::from_secs(60)),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    let (mut processor, models, _github) = processor(&server, home.path(), None);
++    models
++        .send(ModelChangedNotification {
++            changes: vec![ModelChange::Added {
++                slug: "new-model".into(),
++            }],
++        })
++        .unwrap();
++    wait_for_requests(&server, 1).await;
++    assert!(
++        tokio::time::timeout(
++            Duration::from_secs(1),
++            processor.command(TelegramCommandParams::Read {})
++        )
++        .await
++        .unwrap()
++        .unwrap()
++        .configured
++    );
++    processor.shutdown();
++    tokio::time::timeout(Duration::from_secs(5), &mut processor._task)
++        .await
++        .expect("worker stopped before HTTP timeout")
++        .unwrap();
++}
++
++#[tokio::test]
++async fn dropping_processor_releases_its_background_owner() {
++    let home = tempfile::tempdir().unwrap();
++    let server = MockServer::start().await;
++    let (processor, _models, _github) = processor(&server, home.path(), None);
++    let inner = Arc::downgrade(&processor.inner);
++    drop(processor);
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while inner.upgrade().is_some() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("worker owner released on drop");
++}
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -143,6 +143,7 @@ mod session_end;
+ mod skills_list;
+ mod sleep;
+ mod sqlite_recovery;
++mod telegram;
+ mod thread_archive;
+ mod thread_attachments;
+ mod thread_delete;
+diff --git a/codex-rs/app-server/tests/suite/v2/telegram.rs b/codex-rs/app-server/tests/suite/v2/telegram.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/telegram.rs
+@@ -0,0 +1,90 @@
++use anyhow::Result;
++use app_test_support::TestAppServer;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::TelegramCommandParams;
++use codex_app_server_protocol::TelegramCommandResponse;
++use codex_app_server_protocol::TelegramNotificationKind;
++use pretty_assertions::assert_eq;
++use std::collections::BTreeSet;
++
++#[tokio::test]
++async fn telegram_rpc_reads_selects_and_disables_only_its_shared_configuration() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    let settings_path = home.path().join("integrations.json");
++    let saved = r#"{"proxy":{"enabled":false,"selected":"retained","entries":[{"alias":"retained","url":"http://127.0.0.1:8080"}]},"telegram":{"bot_token":"bot-secret","chat_id":"chat-secret","notifications":["needsInput"]}}"#;
++    std::fs::write(&settings_path, saved)?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .build_initialized()
++        .await?;
++    let loaded: TelegramCommandResponse = server
++        .request(|request_id| ClientRequest::TelegramCommand {
++            request_id,
++            params: TelegramCommandParams::Read {},
++        })
++        .await?;
++    assert!(loaded.configured);
++    assert_eq!(
++        loaded.notifications,
++        BTreeSet::from([TelegramNotificationKind::NeedsInput])
++    );
++    let wire = serde_json::to_string(&loaded)?;
++    for secret in ["bot-secret", "chat-secret"] {
++        assert!(!wire.contains(secret));
++    }
++    let rejected_id = server
++        .send_request(
++            "telegram/command",
++            Some(serde_json::json!({"kind": "read", "text": "unexpected"})),
++        )
++        .await?;
++    let rejected = tokio::time::timeout(
++        std::time::Duration::from_secs(10),
++        server.read_stream_until_error_message(RequestId::Integer(rejected_id)),
++    )
++    .await??;
++    assert_eq!(rejected.error.code, -32600);
++    assert_eq!(std::fs::read_to_string(&settings_path)?, saved);
++    let kinds = BTreeSet::from([
++        TelegramNotificationKind::CodexRelease,
++        TelegramNotificationKind::ModelChanges,
++    ]);
++    for notification in &kinds {
++        let _: TelegramCommandResponse = server
++            .request(|request_id| ClientRequest::TelegramCommand {
++                request_id,
++                params: TelegramCommandParams::SetNotification {
++                    notification: *notification,
++                    enabled: true,
++                },
++            })
++            .await?;
++    }
++    let selected: TelegramCommandResponse = server
++        .request(|request_id| ClientRequest::TelegramCommand {
++            request_id,
++            params: TelegramCommandParams::SetNotification {
++                notification: TelegramNotificationKind::NeedsInput,
++                enabled: false,
++            },
++        })
++        .await?;
++    assert_eq!(selected.notifications, kinds);
++    let disabled: TelegramCommandResponse = server
++        .request(|request_id| ClientRequest::TelegramCommand {
++            request_id,
++            params: TelegramCommandParams::Disable {},
++        })
++        .await?;
++    assert_eq!(disabled, TelegramCommandResponse::default());
++    let persisted: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path)?)?;
++    assert!(persisted["telegram"].is_null());
++    assert_eq!(persisted["proxy"]["selected"], "retained");
++    assert_eq!(
++        persisted["proxy"]["entries"][0]["url"],
++        "http://127.0.0.1:8080"
++    );
++    assert!(server.shutdown_gracefully().await?.success());
++    Ok(())
++}

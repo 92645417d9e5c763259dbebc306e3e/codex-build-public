@@ -25,6 +25,7 @@ TopLevelReleaseTermOwner
 ```
 
 - Baseline maps to `release-baseline` and BaselineEstablishedAndCleanupComplete.
+- Baseline preparation for known bugfix authoring uses that command's prepare selector and returns to the same Baseline route before measurement.
 - Roll selects ReleaseRollForward for the sole task's complete declared Patch set unless the user limits its scope. Requested interactive stops consume their read-only exploration before handoff. A newer user-selected tag uses next-tag Baseline after exact prefix export.
 - Before BuildInstall, consume TaskWorkspace's pending-obligation decision.
 - Resolve the requested package-only or installation terminal from user intent; ask only when it is ambiguous.
@@ -33,7 +34,7 @@ TopLevelReleaseTermOwner
 - BuildInstall's handoff must fulfill that selected terminal.
 - An explicit Sync request selects `sync` with the user-selected version and patch tag through [Public Sync](/codex/skills/codex-build/commands/sync.md).
 - Sync publishes snapshots only and never selects Roll, export, build, installation or a test suite.
-- Cleanup maps to exact Attached `main` source restoration followed by release-cleanup on the declared roots. Without a tag, that helper consumes only drained temporary records and output; with an explicitly selected tag, it additionally verifies registered Main and its exact export before retiring the closed task and published lane notes.
+- Cleanup maps to exact Attached `main` source restoration followed by release-cleanup on the declared roots. Without a tag, that helper consumes only drained temporary records and output; with an explicitly selected tag, it additionally verifies registered Main and its exact export before retiring the closed task and published working release documents.
 - Cleanup preserves tasks/rust-suite-baselines.json, exported patches, worktrees, build/docs, installed packages and reusable build inputs; all drained execution records and logs are disposable. Neither installation nor cleanup selects a suite.
 - Within a selected next-tag Baseline, predecessor worktree cleanup stays in release-baseline: validate the exact predecessor prefix or Established zero-patch parent, retire only its registered roles, then reuse the global paths. Its internal baseline cleanup validates the new Established result. Neither operation invokes public release-cleanup or Attached restoration.
 - Missing inputs return their route's typed stop.
@@ -74,10 +75,11 @@ PublicInvocationConstruction
 +-- ReleaseRoots: skill project scratch runtime record
 +-- runner-exec: parser-owned help and RunnerEnv's exact tests or frozen argv selection
 +-- repository-maintenance: skill project scratch runtime roots source release attempt deadline and optional cargo-lock for the fixed workspace Cargo operation
-+-- release-baseline: ReleaseRoots and tag
++-- release-baseline: ReleaseRoots and tag with optional prepare for premeasurement bugfix authoring or required-test inputs for measurement
 +-- release-cleanup: ReleaseRoots and optional explicitly retired tag
 +-- Cleanup Attached restoration: exact supplied Attached repository root
-+-- baseline-coverage: ReleaseRoots Unit or Flat Patch for automatic addition, or user-selected align at any Roll frontier; complete covered compile-only and helper selections
++-- baseline-coverage: ReleaseRoots and complete package roles with Unit or Flat Patch for automatic coverage or user-selected align
++-- baseline-coverage bugfix: owning Flat Patch with affected packages and exact required regression tests
 +-- build-install: parser-owned help and direct BuildInstall entry
 +-- sync: parser-owned help and explicitly selected public snapshot publication
 +-- native-toolchain: project scratch runtime roots source release and capability-selected auxiliary versions
@@ -94,7 +96,7 @@ PublicInvocationConstruction
 - RunnerEnv owns guest temporary paths and fixed capacity admission; callers select no host temporary root or storage policy. Shell-only tools build endpoint arguments internally.
 - Preserve each frozen test selection without splitting its invocation, moving tests between Units, or invoking an internal producer. Launch failure reports the executable, error, and argument count without echoing the expanded command.
 - Generic repository tests receive RunnerEnv's bounded sixteen-test default. Existing native --test-threads, --jobs, or -j arguments may select one positive value no greater than 16; they do not alter the frozen test selection or authorize a broader run.
-- `runner-exec --help`, `repository-format --help`, and `patch-replay --help` are successful read-only parser views before admission. This route selects purpose; help owns syntax without a second option inventory.
+- `runner-exec --help`, `repository-format --help`, `patch-replay --help`, `release-baseline --help`, `baseline-coverage --help` and `release-cleanup --help` are successful read-only parser views before admission. This route selects purpose; help owns syntax without a second option inventory.
 - Construct Bazel `repository-maintenance` only from the installed endpoint and its documented roots, source, release, attempt, and fixed `--deadline 90m`; it fixes the repository-selected `just bazel-lock-update` process.
 - Fork derives its ordinal from existing current-release numbered branch refs. It accepts no record root, caller-supplied ordinal, or maximum.
 - List uses the effective root defaults or overrides; actual source identity selects live Current, a retained parent, or a canonical prefix declared in SourcePrefixes, never root-flag presence.

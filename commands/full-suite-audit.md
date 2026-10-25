@@ -18,6 +18,10 @@ PositiveBaselineCoverageOwner
 - Only rust-suite-baselines.json represents completed coverage, as one canonical map from release tag to its current-tag Established generation.
 - Empty collection or missing selected entry is initial release input only. The selected producer establishes exact zero coverage or publishes inherited coverage after Pass; product consumers require this tag's established entry.
 - Every update preserves all other tag entries byte-semantically under CargoLock and the complete collection preimage. Established stores sorted CoveredPackages plus distinct compile-only/helper roles.
+- BugfixDiff is the exact native canonical source diff from the official parent through the standalone bugfix prefix, with Git index headers omitted by the existing patch producer.
+- Nonempty BugfixDiff is retained in the existing selection and immutable Plan as actual source input, not a digest, revision-derived identifier or separate record.
+- An empty diff is omitted and denotes the unpatched official parent.
+- Baseline source admission validates canonical bugfix-only history beneath the empty marker; product comparison requires the same bugfix source before normalization.
 
 ```
 CompletedBaselineFactOwner
@@ -27,6 +31,8 @@ CompletedBaselineFactOwner
 ```
 
 - A pending proposal is invocation input fixed by the immutable Baseline Plan, not a baseline-collection generation. Initial inheritance leaves the current tag absent; incremental coverage leaves its current Established unchanged.
+- A predecessor Established retains its recorded toolchain facts.
+- Bind inherited proposal CargoVersion to the verified target toolchain before Plan publication.
 - Only a validated and durably published Pass Result publishes the proposed current-tag selection and observed outcomes as Established. Interruption, Helper failure, cancellation, and replacement admission never retag or otherwise advance Established.
 - Reentry consumes the exact retained Plan, Stage, and Result. A retained Pass may finish its still-missing Established publication and cleanup; once Established already matches the proposal, unchanged coverage validates the retained terminal without promoting it twice. No other terminal can promote, infer, or reconstruct a generation.
 
@@ -39,7 +45,19 @@ ZeroCoverageGeneration
 `-- ExecutionEvidence: no Plan Stage Result compile or test
 ```
 
-- Coverage begins at inherited alignment or exact zero. Cross-tag inheritance drops absent members. A selected Unit or Flat Patch automatically adds uncovered upstream packages before its Current focused test. Its complete sorted, disjoint package-role proposal retains all existing roles. Only new packages execute upstream. Private-only packages have no upstream comparison. No product suite is implied.
+- Coverage begins at inherited alignment or exact zero. Cross-tag inheritance drops absent members and binds the proposal to the target's actual bugfix source rather than inheriting the predecessor's diff.
+- With unchanged bugfix source, a selected Unit or Flat Patch automatically adds uncovered baseline packages before its Current focused test. Its complete sorted, disjoint package-role proposal retains all existing roles. Only new packages execute. Private-only packages have no baseline comparison. No product suite is implied.
+- A shared bugfix addition, change or removal uses baseline-coverage with its owning Flat Patch and complete retained package-role proposal.
+- Repeat affected-package for every established package whose behavior or test premises can change, including dependent packages and compile-only roles.
+- A changed source without a proven affected subset executes the complete proposed coverage.
+- Newly covered packages execute alongside affected established packages; required helper binaries retain their existing preparation ownership.
+- Pass replaces only executed or removed package outcomes and carries proven unaffected outcomes forward onto the new source input.
+- Source change with zero coverage updates only the source-bound zero selection and does not invent execution evidence.
+- Supply required-test for each concrete regression test as its exact package-qualified expectation identity.
+- Required tests must be selected, nonignored and observed passing; they cannot be recorded as expected failures or timeouts.
+- Preserve the affected selection and required-test inputs in the existing unresolved task until publication closes.
+- Unchanged-source reentry consumes retained evidence; source changes produce a different immutable Plan even when package coverage is identical.
+- Neither stale Established outcomes nor an old Pass for the same packages establish comparison against changed bugfix source.
 - Explicit user-selected `baseline-coverage --align` accepts a complete desired package-role selection at any registered Roll frontier, including an open Patch. Derive additions, removals, and role changes from Patch effects, upstream ownership, and affected dependents, not paths alone. A nonempty target remeasures every selected upstream package in a distinct marked Plan; repeated marked Plans are consumed. An empty target aligns without execution. Neither mode changes Current topology.
 - Only validated Pass replaces executed or removed Established outcomes; failure preserves its preimage. Retained Plan, Stage, and Result resume exactly without new generation, retry, or topology effect.
 
@@ -88,13 +106,14 @@ RepositoryLocalRustSuiteProfileOwner
 - RunnerEnv bounds compilation and each test round, then terminal cleanup. Its reaped Stopped Helper terminal retains available outcomes without relabeling unfinished tests as Timeout.
 - Before selected Finalize executes, emit one bounded notice from its admitted Established selection and Plan: covered package count, compile/helper roles, known failure/timeout counts, excluded package count, network, concurrency, and per-test/suite windows. This is output, not another selection or record.
 
-- ExecutionProfile and Plan bind TestNetwork to Shared for selected full checks, independently of offline Cargo. A missing current-tag entry admits only initial release establishment; retained Baseline records continue their exact attempt or resume Pass publication without a collection-side pending marker.
+- ExecutionProfile and Plan bind TestNetwork to Shared for selected full checks, independently of offline Cargo.
 
 ## Execution
 
 - Finalize owns one current full-suite execution and its generated tail. Its actual source commit and exact generated preimages bind publication; this is execution input, not a new product identity. No second command accepts that result.
 - Test failure returns findings for selected focused repair. Fresh selected tests replace their same-purpose evidence after reap; interruption continues the current unfinished execution within its original budget.
-- Baseline holds CargoLock through bounded fetch, its selected execution or retained terminal, promotion, and owned cleanup. Native Git role registration selects this tag's actual upstream source path; another tag never replaces it.
+- Baseline holds CargoLock through bounded fetch, its selected execution or retained terminal, promotion, and owned cleanup. Native Git role registration selects this tag's actual baseline source path; another tag never replaces it.
+- Label a nonempty bugfix comparison as patched upstream rather than claiming it is the pristine official source.
 - Cargo stays offline; Baseline and product tests keep network with fixed tools/caches.
 - Stage publication requires RunnerEnv's exact scratch absence after reap. Current test output remains available until same-purpose replacement or explicit drained Cleanup; only baseline comparison JSON survives that Cleanup.
 - NextestConcurrency schedules only.

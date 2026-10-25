@@ -1102,7 +1102,8 @@ func runnerSource(source, projectWorkingRoot, projectScratchRoot, runtimeTempora
 	if baseline {
 		roles, roleErr := readReleaseWorktrees(source, projectScratchRoot, release, window)
 		fixed = fixed && roleErr == nil && roles.Registered[projection.SourceBranch] == source
-		projectionErr = errors.Join(roleErr, runnerTagParentAt(source, release, window))
+		_, sourceErr := releaseBugfixDiff(source, runtimeTemporaryRoot, release, window)
+		projectionErr = errors.Join(roleErr, sourceErr)
 	}
 	if projectionErr != nil || !fixed {
 		condition := fmt.Sprintf("source role rejected: path=%s branch=%s clean=%t", source, projection.SourceBranch, projection.SourceClean)
@@ -1112,24 +1113,6 @@ func runnerSource(source, projectWorkingRoot, projectScratchRoot, runtimeTempora
 		return sourceProjection{}, err
 	}
 	return projection, nil
-}
-
-func runnerTagParentAt(source, release string, window deadline) error {
-	if err := runGitWithin(window, nil, "-C", source, "diff", "--quiet", "--no-ext-diff", "HEAD^", "HEAD", "--"); err != nil {
-		return errors.Join(err, errors.New("upstream baseline marker is not empty"))
-	}
-	if err := runGitWithin(window, nil, "-C", source, "merge-base", "--is-ancestor", release+"^", "HEAD^"); err != nil {
-		return errors.Join(err, errors.New("upstream baseline marker parent differs"))
-	}
-	if err := runGitWithin(window, nil, "-C", source, "merge-base", "--is-ancestor", "HEAD^", release+"^"); err != nil {
-		return errors.Join(err, errors.New("upstream baseline marker parent differs"))
-	}
-	if err := runGitWithin(window, nil, "-C", source, "rev-parse", "--verify", "--quiet", "HEAD^2"); err == nil {
-		return errors.New("upstream baseline marker has multiple parents")
-	} else if errors.Is(err, errNativeTimeout) || errors.Is(err, errOperationCanceled) {
-		return err
-	}
-	return nil
 }
 
 func runProjection(request projectionRequest) (projectionResult, error) {
@@ -1276,7 +1259,10 @@ func runProjection(request projectionRequest) (projectionResult, error) {
 	} else if !os.IsNotExist(outputErr) {
 		return projectionResult{FailureDomain: failureDomainHelper}, outputErr
 	}
-	prepared, err := projectionCargoPreparation(request, projection)
+	prepared := request.PreparedCargo
+	if prepared == nil {
+		prepared, err = prepareProjectionCargo(request, projection)
+	}
 	if err == nil {
 		prepared, err = applyProjectionCargoPreparation(request, projection, prepared)
 	}
@@ -1545,27 +1531,6 @@ func prepareProjectionCargo(request projectionRequest, projection sourceToolchai
 	return &preparedProjectionCargo{Cache: cache, Preparation: preparation}, err
 }
 
-func projectionCargoPreparation(request projectionRequest, projection sourceToolchainProjection) (*preparedProjectionCargo, error) {
-	if request.PreparedCargo == nil {
-		return prepareProjectionCargo(request, projection)
-	}
-	prepared := request.PreparedCargo
-	cache := cacheProjection(request.ProjectWorkingRoot)
-	if cache != prepared.Cache || prepared.Preparation.stage != request.CargoStage {
-		return nil, errors.New("prepared Cargo cache identity changed")
-	}
-	current, err := cargoIdentityFor(request, projection)
-	if err != nil {
-		return nil, err
-	}
-	expected := prepared.Preparation.Materialization.Current
-	current.Generation = expected.Generation
-	if current != expected {
-		return nil, errors.New("prepared Cargo structural identity changed")
-	}
-	return prepared, nil
-}
-
 func applyProjectionCargoPreparation(request projectionRequest, projection sourceToolchainProjection, prepared *preparedProjectionCargo) (*preparedProjectionCargo, error) {
 	if err := request.window.check(); err != nil {
 		return prepared, err
@@ -1584,16 +1549,15 @@ func applyProjectionCargoPreparation(request projectionRequest, projection sourc
 	if err := ensureCargoProjection(prepared.Cache); err != nil {
 		return prepared, err
 	}
-	state, present, err := readCargoState(prepared.Cache.CargoBuild)
-	if err != nil {
-		return prepared, err
-	}
-	if prepared.Preparation.Materialization.Action == "ReusedWorkspace" && (!present || state != current) {
-		return prepared, errors.New("reused Cargo workspace state changed before execution")
-	}
-	if prepared.Preparation.Materialization.Action == "InvalidatedWorkspace" && (!present || state != current) {
-		if err := invalidateCargoWorkspace(request, projection.Toolchain, prepared.Cache); err != nil {
-			return prepared, fmt.Errorf("CargoPreparation/WorkspaceInvalidation: %w", err)
+	if prepared.Preparation.Materialization.Action == "InvalidatedWorkspace" {
+		state, present, err := readCargoState(prepared.Cache.CargoBuild)
+		if err != nil {
+			return prepared, err
+		}
+		if !present || state != current {
+			if err := invalidateCargoWorkspace(request, projection.Toolchain, prepared.Cache); err != nil {
+				return prepared, fmt.Errorf("CargoPreparation/WorkspaceInvalidation: %w", err)
+			}
 		}
 	}
 	if err := request.window.check(); err != nil {
@@ -1620,9 +1584,9 @@ func invalidateCargoWorkspace(request projectionRequest, toolchain ToolchainProj
 	}
 	stdout := &runnerLogWriter{writer: stdoutFile}
 	stderr := &runnerLogWriter{writer: stderrFile}
-	command := exec.Command(filepath.Join(toolchain.Path, "rust", "bin", "cargo"), "clean", "--workspace", "--target-dir", cache.CargoTarget, "--frozen")
+	command := exec.Command(filepath.Join(toolchain.Path, "rust", "bin", "cargo"), "clean", "--workspace", "--frozen")
 	command.Dir = filepath.Join(request.Source, "codex-rs")
-	command.Env = []string{"PATH=/usr/bin", "CARGO_HOME=" + cache.CargoHome, "CARGO_BUILD_BUILD_DIR=" + cache.CargoBuild, "RUSTC_BOOTSTRAP=1"}
+	command.Env = []string{"PATH=/usr/bin", "CARGO_HOME=" + cache.CargoHome, "CARGO_BUILD_BUILD_DIR=" + cache.CargoBuild, "CARGO_TARGET_DIR=" + cache.CargoTarget, "RUSTC_BOOTSTRAP=1"}
 	command.Stdout, command.Stderr = stdout, stderr
 	command.WaitDelay = core.GracePeriod()
 	runErr := request.window.run(command)
@@ -2288,8 +2252,11 @@ func runnerEnvironment(consumer []string, codexHome string) ([]string, error) {
 
 func runnerSystemArguments(networkDisabled bool) ([]string, error) {
 	arguments, err := parseAssetLines("runner bwrap arguments", assets.RunnerBwrapArguments(), false)
-	if err != nil || !networkDisabled {
+	if err != nil {
 		return arguments, err
+	}
+	if !networkDisabled {
+		return append(arguments, "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"), nil
 	}
 	filtered := arguments[:0]
 	for _, argument := range arguments {

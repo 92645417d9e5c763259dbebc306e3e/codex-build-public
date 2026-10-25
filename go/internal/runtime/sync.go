@@ -132,7 +132,7 @@ func runPublicSync(options publicSyncOptions, result publicSyncResult, cancellat
 		return result, writeError
 	}
 	arguments := []string{options.SkillRoot, privateRoot, options.PatchTag, result.PublicRoot, result.Repository, options.Version, repository.DefaultBranchRef.Name, attempt}
-	_, diagnostic, nativeError := runNativeProcess(attempt, script, "sync", arguments, environment, core.PublicSyncLogLimit, "", window.remaining(), cancellation, nil)
+	_, diagnostic, nativeError := runNativeProcess(attempt, script, "sync", arguments, environment, core.PublicSyncLogLimit, "", window.remaining(), cancellation, nil, nil)
 	if nativeError != nil {
 		return result, fmt.Errorf("public snapshot sync: %w: %s", nativeError, diagnostic)
 	}

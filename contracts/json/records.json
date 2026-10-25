@@ -132,6 +132,7 @@
   },
   "RustSuitePlanRecord": {
     "BaselineReanchor": "OptionalTrueOnlyForExplicitNonemptyBaselineAlignment",
+    "BugfixDiff": "OptionalNonemptyExactNativeCanonicalSharedBugfixSourceDiff",
     "CacheRoot": "FixedCurrentProjectCacheRoot",
     "CargoVersion": "ExactTypedCargoVersion",
     "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
@@ -141,6 +142,7 @@
     "HelperBinaries": "SortedUniqueHelperBinaryRustPackages",
     "NextestConcurrency": "PositiveInteger",
     "RecordType": "RustSuitePlanRecord",
+    "RequiredTests": "OptionalSortedUniquePackageQualifiedRegressionTestsThatMustPass",
     "SchemaVersion": 3,
     "Scope": "BaselineOrFull",
     "SourceRole": "FixedUpstreamBaselineOrExplicitProductWorktree",
@@ -167,6 +169,7 @@
     "Selection": "RustSuiteBaselineSelection"
   },
   "RustSuiteBaselineProposal": {
+    "BugfixDiff": "OptionalNonemptyExactNativeCanonicalSharedBugfixSourceDiff",
     "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
     "CoveredPackages": "SortedUniqueCoveredRustPackages",
     "ExecutionProfile": "RustSuiteBaselineExecutionProfile",
@@ -177,6 +180,7 @@
     "ToolchainTarget": "RustTargetTriple"
   },
   "RustSuiteBaselineSelection": {
+    "BugfixDiff": "OptionalNonemptyExactNativeCanonicalSharedBugfixSourceDiff",
     "CompileOnlyPackages": "SortedUniqueCompileOnlyRustPackages",
     "CoveredPackages": "SortedUniqueCoveredRustPackages",
     "ExecutionProfile": "RustSuiteBaselineExecutionProfile",

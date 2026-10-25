@@ -19,6 +19,8 @@ import (
 type ReleaseBaselineOptions struct {
 	endpointOptions
 	WorkingRoot, ScratchRoot, RuntimeRoot, RecordRoot, Tag string
+	Prepare                                                bool
+	RequiredTests                                          []string
 	Cancellation                                           <-chan os.Signal
 	OnLive                                                 func()
 	OnPhase                                                func(string)
@@ -29,9 +31,10 @@ type ReleaseBaselineOptions struct {
 
 type BaselineCoverageOptions struct {
 	ReleaseBaselineOptions
-	Unit, FlatPatch string
-	Align           bool
-	Proposal        rustSuiteBaselineProposal
+	Unit, FlatPatch  string
+	Align            bool
+	AffectedPackages []string
+	Proposal         rustSuiteBaselineProposal
 }
 
 type nativeReleaseBaselineResult struct {
@@ -66,14 +69,14 @@ func rustSuiteRouteFailure(result ReleaseRouteResult, suite RustSuiteResult, err
 }
 
 func (options ReleaseBaselineOptions) rustSuiteOptions() RustSuiteOptions {
-	return RustSuiteOptions{endpointOptions: options.endpointOptions, ProjectWorkingRoot: options.WorkingRoot, ProjectScratchRoot: options.ScratchRoot, RuntimeTemporaryRoot: options.RuntimeRoot, RecordRoot: options.RecordRoot, Source: options.worktrees.Upstream, Scope: "baseline", Tag: options.Tag, BaselineSelectionPath: filepath.Join(options.ScratchRoot, "tasks", "rust-suite-baselines.json"), Cancellation: options.Cancellation, OnLive: options.OnLive, OnPhase: options.OnPhase, releaseBaseline: true, cargoLockHeld: true}
+	return RustSuiteOptions{endpointOptions: options.endpointOptions, ProjectWorkingRoot: options.WorkingRoot, ProjectScratchRoot: options.ScratchRoot, RuntimeTemporaryRoot: options.RuntimeRoot, RecordRoot: options.RecordRoot, Source: options.worktrees.Upstream, Scope: "baseline", Tag: options.Tag, BaselineSelectionPath: filepath.Join(options.ScratchRoot, "tasks", "rust-suite-baselines.json"), Cancellation: options.Cancellation, OnLive: options.OnLive, OnPhase: options.OnPhase, releaseBaseline: true, cargoLockHeld: true, requiredTests: options.RequiredTests}
 }
 
 func RunReleaseBaseline(options ReleaseBaselineOptions) (ReleaseRouteResult, error) {
 	started := time.Now()
 	blocked := releaseRouteResult("Baseline", options.Tag)
-	if err := validateReleaseOptions(options, true); err != nil {
-		return blocked, err
+	if err := validateReleaseOptions(options, true); err != nil || !validRustSuiteRequiredTests(options.RequiredTests) || options.Prepare && len(options.RequiredTests) != 0 {
+		return blocked, errors.Join(err, errors.New("invalid baseline preparation or required tests"))
 	}
 	cargo, err := cargoLock(options.ScratchRoot)
 	if err != nil {
@@ -101,6 +104,17 @@ func RunReleaseBaseline(options ReleaseBaselineOptions) (ReleaseRouteResult, err
 	if err != nil {
 		return blocked.terminal("Fail", failureDomainHelper, "None"), err
 	}
+	if options.Prepare {
+		return blocked.terminal("Pass", failureDomainNone, "BaselineSourcePrepared"), nil
+	}
+	if !start.Ready {
+		fields, taskErr := taskGraphFields(options.taskBytes, "CurrentWorktree")
+		currentDiff, currentErr := releaseBugfixDiff(fields["CurrentWorktree"], options.RuntimeRoot, options.Tag, suite.deadline())
+		baselineDiff, baselineErr := releaseBugfixDiff(suite.Source, options.RuntimeRoot, options.Tag, suite.deadline())
+		if taskErr != nil || currentErr != nil || baselineErr != nil || currentDiff != baselineDiff {
+			return blocked, errors.Join(taskErr, currentErr, baselineErr, errors.New("Current and Baseline bugfix prefixes differ before measurement"))
+		}
+	}
 	inherited, _, inheritedErr := readRustSuiteBaselineFile(suite.BaselineSelectionPath, options.predecessorTag)
 	if inheritedErr != nil {
 		return blocked, inheritedErr
@@ -108,6 +122,10 @@ func RunReleaseBaseline(options ReleaseBaselineOptions) (ReleaseRouteResult, err
 	if inherited.Established != nil {
 		proposal := inherited.Established.Selection.rustSuiteBaselineProposal
 		proposal.Tag = options.Tag
+		proposal.BugfixDiff, err = releaseBugfixDiff(suite.Source, options.RuntimeRoot, options.Tag, suite.deadline())
+		if err != nil {
+			return blocked, err
+		}
 		suite.baselinePreimage = &inherited.Established.Selection
 		suite.baselineProposal = &proposal
 	} else if !start.Bootstrap && !start.Ready {
@@ -259,7 +277,7 @@ func removeCompletedReleaseOutputs(options ReleaseBaselineOptions, window deadli
 	}
 	defer removeOwnedPaths(root)
 	arguments := []string{options.WorkingRoot, options.ScratchRoot, options.RecordRoot, options.RuntimeRoot}
-	_, diagnostic, err := runNativeProcess(root, script, "release-cleanup", arguments, nativeEnvironment(root), 1<<20, "", window.remaining(), options.Cancellation, nil)
+	_, diagnostic, err := runNativeProcess(root, script, "release-cleanup", arguments, nativeEnvironment(root), 1<<20, "", window.remaining(), options.Cancellation, nil, nil)
 	if message := strings.TrimSpace(diagnostic); err != nil && message != "" {
 		err = errors.Join(err, errors.New(message))
 	}
@@ -273,6 +291,10 @@ func validateReleaseCleanupBaseline(suite RustSuiteOptions) error {
 		return errors.Join(readErr, errors.New("cleanup requires established baseline facts"))
 	}
 	selection := value.Established.Selection
+	bugfixDiff, sourceErr := releaseBugfixDiff(suite.Source, suite.RuntimeTemporaryRoot, suite.Tag, suite.deadline())
+	if sourceErr != nil || selection.BugfixDiff != bugfixDiff {
+		return errors.Join(sourceErr, errors.New("baseline source changed; remeasure affected coverage before cleanup"))
+	}
 	if len(selection.CoveredPackages)+len(selection.CompileOnlyPackages)+len(selection.HelperBinaries) == 0 {
 		expected, expectedErr := zeroRustSuiteBaseline(suite)
 		if expectedErr != nil || !rustSuiteSameValue(value, expected) {
@@ -299,7 +321,7 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 	missingSelection := options.Proposal.CompileOnlyPackages == nil || options.Proposal.CoveredPackages == nil || options.Proposal.HelperBinaries == nil
 	onePatch := options.Unit != "" && options.FlatPatch == "" || options.Unit == "" && options.FlatPatch != ""
 	name := options.Unit + options.FlatPatch
-	if err := validateReleaseOptions(options.ReleaseBaselineOptions, true); err != nil || options.Align == onePatch || !options.Align && !validName(name, "-._") || missingSelection {
+	if err := validateReleaseOptions(options.ReleaseBaselineOptions, true); err != nil || options.Align == onePatch || !options.Align && !validName(name, "-._") || missingSelection || !validRustSuitePackages(options.AffectedPackages) || !validRustSuiteRequiredTests(options.RequiredTests) || len(options.AffectedPackages) != 0 && (options.Align || options.FlatPatch == "") {
 		return result, errors.Join(err, errors.New("invalid baseline coverage options"))
 	}
 	var inputErr error
@@ -308,6 +330,7 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 		return result, inputErr
 	}
 	suite := options.rustSuiteOptions()
+	suite.baselineAffected = options.AffectedPackages
 	suite.started, suite.end = started, started.Add(core.StageDeadline())
 	calibrationPlan := RustSuitePlan{}
 	suite.calibrationPlan = &calibrationPlan
@@ -325,28 +348,48 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 		toolchain, toolchainErr = resolveToolchain(options.WorkingRoot, suite.Source, options.RuntimeRoot, suite.deadline())
 	}
 	value, preimage, baselineErr := readRustSuiteBaselineFile(suite.BaselineSelectionPath, suite.Tag)
-	if toolchainErr != nil || baselineErr != nil || value.Established == nil || !validRustSuiteBaselineSelection(value.Established.Selection, options.Tag, toolchain) {
+	if toolchainErr != nil || baselineErr != nil || value.Established == nil || value.Established.Selection.CargoVersion != toolchain.CargoVersion || !validRustSuiteBaselineSelection(value.Established.Selection, options.Tag) {
 		return result, errors.Join(toolchainErr, baselineErr, errors.New("current established baseline differs"))
 	}
 	proposal := options.Proposal
 	proposal.Tag, proposal.ToolchainRoot, proposal.CargoVersion, proposal.ToolchainTarget = options.Tag, toolchain.Root, toolchain.CargoVersion, toolchain.Target
 	proposal.ExecutionProfile = value.Established.Selection.ExecutionProfile
-	if !validRustSuiteBaselineProposal(proposal, options.Tag, toolchain) {
+	proposal.BugfixDiff, err = releaseBugfixDiff(suite.Source, options.RuntimeRoot, options.Tag, suite.deadline())
+	if err != nil {
+		return result, err
+	}
+	if proposal.BugfixDiff != value.Established.Selection.BugfixDiff {
+		if !options.Align && options.FlatPatch == "" {
+			return result, errors.New("changed baseline source requires its owning bugfix Flat Patch")
+		}
+		fields, taskErr := taskGraphFields(options.taskBytes, "CurrentWorktree")
+		currentDiff, currentErr := releaseBugfixDiff(fields["CurrentWorktree"], options.RuntimeRoot, options.Tag, suite.deadline())
+		if taskErr != nil || currentErr != nil || currentDiff != proposal.BugfixDiff {
+			return result, errors.Join(taskErr, currentErr, errors.New("Current and Baseline bugfix prefixes differ"))
+		}
+	}
+	if !validRustSuiteBaselineProposal(proposal, options.Tag) {
 		return result, errors.New("baseline coverage proposal differs")
 	}
 	suite.baselinePreimage = &value.Established.Selection
 	suite.baselineProposal = &proposal
 	suite.baselineReanchor = options.Align && len(proposal.CompileOnlyPackages)+len(proposal.HelperBinaries)+len(proposal.CoveredPackages) != 0
 	packages, err := discoverRustSuitePackages(suite, toolchain)
-	_, aligned, executionErr := rustSuiteBaselineExecution(value.Established.Selection, proposal, packages, options.Align)
+	execution, aligned, executionErr := rustSuiteBaselineExecution(value.Established.Selection, proposal, packages, options.Align, options.AffectedPackages)
 	if err != nil || executionErr != nil {
 		if errors.Is(err, errNativeTimeout) || errors.Is(err, errOperationCanceled) || errors.Is(executionErr, errNativeTimeout) || errors.Is(executionErr, errOperationCanceled) {
 			return result.terminal("Stopped", failureDomainHelper, "None"), errors.Join(err, executionErr)
 		}
 		return result, errors.Join(err, executionErr)
 	}
+	if zeroRustSuiteProposal(execution) && len(options.RequiredTests) != 0 {
+		return result, errors.New("required regression tests need nonempty baseline execution")
+	}
 	sameSelection := rustSuiteSameValue(value.Established.Selection.rustSuiteBaselineProposal, proposal)
 	if sameSelection && !suite.baselineReanchor {
+		if zeroRustSuiteProposal(proposal) {
+			return result.terminal("Pass", failureDomainNone, "BaselineCoverageUnchanged"), nil
+		}
 		prior := RustSuitePlan{}
 		if _, readErr := readCanonicalValue(filepath.Join(rustSuiteRecordRoot(suite), "plan.json"), &prior); readErr == nil {
 			suite.baselineReanchor = prior.BaselineReanchor
@@ -356,7 +399,7 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 		}
 		return result.terminal("Pass", failureDomainNone, "BaselineCoverageUnchanged"), nil
 	}
-	if options.Align && !suite.baselineReanchor {
+	if zeroRustSuiteProposal(execution) {
 		selection := value.Established.Selection
 		selection.rustSuiteBaselineProposal = aligned
 		selection.ExpectedFailures = map[string][]string{}
@@ -373,6 +416,9 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 		return rustSuiteRouteFailure(result, rustResult, runErr)
 	}
 	effect := "BaselineCoverageExpanded"
+	if proposal.BugfixDiff != value.Established.Selection.BugfixDiff {
+		effect = "BaselineBugfixCoverageRemeasured"
+	}
 	if options.Align {
 		effect = "BaselineCoverageAligned"
 	}
@@ -380,6 +426,15 @@ func RunBaselineCoverage(options BaselineCoverageOptions) (ReleaseRouteResult, e
 		return result.terminal("Fail", failureDomainHelper, effect), err
 	}
 	return result.terminal("Pass", failureDomainNone, effect), nil
+}
+
+func releaseBugfixDiff(source, runtimeRoot, tag string, window deadline) (string, error) {
+	data, err := runNativeWithin(runtimeRoot, "release-baseline-source", window.remaining(), window.signals, source, tag)
+	var diff string
+	if err == nil {
+		err = json.Unmarshal(data, &diff)
+	}
+	return diff, err
 }
 
 func validateReleaseOptions(options ReleaseBaselineOptions, requireTag bool) error {
@@ -402,7 +457,7 @@ func runReleaseBaselineNative(options ReleaseBaselineOptions, action string, win
 	defer removeOwnedPaths(root)
 	output := filepath.Join(root, "result")
 	arguments := []string{options.WorkingRoot, options.ScratchRoot, options.RecordRoot, options.Tag, options.taskPath, options.predecessorTag, options.worktrees.Main, options.worktrees.Upstream, string(options.taskBytes), string(options.indexBytes), string(options.nextIndex), output}
-	data, stderr, runErr := runNativeProcess(root, script, action, arguments, nativeEnvironment(root), 8<<20, output, window.remaining(), options.Cancellation, options.OnLive)
+	data, stderr, runErr := runNativeProcess(root, script, action, arguments, nativeEnvironment(root), 8<<20, output, window.remaining(), options.Cancellation, options.OnLive, nil)
 	result := nativeReleaseBaselineResult{}
 	if diagnostic := strings.TrimSpace(stderr); runErr != nil && diagnostic != "" {
 		runErr = errors.Join(runErr, errors.New(diagnostic))
@@ -916,6 +971,11 @@ func executePatchReplay(options PatchReplayOptions) (PatchReplayResult, error) {
 		if len(result.AppliedRows) != 0 {
 			result.ProductEffect = "TargetPrefix"
 		}
+		if strings.HasPrefix(result.Output, "RepositoryFormat") && strings.TrimSpace(stderr) != "" {
+			diagnostic := &diagnosticWriter{}
+			_, _ = diagnostic.Write([]byte(result.Output + "\n" + strings.TrimSpace(stderr)))
+			result.Output = diagnostic.String()
+		}
 		if strings.HasPrefix(result.Output, "RepositoryFormatHelper:") {
 			result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
 			break
@@ -1259,6 +1319,7 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 		}
 	}
 	action, arguments := "patch-replay-"+options.Mode, []string{}
+	environment := nativeEnvironment(root)
 	contract := ""
 	if options.Contract.Purpose != "" || options.Contract.Provides != "" || options.Contract.Boundary != "" || options.Contract.Verification != "" || len(options.Contract.Requires) != 0 || options.Contract.CrossGroup != "" {
 		data, encodeErr := json.Marshal(options.Contract)
@@ -1277,6 +1338,7 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 		}
 		arguments = []string{options.Source, options.Tag, options.PredecessorTag, selector, options.WorkingRoot, options.ActiveTask, options.coverageMode}
 	case "apply":
+		environment = repositoryFormatProxyEnvironment(environment)
 		start, _ := options.startSelector()
 		end, _ := options.endSelector()
 		arguments = []string{options.Source, options.Target, options.Tag, start, end, options.rustfmt, root, options.PredecessorTag, options.ChildPatchSequence}
@@ -1301,7 +1363,7 @@ func runPatchReplayProcess(options PatchReplayOptions, postimages string, window
 	}
 	output := filepath.Join(root, "result")
 	arguments = append(arguments, output)
-	data, stderr, runErr := runNativeProcess(root, script, action, arguments, nativeEnvironment(root), 8<<20, output, window.remaining(), window.signals, options.OnLive)
+	data, stderr, runErr := runNativeProcess(root, script, action, arguments, environment, 8<<20, output, window.remaining(), window.signals, options.OnLive, options.OnPhase)
 	native := nativePatchReplayResult{}
 	if decodeErr := json.Unmarshal(data, &native); runErr == nil || decodeErr == nil {
 		runErr = decodeErr

@@ -1,0 +1,1425 @@
+queue-selected-session-profiles-asynchronously
+
+Lane: mixed
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: queue-selected-session-profiles-asynchronously
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -608,22 +608,20 @@ async fn run_resume_picker_with_launch_context(
+             PageLoadMode::StateDbOnly
+         },
+     };
+-    run_session_picker_with_loader(
+-        tui,
++    let (loader, worker) = spawn_app_server_page_loader(
+         uses_remote_filesystem,
+-        options,
+-        spawn_app_server_page_loader(
+-            uses_remote_filesystem,
+-            app_server,
+-            archive_request_handle,
+-            include_non_interactive,
+-            raw_reasoning_visibility(config),
+-            (!uses_remote_workspace).then(|| config.clone()),
+-            bg_tx,
+-        ),
+-        bg_rx,
+-    )
+-    .await
++        app_server,
++        archive_request_handle,
++        include_non_interactive,
++        raw_reasoning_visibility(config),
++        (!uses_remote_workspace).then(|| config.clone()),
++        bg_tx,
++    );
++    let selection =
++        run_session_picker_with_loader(tui, uses_remote_filesystem, options, loader, bg_rx).await;
++    // Startup's Exit selection may stop the Tokio runtime immediately after return.
++    worker.await?;
++    selection
+ }
+ 
+ pub async fn run_fork_picker_with_app_server(
+@@ -671,22 +669,16 @@ pub async fn run_fork_picker_with_app_server(
+             PageLoadMode::StateDbOnly
+         },
+     };
+-    run_session_picker_with_loader(
+-        tui,
++    let (loader, _worker) = spawn_app_server_page_loader(
+         uses_remote_filesystem,
+-        options,
+-        spawn_app_server_page_loader(
+-            uses_remote_filesystem,
+-            app_server,
+-            archive_request_handle,
+-            /*include_non_interactive*/ false,
+-            raw_reasoning_visibility(config),
+-            (!uses_remote_workspace).then(|| config.clone()),
+-            bg_tx,
+-        ),
+-        bg_rx,
+-    )
+-    .await
++        app_server,
++        archive_request_handle,
++        /*include_non_interactive*/ false,
++        raw_reasoning_visibility(config),
++        (!uses_remote_workspace).then(|| config.clone()),
++        bg_tx,
++    );
++    run_session_picker_with_loader(tui, uses_remote_filesystem, options, loader, bg_rx).await
+ }
+ 
+ async fn run_session_picker_with_loader(
+@@ -878,12 +870,13 @@ fn spawn_app_server_page_loader(
+     raw_reasoning_visibility: RawReasoningVisibility,
+     config: Option<Config>,
+     bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
+-) -> PickerLoader {
++) -> (PickerLoader, tokio::task::JoinHandle<()>) {
+     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PickerLoadRequest>();
+ 
+-    tokio::spawn(async move {
++    let worker = tokio::spawn(async move {
+         let mut app_server = app_server;
+         let mut page_cwd_filter = PageCwdFilter::default();
++        let mut profile_task: Option<tokio::task::JoinHandle<()>> = None;
+         while let Some(request) = request_rx.recv().await {
+             match request {
+                 PickerLoadRequest::Page(request) => {
+@@ -989,44 +982,23 @@ fn spawn_app_server_page_loader(
+                     thread_id,
+                     codex_home,
+                     slot,
+-                    mut archived,
++                    archived,
+                     is_current,
+                 } => {
+-                    let mut result = profiles::apply(
+-                        &mut app_server,
++                    if let Some(previous) = profile_task.take()
++                        && let Err(error) = previous.await
++                    {
++                        warn!(%error, "Profile application task failed");
++                    }
++                    profile_task = Some(tokio::spawn(profiles::run(
++                        app_server.request_handle(),
+                         thread_id,
+-                        &codex_home,
++                        codex_home,
+                         slot,
+-                        &mut archived,
++                        archived,
+                         is_current,
+-                    )
+-                    .await
+-                    .map_err(std::io::Error::other);
+-                    // Read only the changed session, including effects committed before an error.
+-                    let thread = match app_server.thread_read(thread_id, false).await {
+-                        Ok(thread) => Some(Box::new(thread)),
+-                        Err(error) => {
+-                            result = Err(std::io::Error::other(match result {
+-                                Ok(()) => format!(
+-                                    "profile saved, but could not refresh session: {error:#}"
+-                                ),
+-                                Err(previous) => {
+-                                    format!("{previous}; could not refresh session: {error:#}")
+-                                }
+-                            }));
+-                            None
+-                        }
+-                    };
+-                    let _ = bg_tx.send(BackgroundEvent::ProfileApplied {
+-                        thread_id,
+-                        status: if archived {
+-                            SessionStatus::Archived
+-                        } else {
+-                            SessionStatus::Active
+-                        },
+-                        thread,
+-                        result,
+-                    });
++                        bg_tx.clone(),
++                    )));
+                 }
+                 PickerLoadRequest::GenerateTitle {
+                     thread_id,
+@@ -1059,14 +1031,23 @@ fn spawn_app_server_page_loader(
+                 }
+             }
+         }
++        // Closing the picker drops only unstarted targets, not a partially committed profile.
++        if let Some(pending) = profile_task
++            && let Err(error) = pending.await
++        {
++            warn!(%error, "Profile application task failed during picker shutdown");
++        }
+         if let Err(err) = app_server.shutdown().await {
+             warn!(%err, "Failed to shut down app-server picker session");
+         }
+     });
+ 
+-    Arc::new(move |request: PickerLoadRequest| {
+-        let _ = request_tx.send(request);
+-    })
++    (
++        Arc::new(move |request: PickerLoadRequest| {
++            let _ = request_tx.send(request);
++        }),
++        worker,
++    )
+ }
+ 
+ /// Returns the human-readable column header for the given sort key.
+@@ -1136,7 +1117,7 @@ struct PickerState {
+     action: SessionPickerAction,
+     sort_key: PickerSortKey,
+     inline_error: Option<String>,
+-    profile_pending: Option<(ThreadId, u8)>,
++    profile_queue: profiles::ProfileQueue,
+     profile_names: BTreeMap<u8, String>,
+     title_action: Option<TitleAction>,
+     title_generated_for: Option<ThreadId>,
+@@ -1351,7 +1332,7 @@ impl PickerState {
+             action,
+             sort_key: PickerSortKey::UpdatedAt,
+             inline_error: None,
+-            profile_pending: None,
++            profile_queue: profiles::ProfileQueue::default(),
+             profile_names: BTreeMap::new(),
+             title_action: None,
+             title_generated_for: None,
+@@ -1604,7 +1585,7 @@ impl PickerState {
+             }
+             _ if self.keymap.list.accept.is_pressed(key)
+                 && (!matches!(self.archive_state, archive::ArchiveState::Idle)
+-                    || self.profile_pending.is_some()
++                    || self.profile_queue.is_running()
+                     || self.title_action.is_some()) => {}
+             _ if self.keymap.list.accept.is_pressed(key) => {
+                 if let Some(row) = self.filtered_rows.get(self.selected) {
+@@ -1714,7 +1695,7 @@ impl PickerState {
+                 self.set_query(new_query);
+             }
+             _ if self.archive_shortcut_available()
+-                && self.profile_pending.is_none()
++                && !self.profile_queue.is_running()
+                 && self.title_action.is_none()
+                 && crate::key_hint::ctrl(KeyCode::Char('a')).is_press(key) =>
+             {
+@@ -3127,11 +3108,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
+         hint_line_for_row(&second_row_hints, width),
+     ];
+     if matches!(state.action, SessionPickerAction::Resume) {
+-        lines.extend(profiles::hint_lines(
+-            &state.profile_names,
+-            width,
+-            state.profile_pending.map(|(_, slot)| slot),
+-        ));
++        lines.extend(profiles::hint_lines(&state.profile_names, width));
+     }
+     lines
+ }
+@@ -4702,7 +4679,7 @@ mod tests {
+             .expect("start local app-server");
+         let request_handle = app_server.request_handle();
+         let (bg_tx, mut bg_rx) = mpsc::unbounded_channel();
+-        let loader = spawn_app_server_page_loader(
++        let (loader, _worker) = spawn_app_server_page_loader(
+             /*uses_remote_filesystem*/ false,
+             app_server,
+             request_handle,
+diff --git a/codex-rs/tui/src/resume_picker/archive.rs b/codex-rs/tui/src/resume_picker/archive.rs
+--- a/codex-rs/tui/src/resume_picker/archive.rs
++++ b/codex-rs/tui/src/resume_picker/archive.rs
+@@ -110,14 +110,6 @@ impl PickerState {
+         // sources, never SubAgent threads, so only this row can be visible here.
+         if status == self.status {
+             let Some(thread) = thread else { return };
+-            let Some(index) = self
+-                .all_rows
+-                .iter()
+-                .position(|row| row.thread_id == Some(thread_id))
+-            else {
+-                // A filter switch owns its new listing; do not insert a row outside that listing.
+-                return;
+-            };
+             self.thread_history_modes
+                 .insert(thread_id, thread.history_mode);
+             let Some(row) = row_from_app_server_thread(thread) else {
+@@ -127,7 +119,17 @@ impl PickerState {
+                 self.local_cwd_matches
+                     .insert(cwd.clone(), self.row_matches_local_cwd(&row));
+             }
+-            self.all_rows[index] = row;
++            if let Some(existing) = self
++                .all_rows
++                .iter_mut()
++                .find(|row| row.thread_id == Some(thread_id))
++            {
++                *existing = row;
++            } else if self.row_matches_filter(&row) {
++                // A profile may finish before a reload's page. Keep its fresh metadata
++                // only in the current directory scope; the tombstone below rejects old pages.
++                self.all_rows.push(row);
++            }
+             let sort_key = self.sort_key.native_sort_key();
+             self.all_rows.sort_by_key(|row| {
+                 std::cmp::Reverse(match sort_key {
+diff --git a/codex-rs/tui/src/resume_picker/mutation_tests.rs b/codex-rs/tui/src/resume_picker/mutation_tests.rs
+--- a/codex-rs/tui/src/resume_picker/mutation_tests.rs
++++ b/codex-rs/tui/src/resume_picker/mutation_tests.rs
+@@ -1,6 +1,43 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
+ 
++fn updated_thread(thread_id: ThreadId, cwd: &str, created_at: i64, updated_at: i64) -> Thread {
++    Thread {
++        id: thread_id.to_string(),
++        session_id: thread_id.to_string(),
++        originator: None,
++        environments: None,
++        extra: None,
++        forked_from_id: None,
++        parent_thread_id: None,
++        preview: "profile applied".into(),
++        ephemeral: false,
++        section: None,
++        section_entered_at: None,
++        project_id: None,
++        daybreak_enabled: None,
++        history_mode: Default::default(),
++        model_provider: "openai".into(),
++        model: None,
++        reasoning_effort: None,
++        created_at,
++        updated_at,
++        recency_at: Some(updated_at),
++        status: codex_app_server_protocol::ThreadStatus::Idle,
++        path: None,
++        cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(PathBuf::from(cwd)).unwrap(),
++        cli_version: "0.0.0".into(),
++        source: codex_app_server_protocol::SessionSource::Cli,
++        can_accept_direct_input: None,
++        thread_source: None,
++        agent_nickname: None,
++        agent_role: None,
++        git_info: None,
++        name: Some("saved profile values".into()),
++        turns: Vec::new(),
++    }
++}
++
+ #[tokio::test]
+ async fn profile_updates_keep_focus_near_the_original_row() -> Result<()> {
+     for (filter_mode, status) in [
+@@ -44,7 +81,14 @@ async fn profile_updates_keep_focus_near_the_original_row() -> Result<()> {
+             state.view_rows = Some(5);
+             state.density = SessionListDensity::Dense;
+             let scroll_top = state.scroll_top;
+-            state.profile_pending = Some((thread_id, 0));
++            state.view_persistence = Some(SessionPickerViewPersistence {
++                codex_home: PathBuf::from("/tmp/profile-home"),
++            });
++            state.profile_names.insert(0, "inspect".into());
++            state.selected = target;
++            state.request_profile(0);
++            state.selected = selected;
++            requests.lock().unwrap().clear();
+             if target == selected && updated_at == 100 {
+                 let (mut archived, _) = test_picker();
+                 archived.all_rows = rows;
+@@ -56,40 +100,7 @@ async fn profile_updates_keep_focus_near_the_original_row() -> Result<()> {
+                     expected_id
+                 );
+             }
+-            let thread = Thread {
+-                id: thread_id.to_string(),
+-                session_id: thread_id.to_string(),
+-                originator: None,
+-                environments: None,
+-                extra: None,
+-                forked_from_id: None,
+-                parent_thread_id: None,
+-                preview: "profile applied".into(),
+-                ephemeral: false,
+-                section: None,
+-                section_entered_at: None,
+-                project_id: None,
+-                daybreak_enabled: None,
+-                history_mode: Default::default(),
+-                model_provider: "openai".into(),
+-                model: None,
+-                reasoning_effort: None,
+-                created_at: 8 - target as i64,
+-                updated_at,
+-                recency_at: Some(updated_at),
+-                status: codex_app_server_protocol::ThreadStatus::Idle,
+-                path: None,
+-                cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(PathBuf::from("/tmp"))?,
+-                cli_version: "0.0.0".into(),
+-                source: codex_app_server_protocol::SessionSource::Cli,
+-                can_accept_direct_input: None,
+-                thread_source: None,
+-                agent_nickname: None,
+-                agent_role: None,
+-                git_info: None,
+-                name: Some("saved profile values".into()),
+-                turns: Vec::new(),
+-            };
++            let thread = updated_thread(thread_id, "/tmp", 8 - target as i64, updated_at);
+             state
+                 .handle_background_event(BackgroundEvent::ProfileApplied {
+                     thread_id,
+@@ -101,7 +112,7 @@ async fn profile_updates_keep_focus_near_the_original_row() -> Result<()> {
+             assert_eq!(state.filtered_rows[state.selected].thread_id, expected_id);
+             assert_eq!(state.scroll_top, scroll_top);
+             assert_eq!(state.filtered_rows.len(), if leaves_filter { 7 } else { 8 });
+-            assert_eq!(state.profile_pending, None);
++            assert!(!state.profile_queue.is_running());
+             assert!(state.inline_error.is_none());
+             if leaves_filter {
+                 assert!(
+@@ -123,6 +134,108 @@ async fn profile_updates_keep_focus_near_the_original_row() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn profile_completion_during_reload_wins_over_late_pages_in_each_directory_scope()
++-> Result<()> {
++    for status in [SessionStatus::Active, SessionStatus::Archived] {
++        for mode in [
++            SessionFilterMode::All,
++            SessionFilterMode::Cwd,
++            SessionFilterMode::Other,
++        ] {
++            for new_cwd in ["/current", "/changed"] {
++                let (mut state, requests) = test_picker();
++                state.status = status;
++                state.filter_cwd = Some(PathBuf::from("/current"));
++                state.local_filter_cwd = state.filter_cwd.clone();
++                state.view_persistence = Some(SessionPickerViewPersistence {
++                    codex_home: PathBuf::from("/tmp/profile-home"),
++                });
++                state.profile_names.insert(1, "inspect".into());
++                let thread_id = ThreadId::new();
++                let old_cwd = if mode == SessionFilterMode::Cwd {
++                    "/current"
++                } else {
++                    "/elsewhere"
++                };
++                let old = Row {
++                    cwd: Some(PathBuf::from(old_cwd)),
++                    thread_name: Some("old title".into()),
++                    ..test_row(thread_id)
++                };
++                state.all_rows.push(old.clone());
++                state.apply_filter();
++                state.request_profile(1);
++                assert!(matches!(
++                    requests.lock().unwrap().pop(),
++                    Some(PickerLoadRequest::ApplyProfile { .. })
++                ));
++                state.filter_mode = mode;
++                state.start_initial_load();
++                let Some(PickerLoadRequest::Page(request)) = requests.lock().unwrap().pop() else {
++                    panic!("reload must request its first page")
++                };
++                assert!(state.all_rows.is_empty());
++                let thread = updated_thread(thread_id, new_cwd, 1, 10);
++                let updated = row_from_app_server_thread(thread.clone()).unwrap();
++                state
++                    .handle_background_event(BackgroundEvent::ProfileApplied {
++                        thread_id,
++                        status,
++                        thread: Some(Box::new(thread)),
++                        result: Ok(()),
++                    })
++                    .await?;
++                assert!(!state.profile_queue.is_running());
++                let matching = mode == SessionFilterMode::All
++                    || (new_cwd == "/current") == (mode == SessionFilterMode::Cwd);
++                assert_eq!(state.filtered_rows.len(), usize::from(matching));
++                let neighbor = Row {
++                    cwd: Some(PathBuf::from(if mode == SessionFilterMode::Cwd {
++                        "/current"
++                    } else {
++                        "/zzz"
++                    })),
++                    thread_name: Some("neighbor title".into()),
++                    ..test_row(ThreadId::new())
++                };
++                state
++                    .handle_background_event(BackgroundEvent::Page {
++                        request_token: request.request_token,
++                        search_token: request.search_token,
++                        page: Ok(PickerPage {
++                            rows: vec![old, neighbor.clone()],
++                            history_modes: HashMap::new(),
++                            next_cursor: None,
++                            num_scanned_files: 2,
++                            reached_scan_cap: false,
++                        }),
++                    })
++                    .await?;
++                assert_eq!(state.filtered_rows.len(), 1 + usize::from(matching));
++                assert_eq!(
++                    state
++                        .all_rows
++                        .iter()
++                        .find(|row| row.thread_id == Some(thread_id)),
++                    matching.then_some(&updated)
++                );
++                if matching {
++                    assert_eq!(state.filtered_rows[0], updated);
++                }
++                assert_eq!(state.filtered_rows.last(), Some(&neighbor));
++                state.set_query("saved profile".into());
++                assert_eq!(
++                    state.filtered_rows,
++                    if matching { vec![updated] } else { Vec::new() }
++                );
++                assert!(requests.lock().unwrap().is_empty());
++            }
++        }
++    }
++    Ok(())
++}
++
+ #[test]
+ fn mutations_keep_large_list_selection_cursor_and_stale_page_tombstones() {
+     for (listed, changed) in [
+diff --git a/codex-rs/tui/src/resume_picker/profile_tests.rs b/codex-rs/tui/src/resume_picker/profile_tests.rs
+--- a/codex-rs/tui/src/resume_picker/profile_tests.rs
++++ b/codex-rs/tui/src/resume_picker/profile_tests.rs
+@@ -1,6 +1,10 @@
+ use super::*;
+ use crate::legacy_core::config::ConfigBuilder;
+ use app_test_support::create_fake_paginated_rollout;
++use codex_app_server_client::AppServerClient;
++use codex_app_server_client::RemoteAppServerClient;
++use codex_app_server_client::RemoteAppServerConnectArgs;
++use codex_app_server_client::RemoteAppServerEndpoint;
+ use codex_app_server_protocol::ThreadResumeParams;
+ use codex_app_server_protocol::ThreadResumeResponse;
+ use codex_app_server_protocol::ThreadUnsubscribeParams;
+@@ -11,8 +15,10 @@ use codex_protocol::protocol::ThreadSettingsSnapshot;
+ use codex_rollout::RolloutItem;
+ use codex_rollout::RolloutRecorder;
+ use core_test_support::responses;
++use futures::SinkExt;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
++use tokio_tungstenite::tungstenite::Message;
+ 
+ fn create_profile_rollout(home: &Path, preview: &str) -> ThreadId {
+     let id = create_fake_paginated_rollout(
+@@ -37,7 +43,14 @@ async fn apply(
+ ) -> Result<()> {
+     tokio::time::timeout(
+         std::time::Duration::from_secs(20),
+-        super::apply(server, thread_id, home, slot, archived, is_current),
++        super::apply(
++            &server.request_handle(),
++            thread_id,
++            home,
++            slot,
++            archived,
++            is_current,
++        ),
+     )
+     .await?
+ }
+@@ -151,17 +164,25 @@ async fn alt_digits_apply_to_the_selected_session_without_typing_or_resuming() -
+         .handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT))
+         .await?;
+     assert!(requests.lock().unwrap().is_empty());
+-    assert_eq!(state.profile_pending, None);
++    assert!(!state.profile_queue.is_running());
+     state.profile_names = (0..=9)
+         .map(|slot| (slot, format!("profile{slot}")))
+         .collect();
++    state
++        .handle_key(KeyEvent::new(
++            KeyCode::Char('0'),
++            KeyModifiers::CONTROL | KeyModifiers::ALT,
++        ))
++        .await?;
++    assert!(requests.lock().unwrap().is_empty());
++    assert!(!state.profile_queue.is_running());
+     for slot in 0..=9 {
+         state.status = if slot % 2 == 0 {
+             SessionStatus::Active
+         } else {
+             SessionStatus::Archived
+         };
+-        state.profile_pending = None;
++        state.profile_queue = ProfileQueue::default();
+         let selection = state
+             .handle_key(KeyEvent::new(
+                 KeyCode::Char(char::from(b'0' + slot)),
+@@ -170,13 +191,17 @@ async fn alt_digits_apply_to_the_selected_session_without_typing_or_resuming() -
+             .await?;
+         assert!(selection.is_none());
+         assert_eq!(state.query, "");
+-        assert_eq!(state.profile_pending, Some((thread_id, slot)));
+-        let footer = footer_hint_lines(&state, 220);
+-        assert_eq!(footer.len(), 3);
+         assert_eq!(
+-            footer.last().unwrap().to_string().trim(),
+-            format!("saving to profile profile{slot}")
++            state.profile_queue.pending.front().unwrap().thread_id,
++            thread_id
+         );
++        assert_eq!(state.profile_queue.pending.front().unwrap().slot, slot);
++        let footer = footer_hint_lines(&state, 220);
++        for visible_slot in 0..=9 {
++            assert!(footer.iter().any(|line| line.to_string().contains(&format!(
++                "alt+{visible_slot} apply profile profile{visible_slot}"
++            ))));
++        }
+         assert!(matches!(
+             requests.lock().unwrap().pop(),
+             Some(PickerLoadRequest::ApplyProfile { thread_id: target, slot: selected, .. })
+@@ -192,14 +217,366 @@ async fn alt_digits_apply_to_the_selected_session_without_typing_or_resuming() -
+     state.finish_profile(thread_id, Ok(()));
+     assert!(
+         footer_hint_lines(&state, 400)
+-            .last()
++            .iter()
++            .any(|line| line.to_string().contains("alt+9 apply profile profile9"))
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn selected_profiles_queue_serially_across_active_and_archived_views() -> Result<()> {
++    let (mut state, requests) = test_picker();
++    state.view_persistence = Some(SessionPickerViewPersistence {
++        codex_home: PathBuf::from("/tmp/profile-home"),
++    });
++    state.profile_names = BTreeMap::from([(1, "inspect".into()), (2, "archive".into())]);
++    state.filter_mode = SessionFilterMode::Other;
++    state.filter_cwd = Some(PathBuf::from("/tmp"));
++    state.local_filter_cwd = state.filter_cwd.clone();
++    state.view_rows = Some(2);
++    state.ingest_page(PickerPage {
++        rows: (0..8)
++            .map(|index| Row {
++                cwd: Some(PathBuf::from(if index == 0 {
++                    "/tmp"
++                } else {
++                    "/elsewhere"
++                })),
++                preview: if index == 1 {
++                    "unrelated row".into()
++                } else {
++                    "target row".into()
++                },
++                ..test_row(ThreadId::new())
++            })
++            .collect(),
++        history_modes: HashMap::new(),
++        next_cursor: None,
++        num_scanned_files: 8,
++        reached_scan_cap: false,
++    });
++    state.set_query("target".into());
++    let targets = state
++        .filtered_rows
++        .iter()
++        .map(|row| row.thread_id.unwrap())
++        .collect::<Vec<_>>();
++    assert_eq!(targets.len(), 6);
++    state.launch_context = SessionPickerLaunchContext::ExistingSession {
++        current_thread_id: Some(targets[0]),
++    };
++    let pending_rows = state.filtered_rows.clone();
++    for index in 0..targets.len() {
++        state.selected = index;
++        assert!(
++            state
++                .handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT,))
++                .await?
++                .is_none()
++        );
++        assert_eq!(state.profile_queue.pending.len(), index + 1);
++        assert_eq!(state.filtered_rows, pending_rows);
++        assert_eq!(state.selected, index);
++        if index == 0 {
++            assert!(matches!(requests.lock().unwrap().pop(),
++                Some(PickerLoadRequest::ApplyProfile { thread_id, slot: 1, archived: false, is_current: true, .. })
++                if thread_id == targets[0]));
++        }
++        assert!(requests.lock().unwrap().is_empty());
++    }
++    assert_eq!(state.query, "target");
++    state.request_profile(2);
++    assert_eq!(state.profile_queue.pending.len(), 6);
++    assert!(requests.lock().unwrap().is_empty());
++    state.selected = 0;
++    state
++        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
++        .await?;
++    assert_eq!(state.selected, 1);
++    state.toggle_status();
++    let archived_request = requests.lock().unwrap().pop().unwrap();
++    let PickerLoadRequest::Page(page) = archived_request else {
++        panic!("status must load a page")
++    };
++    let archived = ThreadId::new();
++    state
++        .handle_background_event(BackgroundEvent::Page {
++            request_token: page.request_token,
++            search_token: page.search_token,
++            page: Ok(PickerPage {
++                rows: vec![Row {
++                    cwd: Some(PathBuf::from("/elsewhere")),
++                    preview: "target archived".into(),
++                    ..test_row(archived)
++                }],
++                history_modes: HashMap::new(),
++                next_cursor: None,
++                num_scanned_files: 1,
++                reached_scan_cap: false,
++            }),
++        })
++        .await?;
++    let pending_archived_rows = state.filtered_rows.clone();
++    state
++        .handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT))
++        .await?;
++    assert_eq!(state.profile_queue.pending.len(), 7);
++    assert_eq!(state.filtered_rows, pending_archived_rows);
++    assert!(requests.lock().unwrap().is_empty());
++    state.set_query("no matching rows".into());
++    state.cycle_sort_key(/*forward*/ true);
++    requests.lock().unwrap().clear();
++    for (index, thread_id) in targets.iter().copied().enumerate() {
++        state
++            .handle_background_event(BackgroundEvent::ProfileApplied {
++                thread_id,
++                status: SessionStatus::Active,
++                thread: None,
++                result: if index == 1 {
++                    Err(std::io::Error::other("settings rejected"))
++                } else {
++                    Ok(())
++                },
++            })
++            .await?;
++        assert!(matches!(requests.lock().unwrap().pop(),
++            Some(PickerLoadRequest::ApplyProfile { thread_id: next, slot, archived: was_archived, .. })
++            if next == targets.get(index + 1).copied().unwrap_or(archived)
++                && slot == if index == 5 { 2 } else { 1 }
++                && was_archived == (index == 5)));
++        assert!(requests.lock().unwrap().is_empty());
++    }
++    assert!(
++        state
++            .inline_error
++            .as_ref()
+             .unwrap()
+-            .to_string()
+-            .contains("alt+9 apply profile profile9")
++            .contains(&targets[1].to_string())
+     );
++    state.finish_profile(archived, Ok(()));
++    assert!(!state.profile_queue.is_running());
++    assert!(requests.lock().unwrap().is_empty());
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn selected_profiles_allow_incomplete_lists_and_closing_discards_unstarted_targets()
++-> Result<()> {
++    for (status, incomplete) in [SessionStatus::Active, SessionStatus::Archived]
++        .into_iter()
++        .flat_map(|status| (0..4).map(move |incomplete| (status, incomplete)))
++    {
++        let (mut state, requests) = test_picker();
++        state.status = status;
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: PathBuf::from("/tmp/profile-home"),
++        });
++        state.profile_names.insert(1, "inspect".into());
++        state.all_rows = (0..3).map(|_| test_row(ThreadId::new())).collect();
++        state.apply_filter();
++        match incomplete {
++            0 => state
++                .pagination
++                .start_load(19, None, PageLoadMode::StoreDefault),
++            1 => state.pagination.next_cursor = Some(PageCursor::AppServer("more".into())),
++            2 => state.pagination.reached_scan_cap = true,
++            _ => {
++                state
++                    .pagination
++                    .start_load(19, None, PageLoadMode::StoreDefault);
++                state
++                    .handle_background_event(BackgroundEvent::Page {
++                        request_token: 19,
++                        search_token: None,
++                        page: Err(std::io::Error::other("page failed")),
++                    })
++                    .await?;
++                state
++                    .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
++                    .await?;
++                assert!(state.inline_error.is_none());
++            }
++        }
++        let pending_rows = state.filtered_rows.clone();
++        for index in 0..pending_rows.len() {
++            state.selected = index;
++            state
++                .handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT))
++                .await?;
++            assert_eq!(state.profile_queue.pending.len(), index + 1);
++            assert_eq!(state.filtered_rows, pending_rows);
++            assert_eq!(requests.lock().unwrap().len(), 1);
++        }
++        drop(state);
++        assert_eq!(requests.lock().unwrap().len(), 1);
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn queued_sessions_stay_in_place_until_their_profile_completion() -> Result<()> {
++    for status in [SessionStatus::Active, SessionStatus::Archived] {
++        let (mut state, requests) = test_picker();
++        state.status = status;
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: PathBuf::from("/tmp/profile-home"),
++        });
++        state.profile_names.insert(1, "inspect".into());
++        state.all_rows = (0..3).map(|_| test_row(ThreadId::new())).collect();
++        state.apply_filter();
++        let original_rows = state.filtered_rows.clone();
++        for index in 1..3 {
++            state.selected = index;
++            state
++                .handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT))
++                .await?;
++            assert_eq!(state.filtered_rows, original_rows);
++            assert_eq!(state.all_rows, original_rows);
++            assert_eq!(state.selected, index);
++            assert_eq!(state.profile_queue.pending.len(), index);
++        }
++        let first = original_rows[1].thread_id.unwrap();
++        let second = original_rows[2].thread_id.unwrap();
++        assert!(matches!(requests.lock().unwrap().pop(),
++            Some(PickerLoadRequest::ApplyProfile { thread_id, archived, .. })
++            if thread_id == first && archived == (status == SessionStatus::Archived)));
++        assert!(requests.lock().unwrap().is_empty());
++        let applied_status = if status == SessionStatus::Archived {
++            SessionStatus::Active
++        } else {
++            SessionStatus::Archived
++        };
++        state
++            .handle_background_event(BackgroundEvent::ProfileApplied {
++                thread_id: first,
++                status: applied_status,
++                thread: None,
++                result: Ok(()),
++            })
++            .await?;
++        assert_eq!(
++            state.filtered_rows,
++            vec![original_rows[0].clone(), original_rows[2].clone()]
++        );
++        assert_eq!(
++            state.profile_queue.pending.front().unwrap().thread_id,
++            second
++        );
++        assert!(matches!(requests.lock().unwrap().pop(),
++            Some(PickerLoadRequest::ApplyProfile { thread_id, archived, .. })
++            if thread_id == second && archived == (status == SessionStatus::Archived)));
++        state
++            .handle_background_event(BackgroundEvent::ProfileApplied {
++                thread_id: second,
++                status: applied_status,
++                thread: None,
++                result: Ok(()),
++            })
++            .await?;
++        assert_eq!(state.filtered_rows, vec![original_rows[0].clone()]);
++        assert!(!state.profile_queue.is_running());
++        assert!(requests.lock().unwrap().is_empty());
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn pending_profile_allows_page_loading_and_finishes_after_picker_close() -> Result<()> {
++    tokio::time::timeout(std::time::Duration::from_secs(20), async {
++        let home = tempfile::tempdir()?;
++        std::fs::write(home.path().join(PROFILE_FILE),
++            r#"{"1":{"name":"inspect","model":"gpt-6-luna","title":"saved title"}}"#)?;
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let address = listener.local_addr()?;
++        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
++        let (release_tx, release_rx) = oneshot::channel();
++        let server = tokio::spawn(async move {
++            let (stream, _) = listener.accept().await.unwrap();
++            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
++            let mut pending = None;
++            let mut release = Some(release_rx);
++            while let Some(frame) = futures::StreamExt::next(&mut socket).await {
++                let frame = frame.unwrap();
++                if frame.is_close() { break; }
++                if !frame.is_text() { continue; }
++                let request: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
++                let method = request["method"].as_str().unwrap();
++                let result = match method {
++                    "initialize" => json!({"userAgent":"profile-test","codexHome":"/server/.codex"}),
++                    "initialized" => continue,
++                    "thread/settings/update" => {
++                        requests_tx.send(request.clone()).unwrap();
++                        pending = Some(request["id"].clone());
++                        continue;
++                    }
++                    "thread/list" => json!({"data":[],"nextCursor":null}),
++                    "thread/name/set" => json!({}),
++                    "thread/read" => {
++                        requests_tx.send(request.clone()).unwrap();
++                        socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32603,"message":"refresh unavailable"}}).to_string().into())).await.unwrap();
++                        continue;
++                    }
++                    _ => panic!("unexpected profile request: {method}"),
++                };
++                socket.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).await.unwrap();
++                if method != "initialize" { requests_tx.send(request.clone()).unwrap(); }
++                if method == "thread/list" {
++                    release.take().unwrap().await.unwrap();
++                    socket.send(Message::Text(json!({"id":pending.take().unwrap(),"result":{}}).to_string().into())).await.unwrap();
++                }
++            }
++        });
++        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
++            endpoint: RemoteAppServerEndpoint::WebSocket { websocket_url: format!("ws://{address}"), auth_token: None },
++            client_name: "profile-test".into(), client_version: "test".into(),
++            experimental_api: true, mcp_server_openai_form_elicitation: false,
++            opt_out_notification_methods: Vec::new(), channel_capacity: 8,
++        }).await?;
++        let session = AppServerSession::new(
++            crate::backend_id::BackendId::new(), AppServerClient::Remote(client),
++            crate::app_server_session::ThreadParamsMode::Remote,
++        );
++        let (bg_tx, mut bg_rx) = mpsc::unbounded_channel();
++        let handle = session.request_handle();
++        let (loader, worker) = spawn_app_server_page_loader(true, session, handle,
++            false, RawReasoningVisibility::Hidden, None, bg_tx);
++        let thread_id = ThreadId::new();
++        loader(PickerLoadRequest::ApplyProfile {
++            thread_id, codex_home: home.path().to_path_buf(), slot: 1,
++            archived: false, is_current: false,
++        });
++        assert_eq!(requests_rx.recv().await.unwrap()["method"], "thread/settings/update");
++        loader(PickerLoadRequest::Page(PageLoadRequest {
++            cursor: None, request_token: 12, search_token: None,
++            mode: PageLoadMode::StoreDefault, cwd_filter: None, filter_mode: SessionFilterMode::All,
++            status: SessionStatus::Active, provider_filter: ProviderFilter::Any,
++            sort_key: ThreadSortKey::CreatedAt,
++        }));
++        assert_eq!(requests_rx.recv().await.unwrap()["method"], "thread/list");
++        assert!(matches!(bg_rx.recv().await, Some(BackgroundEvent::Page {
++            request_token: 12, page: Ok(_), ..
++        })));
++        assert!(bg_rx.try_recv().is_err());
++        drop(loader);
++        drop(bg_rx);
++        assert!(!worker.is_finished());
++        release_tx.send(()).unwrap();
++        let rename = requests_rx.recv().await.unwrap();
++        assert_eq!(rename["method"], "thread/name/set");
++        assert_eq!(rename["params"]["threadId"], thread_id.to_string());
++        assert_eq!(rename["params"]["name"], "saved title");
++        let refresh = requests_rx.recv().await.unwrap();
++        assert_eq!(refresh["method"], "thread/read");
++        let params: ThreadReadParams = serde_json::from_value(refresh["params"].clone())?;
++        assert!(!params.include_turns);
++        assert_eq!(params.thread_id, thread_id.to_string());
++        worker.await?;
++        server.await?;
++        assert!(requests_rx.try_recv().is_err());
++        Ok::<_, color_eyre::Report>(())
++    }).await?
++}
++
+ #[tokio::test]
+ async fn profile_settings_survive_reopen_without_a_model_turn() -> Result<()> {
+     let mock = responses::start_mock_server().await;
+@@ -409,13 +786,13 @@ async fn configured_profile_hints_are_sorted_grouped_and_wrap_only_at_width() ->
+         .map(|(slot, profile)| (slot, profile.name))
+         .collect::<BTreeMap<_, _>>();
+     assert_eq!(names.keys().copied().collect::<Vec<_>>(), vec![0, 2, 9]);
+-    let wide = hint_lines(&names, 100, None);
++    let wide = hint_lines(&names, 100);
+     assert_eq!(wide.len(), 1);
+     assert_eq!(
+         wide[0].to_string().trim(),
+         "alt+0 apply profile alpha   alt+2 apply profile beta   alt+9 apply profile omega"
+     );
+-    let wrapped = hint_lines(&names, 60, None);
++    let wrapped = hint_lines(&names, 60);
+     assert_eq!(wrapped.len(), 2);
+     assert!(wrapped[0].to_string().contains("alt+0 apply profile alpha"));
+     assert!(wrapped[0].to_string().contains("alt+2 apply profile beta"));
+@@ -428,6 +805,11 @@ async fn configured_profile_hints_are_sorted_grouped_and_wrap_only_at_width() ->
+     assert!(!lines[1].to_string().contains("alt+"));
+     assert!(lines[2].to_string().contains("alt+0"));
+     assert!(lines[6].to_string().contains("alt+9"));
++    assert!(
++        lines
++            .iter()
++            .all(|line| !line.to_string().contains("ctrl+alt"))
++    );
+     let list = layout::areas(Rect::new(0, 0, 50, 30), &state).list;
+     assert!(list.bottom() + lines.len() as u16 <= 30);
+     state.action = SessionPickerAction::Fork;
+@@ -455,7 +837,7 @@ fn profile_names_follow_the_theme_with_ten_stable_slot_colors() {
+                 bg: background,
+             },
+             || {
+-                let colors = hint_lines(&names, 300, None)
++                let colors = hint_lines(&names, 300)
+                     .into_iter()
+                     .flat_map(|line| line.spans)
+                     .filter(|span| names.values().any(|name| name == span.content.as_ref()))
+@@ -468,18 +850,9 @@ fn profile_names_follow_the_theme_with_ten_stable_slot_colors() {
+                     assert_ne!(&colors, previous);
+                 }
+                 let sparse = BTreeMap::from([(9, "p9".to_string())]);
+-                let last = hint_lines(&sparse, 80, None)
+-                    .pop()
+-                    .unwrap()
+-                    .spans
+-                    .pop()
+-                    .unwrap();
++                let last = hint_lines(&sparse, 80).pop().unwrap().spans.pop().unwrap();
+                 assert_eq!(last.content, "p9");
+                 assert_eq!(last.style.fg, Some(colors[9]));
+-                let pending = hint_lines(&names, 80, Some(9));
+-                assert_eq!(pending.len(), 1);
+-                assert_eq!(pending[0].to_string().trim(), "saving to profile p9");
+-                assert_eq!(pending[0].spans.last().unwrap().style.fg, Some(colors[9]));
+                 previous = Some(colors);
+             },
+         );
+@@ -492,27 +865,34 @@ fn profile_failure_preserves_incremental_effects_and_retains_the_error() {
+     let (mut state, requests) = test_picker();
+     let thread_id = ThreadId::new();
+     state.profile_names = BTreeMap::from([(2, "inspect".into())]);
+-    state.profile_pending = Some((thread_id, 2));
++    state.view_persistence = Some(SessionPickerViewPersistence {
++        codex_home: PathBuf::from("/tmp/profile-home"),
++    });
+     state.status = SessionStatus::Archived;
+     state.all_rows = vec![test_row(thread_id)];
+     state.apply_filter();
++    state.request_profile(2);
++    requests.lock().unwrap().clear();
+     state.apply_session_mutation(thread_id, SessionStatus::Active, None);
+     state.finish_profile(
+         thread_id,
+         Err(std::io::Error::other("settings applied, archive failed")),
+     );
+-    assert_eq!(state.profile_pending, None);
+-    assert_eq!(
+-        footer_hint_lines(&state, 220)
+-            .last()
+-            .unwrap()
+-            .to_string()
+-            .trim(),
+-        "alt+2 apply profile inspect"
++    assert!(!state.profile_queue.is_running());
++    let footer = footer_hint_lines(&state, 220);
++    assert!(
++        footer
++            .iter()
++            .any(|line| line.to_string().contains("alt+2 apply profile inspect"))
+     );
+     assert_eq!(
+         state.inline_error.as_deref(),
+-        Some("Could not apply profile: settings applied, archive failed")
++        Some(
++            format!(
++                "Could not apply profile 2 to session {thread_id}: settings applied, archive failed"
++            )
++            .as_str()
++        )
+     );
+     assert!(state.filtered_rows.is_empty());
+     assert!(requests.lock().unwrap().is_empty());
+diff --git a/codex-rs/tui/src/resume_picker/profiles.rs b/codex-rs/tui/src/resume_picker/profiles.rs
+--- a/codex-rs/tui/src/resume_picker/profiles.rs
++++ b/codex-rs/tui/src/resume_picker/profiles.rs
+@@ -4,7 +4,12 @@ use super::*;
+ use crate::render::highlight::convert_syntect_color;
+ use crate::render::highlight::current_syntax_theme;
+ use crate::render::highlight::foreground_style_for_scopes_with_theme;
++use codex_app_server_protocol::ThreadReadParams;
++use codex_app_server_protocol::ThreadReadResponse;
++use codex_app_server_protocol::ThreadSetNameParams;
++use codex_app_server_protocol::ThreadSetNameResponse;
+ use codex_app_server_protocol::ThreadSettingsUpdateParams;
++use codex_app_server_protocol::ThreadSettingsUpdateResponse;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use color_eyre::eyre::WrapErr;
+@@ -12,9 +17,30 @@ use color_eyre::eyre::eyre;
+ use itertools::Itertools;
+ use serde::Deserialize;
+ use std::collections::BTreeMap;
++use std::collections::VecDeque;
+ 
+ const PROFILE_FILE: &str = "resume-profiles.json";
+ 
++#[derive(Clone, Copy)]
++struct ProfileTarget {
++    thread_id: ThreadId,
++    slot: u8,
++    archived: bool,
++    is_current: bool,
++}
++
++#[derive(Default)]
++pub(super) struct ProfileQueue {
++    // Only the front is dispatched. Dropping the picker discards the unstarted tail.
++    pending: VecDeque<ProfileTarget>,
++}
++
++impl ProfileQueue {
++    pub(super) fn is_running(&self) -> bool {
++        !self.pending.is_empty()
++    }
++}
++
+ #[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub(super) struct ResumeProfile {
+@@ -73,7 +99,7 @@ pub(super) async fn load(codex_home: &Path) -> Result<BTreeMap<u8, ResumeProfile
+ }
+ 
+ pub(super) async fn apply(
+-    app_server: &mut AppServerSession,
++    app_server: &AppServerRequestHandle,
+     thread_id: ThreadId,
+     codex_home: &Path,
+     slot: u8,
+@@ -98,33 +124,51 @@ pub(super) async fn apply(
+     // Restore once before mutations, or to satisfy the requested final state.
+     if *archived && (!target_archived || needs_settings || profile.title.is_some()) {
+         app_server
+-            .thread_unarchive(thread_id)
++            .request_typed::<ThreadUnarchiveResponse>(ClientRequest::ThreadUnarchive {
++                request_id: RequestId::String(Uuid::new_v4().to_string()),
++                params: ThreadUnarchiveParams {
++                    thread_id: thread_id.to_string(),
++                },
++            })
+             .await
+             .wrap_err("could not restore the session before applying its profile")?;
+         *archived = false;
+     }
+     if needs_settings {
+         app_server
+-            .thread_settings_update(ThreadSettingsUpdateParams {
+-                thread_id: thread_id.to_string(),
+-                cwd: profile.cwd.map(AbsolutePathBuf::into_path_buf),
+-                model: profile.model,
+-                effort: profile.reasoning_effort,
+-                ..Default::default()
++            .request_typed::<ThreadSettingsUpdateResponse>(ClientRequest::ThreadSettingsUpdate {
++                request_id: RequestId::String(Uuid::new_v4().to_string()),
++                params: ThreadSettingsUpdateParams {
++                    thread_id: thread_id.to_string(),
++                    cwd: profile.cwd.map(AbsolutePathBuf::into_path_buf),
++                    model: profile.model,
++                    effort: profile.reasoning_effort,
++                    ..Default::default()
++                },
+             })
+-            .await?
+-            .then_some(())
+-            .ok_or_else(|| eyre!("this server does not support persistent thread settings"))?;
++            .await
++            .wrap_err("could not save profile settings")?;
+     }
+     if let Some(title) = profile.title {
+         app_server
+-            .thread_set_name(thread_id, title)
++            .request_typed::<ThreadSetNameResponse>(ClientRequest::ThreadSetName {
++                request_id: RequestId::String(Uuid::new_v4().to_string()),
++                params: ThreadSetNameParams {
++                    thread_id: thread_id.to_string(),
++                    name: title,
++                },
++            })
+             .await
+             .wrap_err("profile settings applied, but the title could not be saved")?;
+     }
+     if target_archived && !*archived {
+         app_server
+-            .thread_archive(thread_id)
++            .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
++                request_id: RequestId::String(Uuid::new_v4().to_string()),
++                params: ThreadArchiveParams {
++                    thread_id: thread_id.to_string(),
++                },
++            })
+             .await
+             .wrap_err("profile values applied, but the session could not be archived")?;
+         *archived = true;
+@@ -132,12 +176,64 @@ pub(super) async fn apply(
+     Ok(())
+ }
+ 
++pub(super) async fn run(
++    app_server: AppServerRequestHandle,
++    thread_id: ThreadId,
++    codex_home: PathBuf,
++    slot: u8,
++    mut archived: bool,
++    is_current: bool,
++    bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
++) {
++    let mut result = apply(
++        &app_server,
++        thread_id,
++        &codex_home,
++        slot,
++        &mut archived,
++        is_current,
++    )
++    .await
++    .map_err(|error| std::io::Error::other(format!("{error:#}")));
++    // Read only the changed session, including effects committed before an error.
++    let thread = match app_server
++        .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
++            request_id: RequestId::String(Uuid::new_v4().to_string()),
++            params: ThreadReadParams {
++                thread_id: thread_id.to_string(),
++                include_turns: false,
++            },
++        })
++        .await
++    {
++        Ok(response) => Some(Box::new(response.thread)),
++        Err(error) => {
++            result = Err(std::io::Error::other(match result {
++                Ok(()) => format!("profile saved, but could not refresh session: {error:#}"),
++                Err(previous) => format!("{previous}; could not refresh session: {error:#}"),
++            }));
++            None
++        }
++    };
++    let _ = bg_tx.send(BackgroundEvent::ProfileApplied {
++        thread_id,
++        status: if archived {
++            SessionStatus::Archived
++        } else {
++            SessionStatus::Active
++        },
++        thread,
++        result,
++    });
++}
++
+ impl PickerState {
+     pub(super) fn request_profile(&mut self, slot: u8) {
+         if !matches!(self.action, SessionPickerAction::Resume)
+-            || self.profile_pending.is_some()
+             || !matches!(self.archive_state, archive::ArchiveState::Idle)
+             || self.title_action.is_some()
++            || self.view_persistence.is_none()
++            || !self.profile_names.contains_key(&slot)
+         {
+             return;
+         }
+@@ -148,43 +244,63 @@ impl PickerState {
+         else {
+             return;
+         };
+-        let Some(persistence) = &self.view_persistence else {
+-            return;
+-        };
+-        if !self.profile_names.contains_key(&slot) {
++        if self
++            .profile_queue
++            .pending
++            .iter()
++            .any(|target| target.thread_id == thread_id)
++        {
+             return;
+         }
+-        self.profile_pending = Some((thread_id, slot));
+-        (self.picker_loader)(PickerLoadRequest::ApplyProfile {
++        let was_running = self.profile_queue.is_running();
++        self.profile_queue.pending.push_back(ProfileTarget {
+             thread_id,
+-            codex_home: persistence.codex_home.clone(),
+             slot,
+             archived: self.status == SessionStatus::Archived,
+             is_current: matches!(self.launch_context, SessionPickerLaunchContext::ExistingSession { current_thread_id: Some(current) } if current == thread_id),
+         });
++        if !was_running {
++            self.start_next_profile();
++        }
+         self.request_frame();
+     }
+ 
++    fn start_next_profile(&self) {
++        let Some(target) = self.profile_queue.pending.front() else {
++            return;
++        };
++        let Some(persistence) = &self.view_persistence else {
++            return;
++        };
++        (self.picker_loader)(PickerLoadRequest::ApplyProfile {
++            thread_id: target.thread_id,
++            codex_home: persistence.codex_home.clone(),
++            slot: target.slot,
++            archived: target.archived,
++            is_current: target.is_current,
++        });
++    }
++
+     pub(super) fn finish_profile(&mut self, thread_id: ThreadId, result: std::io::Result<()>) {
+-        if !self
+-            .profile_pending
+-            .is_some_and(|(pending, _)| pending == thread_id)
+-        {
++        let Some(target) = self.profile_queue.pending.front() else {
++            return;
++        };
++        if target.thread_id != thread_id {
+             return;
+         }
+-        self.profile_pending = None;
+         if let Err(error) = result {
+-            self.inline_error = Some(format!("Could not apply profile: {error}"));
++            self.inline_error = Some(format!(
++                "Could not apply profile {} to session {thread_id}: {error}",
++                target.slot
++            ));
+         }
++        self.profile_queue.pending.pop_front();
++        self.start_next_profile();
+         self.request_frame();
+     }
+ }
+ 
+-pub(super) fn hint_lines(
+-    names: &BTreeMap<u8, String>,
+-    width: u16,
+-    pending: Option<u8>,
+-) -> Vec<Line<'static>> {
++pub(super) fn hint_lines(names: &BTreeMap<u8, String>, width: u16) -> Vec<Line<'static>> {
+     let theme = current_syntax_theme();
+     let colors = [
+         "entity.name.type",
+@@ -212,17 +328,9 @@ pub(super) fn hint_lines(
+     let mut lines = Vec::new();
+     let mut line = Line::default();
+     for (slot, name) in names {
+-        if pending.is_some_and(|pending| pending != *slot) {
+-            continue;
+-        }
+-        let mut spans = if pending.is_some() {
+-            vec!["saving to profile ".set_style(footer_hint_label_style())]
+-        } else {
+-            let key = format!("alt+{slot}");
+-            let mut spans = crate::key_hint::key_label_spans(&key);
+-            spans.push(" apply profile ".set_style(footer_hint_label_style()));
+-            spans
+-        };
++        let key = format!("alt+{slot}");
++        let mut spans = crate::key_hint::key_label_spans(&key);
++        spans.push(" apply profile ".set_style(footer_hint_label_style()));
+         let color = colors
+             .iter()
+             .cycle()
+diff --git a/codex-rs/tui/src/resume_picker/title_tests.rs b/codex-rs/tui/src/resume_picker/title_tests.rs
+--- a/codex-rs/tui/src/resume_picker/title_tests.rs
++++ b/codex-rs/tui/src/resume_picker/title_tests.rs
+@@ -281,11 +281,16 @@ fn title_queue_excludes_invalid_rows_and_unavailable_picker_actions() {
+     assert!(!state.title_actions_available());
+     assert!(requests.lock().unwrap().is_empty());
+     state.action = SessionPickerAction::Resume;
+-    state.profile_pending = Some((ThreadId::new(), 0));
++    state.view_persistence = Some(SessionPickerViewPersistence {
++        codex_home: PathBuf::from("/tmp/profile-home"),
++    });
++    state.profile_names.insert(0, "inspect".into());
++    state.request_profile(0);
++    requests.lock().unwrap().clear();
+     state.request_title();
+     assert!(!state.title_actions_available());
+     assert!(requests.lock().unwrap().is_empty());
+-    state.profile_pending = None;
++    state.profile_queue = profiles::ProfileQueue::default();
+     state.edit_title();
+     state.request_title();
+     assert!(!state.title_actions_available());
+diff --git a/codex-rs/tui/src/resume_picker/titles.rs b/codex-rs/tui/src/resume_picker/titles.rs
+--- a/codex-rs/tui/src/resume_picker/titles.rs
++++ b/codex-rs/tui/src/resume_picker/titles.rs
+@@ -29,7 +29,7 @@ impl PickerState {
+     pub(super) fn title_actions_available(&self) -> bool {
+         matches!(self.action, SessionPickerAction::Resume)
+             && self.status == SessionStatus::Active
+-            && self.profile_pending.is_none()
++            && !self.profile_queue.is_running()
+             && matches!(self.archive_state, archive::ArchiveState::Idle)
+             && matches!(
+                 self.title_action,
+diff --git a/docs/resume-profiles.md b/docs/resume-profiles.md
+--- a/docs/resume-profiles.md
++++ b/docs/resume-profiles.md
+@@ -22,8 +22,7 @@
+ - In `codex resume`, select an active or archived session and press its configured `Alt+0` through `Alt+9` shortcut.
+ - The footer lists configured digits in ascending order on a separate line, fitting multiple shortcuts before wrapping at the available width.
+ - Each shortcut shows its profile name, such as `alt+1 apply profile subora`.
+-- During application, the profile shortcut rows show only `saving to profile <name>` for the selected profile.
+-- The ordinary profile shortcuts return after success or failure.
++- Configured profile shortcut hints remain visible and unchanged while profiles are queued or applied.
+ - Profile names use distinct readable foreground colors from the active theme when available.
+ - Slot colors remain stable when other slots are absent.
+ - Themes with fewer than ten distinct readable colors reuse their available colors.
+diff --git a/docs/resume-session-actions.md b/docs/resume-session-actions.md
+--- a/docs/resume-session-actions.md
++++ b/docs/resume-session-actions.md
+@@ -21,3 +21,19 @@
+ - Ctrl+A preserves a conflicting configured list binding or chord prefix.
+ - The currently open conversation must be archived through `/archive`.
+ - Profile archive and restore actions also stay in the picker without submitting a model turn.
++- Alt+0 through Alt+9 enqueue the selected session for the corresponding profile.
++- Profile shortcuts return immediately after enqueueing.
++- More selected sessions can be queued while a profile operation is running.
++- Active and archived sessions share one serial profile queue.
++- Queued sessions stay in place until their native profile operation completes.
++- Search, directory and status changes after admission do not change the captured targets.
++- Already queued sessions are not added twice.
++- Profile work runs independently of page and preview loading.
++- The picker remains open during profile application.
++- Configured profile shortcuts remain visible and unchanged during profile application.
++- Navigation, search, filters and sorting remain available during profile application.
++- A failed target reports its session ID and profile slot.
++- A failed target preserves native changes already committed.
++- The remaining queued targets continue after a failure.
++- Closing the picker discards unstarted targets.
++- The admitted in-flight profile finishes its native operations before its app-server connection shuts down.

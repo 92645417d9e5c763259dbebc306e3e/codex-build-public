@@ -1,0 +1,548 @@
+summarize-credit-deductions-from-usage
+
+Lane: cross
+
+Unit: report-usage-via-session-files
+
+ChildPatch: summarize-credit-deductions-from-usage
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/usage/aggregate.rs b/codex-rs/app-server/src/usage/aggregate.rs
+--- a/codex-rs/app-server/src/usage/aggregate.rs
++++ b/codex-rs/app-server/src/usage/aggregate.rs
+@@ -2,6 +2,7 @@ use super::Error;
+ use super::Rows;
+ use super::UsageRange;
+ use super::UsageReport;
++use super::credits;
+ use super::quota;
+ use super::reader;
+ use super::types::Usage;
+@@ -58,7 +59,7 @@ pub(super) fn load(
+         mut events,
+         models,
+         mut observations,
+-        credits: _,
++        mut credits,
+         mut diagnostics,
+     } = reader::load(home)?;
+     // Native records are immutable response observations. Preserve the first
+@@ -112,6 +113,7 @@ pub(super) fn load(
+     let mut groups = BTreeMap::<(NaiveDate, usize), Usage>::new();
+     let mut missing_prices = BTreeSet::new();
+     let mut primary_costs = BTreeMap::new();
++    let mut costs = BTreeMap::new();
+     for event in events {
+         let Some(time) = DateTime::<Utc>::from_timestamp_millis(event.millis) else {
+             continue;
+@@ -132,8 +134,11 @@ pub(super) fn load(
+             );
+             (quote.usd, quote.input_threshold != 0)
+         });
+-        if event.primary_weekly && event.millis <= now {
+-            *primary_costs.entry(event.millis).or_default() += cost;
++        if event.millis <= now {
++            *costs.entry(event.millis).or_default() += cost;
++            if event.primary_weekly {
++                *primary_costs.entry(event.millis).or_default() += cost;
++            }
+         }
+         groups
+             .entry((date, event.model))
+@@ -159,6 +164,7 @@ pub(super) fn load(
+         }
+     }
+     let quota = quota::estimate(&primary_costs, &mut observations, now);
++    let credits = credits::summarize(&costs, &mut credits, now);
+     Ok(UsageReport {
+         refreshed_at,
+         today,
+@@ -169,6 +175,7 @@ pub(super) fn load(
+         yearly_rows,
+         prices,
+         quota,
++        credits,
+         missing_prices,
+         diagnostics,
+     })
+diff --git a/codex-rs/app-server/src/usage/aggregate_tests.rs b/codex-rs/app-server/src/usage/aggregate_tests.rs
+--- a/codex-rs/app-server/src/usage/aggregate_tests.rs
++++ b/codex-rs/app-server/src/usage/aggregate_tests.rs
+@@ -630,6 +630,7 @@ fn retained_secondary_weekly_windows_leave_primary_cycles_and_costs_unchanged()
+         );
+         let mixed = load(directory.path(), mixed_prices, timezone, now).unwrap();
+         assert_eq!(mixed.quota, primary.quota);
++        assert_eq!(mixed.credits, primary.credits);
+         for (date, models) in &primary.rows {
+             assert_eq!(mixed.rows[date]["gpt-5.4"], models["gpt-5.4"]);
+         }
+@@ -879,3 +880,196 @@ fn deferred_snapshot_does_not_move_a_response_to_another_calendar_day() {
+     assert_eq!(report.monthly_rows["2026-01"]["gpt-5.4"].tokens.total, 110);
+     assert!(!report.monthly_rows.contains_key("2026-02"));
+ }
++
++#[test]
++fn credit_intervals_leave_all_accounting_totals_intact_and_resume_on_the_previous_request() {
++    let directory = tempfile::tempdir().unwrap();
++    let reset = DateTime::parse_from_rfc3339("2026-02-07T00:00:00Z")
++        .unwrap()
++        .timestamp();
++    // The replacement week begins when the preceding request ran, at 00:04.
++    let next_reset = DateTime::parse_from_rfc3339("2026-02-08T00:04:00Z")
++        .unwrap()
++        .timestamp();
++    let mut total = 0;
++    let mut events = Vec::new();
++    for (index, (output, percent, balance)) in [
++        (20_000, 0.0, "100.0"),
++        (5_000, 80.0, "100.0000"),
++        (175_000, 100.0, "100"),
++        (200_000, 100.0, "90"),
++        (2_500, 100.0, "90"),
++        (10_000, 10.0, "90"),
++        (30_750, 50.0, "90"),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        total += output;
++        let mut event = count(
++            &format!("2026-02-01T00:0{index}:00Z"),
++            usage(0, output),
++            usage(0, total),
++        );
++        event["payload"]["rate_limits"] = json!({
++            "plan_type": "pro",
++            "primary": {
++                "used_percent":percent,
++                "window_minutes":10080,
++                "resets_at":if index < 5 { reset } else { next_reset }
++            },
++            "credits": {"balance":balance}
++        });
++        events.push(event);
++        if index == 3 {
++            events.push(events.last().unwrap().clone());
++        }
++    }
++    // Closure is visible at the first decrease and survives duplicate delivery
++    // and further credit-funded requests while the same weekly cycle continues.
++    for end in [4, 5, 6] {
++        write_rollout(
++            directory.path(),
++            "sessions/credits.jsonl",
++            "credits",
++            None,
++            &events[..end],
++        );
++        let during_credit = report(directory.path());
++        assert_eq!(during_credit.quota.len(), 1);
++        assert_eq!(during_credit.quota[0].status, quota::Status::Completed);
++        assert_eq!(during_credit.quota[0].ended_at, "2026-02-01T00:02:00Z");
++        assert_eq!(during_credit.quota[0].sample_count, 3);
++        assert!((during_credit.quota[0].observed_cost_usd - 0.1).abs() < 1e-12);
++        assert!((during_credit.quota[0].estimated_weekly_cost_usd - 0.1).abs() < 1e-12);
++    }
++    write_rollout(
++        directory.path(),
++        "sessions/credits.jsonl",
++        "credits",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert_eq!(report.diagnostics.unique_events, 7);
++    assert_eq!(report.credits.len(), 1);
++    assert_eq!(report.credits[0].started_at, "2026-02-01T00:02:00Z");
++    assert_eq!(report.credits[0].ended_at, "2026-02-01T00:04:00Z");
++    assert_eq!(report.credits[0].used_credits, 10.0);
++    assert_eq!(report.credits[0].sample_count, 3);
++    assert!((report.credits[0].observed_cost_usd - 1.5).abs() < 1e-12);
++    assert_eq!(report.quota.len(), 2);
++    assert_eq!(report.quota[0].ended_at, "2026-02-01T00:02:00Z");
++    assert!((report.quota[0].observed_cost_usd - 0.1).abs() < 1e-12);
++    assert_eq!(report.quota[1].started_at, "2026-02-01T00:04:00Z");
++    assert!((report.quota[1].observed_cost_usd - 0.05).abs() < 1e-12);
++    for estimate in &report.quota {
++        assert!((estimate.estimated_weekly_cost_usd - 0.1).abs() < 1e-12);
++    }
++    for (rows, period) in [
++        (&report.rows, "2026-02-01"),
++        (&report.weekly_rows, "2026-01-26"),
++        (&report.monthly_rows, "2026-02"),
++        (&report.yearly_rows, "2026"),
++    ] {
++        let usage = &rows[period]["gpt-5.4"];
++        assert_eq!(usage.tokens.total, 443_250);
++        assert!((usage.cost - 1.773).abs() < 1e-12);
++    }
++}
++
++#[test]
++fn credit_only_snapshots_keep_actual_deductions_and_all_accounting_totals() {
++    let directory = tempfile::tempdir().unwrap();
++    let events = ["100.00", "99.50", "99.25"]
++        .into_iter()
++        .enumerate()
++        .map(|(index, balance)| {
++            let mut event = count(
++                &format!("2026-02-01T00:0{index}:00Z"),
++                usage(0, 100_000),
++                usage(0, (index as u64 + 1) * 100_000),
++            );
++            event["payload"]["rate_limits"] = json!({"credits": {"balance": balance}});
++            event
++        })
++        .collect::<Vec<_>>();
++    write_rollout(
++        directory.path(),
++        "sessions/credits.jsonl",
++        "credits",
++        None,
++        &events,
++    );
++    let report = report(directory.path());
++    assert!(report.quota.is_empty());
++    assert_eq!(report.credits.len(), 1);
++    let period = &report.credits[0];
++    assert_eq!(period.started_at, "2026-02-01T00:00:00Z");
++    assert_eq!(period.ended_at, "2026-02-01T00:02:00Z");
++    assert_eq!(period.used_credits, 0.75);
++    assert!((period.observed_cost_usd - 0.8).abs() < 1e-12);
++    assert_eq!(period.sample_count, 3);
++    let usage = &report.rows["2026-02-01"]["gpt-5.4"];
++    assert_eq!(usage.tokens.output, 300_000);
++    assert!((usage.cost - 1.2).abs() < 1e-12);
++}
++
++#[test]
++fn native_response_records_preserve_preceding_request_quota_and_credit_costs() {
++    for credit_spending in [false, true] {
++        let directory = tempfile::tempdir().unwrap();
++        let mut values = Vec::new();
++        let mut total = 0;
++        for (index, input) in [100_000, 50_000, 25_000].into_iter().enumerate() {
++            total += input;
++            let record = json!({"type":"token_usage_record",
++                "timestamp":format!("2026-02-01T00:0{index}:00Z"),
++                "payload":{"thread_id":"thread","response_id":format!("response-{index}"),
++                    "usage":usage(input, 0)}});
++            let mut snapshot = count(
++                &format!("2026-02-01T00:0{index}:00.001Z"),
++                usage(0, 0),
++                usage(total, 0),
++            );
++            snapshot["payload"]["rate_limits"] = json!({
++                "plan_type": "pro",
++                "primary":{"window_minutes":10080,"used_percent":20.0*(index+1) as f64,
++                    "resets_at":1770508800},
++                "credits":{"balance":if credit_spending { (100-index).to_string() } else { "100".to_string() }},
++            });
++            if index == 1 {
++                write_rollout(
++                    directory.path(),
++                    "sessions/copy.jsonl",
++                    "thread",
++                    None,
++                    &[record.clone()],
++                );
++            }
++            values.extend([record, snapshot]);
++        }
++        write_rollout(
++            directory.path(),
++            "sessions/records.jsonl",
++            "thread",
++            None,
++            &values,
++        );
++        let report = report(directory.path());
++        assert_eq!(report.diagnostics.duplicate_events, 1);
++        assert_eq!(report.diagnostics.unique_events, 3);
++        assert!((report.rows["2026-02-01"]["gpt-5.4"].cost - 0.35).abs() < 1e-12);
++        if credit_spending {
++            assert_eq!(report.credits.len(), 1);
++            assert_eq!(report.credits[0].used_credits, 2.0);
++            assert_eq!(report.credits[0].sample_count, 3);
++            assert!((report.credits[0].observed_cost_usd - 0.3).abs() < 1e-12);
++        } else {
++            assert_eq!(report.quota.len(), 1);
++            assert_eq!(report.quota[0].sample_count, 3);
++            assert!((report.quota[0].observed_cost_usd - 0.3).abs() < 1e-12);
++            assert!((report.quota[0].estimated_weekly_cost_usd - 0.75).abs() < 1e-12);
++        }
++    }
++}
+diff --git a/codex-rs/app-server/src/usage/credits.rs b/codex-rs/app-server/src/usage/credits.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/credits.rs
+@@ -0,0 +1,81 @@
++use super::types::CreditObservation;
++pub(super) use codex_app_server_protocol::UsageCreditPeriod as Period;
++use std::collections::BTreeMap;
++
++const RECENT_DAYS: i64 = 90;
++
++pub(super) fn summarize(
++    costs: &BTreeMap<i64, f64>,
++    observations: &mut Vec<CreditObservation>,
++    now: i64,
++) -> Vec<Period> {
++    let since = now.saturating_sub(RECENT_DAYS * 24 * 60 * 60 * 1_000);
++    observations.retain(|sample| sample.millis >= since && sample.millis <= now);
++    observations.sort_by_key(|sample| sample.millis);
++    let mut periods = Vec::new();
++    let mut current: Option<(Period, f64)> = None;
++    let mut previous: Option<(&CreditObservation, f64)> = None;
++    let mut costs = costs.iter().peekable();
++    let mut cumulative_cost = 0.0;
++    for same_instant in observations.chunk_by(|left, right| left.millis == right.millis) {
++        let sample = &same_instant[0];
++        // Returned balances describe the preceding request, just like quota observations.
++        while let Some((_, cost)) = costs.next_if(|(millis, _)| **millis < sample.millis) {
++            cumulative_cost += cost;
++        }
++        let prior = previous.replace((sample, cumulative_cost));
++        let interval = if same_instant.iter().any(|other| {
++            other.balance != sample.balance || other.quota_exhausted != sample.quota_exhausted
++        }) {
++            // A conflicting instant cannot choose either side of a billing interval.
++            previous = None;
++            None
++        } else {
++            prior.and_then(|(prior, prior_cost)| {
++                prior
++                    .balance
++                    .zip(sample.balance)
++                    .map(|(before, after)| (prior, prior_cost, before, after))
++            })
++        };
++        if let Some((prior, prior_cost, before, after)) = interval {
++            let cost = cumulative_cost - prior_cost;
++            if let Some((period, lowest_balance)) = &mut current {
++                // Concurrent responses can return an older, higher balance. Only a
++                // new low proves additional spending; a plateau is not recovery.
++                if after < *lowest_balance || sample.quota_exhausted {
++                    period.ended_at.clone_from(&sample.timestamp);
++                    period.used_credits += (*lowest_balance - after).max(0.0);
++                    *lowest_balance = lowest_balance.min(after);
++                    period.observed_cost_usd += cost;
++                    period.sample_count += 1;
++                    continue;
++                }
++            } else if after < before {
++                current = Some((
++                    Period {
++                        started_at: prior.timestamp.clone(),
++                        ended_at: sample.timestamp.clone(),
++                        used_credits: before - after,
++                        observed_cost_usd: cost,
++                        model_usage: None,
++                        sample_count: 2,
++                    },
++                    after,
++                ));
++                continue;
++            }
++        }
++        if let Some((period, _)) = current.take() {
++            periods.push(period);
++        }
++    }
++    if let Some((period, _)) = current {
++        periods.push(period);
++    }
++    periods
++}
++
++#[cfg(test)]
++#[path = "credits_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/usage/credits_tests.rs b/codex-rs/app-server/src/usage/credits_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/usage/credits_tests.rs
+@@ -0,0 +1,160 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++const BASE: i64 = 1_790_000_000_000;
++
++fn sample(seconds: i64, balance: Option<f64>) -> CreditObservation {
++    let millis = BASE + seconds * 1_000;
++    CreditObservation {
++        timestamp: chrono::DateTime::from_timestamp_millis(millis)
++            .unwrap()
++            .to_rfc3339(),
++        millis,
++        balance,
++        quota_exhausted: false,
++    }
++}
++
++fn costs(entries: &[(i64, f64)]) -> BTreeMap<i64, f64> {
++    entries
++        .iter()
++        .map(|(seconds, cost)| (BASE + seconds * 1_000, *cost))
++        .collect()
++}
++
++#[test]
++fn credit_only_deductions_use_preceding_costs_and_stop_at_unchanged_or_higher_balances() {
++    let mut observations = [1000.0, 999.75, 998.5, 998.5, 1098.5, 1098.0, 1097.99]
++        .into_iter()
++        .enumerate()
++        .map(|(index, balance)| sample(index as i64 * 10, Some(balance)))
++        .collect();
++    let periods = summarize(
++        &costs(&[
++            (0, 2.0),
++            (10, 3.0),
++            (20, 77.0),
++            (30, 88.0),
++            (40, 4.0),
++            (50, 0.08),
++            (60, 999.0),
++        ]),
++        &mut observations,
++        BASE + 70_000,
++    );
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].started_at, sample(0, None).timestamp);
++    assert_eq!(periods[0].ended_at, sample(20, None).timestamp);
++    assert_eq!(periods[0].used_credits, 1.5);
++    assert_eq!(periods[0].observed_cost_usd, 5.0);
++    assert_eq!(periods[0].sample_count, 3);
++    assert_eq!(periods[1].started_at, sample(40, None).timestamp);
++    assert_eq!(periods[1].ended_at, sample(60, None).timestamp);
++    assert!((periods[1].used_credits - 0.51).abs() < 1e-9);
++    assert!((periods[1].observed_cost_usd - 4.08).abs() < 1e-9);
++    assert_eq!(periods[1].sample_count, 3);
++}
++
++#[test]
++fn duplicate_delivery_does_not_bridge_missing_or_conflicting_balances() {
++    let mut observations = vec![
++        sample(0, Some(100.0)),
++        sample(10, Some(90.0)),
++        sample(10, Some(90.0)),
++        sample(20, None),
++        sample(30, Some(80.0)),
++        sample(40, Some(79.0)),
++        sample(40, Some(78.0)),
++        sample(50, Some(70.0)),
++        sample(60, Some(69.0)),
++    ];
++    for observation in &mut observations {
++        observation.quota_exhausted = true;
++    }
++    observations.reverse();
++    let periods = summarize(
++        &costs(&[
++            (0, 1.0),
++            (10, 500.0),
++            (20, 500.0),
++            (30, 500.0),
++            (40, 500.0),
++            (50, 2.0),
++        ]),
++        &mut observations,
++        BASE + 70_000,
++    );
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].used_credits, 10.0);
++    assert_eq!(periods[0].observed_cost_usd, 1.0);
++    assert_eq!(periods[0].sample_count, 2);
++    assert_eq!(periods[1].started_at, sample(50, None).timestamp);
++    assert_eq!(periods[1].used_credits, 1.0);
++    assert_eq!(periods[1].observed_cost_usd, 2.0);
++    assert_eq!(periods[1].sample_count, 2);
++}
++
++#[test]
++fn report_window_does_not_infer_deductions_from_old_or_future_balances() {
++    let mut observations = vec![
++        sample(-91 * 86_400, Some(1000.0)),
++        sample(0, Some(100.0)),
++        sample(10, Some(99.5)),
++        sample(30, Some(10.0)),
++    ];
++    let periods = summarize(
++        &costs(&[(0, 2.0), (10, 999.0)]),
++        &mut observations,
++        BASE + 20_000,
++    );
++    assert_eq!(periods.len(), 1);
++    assert_eq!(periods[0].started_at, sample(0, None).timestamp);
++    assert_eq!(periods[0].ended_at, sample(10, None).timestamp);
++    assert_eq!(periods[0].used_credits, 0.5);
++    assert_eq!(periods[0].observed_cost_usd, 2.0);
++}
++
++#[test]
++fn exhausted_windows_keep_plateaus_and_delayed_balances_until_deductions_stop_after_recovery() {
++    let mut observations: Vec<_> = [
++        (100.0, true),
++        (99.0, true),
++        (99.0, true),
++        (99.5, true),
++        (98.0, true),
++        (98.0, true),
++        (97.0, false),
++        (96.0, false),
++        (96.0, false),
++        (96.0, false),
++        (96.0, true),
++        (95.0, true),
++        (95.0, false),
++    ]
++    .into_iter()
++    .enumerate()
++    .map(|(index, (balance, quota_exhausted))| CreditObservation {
++        quota_exhausted,
++        ..sample(index as i64 * 10, Some(balance))
++    })
++    .collect();
++    let charges = costs(&(0..13).map(|index| (index * 10, 1.0)).collect::<Vec<_>>());
++    let periods = summarize(&charges, &mut observations, BASE + 130_000);
++    assert_eq!(periods.len(), 2);
++    assert_eq!(periods[0].started_at, observations[0].timestamp);
++    assert_eq!(periods[0].ended_at, observations[7].timestamp);
++    assert_eq!(periods[0].used_credits, 4.0);
++    assert_eq!(periods[0].observed_cost_usd, 7.0);
++    assert_eq!(periods[0].sample_count, 8);
++    assert_eq!(periods[1].started_at, observations[10].timestamp);
++    assert_eq!(periods[1].ended_at, observations[11].timestamp);
++    assert_eq!(periods[1].used_credits, 1.0);
++    assert_eq!(periods[1].observed_cost_usd, 1.0);
++
++    observations.truncate(6);
++    let open = summarize(&charges, &mut observations, BASE + 130_000);
++    assert_eq!(open.len(), 1);
++    assert_eq!(open[0].ended_at, observations[5].timestamp);
++    assert_eq!(open[0].used_credits, 2.0);
++    assert_eq!(open[0].observed_cost_usd, 5.0);
++}
+diff --git a/codex-rs/app-server/src/usage/mod.rs b/codex-rs/app-server/src/usage/mod.rs
+--- a/codex-rs/app-server/src/usage/mod.rs
++++ b/codex-rs/app-server/src/usage/mod.rs
+@@ -1,5 +1,6 @@
+ //! Local paginated-rollout accounting, with no external process or network dependency.
+ mod aggregate;
++mod credits;
+ mod quota;
+ mod reader;
+ mod types;
+@@ -55,6 +56,7 @@ pub(crate) struct UsageReport {
+     yearly_rows: Rows,
+     prices: Prices,
+     quota: Vec<quota::Estimate>,
++    credits: Vec<credits::Period>,
+     missing_prices: BTreeSet<String>,
+     diagnostics: Diagnostics,
+     today: NaiveDate,

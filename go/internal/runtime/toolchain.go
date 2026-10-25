@@ -92,7 +92,7 @@ func readToolchainRequirements(source, runtimeRoot string, window deadline) (req
 	}
 	defer func() { resultErr = errors.Join(resultErr, removeOwnedPaths(attempt)) }()
 	resultPath := filepath.Join(attempt, "result.json")
-	data, diagnostic, err := runNativeProcess(attempt, filepath.Join(attempt, "native-toolchain.py"), "requirements", []string{source, resultPath}, nativeEnvironment(attempt), 1<<20, resultPath, window.remaining(), window.signals, nil)
+	data, diagnostic, err := runNativeProcess(attempt, filepath.Join(attempt, "native-toolchain.py"), "requirements", []string{source, resultPath}, nativeEnvironment(attempt), 1<<20, resultPath, window.remaining(), window.signals, nil, nil)
 	if err != nil {
 		if message := strings.TrimSpace(diagnostic); message != "" {
 			err = errors.Join(err, errors.New(message))

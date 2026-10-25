@@ -1,0 +1,283 @@
+retain-request-admission-through-core-dispatch
+
+Lane: cross
+
+Unit: coordinate-client-lifecycle-for-local-daemons
+
+ChildPatch: retain-request-admission-through-core-dispatch
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1482,9 +1482,14 @@ impl ThreadRequestProcessor {
+         thread: &CodexThread,
+         op: Op,
+     ) -> CodexResult<String> {
+-        thread
+-            .submit_with_trace(op, self.request_trace_context(request_id).await)
+-            .await
++        let trace = self.request_trace_context(request_id).await;
++        if matches!(op, Op::Compact | Op::RunUserShellCommand { .. }) {
++            thread
++                .submit_with_trace_and_wait_for_dispatch(op, trace)
++                .await
++        } else {
++            thread.submit_with_trace(op, trace).await
++        }
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -497,9 +497,14 @@ impl TurnRequestProcessor {
+         thread: &CodexThread,
+         op: Op,
+     ) -> CodexResult<String> {
+-        thread
+-            .submit_with_trace(op, self.request_trace_context(request_id).await)
+-            .await
++        let trace = self.request_trace_context(request_id).await;
++        if matches!(op, Op::Review { .. } | Op::RealtimeConversationStart(_)) {
++            thread
++                .submit_with_trace_and_wait_for_dispatch(op, trace)
++                .await
++        } else {
++            thread.submit_with_trace(op, trace).await
++        }
+     }
+ 
+     pub(super) fn input_too_large_error(actual_chars: usize) -> JSONRPCErrorError {
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -313,6 +313,7 @@ pub(crate) async fn run_codex_thread_one_shot(
+                         root_turn_id: None,
+                         residency_guard: None,
+                         message_delivery: None,
++                        dispatch_complete: None,
+                     })
+                     .await;
+                 child_cancel.cancel();
+diff --git a/codex-rs/core/src/codex_delegate_tests.rs b/codex-rs/core/src/codex_delegate_tests.rs
+--- a/codex-rs/core/src/codex_delegate_tests.rs
++++ b/codex-rs/core/src/codex_delegate_tests.rs
+@@ -164,6 +164,7 @@ async fn forward_ops_preserves_submission_trace_context() {
+         root_turn_id: Some("root-turn".to_string()),
+         residency_guard: None,
+         message_delivery: None,
++        dispatch_complete: None,
+     };
+     tx_ops.send(submission).await.unwrap();
+     drop(tx_ops);
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -409,6 +409,21 @@ impl CodexThread {
+             .await
+     }
+ 
++    /// Queues an operation and waits until its Core handler has finished dispatching it.
++    ///
++    /// Hosts can retain admission through this wait so queued work cannot appear idle
++    /// before task startup. Operation results still arrive through the event stream.
++    /// Dropping the waiter does not retract the queued operation.
++    pub async fn submit_with_trace_and_wait_for_dispatch(
++        &self,
++        op: Op,
++        trace: Option<W3cTraceContext>,
++    ) -> CodexResult<String> {
++        self.io
++            .submit_with_trace_and_wait_for_dispatch(op, trace)
++            .await
++    }
++
+     /// Submits turn input without requiring the caller to inspect thread state.
+     ///
+     /// The result describes whether Core started a turn, steered an active
+@@ -551,6 +566,7 @@ impl CodexThread {
+                 root_turn_id: None,
+                 residency_guard: None,
+                 message_delivery: None,
++                dispatch_complete: None,
+             })
+             .await
+             .map_err(|_| CodexErr::Fatal("thread session has stopped".to_string()))?;
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -734,6 +734,9 @@ pub(super) async fn submission_loop(
+         }
+         .instrument(dispatch_span)
+         .await;
++        if let Some(dispatch_complete) = sub.dispatch_complete {
++            let _ = dispatch_complete.send(());
++        }
+         drop(sub.residency_guard);
+         if should_exit {
+             shutdown_received = true;
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1097,11 +1097,35 @@ impl SessionIo {
+             root_turn_id,
+             residency_guard,
+             message_delivery,
++            dispatch_complete: None,
+         };
+         self.submit_with_id(sub).await?;
+         Ok(id)
+     }
+ 
++    pub(crate) async fn submit_with_trace_and_wait_for_dispatch(
++        &self,
++        op: Op,
++        trace: Option<W3cTraceContext>,
++    ) -> CodexResult<String> {
++        let id = new_submission_id();
++        let (dispatch_complete, dispatched) = oneshot::channel();
++        self.submit_with_id(Submission {
++            id: id.clone(),
++            op,
++            turn_extension_init: None,
++            trace,
++            parent_turn_id: None,
++            root_turn_id: None,
++            residency_guard: None,
++            message_delivery: None,
++            dispatch_complete: Some(dispatch_complete),
++        })
++        .await?;
++        dispatched.await.map_err(|_| CodexErr::InternalAgentDied)?;
++        Ok(id)
++    }
++
+     /// Use sparingly: prefer `submit()` so submission IDs are generated consistently.
+     pub(crate) async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+         if sub.trace.is_none() {
+@@ -1143,6 +1167,7 @@ impl SessionIo {
+             root_turn_id: None,
+             residency_guard: None,
+             message_delivery: None,
++            dispatch_complete: None,
+         })
+         .await?;
+         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
+@@ -1170,6 +1195,7 @@ impl SessionIo {
+             root_turn_id: None,
+             residency_guard: None,
+             message_delivery: None,
++            dispatch_complete: None,
+         })
+         .await?;
+         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
+diff --git a/codex-rs/core/src/session/step_activation_tests.rs b/codex-rs/core/src/session/step_activation_tests.rs
+--- a/codex-rs/core/src/session/step_activation_tests.rs
++++ b/codex-rs/core/src/session/step_activation_tests.rs
+@@ -514,6 +514,7 @@ fn settings_submission(
+             root_turn_id: None,
+             residency_guard: None,
+             message_delivery: None,
++            dispatch_complete: None,
+         },
+         receiver,
+     )
+diff --git a/codex-rs/core/src/session/submission.rs b/codex-rs/core/src/session/submission.rs
+--- a/codex-rs/core/src/session/submission.rs
++++ b/codex-rs/core/src/session/submission.rs
+@@ -4,6 +4,7 @@ use codex_extension_api::ExtensionDataInit;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::W3cTraceContext;
+ use tokio::sync::OwnedRwLockReadGuard;
++use tokio::sync::oneshot;
+ 
+ #[derive(Debug)]
+ pub(crate) struct Submission {
+@@ -19,4 +20,6 @@ pub(crate) struct Submission {
+     pub residency_guard: Option<OwnedRwLockReadGuard<()>>,
+     /// Owns delivery until dispatch; failed or abandoned submissions discard it.
+     pub message_delivery: Option<crate::agent_communication::MessageDelivery>,
++    /// Acknowledges dispatch so a host can retain admission through task startup.
++    pub dispatch_complete: Option<oneshot::Sender<()>>,
+ }
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -6339,6 +6339,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
+             root_turn_id: None,
+             residency_guard: None,
+             message_delivery: None,
++            dispatch_complete: None,
+         })
+         .await
+         .expect("submit settings");
+@@ -8280,6 +8281,40 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
+     );
+ }
+ 
++#[tokio::test]
++async fn dispatch_wait_distinguishes_queued_work_from_completed_dispatch() {
++    for dispatch in [true, false] {
++        let (session, turn_context) = make_session_and_context().await;
++        let (tx_sub, rx_sub) = async_channel::bounded(2);
++        let (_tx_event, rx_event) = async_channel::unbounded();
++        let io = SessionIo {
++            tx_sub,
++            rx_event,
++            agent_status: watch::channel(AgentStatus::PendingInit).1,
++            session_loop_termination: completed_session_loop_termination(),
++        };
++        let mut request =
++            Box::pin(io.submit_with_trace_and_wait_for_dispatch(Op::Interrupt, /*trace*/ None));
++        assert!(futures::poll!(request.as_mut()).is_pending());
++        assert_eq!(rx_sub.len(), 1);
++
++        if dispatch {
++            io.submit(Op::Shutdown).await.expect("queue shutdown");
++            submission_loop(Arc::new(session), turn_context.config, rx_sub).await;
++            request.await.expect("Core acknowledged dispatch");
++        } else {
++            let submission = rx_sub.recv().await.expect("accepted submission");
++            assert!(futures::poll!(request.as_mut()).is_pending());
++            drop(submission);
++            let error = request.await.expect_err("dropped dispatch must fail");
++            assert!(matches!(
++                error.details(),
++                CodexErrorDetails::InternalAgentDied
++            ));
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn submit_with_trace_captures_current_span_trace_context() {
+     let (_session, _turn_context) = make_session_and_context().await;
+@@ -8389,6 +8424,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
+             root_turn_id: None,
+             residency_guard: None,
+             message_delivery: None,
++            dispatch_complete: None,
+             trace: Some(submission_trace),
+         })
+     });
+@@ -8420,6 +8456,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
+         root_turn_id: None,
+         residency_guard: None,
+         message_delivery: None,
++        dispatch_complete: None,
+         trace: None,
+     });
+ 
+@@ -8781,6 +8818,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
+         root_turn_id: None,
+         residency_guard: None,
+         message_delivery: None,
++        dispatch_complete: None,
+         trace: Some(submission_trace.clone()),
+     });
+     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();

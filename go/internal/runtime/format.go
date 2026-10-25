@@ -30,6 +30,7 @@ type RepositoryFormatOptions struct {
 	repositoryWorktreeOptions
 	Cancellation <-chan os.Signal
 	OnLive       func()
+	OnPhase      func(string)
 }
 
 type RepositoryFormatResult struct {
@@ -86,6 +87,7 @@ func validateRepositoryWorktreeOptions(options repositoryWorktreeOptions) error 
 
 func RunRepositoryFormat(options RepositoryFormatOptions) (result RepositoryFormatResult, resultErr error) {
 	result = repositoryFormatResult(options)
+	window := newDeadline(options.Deadline, options.Cancellation)
 	input, err := repositoryFormatPreimage(options)
 	if err != nil {
 		result.FailureDomain = runnerFailureDomain(err)
@@ -117,46 +119,119 @@ func RunRepositoryFormat(options RepositoryFormatOptions) (result RepositoryForm
 		}
 	}
 	defer func() {
+		if options.OnPhase != nil {
+			options.OnPhase("Cleanup")
+		}
 		if cleanupErr := removeRepositoryEffectAttempt(attempt); cleanupErr != nil {
 			result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
 			resultErr = errors.Join(resultErr, cleanupErr)
 		}
 	}()
-	started := time.Now()
-	supportOutput, err := prepareRepositoryFormatSupport(options, toolchain, attempt)
-	if err != nil {
-		result.Terminal, result.FailureDomain, result.Stderr = "Fail", failureDomainHelper, supportOutput
-		return result, err
+	cache := filepath.Join(attempt, "format-cache")
+	baseEnvironment := repositoryFormatProxyEnvironment([]string{
+		"HOME=" + filepath.Join(attempt, "home"), "TMPDIR=" + filepath.Join(attempt, "tmp"),
+		"LANG=C.UTF-8", "LC_ALL=C.UTF-8", "PATH=" + filepath.Join(toolchain.Path, "bin") + ":/usr/bin",
+	})
+	commands := []struct {
+		phase       string
+		arguments   []string
+		environment []string
+	}{
+		{
+			phase:       "AcquireBuildifier",
+			arguments:   []string{filepath.Join(toolchain.Path, "bin", "dotslash"), "--", "fetch", filepath.Join(options.Source, "tools", "buildifier")},
+			environment: append(slices.Clone(baseEnvironment), "DOTSLASH_CACHE="+filepath.Join(cache, "dotslash")),
+		},
+		{
+			phase:     "AcquireSDKFormatter",
+			arguments: []string{filepath.Join(toolchain.Path, "bin", "uv"), "sync", "--frozen", "--project", filepath.Join(options.Source, "sdk", "python"), "--only-group", "format", "--no-install-project", "--python", "/usr/bin/python3", "--no-python-downloads"},
+			environment: append(slices.Clone(baseEnvironment),
+				"UV_CACHE_DIR="+filepath.Join(cache, "uv"),
+				"UV_PROJECT_ENVIRONMENT="+filepath.Join(attempt, "sdk-environment"),
+			),
+		},
+		{
+			phase:     "AcquireScriptsFormatter",
+			arguments: []string{filepath.Join(toolchain.Path, "bin", "uv"), "sync", "--frozen", "--project", filepath.Join(options.Source, "scripts"), "--no-install-project", "--python", "/usr/bin/python3", "--no-python-downloads"},
+			environment: append(slices.Clone(baseEnvironment),
+				"UV_CACHE_DIR="+filepath.Join(cache, "uv"),
+				"UV_PROJECT_ENVIRONMENT="+filepath.Join(attempt, "scripts-environment"),
+			),
+		},
+		{
+			phase:       "Formatting",
+			arguments:   append([]string{"/usr/bin/bwrap"}, repositoryFormatSandboxArguments(options, toolchain, attempt, gitRoot)...),
+			environment: []string{},
+		},
 	}
-	preparedInput, err := repositoryFormatPreimage(options)
-	if err != nil || !reflect.DeepEqual(preparedInput, input) {
-		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
-		return result, errors.Join(err, errors.New("repository format support changed the source projection"))
-	}
-	arguments := repositoryFormatSandboxArguments(options, toolchain, attempt, gitRoot)
-	command := exec.Command("/usr/bin/bwrap", arguments...)
-	command.Env = []string{}
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
+	supportOutput := &bytes.Buffer{}
+	supportWriter := &boundedWriter{writer: supportOutput, remaining: 4 << 20}
 	stdoutBuffer, stderrBuffer := &bytes.Buffer{}, &bytes.Buffer{}
 	stdoutWriter := &boundedWriter{writer: stdoutBuffer, remaining: 4 << 20}
 	stderrWriter := &boundedWriter{writer: stderrBuffer, remaining: 4 << 20}
-	command.Stdout, command.Stderr = stdoutWriter, stderrWriter
-	remaining := options.Deadline - time.Since(started)
-	if remaining <= 0 {
-		result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
-		return result, errors.New("repository format deadline expired after support preparation")
+	var runErr error
+	for index, selected := range commands {
+		formatting := index == len(commands)-1
+		if formatting {
+			preparedInput, err := repositoryFormatPreimage(options)
+			if err != nil || !reflect.DeepEqual(preparedInput, input) {
+				result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
+				return result, errors.Join(err, errors.New("repository format support changed the source projection"))
+			}
+		}
+		if err := window.check(); err != nil {
+			result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
+			result.TimedOut, result.Canceled = errors.Is(err, errNativeTimeout), errors.Is(err, errOperationCanceled)
+			if !formatting {
+				result.Stderr = supportOutput.String()
+			}
+			return result, err
+		}
+		if options.OnPhase != nil {
+			options.OnPhase(selected.phase)
+		}
+		command := exec.Command(selected.arguments[0], selected.arguments[1:]...)
+		command.Env = selected.environment
+		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
+		command.Stdout, command.Stderr = stdoutWriter, stderrWriter
+		remaining := window.remaining()
+		if !formatting {
+			command.Dir = options.Source
+			command.Stdout, command.Stderr = supportWriter, supportWriter
+			remaining = min(remaining, 5*time.Minute)
+		}
+		if err := command.Start(); err != nil {
+			result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
+			if !formatting {
+				result.Stderr = supportOutput.String()
+			}
+			return result, err
+		}
+		if formatting {
+			result.ExecutionStarted = true
+			if options.OnLive != nil {
+				options.OnLive()
+			}
+		}
+		runErr, result.TimedOut, result.Canceled = waitProcessGroup(command, remaining, core.GracePeriod(), options.Cancellation)
+		if result.TimedOut {
+			runErr = errors.Join(runErr, errNativeTimeout)
+		}
+		if result.Canceled {
+			runErr = errors.Join(runErr, errOperationCanceled)
+		}
+		result.LogsTruncated = stdoutWriter.truncated || stderrWriter.truncated
+		if !formatting {
+			result.LogsTruncated = supportWriter.truncated
+			if runErr != nil || result.LogsTruncated {
+				result.Terminal, result.FailureDomain, result.Stderr = "Fail", failureDomainHelper, supportOutput.String()
+				return result, errors.Join(runErr, errors.New("repository format "+selected.phase+" failed"))
+			}
+		}
 	}
-	if err := command.Start(); err != nil {
-		result.FailureDomain = failureDomainHelper
-		return result, err
+	if options.OnPhase != nil {
+		options.OnPhase("Postimage")
 	}
-	result.ExecutionStarted = true
-	if options.OnLive != nil {
-		options.OnLive()
-	}
-	runErr, timedOut, canceled := waitProcessGroup(command, remaining, core.GracePeriod(), options.Cancellation)
-	result.TimedOut, result.Canceled = timedOut, canceled
-	result.LogsTruncated = stdoutWriter.truncated || stderrWriter.truncated
 	untracked := make([]string, len(input.Untracked))
 	for index, file := range input.Untracked {
 		untracked[index] = file.Path
@@ -176,7 +251,7 @@ func RunRepositoryFormat(options RepositoryFormatOptions) (result RepositoryForm
 	}
 	result.Terminal, result.FailureDomain = "Fail", failureDomainProduct
 	result.Stdout, result.Stderr = stdoutBuffer.String(), stderrBuffer.String()
-	if timedOut || canceled || result.LogsTruncated || postErr != nil {
+	if result.TimedOut || result.Canceled || result.LogsTruncated || postErr != nil {
 		result.FailureDomain = failureDomainHelper
 	}
 	return result, errors.Join(runErr, postErr)
@@ -229,57 +304,16 @@ func removeRepositoryEffectAttempt(attempt string) error {
 	return removePrivateAttempt(attempt)
 }
 
-func prepareRepositoryFormatSupport(options RepositoryFormatOptions, toolchain ToolchainProjection, attempt string) (string, error) {
-	cache := filepath.Join(attempt, "format-cache")
-	baseEnvironment := []string{
-		"HOME=" + filepath.Join(attempt, "home"), "TMPDIR=" + filepath.Join(attempt, "tmp"),
-		"LANG=C.UTF-8", "LC_ALL=C.UTF-8", "PATH=" + filepath.Join(toolchain.Path, "bin") + ":/usr/bin",
-	}
-	type supportCommand struct {
-		arguments   []string
-		environment []string
-	}
-	commands := []supportCommand{
-		{
-			arguments:   []string{filepath.Join(toolchain.Path, "bin", "dotslash"), "--", "fetch", filepath.Join(options.Source, "tools", "buildifier")},
-			environment: append(slices.Clone(baseEnvironment), "DOTSLASH_CACHE="+filepath.Join(cache, "dotslash")),
-		},
-		{
-			arguments: []string{filepath.Join(toolchain.Path, "bin", "uv"), "sync", "--frozen", "--project", filepath.Join(options.Source, "sdk", "python"), "--only-group", "format", "--no-install-project", "--python", "/usr/bin/python3", "--no-python-downloads"},
-			environment: append(slices.Clone(baseEnvironment),
-				"UV_CACHE_DIR="+filepath.Join(cache, "uv"),
-				"UV_PROJECT_ENVIRONMENT="+filepath.Join(attempt, "sdk-environment"),
-			),
-		},
-		{
-			arguments: []string{filepath.Join(toolchain.Path, "bin", "uv"), "sync", "--frozen", "--project", filepath.Join(options.Source, "scripts"), "--no-install-project", "--python", "/usr/bin/python3", "--no-python-downloads"},
-			environment: append(slices.Clone(baseEnvironment),
-				"UV_CACHE_DIR="+filepath.Join(cache, "uv"),
-				"UV_PROJECT_ENVIRONMENT="+filepath.Join(attempt, "scripts-environment"),
-			),
-		},
-	}
-	end := time.Now().Add(options.Deadline)
-	output := &bytes.Buffer{}
-	writer := &boundedWriter{writer: output, remaining: 4 << 20}
-	for _, support := range commands {
-		remaining := time.Until(end)
-		if remaining <= 0 {
-			return output.String(), errors.New("repository format support timed out")
-		}
-		command := exec.Command(support.arguments[0], support.arguments[1:]...)
-		command.Dir, command.Env = options.Source, support.environment
-		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
-		command.Stdout, command.Stderr = writer, writer
-		if err := command.Start(); err != nil {
-			return output.String(), err
-		}
-		runErr, timedOut, canceled := waitProcessGroup(command, remaining, core.GracePeriod(), options.Cancellation)
-		if runErr != nil || timedOut || canceled || writer.truncated {
-			return output.String(), errors.Join(runErr, errors.New("repository format support preparation failed"))
+func repositoryFormatProxyEnvironment(environment []string) []string {
+	for _, name := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	} {
+		if value, present := os.LookupEnv(name); present {
+			environment = append(environment, name+"="+value)
 		}
 	}
-	return output.String(), nil
+	return environment
 }
 
 func repositoryEffectSource(options repositoryWorktreeOptions, projection sourceProjection) bool {

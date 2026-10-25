@@ -224,8 +224,12 @@ def valid_export_commit(repository, tag):
     if not commit:
         return False
     paths = changed(repository, commit + "^", commit)
+    removed = set(repository.text("diff-tree", "--no-commit-id", "--name-only", "--diff-filter=D", "-r", commit).splitlines())
+    other_paths = [path for path in paths if not path.startswith(tag + "/")]
+    if any(path not in removed or not re.fullmatch(r"rust-v[0-9A-Za-z._-]+/.+", path) or path.split("/", 1)[0].endswith(("-prev", ".pending")) for path in other_paths):
+        return False
     tracked = tuple(sorted(path.removeprefix(tag + "/") for path in repository.text("ls-tree", "-r", "--name-only", commit, "--", tag).splitlines()))
-    return repository.text("show", "-s", "--format=%s", commit) == "update " + tag and commit_identity(repository, commit) and all(path.startswith(tag + "/") for path in paths) and repository.ok("diff", "--quiet", commit, "--", ":(literal)" + tag) and root_inventory(join(repository.path, tag), repository.path) == tracked
+    return repository.text("show", "-s", "--format=%s", commit) == "update " + tag and commit_identity(repository, commit) and repository.ok("diff", "--quiet", commit, "--", ":(literal)" + tag) and root_inventory(join(repository.path, tag), repository.path) == tracked
 
 def fields(repository, commit):
     if not commit_identity(repository, commit):
@@ -322,17 +326,15 @@ def root_inventory(path, parent, missing=False):
 
 def release_documents(root, lanes=LANES):
     documents = {}
-    for relative in ("notes.md", *(join(lane_path(lane), "notes.md") for lane in lanes)):
-        path = join(root, relative)
-        if not os.path.lexists(path):
-            continue
-        must(kind(path, REGULAR) and os.path.realpath(path) == path)
+    path = join(root, "notes.md")
+    if os.path.lexists(path):
+        must(kind(path, REGULAR) and os.path.realpath(path) == path and stat.S_IMODE(os.lstat(path).st_mode) == 0o644)
         data = regular_bytes(path)
         text = data.decode("utf-8")
         must(not data or text.endswith("\n"))
         must("\r" not in text and "\x00" not in text)
         must(all(re.fullmatch(r"- \S.*", line) for line in text.splitlines()))
-        documents[relative] = data
+        documents["notes.md"] = data
     diagram = join(lane_path("cross"), "relationships.txt")
     path = join(root, diagram)
     if "cross" in lanes and os.path.lexists(path):
@@ -342,7 +344,8 @@ def release_documents(root, lanes=LANES):
         documents[diagram] = data
     return documents
 
-def require_cross_diagram(documents, lanes):
+def require_release_documents(documents, lanes):
+    roll_require("notes.md" in documents, "notes.md", "ReleaseNotes", "version-root notes", "absent")
     if "cross" in lanes:
         diagram = join(lane_path("cross"), "relationships.txt")
         roll_require(diagram in documents, diagram, "CrossDiagram", "reviewed cross relationship diagram", "absent")
@@ -355,10 +358,9 @@ def working_release_documents(root):
         if name == "notes.md":
             continue
         path = join(root, name)
-        must(name in {lane_path(lane) for lane in LANES})
+        must(name == lane_path("cross"))
         must(kind(path, DIRECTORY) and os.path.realpath(path) == path)
-        allowed = {"notes.md", "relationships.txt"} if name == lane_path("cross") else {"notes.md"}
-        must(set(os.listdir(path)) <= allowed)
+        must(set(os.listdir(path)) <= {"relationships.txt"})
     return release_documents(root)
 
 def changed(repository, start=None, end=None, *, attributes=None, index=None):
@@ -439,8 +441,14 @@ def first_parent(repository, base, head="HEAD"):
     return [head if distance == 0 else f"{head}~{distance}" for distance in reversed(range(count))]
 
 def validate_history(rows, complete=False, partial=False):
-    must(rows and rows[0][2:8] == NORMALIZATION_TRANSFORM)
-    must(rows[0][8] == "normalization-transform")
+    must(rows)
+    bugfix_count = next((index for index, row in enumerate(rows) if row[2] != "bugfix" or row[6] != "GitDiff"), len(rows))
+    normalized = bugfix_count < len(rows) and rows[bugfix_count][2:8] == NORMALIZATION_TRANSFORM
+    if normalized:
+        must(rows[bugfix_count][8] == "normalization-transform")
+        must(all(row[2] != "bugfix" for row in rows[bugfix_count + 1:] if row[6] == "GitDiff"))
+    else:
+        must(all(row[6] == TRANSFORM for row in rows[bugfix_count:]))
     ordinary = [row for row in rows if row[6] == "GitDiff"]
     last, structures = -1, set()
     layout, scopes = None, set()
@@ -480,7 +488,7 @@ def validate_history(rows, complete=False, partial=False):
             if prerequisite not in available:
                 raise LaneStructureError(f"{lane}/{group}", "Requires", "an earlier complete Unit or Flat Patch", prerequisite)
         structures.add(identity)
-    tail = [row for row in rows[1:] if row[6] == TRANSFORM]
+    tail = [row for row in rows[bugfix_count + int(normalized):] if row[6] == TRANSFORM]
     must(not tail or ordinary and rows[-len(tail):] == tail)
     segments = [row[7] for row in tail]
     must(segments in ([], ["schema"], ["snapshot"], ["schema", "snapshot"]))
@@ -605,7 +613,7 @@ def project_matches_export(source, base, export, head="HEAD"):
     lane_directories = {name.split("/", 1)[0] for name, _ in projected}
     lanes = [lane for lane in LANES if lane_path(lane) in lane_directories]
     documents = release_documents(export, lanes)
-    require_cross_diagram(documents, lanes)
+    require_release_documents(documents, lanes)
     expected = tuple(sorted([name for name, _ in projected] + list(documents)))
     must(root_inventory(export, dir_name(export)) == expected)
     for name, data in projected:
@@ -1110,6 +1118,8 @@ def rust_suite_execute(arguments):
         bindings.append({"Environments": environments, "Package": package, "Path": path})
     bindings.sort(key=itemgetter("Package", "Path"))
     if {package["name"] for package in packages.values()} <= set(excluded):
+        if plan.get("RequiredTests"):
+            fail("required-tests", "selected nonignored regression tests", "all packages excluded")
         must(compile_only or helpers)
         replace_regular(preparation_path, canonical(rust_suite_preparation(plan, "Complete", [], bindings)))
         return
@@ -1139,6 +1149,12 @@ slow-timeout = {{ period = "{timeout}ms", terminate-after = 1, grace-period = "0
         selected_packages, selected_tests = rust_suite_discovery(regular_bytes("/result/rust-suite-discovery.json"), omitted)
     except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as error:
         fail("current-test-discovery", "nonempty canonical identities", error)
+    required = set(plan.get("RequiredTests", []))
+    available = {test["ExpectationIdentity"] for test in selected_tests if not test["Ignored"]}
+    ignored = {test["ExpectationIdentity"] for test in selected_tests if test["Ignored"]}
+    unavailable = (required - available) | (required & ignored)
+    if unavailable:
+        fail("required-tests", "selected nonignored regression tests", ", ".join(sorted(unavailable)))
     if any(event.get("type") == "test" for event in events):
         names = {test["ResultName"] for test in selected_tests}
         passed = set()
@@ -1397,9 +1413,11 @@ def transport_export_rows(root, predecessor, current_tag=""):
     groups = transport_groups(rows)
     must(groups)
     lanes = {group[0] for group in groups}
-    require_cross_diagram(documents, lanes)
+    require_release_documents(documents, lanes)
     must(all(path == "notes.md" or dir_name(path) in {lane_path(lane) for lane in lanes} for path in documents))
-    history = validate_history([("", "", *NORMALIZATION_TRANSFORM, "normalization-transform", None), *rows])
+    bugfix_count = next((index for index, row in enumerate(rows) if row[2] != "bugfix"), len(rows))
+    history = rows[:bugfix_count] + ([("", "", *NORMALIZATION_TRANSFORM, "normalization-transform", None)] if bugfix_count < len(rows) else []) + rows[bugfix_count:]
+    validate_history(history)
     for row, relative in projected_patch_rows(rows):
         roll_require(row[0] == join(root, relative), row[0], "ArtifactPath", relative, os.path.relpath(row[0], root))
     return history
@@ -1519,17 +1537,17 @@ def transport_format_generation(target, formatter, asset_root, iteration):
     command = [endpoint, "repository-format", "--skill-root", dir_name(endpoint), "--project-working-root", working, "--project-scratch-root", scratch, "--runtime-tmp-root", runtime, "--source", target.path, "--release", tag, "--attempt-id", attempt, "--deadline", deadline]
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
-        process = subprocess.run(command, env=ENV, capture_output=True)
+        process = subprocess.run(command, env={**os.environ, **ENV}, stdout=subprocess.PIPE)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
     try:
         result = json.loads(process.stdout, object_pairs_hook=unique_json_object)
         must(isinstance(result, dict) and result.get("RecordType") == "RepositoryFormatResult" and result.get("Source") == target.path and result.get("Release") == tag and result.get("AttemptID") == attempt)
     except (ValueError, RuntimeError):
-        return "RepositoryFormatHelper: invalid formatter terminal; " + process.stderr.decode(errors="replace")[:4096]
+        return "RepositoryFormatHelper: invalid formatter terminal"
     if process.returncode or result.get("Terminal") != "Pass":
         domain = "Product" if result.get("FailureDomain") == "Product" else "Helper"
-        diagnostic = "\n".join((result.get("Stderr", ""), result.get("Stdout", ""), process.stderr.decode(errors="replace"))).strip()
+        diagnostic = "\n".join((result.get("Stderr", ""), result.get("Stdout", ""))).strip()
         return f"RepositoryFormat{domain}: {diagnostic[:4096] or result.get('Terminal')}"
     must(result.get("FailureDomain") == "None")
     return ""
@@ -2027,7 +2045,7 @@ def transport_apply_unit(source, target, members, rustfmt, asset_root, formatter
             change_class(target, row[2], row[6], row[7])
             metadata_commit(target, *row[2:8], contract=row[9])
             applied += 1
-        failure = transport_chrome(target, asset_root, True)
+        failure = transport_chrome(target, asset_root, True) if metadata[0] != "bugfix" else ""
         if failure:
             transport_reset(target, applied)
         return failure
@@ -2132,7 +2150,7 @@ def transport_revise(arguments):
         revised_later = revised_groups[group_index][3][patch_index + 1:]
         must(transport_patch_records(revised_later) == later_records)
         must(transport_group_selector(revised_groups[-1]) == terminal_selector)
-        failure = transport_chrome(target, asset_root, True)
+        failure = transport_chrome(target, asset_root, True) if lane != "bugfix" else ""
         if failure:
             restore_original()
             transport_write_result(output, {**transport_result_identity(patch_kind, lane, group, patch), "Output": failure, "Result": "Conflict"})
@@ -2206,7 +2224,7 @@ def transport_commit(arguments):
     signal.signal(signal.SIGTERM, transport_interrupt)
     try:
         must(roll_format_patch(target, rustfmt))
-        failure = transport_chrome(target, dir_name(output), True)
+        failure = transport_chrome(target, dir_name(output), True) if lane != "bugfix" else ""
         if failure:
             restore_input()
             transport_write_result(output, {**transport_result_identity(patch_kind, lane, group, patch), "Output": failure, "Result": "Conflict"})
@@ -2270,6 +2288,11 @@ def transport_export(arguments):
         transport_write_result(output, {"Result": "Input", "Output": str(RollInputError(open_patch, "OpenPatch", "TaskWorkspace closure before export", open_patch))})
         return
     transport_source_coverage(rows, working, task_path, tag)
+    source_prefixes = release_task_fields(regular_bytes(task_path))["SourcePrefixes"].split(", ")
+    predecessor = source_prefixes[0]
+    if set(source_prefixes) - {tag, predecessor}:
+        raise RollInputError(task_path, "SourcePrefixes", "current tag and primary predecessor before bounded export retention", source_prefixes)
+    retained = {tag, tag + "-prev", predecessor}
     projected, findings = project(source, base, head, skip_line_limit=skip_line_limit == "true")
     if findings:
         transport_write_result(output, findings[0])
@@ -2283,10 +2306,7 @@ def transport_export(arguments):
     lanes = [lane for lane in LANES if lane_path(lane) in lane_directories]
     documents_root = join(scratch, "lane-notes", tag)
     documents = release_documents(documents_root, lanes)
-    require_cross_diagram(documents, lanes)
-    missing_notes = {"notes.md", *(join(lane_path(lane), "notes.md") for lane in lanes)} - documents.keys()
-    if missing_notes:
-        raise RuntimeError("missing working notes under " + documents_root + ": " + ", ".join(sorted(missing_notes)))
+    require_release_documents(documents, lanes)
     projected = tuple(sorted((*projected, *documents.items())))
     clone_seed = ""
     if private is None:
@@ -2307,6 +2327,11 @@ def transport_export(arguments):
         must(not clone_seed or staged.text("rev-parse", "HEAD") == clone_seed)
         staged_before = export_preimage(staged, tag)
         must(before is None or staged_before == before)
+        names = {name for name, _ in staged_before[1]} | {path.split("/", 1)[0] for path in staged_before[2]}
+        retired = sorted(names - retained)
+        tracked_retired = [name for name in retired if staged.bytes("ls-files", "--", name)]
+        for name in retired:
+            remove(join(staged_root, name))
         target, previous = join(staged_root, tag), join(staged_root, tag + "-prev")
         remove(previous)
         if exists(target):
@@ -2317,13 +2342,15 @@ def transport_export(arguments):
         if b"/rust-v*-prev/" not in ignored.splitlines():
             remove(exclude)
             write(exclude, ignored + b"\n/rust-v*-prev/\n", 0o644)
-        staged.run("add", "-f", "-A", "--", tag)
+        staged.run("add", "-f", "-A", "--", tag, *tracked_retired)
         staged.run("commit", "--quiet", "--no-verify", "--allow-empty", "-m", "update " + tag)
         must(commit_identity(staged, "HEAD") and staged.ok("diff", "--cached", "--quiet"))
         must(valid_export_commit(staged, tag))
         project_matches_export(source, base, target, head)
         previous_contents = tuple((path, stat.S_IMODE(os.lstat(join(previous, path)).st_mode), regular_bytes(join(previous, path))) for path in root_inventory(previous, staged_root, True))
         must((previous_contents if exists(previous) else None) == dict(staged_before[1])[tag])
+        predecessor_root = join(staged_root, predecessor)
+        must((source_prefix_preimage(predecessor_root) if exists(predecessor_root) else None) == dict(staged_before[1]).get(predecessor))
         must(source.clean() and source.text("rev-parse", "HEAD") == head)
         must(export_preimage(private, tag) == before if private else not exists(private_root))
         must(release_documents(documents_root, lanes) == documents)
@@ -2430,11 +2457,29 @@ def release_fixed(repository, main_path, upstream_path, tag):
     must(common == main.text("rev-parse", "--path-format=absolute", "--git-common-dir") == upstream.text("rev-parse", "--path-format=absolute", "--git-common-dir"))
     agents(main, upstream)
     release = "refs/tags/" + tag + "^{}"
-    marker = "refs/heads/" + tag + "-upstream-baseline"
     must(repository.has_ref("refs/tags/" + tag) and repository.ok("cat-file", "-e", release + "^") and not repository.ok("cat-file", "-e", release + "^2"))
     must(main.ok("merge-base", "--is-ancestor", release + "^", "HEAD"))
-    must(not repository.ok("cat-file", "-e", marker + "^2") and release_same(repository, marker + "^", release + "^") and repository.ok("diff", "--quiet", marker + "^", marker) and upstream.text("show", "-s", "--format=%s", "HEAD") == tag + " baseline marker")
+    release_bugfix_diff(upstream, tag)
     return main, release
+
+def release_bugfix_diff(repository, tag):
+    base = transport_base(repository, tag)
+    marker = repository.branch() == tag + "-upstream-baseline"
+    head = "HEAD^" if marker else "HEAD"
+    if marker:
+        must(not repository.ok("cat-file", "-e", "HEAD^2") and repository.ok("diff", "--quiet", "HEAD^", "HEAD") and repository.text("show", "-s", "--format=%s", "HEAD") == tag + " baseline marker")
+    rows = history_rows(repository, base, head)
+    if rows:
+        validate_history(rows, partial=True)
+    prefix = [row for row in rows if row[2] == "bugfix" and row[6] == "GitDiff"]
+    must(not marker or len(prefix) == len(rows))
+    return patch_bytes(repository, base, prefix[-1][0], base).decode() if prefix else ""
+
+def release_baseline_source(arguments):
+    must(len(arguments) == 3)
+    path, tag, output = arguments
+    repository = transport_repository(path, True)
+    transport_write_result(output, release_bugfix_diff(repository, tag))
 
 def release_task_fields(data):
     fields = {}
@@ -2510,6 +2555,12 @@ def release_baseline_start(arguments):
         must(regular_bytes(task_path) == task_before and regular_bytes(index_path) == index_before)
         transport_write_result(output, {"Bootstrap": False, "PredecessorTag": predecessor, "Ready": True, "Result": "Started"})
         return
+    if exists(main_path) and exists(upstream_path) and Repo(main_path).branch() == tag + "-main-worktree" and Repo(upstream_path).branch() == tag + "-upstream-baseline":
+        release_fixed(repository, main_path, upstream_path, tag)
+        release_baseline_fetch(working, upstream_path)
+        must(regular_bytes(task_path) == task_before and regular_bytes(index_path) == index_before)
+        transport_write_result(output, {"Bootstrap": bootstrap, "PredecessorTag": predecessor, "Ready": False, "Result": "Started"})
+        return
     common = repository.text("rev-parse", "--path-format=absolute", "--git-common-dir")
     roles = (
         (main_path, "main-worktree", False),
@@ -2534,7 +2585,11 @@ def release_baseline_start(arguments):
             continue
         revision = repository.text("rev-parse", reference)
         if marker:
-            must(repository.text("show", "-s", "--format=%s", reference) == predecessor + " baseline marker" and release_same(repository, reference + "^", predecessor_base) and repository.ok("diff", "--quiet", reference + "^", reference))
+            must(repository.text("show", "-s", "--format=%s", reference) == predecessor + " baseline marker" and repository.ok("diff", "--quiet", reference + "^", reference))
+            bugfix_rows = history_rows(repository, predecessor_base, reference + "^")
+            if bugfix_rows:
+                validate_history(bugfix_rows)
+                must(all(row[2] == "bugfix" and row[6] == "GitDiff" for row in bugfix_rows))
         elif source_before is None:
             must(selection is not None and release_same(repository, reference, predecessor_base))
         else:
@@ -2574,17 +2629,23 @@ def release_baseline_start(arguments):
         if marker:
             if release_same(current, "HEAD", base):
                 native_commit(current, "--allow-empty", "-m", tag + " baseline marker")
-            must(current.text("show", "-s", "--format=%s", "HEAD") == tag + " baseline marker" and release_same(current, "HEAD^", base) and current.ok("diff", "--quiet", "HEAD^", "HEAD"))
+            release_bugfix_diff(current, tag)
         else:
-            must(release_same(current, "HEAD", base))
+            rows = history_rows(current, base)
+            if rows:
+                validate_history(rows)
+                must(all(row[2] == "bugfix" and row[6] == "GitDiff" for row in rows))
     release_fixed(repository, main_path, upstream_path, tag)
+    release_baseline_fetch(working, upstream_path)
+    release_fixed(repository, main_path, upstream_path, tag)
+    must((source_before is None and not exists(source_root) or source_before is not None and source_prefix_preimage(source_root) == source_before) and regular_bytes(task_path) == task_before and regular_bytes(index_path) == index_before)
+    transport_write_result(output, {"Bootstrap": bootstrap, "PredecessorTag": predecessor, "Ready": False, "Result": "Started"})
+
+def release_baseline_fetch(working, upstream_path):
     cargo_home = join(working, "build", "cache", "cargo-home")
     must(kind(cargo_home, DIRECTORY) and not any(exists(join(cargo_home, name)) for name in ("config", "config.toml", "credentials", "credentials.toml")))
     environment = {**ENV, "CARGO_HOME": cargo_home, "CARGO_TERM_COLOR": "never", "HOME": "/nonexistent"}
     must(subprocess.run((join(working, "build", "toolchains", "native", "toolchain", "rust", "bin", "cargo"), "fetch", "--locked"), cwd=join(upstream_path, "codex-rs"), env=environment).returncode == 0)
-    release_fixed(repository, main_path, upstream_path, tag)
-    must((source_before is None and not exists(source_root) or source_before is not None and source_prefix_preimage(source_root) == source_before) and regular_bytes(task_path) == task_before and regular_bytes(index_path) == index_before)
-    transport_write_result(output, {"Bootstrap": bootstrap, "PredecessorTag": predecessor, "Ready": False, "Result": "Started"})
 
 def release_retire_documents(working, scratch, tag):
     documents_root = join(scratch, "lane-notes", tag)
@@ -2733,6 +2794,7 @@ COMMANDS = {
     "release-baseline-cleanup": release_baseline_cleanup,
     "release-cleanup": release_cleanup,
     "release-baseline-start": release_baseline_start,
+    "release-baseline-source": release_baseline_source,
     "rust-suite-execute": rust_suite_execute,
 }
 

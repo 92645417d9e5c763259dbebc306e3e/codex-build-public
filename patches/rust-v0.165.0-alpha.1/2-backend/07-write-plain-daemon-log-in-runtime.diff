@@ -1,0 +1,295 @@
+write-plain-daemon-log-in-runtime
+
+Lane: backend
+
+FlatPatch: write-plain-daemon-log-in-runtime
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Write managed daemon diagnostics as plain text in its runtime daemon.log.
+
+Requires: Unit:normalization/route-app-server-runtime-to-harness
+
+Provides: Name the managed daemon log daemon.log, disable ANSI for managed Unix-socket text logging, and read that path in startup diagnostics while preserving updater log names and native previous-log preservation.
+
+Boundary: Runtime root placement remains with normalization; JSON logging, unmanaged server logging, updater lifecycle, package discovery, and feedback attachment policy retain their existing owners.
+
+Verification: app-server-daemon log_tests and backend pid tests verify runtime paths, updater naming, bounded diagnostic tails, preservation failure, and append handoff; app-server stderr formatting retains its native managed-daemon predicate.
+
+
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -363,7 +363,6 @@ impl PidBackend {
+         Ok(reservation_lock)
+     }
+ 
+-    #[cfg(any(unix, windows))]
+     async fn open_stderr_log(&self) -> Result<fs::File> {
+         let stderr_log_file = stderr_log_file_for_pid_file(&self.pid_file);
+         super::stderr_log::preserve(&stderr_log_file).await;
+@@ -471,7 +470,11 @@ pub(crate) async fn read_stderr_log_tail(pid_file: &Path) -> Result<Option<PidLo
+ }
+ 
+ fn stderr_log_file_for_pid_file(pid_file: &Path) -> PathBuf {
+-    pid_file.with_extension("stderr.log")
++    if pid_file.file_name() == Some(std::ffi::OsStr::new(crate::DAEMON_PID_FILE_NAME)) {
++        pid_file.with_extension("log")
++    } else {
++        pid_file.with_extension("stderr.log")
++    }
+ }
+ 
+ async fn read_log_tail(path: &Path, byte_limit: u64) -> Result<Option<String>> {
+@@ -782,6 +785,10 @@ async fn read_process_details(pid: u32) -> Result<(String, String)> {
+ #[path = "pid_tests.rs"]
+ mod tests;
+ 
++#[cfg(test)]
++#[path = "pid_log_tests.rs"]
++mod log_tests;
++
+ #[cfg(windows)]
+ use super::windows::try_lock_file;
+ 
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_log_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_log_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-daemon/src/backend/pid_log_tests.rs
+@@ -0,0 +1,41 @@
++//! Log naming and tail reads do not depend on process-launch platform support.
++
++use super::PidLogTail;
++use super::read_stderr_log_tail;
++use super::stderr_log_file_for_pid_file;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++#[tokio::test]
++async fn read_stderr_log_tail_returns_recent_complete_lines() {
++    let temp_dir = TempDir::new().expect("temp dir");
++    let pid_file = temp_dir.path().join(crate::DAEMON_PID_FILE_NAME);
++    let log_file = stderr_log_file_for_pid_file(&pid_file);
++    let contents = format!("{}\nrecent error\nusage", "x".repeat(4100));
++    tokio::fs::write(&log_file, contents)
++        .await
++        .expect("write stderr log");
++
++    assert_eq!(
++        read_stderr_log_tail(&pid_file)
++            .await
++            .expect("read stderr log"),
++        Some(PidLogTail {
++            path: log_file,
++            contents: "recent error\nusage".to_string(),
++        })
++    );
++}
++
++#[test]
++fn managed_daemon_log_is_renamed_without_renaming_updater_log() {
++    let temp_dir = TempDir::new().expect("temp dir");
++    assert_eq!(
++        stderr_log_file_for_pid_file(&temp_dir.path().join(crate::DAEMON_PID_FILE_NAME)),
++        temp_dir.path().join("daemon.log")
++    );
++    assert_eq!(
++        stderr_log_file_for_pid_file(&temp_dir.path().join(crate::DAEMON_UPDATE_PID_FILE_NAME)),
++        temp_dir.path().join("daemon-updater.stderr.log")
++    );
++}
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid_tests.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+@@ -12,11 +12,9 @@ use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
+ use super::PidBackend;
+ use super::PidCommandKind;
+ use super::PidFileState;
+-use super::PidLogTail;
+ use super::PidRecord;
+ #[cfg(unix)]
+ use super::read_process_start_time;
+-use super::read_stderr_log_tail;
+ use super::stderr_log_file_for_pid_file;
+ use super::try_lock_file;
+ 
+@@ -631,27 +629,6 @@ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
+     );
+ }
+ 
+-#[tokio::test]
+-async fn read_stderr_log_tail_returns_recent_complete_lines() {
+-    let temp_dir = TempDir::new().expect("temp dir");
+-    let pid_file = temp_dir.path().join("app-server.pid");
+-    let log_file = stderr_log_file_for_pid_file(&pid_file);
+-    let contents = format!("{}\nrecent error\nusage", "x".repeat(4100));
+-    tokio::fs::write(&log_file, contents)
+-        .await
+-        .expect("write stderr log");
+-
+-    assert_eq!(
+-        read_stderr_log_tail(&pid_file)
+-            .await
+-            .expect("read stderr log"),
+-        Some(PidLogTail {
+-            path: log_file,
+-            contents: "recent error\nusage".to_string(),
+-        })
+-    );
+-}
+-
+ #[tokio::test]
+ async fn stale_creation_time_never_stops_reused_pid() {
+     let temp = TempDir::new().expect("temp");
+diff --git a/codex-rs/app-server-daemon/src/daemon_log_tests.rs b/codex-rs/app-server-daemon/src/daemon_log_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-daemon/src/daemon_log_tests.rs
+@@ -0,0 +1,57 @@
++//! Managed log paths and diagnostics are independent of process lifecycle support.
++
++use super::Daemon;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++#[tokio::test]
++async fn not_ready_context_reports_daemon_app_server_before_stderr() {
++    let home = TempDir::new().expect("home");
++    let harness = TempDir::new().expect("harness");
++    let daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
++    let stderr_log = daemon.pid_file.with_extension("log");
++    tokio::fs::create_dir_all(stderr_log.parent().expect("stderr log parent"))
++        .await
++        .expect("stderr log directory");
++    tokio::fs::write(&stderr_log, "unexpected argument")
++        .await
++        .expect("write stderr log");
++
++    assert_eq!(
++        daemon.app_server_not_ready_context().await,
++        format!(
++            "app server did not become ready on {}\n\n\
++             Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
++             Managed app-server stderr ({}):\n  unexpected argument",
++            daemon.socket_path.display(),
++            daemon.managed_codex_bin.display(),
++            stderr_log.display()
++        )
++    );
++}
++
++#[test]
++fn daemon_roots_keep_runtime_state_and_managed_install_separate() {
++    let temp = TempDir::new().expect("temp dir");
++    let home = temp.path().join("home");
++    let harness = temp.path().join("harness");
++    let daemon = Daemon::from_roots(&home, &harness).expect("daemon roots");
++
++    assert_eq!(daemon.codex_home, home);
++    assert_eq!(
++        daemon.socket_path,
++        harness.join("app-server-control/app-server-control.sock")
++    );
++    assert_eq!(
++        daemon.settings_file,
++        harness.join("app-server-daemon/settings.json")
++    );
++    assert_eq!(
++        daemon.managed_codex_bin,
++        home.join("packages/app-server-daemon/current/bin/codex")
++    );
++    assert_eq!(
++        daemon.pid_file.with_extension("log"),
++        harness.join("app-server-daemon/daemon.log")
++    );
++}
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -314,11 +314,7 @@ pub use backend::stderr_log::stderr_writer;
+ /// Full queues and oversized records are dropped; shutdown never waits for disk I/O.
+ /// Native and other-process stderr writes remain best effort during pruning.
+ pub fn maintain_stderr_log() -> Result<()> {
+-    backend::stderr_log::start(
+-        Daemon::from_environment()?
+-            .pid_file
+-            .with_extension("stderr.log"),
+-    );
++    backend::stderr_log::start(Daemon::from_environment()?.pid_file.with_extension("log"));
+     Ok(())
+ }
+ 
+@@ -1593,56 +1589,8 @@ mod tests {
+         backend.stop().await.expect("stop local backend");
+         assert!(bootstrapped.expect("managed local backend"));
+     }
+-
+-    #[tokio::test]
+-    async fn not_ready_context_reports_daemon_app_server_before_stderr() {
+-        let home = TempDir::new().expect("home");
+-        let harness = TempDir::new().expect("harness");
+-        let daemon = Daemon::from_roots(home.path(), harness.path()).expect("daemon roots");
+-        let stderr_log = daemon.pid_file.with_extension("stderr.log");
+-        tokio::fs::create_dir_all(stderr_log.parent().expect("stderr log parent"))
+-            .await
+-            .expect("stderr log directory");
+-        tokio::fs::write(&stderr_log, "unexpected argument")
+-            .await
+-            .expect("write stderr log");
+-
+-        assert_eq!(
+-            daemon.app_server_not_ready_context().await,
+-            format!(
+-                "app server did not become ready on {}\n\n\
+-                 Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
+-                 Managed app-server stderr ({}):\n  unexpected argument",
+-                daemon.socket_path.display(),
+-                daemon.managed_codex_bin.display(),
+-                stderr_log.display()
+-            )
+-        );
+-    }
+-
+-    #[test]
+-    fn daemon_roots_keep_runtime_state_and_managed_install_separate() {
+-        let temp = TempDir::new().expect("temp dir");
+-        let home = temp.path().join("home");
+-        let harness = temp.path().join("harness");
+-        let daemon = Daemon::from_roots(&home, &harness).expect("daemon roots");
+-
+-        assert_eq!(daemon.codex_home, home);
+-        assert_eq!(
+-            daemon.socket_path,
+-            harness.join("app-server-control/app-server-control.sock")
+-        );
+-        assert_eq!(
+-            daemon.settings_file,
+-            harness.join("app-server-daemon/settings.json")
+-        );
+-        assert_eq!(
+-            daemon.managed_codex_bin,
+-            home.join("packages/app-server-daemon/current/bin/codex")
+-        );
+-        assert_eq!(
+-            daemon.pid_file.with_extension("stderr.log"),
+-            harness.join("app-server-daemon/daemon.stderr.log")
+-        );
+-    }
+ }
++
++#[cfg(test)]
++#[path = "daemon_log_tests.rs"]
++mod log_tests;
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -744,6 +744,7 @@ pub async fn run_main_with_transport_options(
+             .boxed(),
+         LogFormat::Default => tracing_subscriber::fmt::layer()
+             .with_writer(codex_app_server_daemon::stderr_writer)
++            .with_ansi(!managed_daemon)
+             .with_span_events(stderr_span_events())
+             .with_filter(EnvFilter::from_default_env())
+             .boxed(),

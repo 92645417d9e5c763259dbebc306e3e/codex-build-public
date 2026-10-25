@@ -1,0 +1,397 @@
+activate-complete-output-for-personal-websocket
+
+Lane: cross
+
+Unit: commit-model-output-after-successful-response
+
+ChildPatch: activate-complete-output-for-personal-websocket
+
+Form: GitDiff
+
+Segment: snapshot
+
+
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -2124,6 +2124,13 @@ impl ModelClientSession {
+                 .current_client_setup(ClientRouting::Workspace)
+                 .await
+                 .map_err(fail_setup)?;
++            let complete_output = client_setup.auth.as_ref().is_some_and(|auth| {
++                auth.is_chatgpt_auth()
++                    && matches!(
++                        auth.account_plan_type(),
++                        Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++                    )
++            });
+             let include_internal = self
+                 .client
+                 .state
+@@ -2363,16 +2370,28 @@ impl ModelClientSession {
+                     ),
+                 ],
+             );
+-            let stream_result = websocket_connection
+-                .stream_request(
+-                    ws_request,
+-                    self.websocket_session.connection_reused(),
+-                    Some(Arc::clone(&self.turn_state)),
+-                    observer
+-                        .as_ref()
+-                        .map(|observer| Arc::clone(observer) as Arc<dyn ResponseObserver>),
+-                )
+-                .await;
++            let transport_observer = observer
++                .as_ref()
++                .map(|observer| Arc::clone(observer) as Arc<dyn ResponseObserver>);
++            let stream_result = if complete_output {
++                websocket_connection
++                    .stream_complete_response(
++                        ws_request,
++                        self.websocket_session.connection_reused(),
++                        Some(Arc::clone(&self.turn_state)),
++                        transport_observer,
++                    )
++                    .await
++            } else {
++                websocket_connection
++                    .stream_request(
++                        ws_request,
++                        self.websocket_session.connection_reused(),
++                        Some(Arc::clone(&self.turn_state)),
++                        transport_observer,
++                    )
++                    .await
++            };
+             if let Some(original_item_ids) = original_item_ids {
+                 for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
+                     item.set_id(original_item_id);
+diff --git a/codex-rs/core/tests/suite/client_websockets_recording_tests.rs b/codex-rs/core/tests/suite/client_websockets_recording_tests.rs
+--- a/codex-rs/core/tests/suite/client_websockets_recording_tests.rs
++++ b/codex-rs/core/tests/suite/client_websockets_recording_tests.rs
+@@ -1,5 +1,6 @@
+ use super::*;
+ use codex_protocol::response_metrics::ResponseAttemptEnd;
++use core_test_support::responses::ev_function_call;
+ use core_test_support::responses::ev_output_text_delta;
+ use core_test_support::responses::ev_reasoning_item;
+ use core_test_support::responses::ev_reasoning_item_added;
+@@ -62,9 +63,11 @@ async fn incomplete_responses_preserve_reported_usage_and_the_original_error() {
+                 .await
+                 .unwrap();
+             let mut failure = None;
++            let mut saw_output = false;
+             while let Some(event) = stream.next().await {
+                 match event {
+                     Ok(ResponseEvent::Completed { .. }) => panic!("incomplete response completed"),
++                    Ok(ResponseEvent::OutputTextDelta(_)) => saw_output = true,
+                     Ok(_) => {}
+                     Err(error) => {
+                         failure = Some(error);
+@@ -72,6 +75,7 @@ async fn incomplete_responses_preserve_reported_usage_and_the_original_error() {
+                     }
+                 }
+             }
++            assert_eq!(saw_output, !auth.is_chatgpt_auth());
+             let error = failure.expect("native incomplete error");
+             let codex_protocol::error::CodexErrorDetails::ResponseIncomplete(incomplete) =
+                 error.details()
+@@ -162,6 +166,74 @@ async fn http_retries_do_not_create_response_records() {
+     assert!(harness.response_attempts().is_empty());
+ }
+ 
++#[test_case::test_case(Some("plus"), true; "plus")]
++#[test_case::test_case(Some("pro"), true; "pro")]
++#[test_case::test_case(Some("prolite"), true; "prolite")]
++#[test_case::test_case(Some("promax"), false; "promax")]
++#[test_case::test_case(Some("business"), false; "business")]
++#[test_case::test_case(Some("free"), false; "free")]
++#[test_case::test_case(None, false; "api_key")]
++#[tokio::test]
++async fn failed_response_withholds_model_events_only_for_admitted_accounts(
++    plan: Option<&str>,
++    complete: bool,
++) {
++    skip_if_no_network!();
++    let server = start_websocket_server(vec![vec![vec![
++        ev_response_created("r1"),
++        ev_reasoning_summary_text_delta("Uncommitted reasoning"),
++        ev_output_text_delta("Uncommitted answer"),
++        ev_function_call("call-1", "exec_command", "{\"cmd\":\"should-not-run\"}"),
++    ]]])
++    .await;
++    let harness = websocket_harness_with_provider_options_and_auth(
++        websocket_provider(&server),
++        false,
++        false,
++        &[],
++        Some(plan.map_or_else(|| CodexAuth::from_api_key("dummy"), personal_auth)),
++    )
++    .await;
++    let mut session = harness.client.new_session();
++    let mut stream = session
++        .stream(
++            &prompt_with_input(vec![message_item("hello")]),
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            None,
++            &turn_metadata(&harness, Some("turn-1")),
++            &InferenceTraceContext::disabled(),
++        )
++        .await
++        .unwrap();
++    let mut counts = (0, 0, 0);
++    let mut failed = false;
++    while let Some(event) = stream.next().await {
++        match event {
++            Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })) => counts.0 += 1,
++            Ok(ResponseEvent::ReasoningSummaryDelta { .. }) => counts.1 += 1,
++            Ok(ResponseEvent::OutputTextDelta(_)) => counts.2 += 1,
++            Err(_) => failed = true,
++            _ => {}
++        }
++    }
++    assert!(failed);
++    let expected = usize::from(!complete);
++    assert_eq!(counts, (expected, expected, expected));
++    let records = harness.response_attempts();
++    assert_eq!(records.len(), 1);
++    assert_eq!(
++        records[0].end_reason,
++        Some(ResponseAttemptEnd::TransportClosed)
++    );
++    assert!(records[0].ttfb_ms.is_some());
++    assert!(records[0].ttfc_ms.is_some());
++    assert_eq!(records[0].tokens.output, None);
++    server.shutdown().await;
++}
++
+ #[tokio::test]
+ async fn prewarm_is_unrecorded_and_committed_output_retains_native_reasoning_order() {
+     skip_if_no_network!();
+@@ -285,3 +357,222 @@ async fn prewarm_is_unrecorded_and_committed_output_retains_native_reasoning_ord
+     assert_eq!(requests[1].body_json()["previous_response_id"], "warm");
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn interrupted_output_retains_usage_without_incremental_continuation() {
++    skip_if_no_network!();
++    let mut interrupted = ev_completed("r1");
++    interrupted["type"] = json!("response.incomplete");
++    interrupted["response"]["incomplete_details"] = json!({"reason": "interrupted"});
++    let server = start_websocket_server(vec![vec![
++        vec![
++            ev_response_created("r1"),
++            ev_assistant_message("m1", "discard this"),
++            interrupted,
++        ],
++        vec![
++            ev_response_created("r2"),
++            ev_assistant_message("m2", "complete answer"),
++            ev_completed("r2"),
++        ],
++    ]])
++    .await;
++    let harness = websocket_harness_with_provider_options_and_auth(
++        websocket_provider(&server),
++        false,
++        false,
++        &[],
++        Some(personal_auth("plus")),
++    )
++    .await;
++    let mut session = harness.client.new_session();
++    let mut stream = session
++        .stream(
++            &prompt_with_input(vec![message_item("hello")]),
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            None,
++            &turn_metadata(&harness, Some("turn-1")),
++            &InferenceTraceContext::disabled(),
++        )
++        .await
++        .unwrap();
++    let mut saw_interrupted = false;
++    while let Some(event) = stream.next().await {
++        match event.unwrap() {
++            ResponseEvent::OutputItemAdded(_) | ResponseEvent::OutputItemDone(_) => {
++                panic!("interrupted output escaped")
++            }
++            ResponseEvent::Interrupted { token_usage, .. } => {
++                assert!(token_usage.is_some());
++                saw_interrupted = true;
++            }
++            _ => {}
++        }
++    }
++    assert!(saw_interrupted);
++    let rows = harness.response_attempts();
++    assert_eq!(rows[0].end_reason, Some(ResponseAttemptEnd::Interrupted));
++    assert!(rows[0].tokens.output.is_some());
++    stream_until_complete(
++        &mut session,
++        &harness,
++        &prompt_with_input(vec![message_item("hello"), message_item("updated input")]),
++    )
++    .await;
++    let next = server.single_connection()[1].body_json();
++    assert!(next["previous_response_id"].is_null());
++    assert_eq!(
++        next["input"],
++        serde_json::to_value(vec![message_item("hello"), message_item("updated input")]).unwrap()
++    );
++    server.shutdown().await;
++}
++
++#[test_case::test_case(false; "interruption_discards_output")]
++#[test_case::test_case(true; "completion_wins_interrupt_race")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn steered_input_preserves_response_output_and_usage(completed: bool) -> anyhow::Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut terminal = ev_completed("steered-response");
++    terminal["response"]["usage"] = json!({
++        "input_tokens": 100, "output_tokens": 12, "total_tokens": 112
++    });
++    if !completed {
++        terminal["type"] = json!("response.incomplete");
++        terminal["response"]["incomplete_details"] = json!({"reason": "interrupted"});
++    }
++    // The terminal is sent only after the real session sends response.interrupt.
++    // Returning completed models the server finishing before it can honor that interrupt.
++    let server = start_websocket_server(vec![vec![
++        vec![ev_response_created("warmup"), ev_completed("warmup")],
++        vec![
++            ev_response_created("steered-response"),
++            core_test_support::responses::ev_message_item_added("original-message", ""),
++            ev_output_text_delta("original answer"),
++            ev_assistant_message("original-message", "original answer"),
++        ],
++        vec![terminal],
++        vec![
++            ev_response_created("follow-up"),
++            ev_assistant_message("final-message", "updated answer"),
++            ev_completed("follow-up"),
++        ],
++    ]])
++    .await;
++    let test = test_codex()
++        .with_auth(personal_auth("plus"))
++        .with_model_info_override(MODEL, |model| model.use_responses_lite = true)
++        .with_config(|config| {
++            assert!(config.features.enabled(Feature::InstantInterrupt));
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.stream_max_retries = Some(0);
++        })
++        .build_with_websocket_server(&server)
++        .await?;
++    let mut updates = test.thread_manager.response_attempt_receiver();
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "original input".into(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            let row = updates.recv().await.unwrap();
++            if row.response_id.as_deref() == Some("steered-response") && row.ttfc_ms.is_some() {
++                assert_eq!(row.end_reason, None);
++                break;
++            }
++        }
++    })
++    .await?;
++    assert!(matches!(
++        test.codex
++            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++                text: "steered input".into(),
++                text_elements: Vec::new(),
++            }]))
++            .await?,
++        codex_core::TurnInputSubmission::Steered { .. }
++    ));
++    let mut events = Vec::new();
++    core_test_support::wait_for_event_with_timeout(
++        &test.codex,
++        |event| {
++            events.push(event.clone());
++            matches!(event, EventMsg::TurnComplete(_))
++        },
++        Duration::from_secs(10),
++    )
++    .await;
++    assert!(
++        !events
++            .iter()
++            .any(|event| matches!(event, EventMsg::Error(_)))
++    );
++    let visible = serde_json::to_string(&events)?;
++    assert_eq!(visible.contains("original answer"), completed);
++    assert!(visible.contains("updated answer"));
++    assert!(events.iter().any(|event| matches!(event,
++        EventMsg::TokenCount(event) if event.info.as_ref().is_some_and(|info|
++            info.total_token_usage.input_tokens == 100
++                && info.total_token_usage.output_tokens == 12
++                && info.last_token_usage.total_tokens == if completed { 112 } else { 0 })
++    )));
++    let mut row = None;
++    while let Ok(update) = updates.try_recv() {
++        if update.response_id.as_deref() == Some("steered-response") && update.end_reason.is_some()
++        {
++            row = Some(update);
++        }
++    }
++    let row =
++        row.expect("the interrupted or completed attempt is published before turn completion");
++    assert_eq!(row.tokens.input, Some(100));
++    assert_eq!(row.tokens.output, Some(12));
++    assert_eq!(
++        row.end_reason,
++        Some(if completed {
++            ResponseAttemptEnd::Completed
++        } else {
++            ResponseAttemptEnd::Interrupted
++        })
++    );
++    let requests = server.single_connection();
++    assert_eq!(requests.len(), 4);
++    assert_eq!(
++        requests[2].body_json(),
++        json!({
++            "type": "response.interrupt", "response_id": "steered-response", "mode": "discard_partial_items"
++        })
++    );
++    let follow_up = requests[3].body_json();
++    if completed {
++        assert_eq!(follow_up["previous_response_id"], "steered-response");
++    } else {
++        assert!(follow_up["previous_response_id"].is_null());
++        assert!(follow_up["input"].to_string().contains("original input"));
++        assert!(!follow_up["input"].to_string().contains("original answer"));
++    }
++    assert!(follow_up["input"].to_string().contains("steered input"));
++    test.codex.flush_rollout().await?;
++    let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(
++        &test.codex.rollout_path().expect("test rollout path"),
++    )
++    .await?;
++    assert_eq!(errors, 0);
++    assert!(items.iter().any(|item| matches!(item,
++        codex_rollout::RolloutItem::TokenUsageRecord(record)
++            if record.response_id == "steered-response" && record.usage.output_tokens == 12
++    )));
++    assert_eq!(
++        serde_json::to_string(&items)?.contains("original answer"),
++        completed
++    );
++    test.codex.shutdown_and_wait().await?;
++    server.shutdown().await;
++    Ok(())
++}

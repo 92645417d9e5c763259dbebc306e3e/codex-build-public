@@ -1,0 +1,256 @@
+drain-response-history-on-shutdown
+
+Lane: cross
+
+Unit: track-model-responses-by-attempt
+
+ChildPatch: drain-response-history-on-shutdown
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1511,6 +1511,9 @@ impl ThreadRequestProcessor {
+         for thread_id in report.timed_out {
+             warn!("timed out waiting for thread {thread_id} to shut down");
+         }
++        if let Err(error) = self.thread_manager.response_history().shutdown().await {
++            warn!("failed to drain response history on shutdown: {error}");
++        }
+         match board_pool {
+             Ok(Some(pool)) => pool.close().await,
+             Ok(None) => {}
+diff --git a/codex-rs/app-server/tests/suite/v2/response_metrics.rs b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+--- a/codex-rs/app-server/tests/suite/v2/response_metrics.rs
++++ b/codex-rs/app-server/tests/suite/v2/response_metrics.rs
+@@ -239,6 +239,45 @@ async fn response_pages_and_notifications_share_records_across_sessions() -> Res
+             .success()
+     );
+     let sqlite = SqliteConfig::new_for_testing(sqlite_home.path().abs());
++    for database in sqlite.runtime_db_paths() {
++        assert!(
++            !database.path.with_extension("sqlite-wal").exists(),
++            "{}",
++            database.label
++        );
++        assert!(
++            !database.path.with_extension("sqlite-shm").exists(),
++            "{}",
++            database.label
++        );
++    }
++    let standalone_home = TempDir::new()?;
++    let standalone = standalone_home.path().join("logs.sqlite");
++    std::fs::copy(sqlite.logs_db_path(), &standalone)?;
++    let reader = sqlite.open_read_only_pool(&standalone, None).await?;
++    let persisted_final: Vec<(String, i64, String, i64, i64, Option<i64>)> = sqlx::query_as(
++        "SELECT id, revision, end_reason, received_bytes, output_tokens, cache_write_tokens FROM responses ORDER BY id DESC",
++    )
++    .fetch_all(&reader)
++    .await?;
++    let expected_final: Vec<_> = records
++        .iter()
++        .map(|record| {
++            (
++                record.attempt_id.to_string(),
++                i64::try_from(record.revision).unwrap(),
++                "completed".to_string(),
++                i64::try_from(record.received_payload_bytes).unwrap(),
++                i64::try_from(record.tokens.output.unwrap()).unwrap(),
++                record
++                    .tokens
++                    .cache_write
++                    .map(|tokens| i64::try_from(tokens).unwrap()),
++            )
++        })
++        .collect();
++    assert_eq!(persisted_final, expected_final);
++    reader.close().await;
+     let mut reopened = TestAppServer::builder()
+         .with_codex_home(home.path())
+         .with_env_overrides(&[("OPENAI_API_KEY", None), ("CODEX_API_KEY", None)])
+diff --git a/codex-rs/core/src/response_history.rs b/codex-rs/core/src/response_history.rs
+--- a/codex-rs/core/src/response_history.rs
++++ b/codex-rs/core/src/response_history.rs
+@@ -213,6 +213,14 @@ impl ResponseHistory {
+         Ok(())
+     }
+ 
++    /// Stop persistence admission and drain accepted writes before the host closes SQLite.
++    pub async fn shutdown(&self) -> Result<(), String> {
++        if let Some(backup) = self.backup.get() {
++            backup.shutdown().await?;
++        }
++        Ok(())
++    }
++
+     fn restore(
+         &self,
+         page: ResponseHistoryPage,
+diff --git a/codex-rs/core/src/response_history/backup.rs b/codex-rs/core/src/response_history/backup.rs
+--- a/codex-rs/core/src/response_history/backup.rs
++++ b/codex-rs/core/src/response_history/backup.rs
+@@ -50,6 +50,7 @@ impl BackupStatus {
+ enum Command {
+     Write(ResponseAttempt),
+     Flush(oneshot::Sender<Result<(), String>>),
++    Shutdown(oneshot::Sender<Result<(), String>>),
+ }
+ 
+ impl Backup {
+@@ -82,6 +83,7 @@ impl Backup {
+                     status.record_error(error);
+                 }
+             });
++            let mut shutdown_replies = Vec::new();
+             while let Some(command) = receiver.recv().await {
+                 match command {
+                     Command::Write(record) => {
+@@ -120,14 +122,21 @@ impl Backup {
+                     Command::Flush(reply) => {
+                         let _ = reply.send(status_tx.borrow().error().cloned().map_or(Ok(()), Err));
+                     }
++                    Command::Shutdown(reply) => {
++                        receiver.close();
++                        shutdown_replies.push(reply);
++                    }
+                 }
+             }
++            for reply in shutdown_replies {
++                let _ = reply.send(status_tx.borrow().error().cloned().map_or(Ok(()), Err));
++            }
+         });
+         Self { sender, status }
+     }
+ 
+     pub(super) fn write(&self, record: ResponseAttempt) {
+-        // Dropping the last sender lets the worker drain accepted writes.
++        // Shutdown closes admission and drains accepted writes even when owners remain.
+         if self.sender.send(Command::Write(record)).is_err() {
+             tracing::warn!("response history writer stopped");
+         }
+@@ -168,6 +177,15 @@ impl Backup {
+         done.await
+             .map_err(|_| "response history writer stopped".to_owned())?
+     }
++
++    pub(super) async fn shutdown(&self) -> Result<(), String> {
++        let (reply, done) = oneshot::channel();
++        self.sender
++            .send(Command::Shutdown(reply))
++            .map_err(|_| "response history writer stopped".to_owned())?;
++        done.await
++            .map_err(|_| "response history writer stopped".to_owned())?
++    }
+ }
+ 
+ fn is_sqlite_busy(error: &anyhow::Error) -> bool {
+@@ -345,6 +363,40 @@ mod tests {
+         runtime.close().await;
+     }
+ 
++    #[tokio::test]
++    async fn shutdown_drains_commands_accepted_after_its_marker() {
++        let home = tempfile::tempdir().unwrap();
++        let (metrics, history, runtime) = recording(home.path()).await;
++        let backup = history.backup();
++        backup.ready().await.unwrap();
++        let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++        attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++        let mut final_record = history.notification_snapshot()[0].clone();
++        final_record.revision += 1;
++        final_record.tokens.output = Some(77);
++        let (shutdown, stopped) = oneshot::channel();
++        let (flush, flushed) = oneshot::channel();
++        // No await: all three commands are accepted before shutdown closes admission.
++        assert!(backup.sender.send(Command::Shutdown(shutdown)).is_ok());
++        assert!(
++            backup
++                .sender
++                .send(Command::Write(final_record.clone()))
++                .is_ok()
++        );
++        assert!(backup.sender.send(Command::Flush(flush)).is_ok());
++        stopped.await.unwrap().unwrap();
++        flushed.await.unwrap().unwrap();
++        assert!(backup.sender.is_closed());
++        let saved = runtime
++            .response_history()
++            .page(None, None, None, None, 10)
++            .await
++            .unwrap();
++        assert_eq!(saved.data, vec![final_record]);
++        runtime.close().await;
++    }
++
+     #[tokio::test]
+     async fn recent_pages_and_publications_do_not_wait_for_storage() {
+         let history = Arc::new(ResponseHistory::new(None));
+diff --git a/codex-rs/core/src/response_history/backup_tests.rs b/codex-rs/core/src/response_history/backup_tests.rs
+--- a/codex-rs/core/src/response_history/backup_tests.rs
++++ b/codex-rs/core/src/response_history/backup_tests.rs
+@@ -124,6 +124,7 @@ async fn filtered_history_survives_eviction_restart_and_newer_insertions() {
+         attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
+     }
+     history.flush().await.unwrap();
++    history.shutdown().await.unwrap();
+     runtime.close().await;
+     let (reopened_metrics, reopened, _reopened_runtime) = recording(home.path()).await;
+     let first = reopened
+@@ -170,6 +171,7 @@ async fn storage_failure_is_visible_without_losing_live_records() {
+     let page = history.page(None, None, None, None, 100).await;
+     assert_eq!(page.data, history.notification_snapshot());
+     assert!(page.persistence_error.unwrap().contains("closed"));
++    assert!(history.shutdown().await.is_err());
+ }
+ 
+ #[tokio::test]
+@@ -188,4 +190,44 @@ async fn unavailable_native_storage_preserves_live_records_and_reports_failure()
+         page.persistence_error.as_deref(),
+         Some("native response storage unavailable")
+     );
++    assert!(history.shutdown().await.is_err());
++}
++
++#[tokio::test]
++async fn shutdown_drains_final_writes_before_native_pool_closure() {
++    let home = tempfile::tempdir().unwrap();
++    let sqlite = SqliteConfig::new_for_testing(home.path().abs());
++    let (metrics, history, runtime) = recording(home.path()).await;
++    let attempt = metrics.start(context(), Instant::now(), chrono::Utc::now().timestamp());
++    attempt.sent(Instant::now());
++    attempt.received(
++        ResponseObservation {
++            payload_bytes: 512,
++            usage: Some(json!({"output_tokens": 17})),
++            terminal: Some(ResponseAttemptEnd::Completed),
++            ..Default::default()
++        },
++        Instant::now(),
++    );
++    attempt.ended(ResponseAttemptEnd::Completed, Instant::now());
++    let expected = history.notification_snapshot()[0].clone();
++    // No flush or yield before shutdown: its acknowledgement owns the final write.
++    history.shutdown().await.unwrap();
++    runtime.close().await;
++    let path = sqlite.logs_db_path();
++    assert!(!path.with_extension("sqlite-wal").exists());
++    assert!(!path.with_extension("sqlite-shm").exists());
++    let standalone_home = tempfile::tempdir().unwrap();
++    let standalone_sqlite = SqliteConfig::new_for_testing(standalone_home.path().abs());
++    std::fs::copy(&path, standalone_sqlite.logs_db_path()).unwrap();
++    let reopened = codex_state::StateRuntime::init(standalone_sqlite, "test".into())
++        .await
++        .unwrap();
++    let saved = reopened
++        .response_history()
++        .page(None, None, None, None, 10)
++        .await
++        .unwrap();
++    assert_eq!(saved.data, vec![expected]);
++    reopened.close().await;
+ }

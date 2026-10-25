@@ -38,6 +38,7 @@ type RustSuiteOptions struct {
 	calibrationPlan                                  *RustSuitePlan
 	baselinePreimage                                 *rustSuiteBaselineInput
 	baselineProposal                                 *rustSuiteBaselineProposal
+	baselineAffected, requiredTests                  []string
 }
 
 type RustSuiteDiagnostic struct {
@@ -108,6 +109,7 @@ type rustSuiteBaselineInput struct {
 }
 
 type rustSuiteBaselineProposal struct {
+	BugfixDiff                                           string `json:",omitempty"`
 	Tag, ToolchainRoot, CargoVersion, ToolchainTarget    string
 	CompileOnlyPackages, HelperBinaries, CoveredPackages []string
 	ExecutionProfile                                     rustSuiteBaselineProfile
@@ -131,7 +133,9 @@ type rustSuiteBaselineProfile struct {
 
 type RustSuitePlan struct {
 	TestNetwork                         string
-	BaselineReanchor                    bool `json:",omitempty"`
+	BaselineReanchor                    bool     `json:",omitempty"`
+	BugfixDiff                          string   `json:",omitempty"`
+	RequiredTests                       []string `json:",omitempty"`
 	SchemaVersion                       int
 	RecordType, Scope, Tag              string
 	SourceRole                          string
@@ -424,6 +428,10 @@ func readRustSuiteResult(options RustSuiteOptions, alreadyEstablished bool) (Rus
 	source, sourceErr := suiteSource(options)
 	if sourceErr == nil {
 		sourceErr = validateRustSuiteSourceRole(options, source)
+	}
+	bugfixDiff, bugfixErr := releaseBugfixDiff(options.Source, options.RuntimeTemporaryRoot, options.Tag, options.deadline())
+	if bugfixErr != nil || plan.BugfixDiff != bugfixDiff || len(options.requiredTests) != 0 && !sameStrings(plan.RequiredTests, options.requiredTests) {
+		sourceErr = errors.Join(sourceErr, bugfixErr, errors.New("retained baseline source or required tests differ"))
 	}
 	toolchain, toolchainErr := resolveToolchain(options.ProjectWorkingRoot, options.Source, options.RuntimeTemporaryRoot, options.deadline())
 	if options.Scope != "baseline" {
@@ -819,8 +827,8 @@ func prepareRustSuiteBaselinePromotion(options RustSuiteOptions, plan RustSuiteP
 		return nil, errors.New("baseline promotion input differs")
 	}
 	established, proposal := *options.baselinePreimage, *options.baselineProposal
-	execution, aligned, executionErr := rustSuiteBaselineExecution(established, proposal, packages, options.baselineReanchor)
-	if toolchainErr != nil || packageErr != nil || executionErr != nil || plan.BaselineReanchor != options.baselineReanchor || !validRustSuiteBaselineSelection(established, established.Tag, toolchain) || !validRustSuiteBaselineProposal(proposal, options.Tag, toolchain) || !rustSuitePlanMatchesProposal(plan, execution, packages) {
+	execution, aligned, executionErr := rustSuiteBaselineExecution(established, proposal, packages, options.baselineReanchor, options.baselineAffected)
+	if toolchainErr != nil || packageErr != nil || executionErr != nil || plan.BaselineReanchor != options.baselineReanchor || !validRustSuiteBaselineSelection(established, established.Tag) || proposal.CargoVersion != toolchain.CargoVersion || !validRustSuiteBaselineProposal(proposal, options.Tag) || !rustSuitePlanMatchesProposal(plan, execution, packages) {
 		return nil, errors.Join(toolchainErr, packageErr, executionErr, errors.New("baseline promotion binding differs"))
 	}
 	priorFailures, priorTimeouts := map[string][]string{}, map[string][]string{}
@@ -914,7 +922,7 @@ func rustSuitePlanMatchesProposal(plan RustSuitePlan, selection rustSuiteBaselin
 
 func rustSuitePlanMatchesPolicy(plan RustSuitePlan, selection rustSuiteBaselineProposal, packages []string) bool {
 	excluded, err := rustSuiteTransientExclusions(packages, selection)
-	return err == nil && plan.TestNetwork == selection.ExecutionProfile.TestNetwork && plan.Tag == selection.Tag && plan.ToolchainRoot == selection.ToolchainRoot && plan.CargoVersion == selection.CargoVersion && plan.ToolchainTarget == selection.ToolchainTarget && sameStrings(plan.CompileOnlyPackages, selection.CompileOnlyPackages) && sameStrings(plan.HelperBinaries, selection.HelperBinaries) && sameStrings(plan.ExcludedPackages, excluded) && plan.NextestConcurrency == selection.ExecutionProfile.NextestConcurrency && plan.TestTimeoutMilliseconds == selection.ExecutionProfile.TestTimeoutMilliseconds
+	return err == nil && plan.BugfixDiff == selection.BugfixDiff && plan.TestNetwork == selection.ExecutionProfile.TestNetwork && plan.Tag == selection.Tag && plan.ToolchainRoot == selection.ToolchainRoot && plan.CargoVersion == selection.CargoVersion && plan.ToolchainTarget == selection.ToolchainTarget && sameStrings(plan.CompileOnlyPackages, selection.CompileOnlyPackages) && sameStrings(plan.HelperBinaries, selection.HelperBinaries) && sameStrings(plan.ExcludedPackages, excluded) && plan.NextestConcurrency == selection.ExecutionProfile.NextestConcurrency && plan.TestTimeoutMilliseconds == selection.ExecutionProfile.TestTimeoutMilliseconds
 }
 
 func rustSuiteResultForStage(plan RustSuitePlan, stage RustSuiteStageResult) RustSuiteResult {
@@ -965,6 +973,15 @@ func rustSuiteStageDiagnostics(plan RustSuitePlan, stage RustSuiteStageResult) [
 	}
 	if stage.Preparation != nil && stage.Execution.CompletedTests != stage.Preparation.SelectedTestCount {
 		diagnostics = append(diagnostics, RustSuiteDiagnostic{Field: "selected-test-completion", Expected: fmt.Sprintf("%d completed selected tests", stage.Preparation.SelectedTestCount), Actual: fmt.Sprintf("%d completed selected tests", stage.Execution.CompletedTests)})
+	}
+	required := []string{}
+	for _, identity := range plan.RequiredTests {
+		if sortedHas(stage.Failures, identity) || sortedHas(stage.Timeouts, identity) {
+			required = append(required, identity)
+		}
+	}
+	if len(required) != 0 {
+		diagnostics = append(diagnostics, RustSuiteDiagnostic{Field: "required-tests", Expected: "all required regression tests pass", Actual: boundedRunnerDiagnostic(strings.Join(required, ", "))})
 	}
 
 	return diagnostics
@@ -1017,10 +1034,17 @@ func prepareRustSuite(options RustSuiteOptions) (rustSuitePreflight, error) {
 	if err != nil {
 		return rustSuitePreflight{}, preflightHelperError{err}
 	}
+	if options.baselinePreimage != nil && options.baselinePreimage.Tag != options.Tag && options.baselineProposal != nil {
+		options.baselineProposal.CargoVersion = toolchain.CargoVersion
+	}
 	preflight := rustSuitePreflight{}
 	selection, packages, selectionErr := readRustSuitePendingBaseline(options, toolchain)
 	if selectionErr != nil {
 		return rustSuitePreflight{}, selectionErr
+	}
+	bugfixDiff, sourceErr := releaseBugfixDiff(options.Source, options.RuntimeTemporaryRoot, options.Tag, options.deadline())
+	if sourceErr != nil || selection.BugfixDiff != bugfixDiff {
+		return rustSuitePreflight{}, errors.Join(sourceErr, errors.New("baseline proposal source differs"))
 	}
 	compileOnly, helpers := append([]string{}, selection.CompileOnlyPackages...), append([]string{}, selection.HelperBinaries...)
 	concurrency := selection.ExecutionProfile.NextestConcurrency
@@ -1034,6 +1058,7 @@ func prepareRustSuite(options RustSuiteOptions) (rustSuitePreflight, error) {
 	}
 	plan := RustSuitePlan{
 		SchemaVersion: core.SchemaVersion, RecordType: "RustSuitePlanRecord", Scope: options.Scope, Tag: options.Tag, SourceRole: role, BaselineReanchor: options.baselineReanchor,
+		BugfixDiff: selection.BugfixDiff, RequiredTests: options.requiredTests,
 		ToolchainRoot: toolchain.Root, CargoVersion: toolchain.CargoVersion, ToolchainTarget: toolchain.Target,
 		CacheRoot:               filepath.Join(options.ProjectWorkingRoot, "build", "cache"),
 		TestNetwork:             "Shared",
@@ -1052,6 +1077,10 @@ func establishedRustSuitePlan(options RustSuiteOptions, toolchain ToolchainProje
 		return RustSuitePlan{}, err
 	}
 	selection := generation.Selection
+	bugfixDiff, sourceErr := releaseBugfixDiff(options.Source, options.RuntimeTemporaryRoot, options.Tag, options.deadline())
+	if sourceErr != nil || selection.BugfixDiff != bugfixDiff {
+		return RustSuitePlan{}, errors.Join(sourceErr, errors.New("product bugfix source differs from Established Baseline"))
+	}
 	packages, packageErr := discoverRustSuitePackages(options, toolchain)
 	excluded, exclusionErr := rustSuiteTransientExclusions(packages, selection.rustSuiteBaselineProposal)
 	if packageErr != nil || exclusionErr != nil {
@@ -1063,6 +1092,7 @@ func establishedRustSuitePlan(options RustSuiteOptions, toolchain ToolchainProje
 	}
 	plan := RustSuitePlan{
 		SchemaVersion: core.SchemaVersion, RecordType: "RustSuitePlanRecord", Scope: options.Scope, Tag: options.Tag, SourceRole: sourceRole,
+		BugfixDiff:    selection.BugfixDiff,
 		ToolchainRoot: toolchain.Root, CargoVersion: toolchain.CargoVersion, ToolchainTarget: toolchain.Target,
 		CacheRoot:               filepath.Join(options.ProjectWorkingRoot, "build", "cache"),
 		TestNetwork:             "Shared",
@@ -1184,26 +1214,30 @@ func decodeRustSuiteBaselineFile(data []byte) (rustSuiteBaselineFile, error) {
 		return rustSuiteBaselineFile{}, errors.New("baseline file fields differ")
 	}
 	var generationFields, selectionFields map[string]json.RawMessage
-	if json.Unmarshal(fields["Established"], &generationFields) != nil || !sameStrings(sortedMapKeys(generationFields), []string{"Selection"}) || json.Unmarshal(generationFields["Selection"], &selectionFields) != nil || !sameStrings(sortedMapKeys(selectionFields), baselineSelectionFields()) {
+	if json.Unmarshal(fields["Established"], &generationFields) != nil || !sameStrings(sortedMapKeys(generationFields), []string{"Selection"}) || json.Unmarshal(generationFields["Selection"], &selectionFields) != nil || !sameStrings(sortedMapKeys(selectionFields), baselineSelectionFields(value.Established.Selection)) {
 		return rustSuiteBaselineFile{}, errors.New("established baseline fields differ")
 	}
 
 	return value, nil
 }
 
-func baselineSelectionFields() []string {
-	return []string{"CargoVersion", "CompileOnlyPackages", "CoveredPackages", "ExecutionProfile", "ExpectedFailures", "ExpectedTimeouts", "HelperBinaries", "Tag", "ToolchainRoot", "ToolchainTarget"}
+func baselineSelectionFields(selection rustSuiteBaselineInput) []string {
+	fields := []string{"CargoVersion", "CompileOnlyPackages", "CoveredPackages", "ExecutionProfile", "ExpectedFailures", "ExpectedTimeouts", "HelperBinaries", "Tag", "ToolchainRoot", "ToolchainTarget"}
+	if selection.BugfixDiff != "" {
+		fields = append([]string{"BugfixDiff"}, fields...)
+	}
+	return fields
 }
 
 func readRustSuitePendingBaseline(options RustSuiteOptions, toolchain ToolchainProjection) (rustSuiteBaselineProposal, []string, error) {
-	if options.baselinePreimage == nil || options.baselineProposal == nil || !validRustSuiteBaselineSelection(*options.baselinePreimage, options.baselinePreimage.Tag, toolchain) || !validRustSuiteBaselineProposal(*options.baselineProposal, options.Tag, toolchain) {
+	if options.baselinePreimage == nil || options.baselineProposal == nil || !validRustSuiteBaselineSelection(*options.baselinePreimage, options.baselinePreimage.Tag) || options.baselineProposal.CargoVersion != toolchain.CargoVersion || !validRustSuiteBaselineProposal(*options.baselineProposal, options.Tag) {
 		return rustSuiteBaselineProposal{}, nil, rustSuitePreflightError{Diagnostics: []RustSuiteDiagnostic{{Field: "baseline-proposal", Expected: "one valid Plan-bound proposal and Established preimage", Actual: "generation differs"}}}
 	}
 	packages, packageErr := discoverRustSuitePackages(options, toolchain)
 	if packageErr != nil {
 		return rustSuiteBaselineProposal{}, nil, packageErr
 	}
-	execution, _, executionErr := rustSuiteBaselineExecution(*options.baselinePreimage, *options.baselineProposal, packages, options.baselineReanchor)
+	execution, _, executionErr := rustSuiteBaselineExecution(*options.baselinePreimage, *options.baselineProposal, packages, options.baselineReanchor, options.baselineAffected)
 	return execution, packages, executionErr
 }
 
@@ -1219,7 +1253,7 @@ func discoverRustSuitePackages(options RustSuiteOptions, toolchain ToolchainProj
 		return nil, errors.Join(err, removePrivateAttemptWithin(root, newDeadline(core.GracePeriod(), nil)))
 	}
 	output := filepath.Join(root, "result")
-	data, stderr, runErr := runNativeProcess(root, script, "rust-suite-packages", []string{options.Source, filepath.Join(toolchain.Path, "rust", "bin", "cargo"), filepath.Join(options.ProjectWorkingRoot, "build", "cache", "cargo-home"), output}, nativeEnvironment(root), 8<<20, output, options.remaining(), options.Cancellation, options.OnLive)
+	data, stderr, runErr := runNativeProcess(root, script, "rust-suite-packages", []string{options.Source, filepath.Join(toolchain.Path, "rust", "bin", "cargo"), filepath.Join(options.ProjectWorkingRoot, "build", "cache", "cargo-home"), output}, nativeEnvironment(root), 8<<20, output, options.remaining(), options.Cancellation, options.OnLive, nil)
 	runErr = errors.Join(runErr, removePrivateAttemptWithin(root, newDeadline(core.GracePeriod(), nil)))
 	if diagnostic := strings.TrimSpace(stderr); runErr != nil && diagnostic != "" {
 		runErr = errors.Join(runErr, errors.New(diagnostic))
@@ -1234,7 +1268,7 @@ func discoverRustSuitePackages(options RustSuiteOptions, toolchain ToolchainProj
 	return packages, nil
 }
 
-func rustSuiteBaselineExecution(established rustSuiteBaselineInput, proposed rustSuiteBaselineProposal, packages []string, align bool) (rustSuiteBaselineProposal, rustSuiteBaselineProposal, error) {
+func rustSuiteBaselineExecution(established rustSuiteBaselineInput, proposed rustSuiteBaselineProposal, packages []string, align bool, affected []string) (rustSuiteBaselineProposal, rustSuiteBaselineProposal, error) {
 	members := rustSuitePackageSet(packages)
 	aligned := proposed
 	if established.Tag != proposed.Tag {
@@ -1264,25 +1298,36 @@ func rustSuiteBaselineExecution(established rustSuiteBaselineInput, proposed rus
 			}
 		}
 	}
+	changedSource := established.BugfixDiff != proposed.BugfixDiff
+	selected := rustSuitePackageSet(proposed.CoveredPackages, proposed.CompileOnlyPackages, proposed.HelperBinaries)
+	for _, name := range affected {
+		if !selected[name] {
+			return rustSuiteBaselineProposal{}, rustSuiteBaselineProposal{}, errors.New("affected package is outside proposed coverage")
+		}
+	}
+	if changedSource && len(affected) == 0 {
+		return proposed, proposed, nil
+	}
 	if rustSuiteSameValue(established.rustSuiteBaselineProposal, proposed) {
 		return proposed, proposed, nil
 	}
 	oldCovered := rustSuitePackageSet(established.CoveredPackages)
 	oldCompile, oldHelpers := rustSuitePackageSet(established.CompileOnlyPackages), rustSuitePackageSet(established.HelperBinaries)
+	remeasure := rustSuitePackageSet(affected)
 	execution := proposed
 	execution.CompileOnlyPackages, execution.HelperBinaries, execution.CoveredPackages = []string{}, []string{}, []string{}
 	for _, name := range proposed.CoveredPackages {
-		if !oldCovered[name] {
+		if !oldCovered[name] || changedSource && remeasure[name] {
 			execution.CoveredPackages = append(execution.CoveredPackages, name)
 		}
 	}
 	for _, name := range proposed.CompileOnlyPackages {
-		if !oldCompile[name] {
+		if !oldCompile[name] || changedSource && remeasure[name] {
 			execution.CompileOnlyPackages = append(execution.CompileOnlyPackages, name)
 		}
 	}
 	for _, name := range proposed.HelperBinaries {
-		if len(execution.CoveredPackages) != 0 || !oldHelpers[name] {
+		if len(execution.CoveredPackages) != 0 || !oldHelpers[name] || changedSource && remeasure[name] {
 			execution.HelperBinaries = append(execution.HelperBinaries, name)
 		}
 	}
@@ -1301,18 +1346,14 @@ func rustSuitePresentPackages(names []string, members map[string]bool) []string 
 
 func readRustSuiteEstablishedGeneration(options RustSuiteOptions, toolchain ToolchainProjection) (rustSuiteBaselineGeneration, error) {
 	value, _, err := readRustSuiteBaselineFile(options.BaselineSelectionPath, options.Tag)
-	if err != nil || value.Established == nil || !validRustSuiteBaselineSelection(value.Established.Selection, options.Tag, toolchain) {
+	if err != nil || value.Established == nil || value.Established.Selection.CargoVersion != toolchain.CargoVersion || !validRustSuiteBaselineSelection(value.Established.Selection, options.Tag) {
 		return rustSuiteBaselineGeneration{}, rustSuitePreflightError{Diagnostics: []RustSuiteDiagnostic{{Field: "baseline-established", Expected: "one valid established generation for this tag", Actual: errors.Join(err, errors.New("generation differs")).Error()}}}
 	}
 	return *value.Established, nil
 }
 
-func validRustSuiteBaselineProposal(selection rustSuiteBaselineProposal, tag string, toolchain ToolchainProjection) bool {
-	return validRustSuiteBaselineCommon(selection.Tag, selection.ToolchainRoot, selection.CargoVersion, selection.ToolchainTarget, selection.CompileOnlyPackages, selection.HelperBinaries, selection.CoveredPackages, selection.ExecutionProfile, tag, toolchain)
-}
-
-func validRustSuiteBaselineSelection(selection rustSuiteBaselineInput, tag string, toolchain ToolchainProjection) bool {
-	if !validRustSuiteBaselineCommon(selection.Tag, selection.ToolchainRoot, selection.CargoVersion, selection.ToolchainTarget, selection.CompileOnlyPackages, selection.HelperBinaries, selection.CoveredPackages, selection.ExecutionProfile, tag, toolchain) || !validRustSuiteExpectations(selection.ExpectedFailures) || !validRustSuiteExpectations(selection.ExpectedTimeouts) {
+func validRustSuiteBaselineSelection(selection rustSuiteBaselineInput, tag string) bool {
+	if !validRustSuiteBaselineProposal(selection.rustSuiteBaselineProposal, tag) || !validRustSuiteExpectations(selection.ExpectedFailures) || !validRustSuiteExpectations(selection.ExpectedTimeouts) {
 		return false
 	}
 	covered := rustSuitePackageSet(selection.CoveredPackages)
@@ -1372,16 +1413,16 @@ func publishRustSuiteBaselineTiming(options RustSuiteOptions) error {
 	return publishRustSuiteBaselineFile(options.BaselineSelectionPath, options.Tag, rustSuiteBaselinePredecessor(options), preimage, value)
 }
 
-func validRustSuiteBaselineCommon(tag, root, cargoVersion, target string, compileOnly, helpers, coveredPackages []string, profile rustSuiteBaselineProfile, expectedTag string, toolchain ToolchainProjection) bool {
-	if profile.TestNetwork != "Shared" {
+func validRustSuiteBaselineProposal(selection rustSuiteBaselineProposal, expectedTag string) bool {
+	if selection.ExecutionProfile.TestNetwork != "Shared" {
 		return false
 	}
-	missing := compileOnly == nil || helpers == nil || coveredPackages == nil
-	if missing || tag != expectedTag || root != toolchain.Root || cargoVersion != toolchain.CargoVersion || target != toolchain.Target || !validRustSuitePackages(compileOnly) || !validRustSuitePackages(helpers) || !validRustSuitePackages(coveredPackages) || profile.NextestConcurrency <= 0 || !validRustSuiteTiming(profile) {
+	missing := selection.CompileOnlyPackages == nil || selection.HelperBinaries == nil || selection.CoveredPackages == nil
+	if missing || selection.Tag != expectedTag || selection.ToolchainRoot != nativeToolchainRoot || !validToolRelease(selection.CargoVersion) || selection.ToolchainTarget != nativeTarget || !validRustSuitePackages(selection.CompileOnlyPackages) || !validRustSuitePackages(selection.HelperBinaries) || !validRustSuitePackages(selection.CoveredPackages) || selection.ExecutionProfile.NextestConcurrency <= 0 || !validRustSuiteTiming(selection.ExecutionProfile) {
 		return false
 	}
-	covered, special := rustSuitePackageSet(coveredPackages), map[string]bool{}
-	for _, name := range append(append([]string{}, compileOnly...), helpers...) {
+	covered, special := rustSuitePackageSet(selection.CoveredPackages), map[string]bool{}
+	for _, name := range append(append([]string{}, selection.CompileOnlyPackages...), selection.HelperBinaries...) {
 		if special[name] || covered[name] {
 			return false
 		}
@@ -1402,6 +1443,10 @@ func validRustSuiteExpectations(expectations map[string][]string) bool {
 		}
 	}
 	return true
+}
+
+func validRustSuiteRequiredTests(tests []string) bool {
+	return sortedUniqueRustSuiteOutcomes(tests) && validRustSuiteExpectations(rustSuiteExpectationMap(tests))
 }
 
 func flattenRustSuiteExpectations(expectations map[string][]string) []string {
@@ -1458,6 +1503,9 @@ func establishZeroRustSuiteBaseline(options RustSuiteOptions) error {
 }
 
 func zeroRustSuiteBaseline(options RustSuiteOptions) (rustSuiteBaselineFile, error) {
+	if len(options.requiredTests) != 0 {
+		return rustSuiteBaselineFile{}, errors.New("required regression tests need nonempty baseline coverage")
+	}
 	if err := options.phase("Toolchain"); err != nil {
 		return rustSuiteBaselineFile{}, err
 	}
@@ -1480,16 +1528,21 @@ func zeroRustSuiteBaseline(options RustSuiteOptions) (rustSuiteBaselineFile, err
 	}
 	if value.Established != nil {
 		selection := value.Established.Selection
-		if !zeroRustSuiteProposal(selection.rustSuiteBaselineProposal) || !validRustSuiteBaselineSelection(selection, options.Tag, toolchain) {
+		if !zeroRustSuiteProposal(selection.rustSuiteBaselineProposal) || selection.CargoVersion != toolchain.CargoVersion || !validRustSuiteBaselineSelection(selection, options.Tag) {
 			return rustSuiteBaselineFile{}, errors.New("established zero baseline differs")
 		}
 		proposal = selection.rustSuiteBaselineProposal
 	} else if options.baselineProposal != nil {
-		if !zeroRustSuiteProposal(*options.baselineProposal) || !validRustSuiteBaselineProposal(*options.baselineProposal, options.Tag, toolchain) {
+		proposal = *options.baselineProposal
+		if !zeroRustSuiteProposal(proposal) || !validRustSuiteBaselineProposal(proposal, options.Tag) {
 			return rustSuiteBaselineFile{}, errors.New("inherited zero baseline proposal differs")
 		}
-		proposal = *options.baselineProposal
+		proposal.CargoVersion = toolchain.CargoVersion
 		proposal.ExecutionProfile.BaselineElapsedMilliseconds = nil
+	}
+	proposal.BugfixDiff, err = releaseBugfixDiff(options.Source, options.RuntimeTemporaryRoot, options.Tag, options.deadline())
+	if err != nil {
+		return rustSuiteBaselineFile{}, err
 	}
 	selection := rustSuiteBaselineInput{rustSuiteBaselineProposal: proposal, ExpectedFailures: map[string][]string{}, ExpectedTimeouts: map[string][]string{}}
 	return rustSuiteBaselineFile{Established: &rustSuiteBaselineGeneration{Selection: selection}}, nil
@@ -1548,6 +1601,7 @@ func rustSuiteCargoStage(scope string) string {
 }
 
 func rustSuiteCommand(plan RustSuitePlan) []string {
+	plan.BugfixDiff = ""
 	data, _ := core.CanonicalJSON(plan)
 	return []string{"/usr/bin/python3", "/runner/release-roll.py", "rust-suite-execute", "/workspace-lower", "/workspace", string(data)}
 }
@@ -1819,6 +1873,11 @@ func rustSuiteStageTerminal(plan RustSuitePlan, projection projectionResult, out
 		return "Stopped"
 	}
 	accepted := len(outcomes.Failures)+len(outcomes.Timeouts) <= rustSuiteBaselineOutcomeLimit
+	for _, identity := range plan.RequiredTests {
+		if sortedHas(outcomes.Failures, identity) || sortedHas(outcomes.Timeouts, identity) {
+			accepted = false
+		}
+	}
 	if plan.Scope != "baseline" {
 		accepted = accepted && subsetRustSuiteOutcomes(outcomes, rustSuiteOutcomes{Failures: plan.ExpectedFailures, Timeouts: plan.ExpectedTimeouts})
 	}
@@ -1864,6 +1923,7 @@ func rustSuitePlanDiagnostics(plan RustSuitePlan, scope, tag string, source sour
 	rustSuiteAppendDiagnostic(&diagnostics, "plan-type", "RustSuitePlanRecord", plan.RecordType, plan.RecordType == "RustSuitePlanRecord")
 	rustSuiteAppendDiagnostic(&diagnostics, "plan-scope", scope, plan.Scope, plan.Scope == scope)
 	rustSuiteAppendDiagnostic(&diagnostics, "plan-baseline-reanchor", "false outside baseline", fmt.Sprint(plan.BaselineReanchor), scope == "baseline" || !plan.BaselineReanchor)
+	rustSuiteAppendDiagnostic(&diagnostics, "plan-required-tests", "sorted unique baseline regression identities", strings.Join(plan.RequiredTests, ","), validRustSuiteRequiredTests(plan.RequiredTests) && (scope == "baseline" || len(plan.RequiredTests) == 0))
 	rustSuiteAppendDiagnostic(&diagnostics, "plan-tag", tag, plan.Tag, plan.Tag == tag)
 	role := "ExplicitProductWorktree"
 	if scope == "baseline" {

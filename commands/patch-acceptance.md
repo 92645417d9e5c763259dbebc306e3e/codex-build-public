@@ -3,16 +3,16 @@
 ## Inputs
 
 - Consume ReleaseRollForward's OriginalPatchPurposeOwner decision before any transport or source acceptance.
-- Read the complete selected Unit or Flat Patch, native owners and affected consumers, retained frontiers, Established policy and ToolchainTarget, and applicable notes in root-then-lane order.
+- Read the complete selected Unit or Flat Patch, native owners and affected consumers, retained frontiers, Established policy and ToolchainTarget, and current and applicable source version-root notes.
 - Use first-commit contracts and direct prerequisite contracts as source locators, subject to that authority-first decision.
 - Historical exports remain read-only purpose evidence and unchanged transport input.
-- Authored Rust source consumes the installed lang skill's [Rust language owner](/codex/skills/lang/references/rust.md) and its `PurposeBoundRustChange`.
+- Authored Rust source consumes the installed rust skill's [construction owner](/codex/skills/rust/references/rust.md) and its `PurposeBoundRustChange`.
 
 ## Semantic Acceptance
 
 - The product agent performs cumulative source acceptance synchronously in the linear Roll.
 - Before dependent edits, resolve the complete assignment and Rust construction, including effective-configuration coverage for every requested entrypoint.
-- Before publication or post-check continuation, compare the cumulative responsibility with its native base through lang's [Rust Semantic review](/codex/skills/lang/references/rust/post-green-review.md).
+- Before publication or post-check continuation, compare the cumulative responsibility with its native base through rust's [Semantic review](/codex/skills/rust/references/rust/post-green-review.md).
 - Include temporary Main corrections and all Child Patches, not only the latest hunk or selected tests.
 - For each approved effect, locate the actual producer, consumer, lifecycle, failure and cleanup implementation.
 - Check that native-supplied behavior has not been claimed as a private dependency or duplicated by the candidate.
@@ -109,6 +109,8 @@ EstablishedTargetAcceptanceOwner
 
 - Complete direct semantic review and assigned behavior before TaskWorkspace reduction and the next selection.
 - A discovered material defect returns to its actual Unit or Flat Patch through the existing Current revision or earlier-Unit Fork route.
+- Private-combination defects remain in their corresponding original Units; discovery timing cannot justify a new integration owner.
+- A demonstrated standalone upstream defect consumes ReleaseRollForward's shared bugfix source change, including affected baseline measurement and passing regression evidence before comparison reuse.
 - Preserve actual later source, conflicts, unfinished behavior, retained parents, and declared suffix rather than restoring saved task text or relabeling work.
 - If a defect cannot be consumed yet, retain only its unresolved cause and successor in the existing task.
 - Do not create a review task, finding registry, placeholder commit, stash, or alternate recovery topology.

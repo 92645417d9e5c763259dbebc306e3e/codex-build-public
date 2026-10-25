@@ -1,0 +1,405 @@
+fit-session-primary-column-to-content
+
+Lane: mixed
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: fit-session-primary-column-to-content
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -2371,6 +2371,8 @@ impl PickerState {
+     }
+ 
+     fn rendered_height_between(&self, start: usize, end_inclusive: usize) -> usize {
++        let width = self.view_width.unwrap_or(u16::MAX);
++        let primary_width = dense_primary_width(self, width);
+         self.filtered_rows
+             .get(start..=end_inclusive)
+             .unwrap_or_default()
+@@ -2393,7 +2395,8 @@ impl PickerState {
+                     is_selected,
+                     is_expanded,
+                     /*is_zebra*/ false,
+-                    self.view_width.unwrap_or(u16::MAX),
++                    width,
++                    primary_width,
+                 )
+                 .len()
+                     + separator_height
+@@ -2414,6 +2417,8 @@ impl PickerState {
+         }
+         let capacity = self.available_content_rows(viewport_height);
+         let mut used = 0usize;
++        let width = self.view_width.unwrap_or(u16::MAX);
++        let primary_width = dense_primary_width(self, width);
+         for (offset, row) in self.filtered_rows[self.scroll_top..].iter().enumerate() {
+             let row_idx = self.scroll_top + offset;
+             let is_selected = row_idx == self.selected;
+@@ -2425,7 +2430,8 @@ impl PickerState {
+                 is_selected,
+                 is_expanded,
+                 /*is_zebra*/ false,
+-                self.view_width.unwrap_or(u16::MAX),
++                width,
++                primary_width,
+             )
+             .len();
+             let separator_height = if offset > 0 {
+@@ -3326,6 +3332,7 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+ 
+     let start = state.scroll_top.min(rows.len().saturating_sub(1));
+     let mut y = content_area.y;
++    let primary_width = dense_primary_width(state, area.width);
+     for (idx, row) in rows[start..].iter().enumerate() {
+         if y >= content_area.y.saturating_add(content_area.height) {
+             break;
+@@ -3338,8 +3345,15 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+         let is_expanded =
+             is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
+         let is_zebra = row_idx.is_multiple_of(2);
+-        for line in render_session_lines(row, state, is_selected, is_expanded, is_zebra, area.width)
+-        {
++        for line in render_session_lines(
++            row,
++            state,
++            is_selected,
++            is_expanded,
++            is_zebra,
++            area.width,
++            primary_width,
++        ) {
+             if y >= content_area.y.saturating_add(content_area.height) {
+                 break;
+             }
+@@ -3393,14 +3407,21 @@ fn render_session_lines(
+     is_expanded: bool,
+     is_zebra: bool,
+     width: u16,
++    primary_width: usize,
+ ) -> Vec<Line<'static>> {
+     match state.density {
+         SessionListDensity::Comfortable => {
+             render_comfortable_session_lines(row, state, is_selected, is_expanded, is_zebra, width)
+         }
+-        SessionListDensity::Dense => {
+-            render_dense_session_lines(row, state, is_selected, is_expanded, is_zebra, width)
+-        }
++        SessionListDensity::Dense => render_dense_session_lines(
++            row,
++            state,
++            is_selected,
++            is_expanded,
++            is_zebra,
++            width,
++            primary_width,
++        ),
+     }
+ }
+ 
+@@ -3441,12 +3462,14 @@ fn render_comfortable_session_lines(
+         .cwd
+         .as_ref()
+         .map(|path| format_directory_display(path, /*max_width*/ None));
+-    let show_cwd = state.filter_mode == SessionFilterMode::All
+-        || row
+-            .cwd
+-            .as_deref()
+-            .zip(state.local_filter_cwd.as_deref())
+-            .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd));
++    let show_cwd = (state.filter_mode != SessionFilterMode::Other
++        || matches!(state.sort_key, PickerSortKey::MessageCount(_)))
++        && (state.filter_mode != SessionFilterMode::Cwd
++            || row
++                .cwd
++                .as_deref()
++                .zip(state.local_filter_cwd.as_deref())
++                .is_some_and(|(row_cwd, filter_cwd)| !paths_match(row_cwd, filter_cwd)));
+     let footer_lines = render_footer_lines(&primary, branch, cwd.as_deref(), show_cwd, width);
+     lines.extend(apply_session_row_background(footer_lines, row_style, width));
+     lines
+@@ -3496,12 +3519,14 @@ fn render_dense_session_lines(
+     is_expanded: bool,
+     is_zebra: bool,
+     width: u16,
++    primary_width: usize,
+ ) -> Vec<Line<'static>> {
+     let marker = selection_marker(is_selected, is_expanded);
+     let primary = row_primary_value(row, state);
+     let mut lines = vec![dense_summary_line(DenseSummaryInput {
+         marker,
+         primary: &primary,
++        primary_width,
+         title: row.display_preview(),
+         thread_id: row.thread_id,
+         use_theme_colors: state.use_theme_colors,
+@@ -3520,6 +3545,7 @@ struct DenseSummaryInput<'a> {
+     use_theme_colors: bool,
+     marker: Span<'static>,
+     primary: &'a str,
++    primary_width: usize,
+     title: &'a str,
+     is_selected: bool,
+     is_zebra: bool,
+@@ -3529,7 +3555,7 @@ struct DenseSummaryInput<'a> {
+ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+     let marker_width = input.marker.width();
+     let available = (input.width as usize).saturating_sub(marker_width);
+-    let columns = dense_columns(available);
++    let columns = dense_columns(available, input.primary_width);
+     let title = session_title_span(
+         dense_column_text(input.title, columns.title_width),
+         input.thread_id,
+@@ -3558,14 +3584,30 @@ struct DenseColumns {
+     title_width: usize,
+ }
+ 
+-fn dense_columns(width: usize) -> DenseColumns {
+-    let date_width = SESSION_META_DATE_WIDTH;
++fn dense_columns(width: usize, primary_width: usize) -> DenseColumns {
++    let date_width = primary_width.min(width);
+     DenseColumns {
+         date_width,
+         title_width: width.saturating_sub(date_width),
+     }
+ }
+ 
++fn dense_primary_width(state: &PickerState, width: u16) -> usize {
++    let available = usize::from(width).saturating_sub(2);
++    let mut primary = SESSION_META_DATE_WIDTH;
++    let mut title = 0;
++    for row in state
++        .filtered_rows
++        .iter()
++        .skip(state.scroll_top)
++        .take(state.view_rows.unwrap_or(state.filtered_rows.len()))
++    {
++        primary = primary.max(crate::width::display_width(&row_primary_value(row, state)) + 1);
++        title = title.max(crate::width::display_width(row.display_preview()) + 1);
++    }
++    primary.min(available.saturating_sub(title.min(available / 2)))
++}
++
+ fn dense_zebra_style() -> Style {
+     dense_row_background_style(/*selected*/ false)
+ }
+@@ -3587,8 +3629,18 @@ fn dense_row_background_style(selected: bool) -> Style {
+ }
+ 
+ fn dense_column_text(text: &str, width: usize) -> String {
+-    let text = truncate_text(text, width.saturating_sub(1));
+-    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
++    let content_width = width.saturating_sub(1);
++    let text = if crate::width::display_width(text) > content_width {
++        let ellipsis = if content_width >= 3 { "..." } else { "" };
++        let line = crate::line_truncation::truncate_line_to_width(
++            Line::from(text.to_owned()),
++            content_width.saturating_sub(ellipsis.len()),
++        );
++        format!("{line}{ellipsis}")
++    } else {
++        text.to_owned()
++    };
++    let padding = width.saturating_sub(crate::width::display_width(&text));
+     format!("{text}{}", " ".repeat(padding))
+ }
+ 
+@@ -3619,6 +3671,15 @@ fn session_title_span(
+ }
+ 
+ fn row_primary_value(row: &Row, state: &PickerState) -> String {
++    if state.filter_mode == SessionFilterMode::Other
++        && !matches!(state.sort_key, PickerSortKey::MessageCount(_))
++    {
++        return row
++            .cwd
++            .as_deref()
++            .map(|path| format_directory_display(path, /*max_width*/ None))
++            .unwrap_or_default();
++    }
+     let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
+     match &state.sort_key {
+         PickerSortKey::CreatedAt => format_relative_time(reference, row.created_at),
+@@ -6547,6 +6608,41 @@ session_picker_view = "dense"
+         );
+     }
+ 
++    #[test]
++    fn dense_other_column_uses_available_width_and_keeps_titles_aligned() {
++        let (mut state, _) = test_picker();
++        state.filter_mode = SessionFilterMode::Other;
++        state.density = SessionListDensity::Dense;
++        for (directory, title) in [
++            ("/projects/long-workspace", "one"),
++            ("/projects/开发/tooling", "two"),
++            ("/projects/ｶﾞ-tooling", "three"),
++        ] {
++            let mut row = test_row(ThreadId::new());
++            row.cwd = Some(PathBuf::from(directory));
++            row.thread_name = Some(title.into());
++            state.filtered_rows.push(row);
++        }
++        state.view_rows = Some(3);
++        for width in [60, 24] {
++            let primary_width = dense_primary_width(&state, width);
++            for row in &state.filtered_rows {
++                let lines =
++                    render_session_lines(row, &state, false, false, false, width, primary_width);
++                let rendered = lines[0].to_string();
++                let title_start = rendered.find(row.display_preview()).unwrap();
++                assert_eq!(
++                    crate::width::display_width(&rendered[..title_start]),
++                    2 + primary_width,
++                );
++                assert!(lines[0].width() <= usize::from(width));
++                if width == 60 {
++                    assert!(rendered.contains(row.cwd.as_ref().unwrap().to_str().unwrap()));
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn dense_session_line_prefers_thread_name_over_preview() {
+         let mut row = dense_snapshot_row();
+@@ -6567,8 +6663,13 @@ session_picker_view = "dense"
+             Some(parse_timestamp_str("2026-04-28T18:00:00Z").expect("timestamp"));
+ 
+         let rendered = render_dense_session_lines(
+-            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
+-            /*is_zebra*/ false, /*width*/ 100,
++            &row,
++            &state,
++            /*is_selected*/ false,
++            /*is_expanded*/ false,
++            /*is_zebra*/ false,
++            /*width*/ 100,
++            dense_primary_width(&state, 100),
+         )
+         .into_iter()
+         .map(|line| line.to_string())
+@@ -6584,6 +6685,7 @@ session_picker_view = "dense"
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
+             primary: "15m ago",
++            primary_width: SESSION_META_DATE_WIDTH,
+             title: "Selected dense row",
+             thread_id: None,
+             use_theme_colors: true,
+@@ -6602,6 +6704,7 @@ session_picker_view = "dense"
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
+             primary: "15m ago",
++            primary_width: SESSION_META_DATE_WIDTH,
+             title: "Zebra dense row",
+             thread_id: None,
+             use_theme_colors: true,
+diff --git a/codex-rs/tui/src/resume_picker/message_count_tests.rs b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+--- a/codex-rs/tui/src/resume_picker/message_count_tests.rs
++++ b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+@@ -184,7 +184,8 @@ async fn pending_and_completed_counts_replace_time_without_changing_titles_in_ei
+     state.sort_key = PickerSortKey::CreatedAt;
+     state.cycle_sort_key(/*forward*/ true);
+     let (token, _counts, _cancellation) = take_counts(&requests);
+-    let session = row("keep this title", "2026-10-16T00:00:00Z");
++    let mut session = row("keep this title", "2026-10-16T00:00:00Z");
++    session.cwd = Some(PathBuf::from("/projects/other-session"));
+     let failed = row("failed session", "2026-10-15T00:00:00Z");
+     state.relative_time_reference = Some(parse_timestamp_str("2026-10-17T00:00:00Z").unwrap());
+     deliver(
+@@ -195,13 +196,27 @@ async fn pending_and_completed_counts_replace_time_without_changing_titles_in_ei
+     )
+     .await;
+     let render = |state: &PickerState, expanded| {
+-        render_session_lines(&session, state, false, expanded, false, 120)
+-            .into_iter()
+-            .map(|line| line.to_string())
+-            .collect::<Vec<_>>()
+-            .join("\n")
++        render_session_lines(
++            &session,
++            state,
++            false,
++            expanded,
++            false,
++            120,
++            dense_primary_width(state, 120),
++        )
++        .into_iter()
++        .map(|line| line.to_string())
++        .collect::<Vec<_>>()
++        .join("\n")
+     };
+-    for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
++    for (filter, density) in [
++        (SessionFilterMode::All, SessionListDensity::Dense),
++        (SessionFilterMode::All, SessionListDensity::Comfortable),
++        (SessionFilterMode::Other, SessionListDensity::Dense),
++        (SessionFilterMode::Other, SessionListDensity::Comfortable),
++    ] {
++        state.filter_mode = filter;
+         state.density = density;
+         let pending = render(&state, false);
+         assert!(pending.contains("keep this title"));
+@@ -223,9 +238,16 @@ async fn pending_and_completed_counts_replace_time_without_changing_titles_in_ei
+     }
+     state.message_count_finished(token, session.thread_id.unwrap(), Ok(133));
+     assert_eq!(row_primary_value(&session, &state), "133");
+-    for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
++    for (filter, density) in [
++        (SessionFilterMode::All, SessionListDensity::Dense),
++        (SessionFilterMode::All, SessionListDensity::Comfortable),
++        (SessionFilterMode::Other, SessionListDensity::Dense),
++        (SessionFilterMode::Other, SessionListDensity::Comfortable),
++    ] {
++        state.filter_mode = filter;
+         state.density = density;
+         let completed = render(&state, false);
++        assert_eq!(row_primary_value(&session, &state), "133");
+         assert!(completed.contains("133"));
+         assert!(completed.contains("keep this title"));
+         assert!(!completed.contains("ago"));
+@@ -244,6 +266,7 @@ async fn pending_and_completed_counts_replace_time_without_changing_titles_in_ei
+             .contains("history unavailable")
+     );
+     state.sort_key = PickerSortKey::UpdatedAt;
++    state.filter_mode = SessionFilterMode::All;
+     for density in [SessionListDensity::Dense, SessionListDensity::Comfortable] {
+         state.density = density;
+         let timed = render(&state, false);
+diff --git a/codex-rs/tui/src/resume_picker_color_tests.rs b/codex-rs/tui/src/resume_picker_color_tests.rs
+--- a/codex-rs/tui/src/resume_picker_color_tests.rs
++++ b/codex-rs/tui/src/resume_picker_color_tests.rs
+@@ -41,8 +41,13 @@ fn thread_colors_and_selection_contrast_in_both_picker_layouts() {
+                 state.use_theme_colors = use_colors;
+                 for (selected, zebra) in [(true, false), (false, false), (false, true)] {
+                     let lines = render_session_lines(
+-                        &row, &state, selected, /*is_expanded*/ false, zebra,
++                        &row,
++                        &state,
++                        selected,
++                        /*is_expanded*/ false,
++                        zebra,
+                         /*width*/ 40,
++                        dense_primary_width(&state, 40),
+                     );
+                     let area = Rect::new(
+                         /*x*/ 0,
+diff --git a/docs/resume-session-actions.md b/docs/resume-session-actions.md
+--- a/docs/resume-session-actions.md
++++ b/docs/resume-session-actions.md
+@@ -6,6 +6,8 @@
+ - The same directional navigation applies to the `Updated`, `Created`, `Messages` sorting choices.
+ - `Other` lists sessions outside the existing `Cwd` scope, within the selected active or archived status and provider.
+ - Local linked worktrees with the same repository-relative cwd stay in the `Cwd` scope and are excluded from `Other`.
++- `Other` displays the session directory in the first field unless `Messages` sorting takes precedence.
++- Dense rows share a content-sized first column that uses available space before truncating paths and keeps titles aligned.
+ - Directory exclusion is applied by the app-server before pagination.
+ - Remote paths are resolved by that server, not the client's filesystem.
+ - Search, sorting and profile actions keep the selected scope.

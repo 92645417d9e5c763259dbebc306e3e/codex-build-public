@@ -54,10 +54,19 @@ func RunCLI(arguments []string, stdout, stderr io.Writer) int {
 func runRelease(arguments []string, command, route string, invoke func(ReleaseBaselineOptions) (ReleaseRouteResult, error), stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	if len(arguments) == 1 && arguments[0] == "--help" {
+		flags.SetOutput(stdout)
+	}
 	options := ReleaseBaselineOptions{}
 	bindPublicRoots(flags, &options.endpointOptions, &options.WorkingRoot, &options.ScratchRoot, &options.RuntimeRoot, &options.RecordRoot)
 	flags.StringVar(&options.Tag, "tag", "", "")
-	if parsePublicFlags(flags, arguments) != nil || flags.NArg() != 0 {
+	if command == "release-baseline" {
+		flags.BoolVar(&options.Prepare, "prepare", false, "prepare the shared bugfix source without measuring coverage")
+		flags.Var((*repeatedStrings)(&options.RequiredTests), "required-test", "package-qualified regression identity that must pass; repeat in sorted order")
+	}
+	if err := parsePublicFlags(flags, arguments); errors.Is(err, flag.ErrHelp) {
+		return 0
+	} else if err != nil || flags.NArg() != 0 {
 		return 2
 	}
 	return runReleaseOperation(&options, route, command, func() (ReleaseRouteResult, error) { return invoke(options) }, stdout, stderr)
@@ -66,16 +75,23 @@ func runRelease(arguments []string, command, route string, invoke func(ReleaseBa
 func runBaselineCoverage(arguments []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("baseline-coverage", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	if len(arguments) == 1 && arguments[0] == "--help" {
+		flags.SetOutput(stdout)
+	}
 	options := BaselineCoverageOptions{Proposal: rustSuiteBaselineProposal{CompileOnlyPackages: []string{}, CoveredPackages: []string{}, HelperBinaries: []string{}}}
 	bindPublicRoots(flags, &options.endpointOptions, &options.WorkingRoot, &options.ScratchRoot, &options.RuntimeRoot, &options.RecordRoot)
 	flags.StringVar(&options.Tag, "tag", "", "")
 	flags.StringVar(&options.Unit, "unit", "", "")
 	flags.StringVar(&options.FlatPatch, "flat-patch", "", "")
 	flags.BoolVar(&options.Align, "align", false, "")
+	flags.Var((*repeatedStrings)(&options.AffectedPackages), "affected-package", "package affected by a changed shared bugfix source; repeat in sorted order")
+	flags.Var((*repeatedStrings)(&options.RequiredTests), "required-test", "package-qualified regression identity that must pass; repeat in sorted order")
 	flags.Var((*repeatedStrings)(&options.Proposal.CompileOnlyPackages), "compile-only-package", "")
 	flags.Var((*repeatedStrings)(&options.Proposal.HelperBinaries), "helper-binary", "")
 	flags.Var((*repeatedStrings)(&options.Proposal.CoveredPackages), "covered-package", "")
-	if parsePublicFlags(flags, arguments) != nil || flags.NArg() != 0 {
+	if err := parsePublicFlags(flags, arguments); errors.Is(err, flag.ErrHelp) {
+		return 0
+	} else if err != nil || flags.NArg() != 0 {
 		return 2
 	}
 	return runReleaseOperation(&options.ReleaseBaselineOptions, "RollCoverage", "baseline-coverage", func() (ReleaseRouteResult, error) { return RunBaselineCoverage(options) }, stdout, stderr)
@@ -397,7 +413,8 @@ func runRepositoryFormat(arguments []string, stdout, stderr io.Writer) int {
 	}
 	defer releaseController()
 	options.Cancellation = cancellation
-	newWaitNotice(stderr, "repository-format")
+	notice := newWaitNotice(stderr, "repository-format")
+	options.OnPhase = notice.Phase
 	result, err = RunRepositoryFormat(options)
 	return writeResult(result, result.Terminal, err, stdout, stderr)
 }

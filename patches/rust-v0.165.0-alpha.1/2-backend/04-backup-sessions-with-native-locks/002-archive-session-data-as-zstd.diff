@@ -1,0 +1,538 @@
+archive-session-data-as-zstd
+
+Lane: backend
+
+Unit: backup-sessions-with-native-locks
+
+ChildPatch: archive-session-data-as-zstd
+
+Form: GitDiff
+
+Segment: none
+
+
+diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
+--- a/codex-rs/cli/Cargo.toml
++++ b/codex-rs/cli/Cargo.toml
+@@ -96,6 +96,7 @@ serde_json = { workspace = true }
+ sqlx = { workspace = true }
+ supports-color = { workspace = true }
+ sys-locale = { workspace = true }
++tar = { workspace = true }
+ tempfile = { workspace = true }
+ tokio = { workspace = true, features = [
+     "io-std",
+@@ -113,6 +114,7 @@ tracing-subscriber = { workspace = true }
+ unicode-segmentation = { workspace = true }
+ url = { workspace = true }
+ which = { workspace = true }
++zstd = { workspace = true }
+ 
+ [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ tikv-jemallocator = { workspace = true }
+@@ -141,11 +143,9 @@ jsonwebtoken = { workspace = true }
+ predicates = { workspace = true }
+ pretty_assertions = { workspace = true }
+ sha2 = { workspace = true }
+-tar = { workspace = true }
+ tokio-tungstenite = { workspace = true }
+ vt100 = { workspace = true }
+ wiremock = { workspace = true }
+-zstd = { workspace = true }
+ 
+ [package.metadata.cargo-shear]
+ # These Rust sources are intentionally Bazel-only macrobenchmarks rather than
+diff --git a/codex-rs/cli/src/backup_sessions.rs b/codex-rs/cli/src/backup_sessions.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/cli/src/backup_sessions.rs
+@@ -0,0 +1,203 @@
++use std::fs;
++use std::fs::File;
++use std::io;
++use std::io::Seek;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++
++use anyhow::Context;
++use clap::Parser;
++use codex_core::config::ConfigBuilder;
++use codex_utils_cli::CliConfigOverrides;
++
++const DIRECTORIES: [&str; 2] = ["archived_sessions", "sessions"];
++const INDEX: &str = "session_index.jsonl";
++
++#[derive(Debug, Parser)]
++pub(crate) struct BackupSessionsCommand {
++    /// New zstd-compressed tar archive in an existing directory. Never overwritten.
++    #[arg(value_name = "OUTPUT.tar.zst")]
++    output: PathBuf,
++}
++
++pub(crate) async fn run(
++    command: BackupSessionsCommand,
++    config_overrides: CliConfigOverrides,
++) -> anyhow::Result<()> {
++    let config = ConfigBuilder::default()
++        .cli_overrides(
++            config_overrides
++                .parse_overrides()
++                .map_err(anyhow::Error::msg)?,
++        )
++        .build()
++        .await?;
++    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
++    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
++    let cancelled = Arc::new(AtomicBool::new(false));
++    let worker_cancelled = Arc::clone(&cancelled);
++    // The worker owns both the locks and staging file, even if its async waiter is dropped.
++    let mut worker = tokio::task::spawn_blocking(move || {
++        create_backup(
++            &config.codex_home,
++            &config.codex_harness,
++            &command.output,
++            &worker_cancelled,
++        )
++    });
++    let result = tokio::select! {
++        result = &mut worker => result,
++        _ = interrupt.recv() => {
++            cancelled.store(true, Ordering::Relaxed);
++            worker.await
++        }
++        _ = terminate.recv() => {
++            cancelled.store(true, Ordering::Relaxed);
++            worker.await
++        }
++    };
++    let output = result.context("session backup worker failed")??;
++    println!("Backup completed: {}", output.display());
++    Ok(())
++}
++
++fn create_backup(
++    home: &Path,
++    harness: &Path,
++    output: &Path,
++    cancelled: &AtomicBool,
++) -> anyhow::Result<PathBuf> {
++    let parent = output
++        .parent()
++        .filter(|parent| !parent.as_os_str().is_empty())
++        .unwrap_or_else(|| Path::new("."))
++        .canonicalize()
++        .context("backup destination directory is unavailable")?;
++    let filename = output
++        .file_name()
++        .context("backup output needs a filename")?;
++    let output = parent.join(filename);
++    match output.symlink_metadata() {
++        Ok(_) => anyhow::bail!(
++            "refusing to overwrite an existing backup: {}",
++            output.display()
++        ),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++        Err(error) => return Err(error.into()),
++    }
++    check_sources(home)?;
++    let _locks = codex_rollout::try_acquire_session_backup_lock(home, harness)
++        .context("session backup requires all native session-data locks to be idle")?;
++    // Acquisition may span many files. Recheck every source only after the full lock set is held.
++    check_sources(home)?;
++    for directory in DIRECTORIES {
++        let source = home.join(directory);
++        if !source.symlink_metadata()?.file_type().is_symlink()
++            && parent.starts_with(source.canonicalize()?)
++        {
++            anyhow::bail!("backup output cannot be inside {directory}");
++        }
++    }
++    ensure_running(cancelled)?;
++    let mut staged = tempfile::Builder::new()
++        .prefix(".codex-sessions-backup-")
++        .tempfile_in(parent)?;
++    if let Err(error) = write_archive(home, staged.as_file_mut(), cancelled) {
++        staged
++            .close()
++            .with_context(|| format!("backup failed ({error}); staging cleanup failed"))?;
++        return Err(error.into());
++    }
++    match staged.persist_noclobber(&output) {
++        Ok(_) => Ok(output),
++        Err(error) => {
++            let publication_error = error.error;
++            error.file.close().with_context(|| {
++                format!("backup publication failed ({publication_error}); staging cleanup failed")
++            })?;
++            Err(publication_error).context("failed to publish backup without overwriting")
++        }
++    }
++}
++
++fn check_sources(home: &Path) -> anyhow::Result<()> {
++    for directory in DIRECTORIES {
++        let path = home.join(directory);
++        anyhow::ensure!(
++            path.metadata()?.is_dir(),
++            "source is not a directory: {}",
++            path.display()
++        );
++    }
++    let index = home.join(INDEX);
++    anyhow::ensure!(
++        index.metadata()?.is_file(),
++        "source index is not a file: {}",
++        index.display()
++    );
++    Ok(())
++}
++
++fn write_archive(home: &Path, file: &mut File, cancelled: &AtomicBool) -> io::Result<()> {
++    let mut encoder = zstd::stream::write::Encoder::new(&mut *file, 0)?;
++    encoder.include_checksum(true)?;
++    let mut archive = tar::Builder::new(CancellableWriter {
++        inner: encoder,
++        cancelled,
++    });
++    archive.follow_symlinks(false);
++    for directory in DIRECTORIES {
++        let source = home.join(directory);
++        if source.symlink_metadata()?.file_type().is_symlink() {
++            archive.append_path_with_name(source, directory)?;
++        } else {
++            archive.append_dir_all(directory, source)?;
++        }
++    }
++    archive.append_path_with_name(home.join(INDEX), INDEX)?;
++    archive.into_inner()?.inner.finish()?;
++    file.rewind()?;
++    let mut decoder = zstd::stream::read::Decoder::new(&mut *file)?;
++    io::copy(
++        &mut decoder,
++        &mut CancellableWriter {
++            inner: io::sink(),
++            cancelled,
++        },
++    )?;
++    ensure_running(cancelled)
++}
++
++fn ensure_running(cancelled: &AtomicBool) -> io::Result<()> {
++    if cancelled.load(Ordering::Relaxed) {
++        // Write::write_all and io::copy retry Interrupted, so cancellation must be terminal.
++        Err(io::Error::other("session backup cancelled"))
++    } else {
++        Ok(())
++    }
++}
++
++struct CancellableWriter<'a, W> {
++    inner: W,
++    cancelled: &'a AtomicBool,
++}
++
++impl<W: Write> Write for CancellableWriter<'_, W> {
++    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
++        ensure_running(self.cancelled)?;
++        self.inner.write(buffer)
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        ensure_running(self.cancelled)?;
++        self.inner.flush()
++    }
++}
++
++#[cfg(test)]
++#[path = "backup_sessions_tests.rs"]
++mod tests;
+diff --git a/codex-rs/cli/src/backup_sessions_tests.rs b/codex-rs/cli/src/backup_sessions_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/cli/src/backup_sessions_tests.rs
+@@ -0,0 +1,237 @@
++use std::collections::BTreeMap;
++use std::io::Read;
++use std::os::unix::fs::symlink;
++use std::os::unix::net::UnixListener;
++
++use clap::Parser;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++use super::*;
++
++fn fixture() -> (TempDir, TempDir, TempDir) {
++    let home = TempDir::new().unwrap();
++    let harness = TempDir::new().unwrap();
++    let destination = TempDir::new().unwrap();
++    for directory in DIRECTORIES {
++        fs::create_dir(home.path().join(directory)).unwrap();
++    }
++    fs::write(home.path().join("sessions/active.jsonl"), b"active\n").unwrap();
++    fs::write(
++        home.path().join("archived_sessions/archive.jsonl.zst"),
++        b"stored compressed bytes",
++    )
++    .unwrap();
++    fs::write(home.path().join(INDEX), b"names\n").unwrap();
++    fs::write(home.path().join("state.sqlite"), b"not a backup member").unwrap();
++    (home, harness, destination)
++}
++
++fn assert_destination_empty(destination: &Path) {
++    assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
++}
++
++#[test]
++fn backup_command_is_discoverable_and_requires_an_output() {
++    use clap::CommandFactory;
++    let parsed =
++        crate::MultitoolCli::try_parse_from(["codex", "backup-sessions", "sessions.tar.zst"])
++            .unwrap();
++    let Some(crate::Subcommand::BackupSessions(command)) = parsed.subcommand else {
++        panic!("expected standalone backup command");
++    };
++    assert_eq!(command.output, PathBuf::from("sessions.tar.zst"));
++    assert!(crate::MultitoolCli::try_parse_from(["codex", "backup-sessions"]).is_err());
++    assert!(
++        crate::MultitoolCli::command()
++            .render_long_help()
++            .to_string()
++            .contains("backup-sessions")
++    );
++    assert!(
++        crate::reject_root_strict_config_for_subcommand(
++            true,
++            &Some(crate::Subcommand::BackupSessions(command))
++        )
++        .is_err()
++    );
++    assert!(
++        crate::reject_remote_mode_for_subcommand(Some("unix:///remote"), None, "backup-sessions")
++            .is_err()
++    );
++}
++
++#[test]
++fn backup_roundtrips_exact_sources_and_preserves_symlinks() {
++    let (home, harness, destination) = fixture();
++    let outside = TempDir::new().unwrap();
++    fs::write(outside.path().join("private"), b"outside").unwrap();
++    symlink(outside.path(), home.path().join("sessions/link")).unwrap();
++    let output = destination.path().join("snapshot.tar.zst");
++    let result = create_backup(
++        home.path(),
++        harness.path(),
++        &output,
++        &AtomicBool::new(false),
++    )
++    .unwrap();
++    assert_eq!(result, output);
++    let decoder = zstd::stream::read::Decoder::new(File::open(&output).unwrap()).unwrap();
++    let mut archive = tar::Archive::new(decoder);
++    let mut files = BTreeMap::new();
++    let mut roots = std::collections::BTreeSet::new();
++    let mut saw_link = false;
++    for entry in archive.entries().unwrap() {
++        let mut entry = entry.unwrap();
++        let path = entry.path().unwrap().into_owned();
++        roots.insert(path.components().next().unwrap().as_os_str().to_owned());
++        if entry.header().entry_type().is_symlink() {
++            assert_eq!(path, Path::new("sessions/link"));
++            assert_eq!(
++                entry.link_name().unwrap().unwrap().into_owned(),
++                outside.path()
++            );
++            saw_link = true;
++        } else if entry.header().entry_type().is_file() {
++            let mut contents = Vec::new();
++            entry.read_to_end(&mut contents).unwrap();
++            files.insert(path, contents);
++        }
++    }
++    assert!(saw_link);
++    assert_eq!(
++        roots,
++        ["archived_sessions", "sessions", INDEX]
++            .map(std::ffi::OsString::from)
++            .into()
++    );
++    assert_eq!(
++        files,
++        BTreeMap::from([
++            (PathBuf::from("sessions/active.jsonl"), b"active\n".to_vec()),
++            (
++                PathBuf::from("archived_sessions/archive.jsonl.zst"),
++                b"stored compressed bytes".to_vec()
++            ),
++            (PathBuf::from(INDEX), b"names\n".to_vec()),
++        ])
++    );
++    assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 1);
++    drop(codex_rollout::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++}
++
++#[test]
++fn busy_native_lock_prevents_archive_creation() {
++    let (home, harness, destination) = fixture();
++    let coordinator = Arc::new(codex_rollout::WriterLockCoordinator::new(harness.path()));
++    let writer = coordinator
++        .acquire(codex_protocol::ThreadId::default())
++        .unwrap();
++    let error = create_backup(
++        home.path(),
++        harness.path(),
++        &destination.path().join("backup.tar.zst"),
++        &AtomicBool::new(false),
++    )
++    .unwrap_err();
++    assert!(format!("{error:#}").contains("active thread writer"));
++    assert_destination_empty(destination.path());
++    drop(writer);
++    drop(codex_rollout::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++}
++
++#[test]
++fn backup_preserves_existing_output_and_rejects_recursive_destination() {
++    let (home, harness, destination) = fixture();
++    let output = destination.path().join("existing.tar.zst");
++    fs::write(&output, b"existing archive").unwrap();
++    assert!(
++        create_backup(
++            home.path(),
++            harness.path(),
++            &output,
++            &AtomicBool::new(false)
++        )
++        .is_err()
++    );
++    assert_eq!(fs::read(&output).unwrap(), b"existing archive");
++    let linked_output = destination.path().join("existing-link.tar.zst");
++    symlink(&output, &linked_output).unwrap();
++    assert!(
++        create_backup(
++            home.path(),
++            harness.path(),
++            &linked_output,
++            &AtomicBool::new(false)
++        )
++        .is_err()
++    );
++    let recursive = home.path().join("sessions/backup.tar.zst");
++    assert!(
++        create_backup(
++            home.path(),
++            harness.path(),
++            &recursive,
++            &AtomicBool::new(false)
++        )
++        .is_err()
++    );
++    assert!(!recursive.exists());
++    drop(codex_rollout::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++}
++
++#[test]
++fn missing_sources_and_archive_failure_leave_no_output_or_locks() {
++    let (home, harness, destination) = fixture();
++    let output = destination.path().join("backup.tar.zst");
++    fs::remove_file(home.path().join(INDEX)).unwrap();
++    assert!(
++        create_backup(
++            home.path(),
++            harness.path(),
++            &output,
++            &AtomicBool::new(false)
++        )
++        .is_err()
++    );
++    assert_destination_empty(destination.path());
++    fs::write(home.path().join(INDEX), b"restored\n").unwrap();
++    let _socket = UnixListener::bind(home.path().join("sessions/socket")).unwrap();
++    assert!(
++        create_backup(
++            home.path(),
++            harness.path(),
++            &output,
++            &AtomicBool::new(false)
++        )
++        .is_err()
++    );
++    assert_destination_empty(destination.path());
++    drop(codex_rollout::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++}
++
++#[test]
++fn cancellation_stops_copying_and_releases_backup_ownership() {
++    let (home, harness, destination) = fixture();
++    let cancelled = AtomicBool::new(true);
++    let error = create_backup(
++        home.path(),
++        harness.path(),
++        &destination.path().join("backup.tar.zst"),
++        &cancelled,
++    )
++    .unwrap_err();
++    assert!(error.to_string().contains("cancelled"));
++    assert_destination_empty(destination.path());
++    drop(codex_rollout::try_acquire_session_backup_lock(home.path(), harness.path()).unwrap());
++
++    let cancelled = AtomicBool::new(false);
++    let mut writer = CancellableWriter {
++        inner: Vec::new(),
++        cancelled: &cancelled,
++    };
++    writer.write_all(b"first chunk").unwrap();
++    cancelled.store(true, Ordering::Relaxed);
++    assert!(writer.write_all(b"second chunk").is_err());
++    assert_eq!(writer.inner, b"first chunk");
++}
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -52,6 +52,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 
+ #[cfg(any(target_os = "macos", target_os = "windows"))]
+ mod app_cmd;
++mod backup_sessions;
+ mod cloud_config;
+ mod config_override_args;
+ mod daemon_install;
+@@ -226,6 +227,9 @@ enum Subcommand {
+     /// Forcibly rebuild SQLite indexes for existing paginated rollouts.
+     RebuildRolloutIndex(migrate_rollouts::MigrateRolloutsCommand),
+ 
++    /// Back up local sessions as tar.zst, refusing any active session-data lock.
++    BackupSessions(backup_sessions::BackupSessionsCommand),
++
+     /// [experimental] Migrate configured SQLite databases to DELETE mode in place.
+     MigrateNfsDb(migrate_nfs_db::MigrateNfsDbCommand),
+ 
+@@ -1639,6 +1643,14 @@ async fn cli_main(
+             )
+             .await?;
+         }
++        Some(Subcommand::BackupSessions(command)) => {
++            reject_remote_mode_for_subcommand(
++                root_remote.as_deref(),
++                root_remote_auth_token_env.as_deref(),
++                "backup-sessions",
++            )?;
++            backup_sessions::run(command, root_config_overrides).await?;
++        }
+         Some(Subcommand::MigrateNfsDb(command)) => {
+             reject_remote_mode_for_subcommand(
+                 root_remote.as_deref(),
+@@ -2405,6 +2417,7 @@ fn unsupported_subcommand_name_for_strict_config(
+         Some(Subcommand::Plugin(_)) => Some("plugin"),
+         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
+         Some(Subcommand::RebuildRolloutIndex(_)) => Some("rebuild-rollout-index"),
++        Some(Subcommand::BackupSessions(_)) => Some("backup-sessions"),
+         Some(Subcommand::MigrateNfsDb(_)) => Some("migrate-nfs-db"),
+         #[cfg(any(target_os = "macos", target_os = "windows"))]
+         Some(Subcommand::App(_)) => Some("app"),

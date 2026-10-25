@@ -1,0 +1,438 @@
+query-github-releases-with-shared-routing
+
+Lane: cross
+
+Unit: monitor-codex-releases-through-github
+
+ChildPatch: query-github-releases-with-shared-routing
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2148,6 +2148,7 @@ dependencies = [
+  "pretty_assertions",
+  "rcgen",
+  "rmcp",
++ "semver",
+  "serde",
+  "serde_json",
+  "serial_test",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -103,6 +103,7 @@ codex-utils-path-uri = { workspace = true }
+ chrono = { workspace = true }
+ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
++semver = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ sha2 = { workspace = true }
+diff --git a/codex-rs/app-server/src/github_http.rs b/codex-rs/app-server/src/github_http.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/github_http.rs
+@@ -0,0 +1,170 @@
++use codex_app_server_protocol::GithubRelease;
++use codex_app_server_protocol::GithubStatus;
++use codex_http_client::ClientRouteClass;
++use codex_http_client::HttpClientFactory;
++use codex_http_client::RouteAwareClientPool;
++use codex_login::default_client::default_headers;
++use semver::Version;
++use serde::Deserialize;
++use serde::de::DeserializeOwned;
++use std::time::Duration;
++use url::Url;
++
++const TIMEOUT: Duration = Duration::from_secs(10);
++const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
++const RELEASE_QUERY: &str = r#"{
++  repository(owner: "openai", name: "codex") {
++    releases(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) {
++      nodes { tagName url isDraft }
++    }
++  }
++}"#;
++const STABLE_RELEASE_QUERY: &str = r#"{
++  repository(owner: "openai", name: "codex") {
++    latestRelease { tagName url isDraft }
++  }
++}"#;
++
++pub(crate) struct GithubHttp {
++    pool: RouteAwareClientPool,
++    base: Url,
++}
++
++#[derive(Deserialize)]
++struct GithubResponse<T> {
++    data: Option<GithubData<T>>,
++    #[serde(default)]
++    errors: Vec<serde::de::IgnoredAny>,
++}
++
++#[derive(Deserialize)]
++struct GithubData<T> {
++    repository: T,
++}
++
++#[derive(Deserialize)]
++struct GithubRepository {
++    releases: GithubReleases,
++}
++
++#[derive(Deserialize)]
++struct GithubReleases {
++    nodes: Vec<Release>,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct GithubStableRepository {
++    latest_release: Option<Release>,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct Release {
++    tag_name: String,
++    url: String,
++    is_draft: bool,
++}
++
++impl Release {
++    fn version(self) -> Option<(Version, String)> {
++        if self.is_draft {
++            return None;
++        }
++        let version = self.tag_name.strip_prefix("rust-v")?.parse().ok()?;
++        Some((version, self.url))
++    }
++}
++
++impl GithubHttp {
++    pub(crate) fn new(factory: HttpClientFactory) -> Self {
++        Self {
++            pool: RouteAwareClientPool::new_without_redirects_or_request_logging(
++                factory,
++                ClientRouteClass::Other,
++            ),
++            base: Url::parse("https://api.github.com").expect("valid GitHub URL"),
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn with_url(factory: HttpClientFactory, base: Url) -> Self {
++        Self {
++            base,
++            ..Self::new(factory)
++        }
++    }
++
++    pub(crate) async fn releases(&self, token: &str) -> Result<GithubStatus, ()> {
++        let (recent, _) = self.query::<GithubRepository>(token, RELEASE_QUERY).await?;
++        let (stable, remaining) = self
++            .query::<GithubStableRepository>(token, STABLE_RELEASE_QUERY)
++            .await?;
++        let latest_release = stable
++            .latest_release
++            .and_then(Release::version)
++            .filter(|(version, _)| version.pre.is_empty());
++        let latest_prerelease = recent
++            .releases
++            .nodes
++            .into_iter()
++            .filter_map(Release::version)
++            .filter(|(version, _)| !version.pre.is_empty())
++            .max_by(|(left, _), (right, _)| left.cmp(right));
++        let public_release = |(version, url): (Version, String)| GithubRelease {
++            version: version.to_string(),
++            url,
++        };
++        Ok(GithubStatus {
++            latest_release: latest_release.map(public_release),
++            latest_prerelease: latest_prerelease.map(public_release),
++            checked_at: chrono::Utc::now().timestamp(),
++            remaining,
++        })
++    }
++
++    async fn query<T: DeserializeOwned>(
++        &self,
++        token: &str,
++        query: &str,
++    ) -> Result<(T, Option<u64>), ()> {
++        let mut url = self.base.clone();
++        url.path_segments_mut()
++            .map_err(|_| ())?
++            .clear()
++            .push("graphql");
++        let mut response = self
++            .pool
++            .post(url)
++            .headers(default_headers())
++            .header("authorization", format!("Bearer {}", token.trim()))
++            .json(&serde_json::json!({ "query": query }))
++            .timeout(TIMEOUT)
++            .send()
++            .await
++            .map_err(|_| ())?;
++        if response.status().as_u16() != 200 {
++            return Err(());
++        }
++        let remaining = response
++            .headers()
++            .get("x-ratelimit-remaining")
++            .and_then(|value| value.to_str().ok()?.parse().ok());
++        let mut body = Vec::new();
++        while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
++            if chunk.len() > RESPONSE_LIMIT.saturating_sub(body.len()) {
++                return Err(());
++            }
++            body.extend_from_slice(&chunk);
++        }
++        let response: GithubResponse<T> = serde_json::from_slice(&body).map_err(|_| ())?;
++        if !response.errors.is_empty() {
++            return Err(());
++        }
++        Ok((response.data.ok_or(())?.repository, remaining))
++    }
++}
++
++#[cfg(test)]
++#[path = "github_http_tests.rs"]
++mod tests;
+diff --git a/codex-rs/app-server/src/github_http_tests.rs b/codex-rs/app-server/src/github_http_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/github_http_tests.rs
+@@ -0,0 +1,212 @@
++use super::*;
++use codex_http_client::OutboundProxyPolicy;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::ResponseTemplate;
++use wiremock::matchers::body_json;
++use wiremock::matchers::method;
++use wiremock::matchers::path;
++
++fn client(server: &MockServer) -> GithubHttp {
++    GithubHttp::with_url(
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++        Url::parse(&server.uri()).expect("mock URL"),
++    )
++}
++
++#[tokio::test]
++async fn release_query_selects_only_required_fields_and_independent_channels() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .and(body_json(json!({"query": RELEASE_QUERY})))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header("x-ratelimit-remaining", "4999")
++                .set_body_json(json!({
++                    "data": { "repository": { "releases": { "nodes":
++                        (1..=10).map(|number| json!({
++                            "tagName": format!("rust-v9.1.0-alpha.{number}"),
++                            "url": format!("https://example.invalid/alpha/{number}"),
++                            "isDraft": false
++                        })).collect::<Vec<_>>()
++                    } } }
++                })),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .and(body_json(json!({"query": STABLE_RELEASE_QUERY})))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header("x-ratelimit-remaining", "4998")
++                .set_body_json(json!({
++                    "data": { "repository": { "latestRelease": {
++                        "tagName": "rust-v9.0.0", "url": "https://example.invalid/stable", "isDraft": false
++                    } } }
++                })),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++
++    let status = client(&server)
++        .releases("github-token")
++        .await
++        .expect("GitHub observation");
++    assert_eq!(status.remaining, Some(4998));
++    assert!(status.checked_at > 0);
++    assert_eq!(
++        status.latest_release,
++        Some(GithubRelease {
++            version: "9.0.0".into(),
++            url: "https://example.invalid/stable".into(),
++        })
++    );
++    assert_eq!(
++        status.latest_prerelease,
++        Some(GithubRelease {
++            version: "9.1.0-alpha.10".into(),
++            url: "https://example.invalid/alpha/10".into(),
++        })
++    );
++    let requests = server.received_requests().await.expect("requests");
++    assert_eq!(requests.len(), 2);
++    for (index, request) in requests.iter().enumerate() {
++        assert_eq!(
++            request.headers["authorization"].to_str().ok(),
++            Some("Bearer github-token")
++        );
++        let body: Value = serde_json::from_slice(&request.body).expect("GraphQL JSON");
++        let query = body["query"].as_str().expect("query");
++        if index == 0 {
++            assert!(query.contains("first: 10") && query.contains("CREATED_AT"));
++        } else {
++            assert!(query.contains("latestRelease"));
++        }
++        for field in ["tagName", "url", "isDraft"] {
++            assert!(query.contains(field), "{field}");
++        }
++        for unused in ["releaseAssets", "description", "author"] {
++            assert!(!query.contains(unused), "{unused}");
++        }
++    }
++}
++
++#[tokio::test]
++async fn secret_bearing_github_requests_do_not_follow_redirects() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .respond_with(
++            ResponseTemplate::new(307)
++                .insert_header("location", format!("{}/redirected", server.uri())),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    Mock::given(path("/redirected"))
++        .respond_with(ResponseTemplate::new(200))
++        .expect(0)
++        .mount(&server)
++        .await;
++    assert!(client(&server).releases("github-token").await.is_err());
++}
++
++#[tokio::test]
++async fn github_rejects_oversized_response_bodies() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/graphql"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++            "data": { "repository": { "releases": { "nodes": [{
++                "tagName": "rust-v9.0.0",
++                "url": "x".repeat(RESPONSE_LIMIT),
++                "isDraft": false
++            }] } } }
++        })))
++        .expect(1)
++        .mount(&server)
++        .await;
++    assert!(client(&server).releases("github-token").await.is_err());
++}
++
++#[tokio::test]
++async fn graphql_errors_reject_absent_and_partial_observations() {
++    for failed_query in [RELEASE_QUERY, STABLE_RELEASE_QUERY] {
++        for data in [
++            Value::Null,
++            json!({"repository": {"releases": {"nodes": []}}}),
++        ] {
++            let server = MockServer::start().await;
++            Mock::given(method("POST"))
++                .and(path("/graphql"))
++                .and(body_json(json!({"query": failed_query})))
++                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                    "data": data,
++                    "errors": [{"message": "Resource not accessible"}]
++                })))
++                .expect(1)
++                .mount(&server)
++                .await;
++            if failed_query == STABLE_RELEASE_QUERY {
++                Mock::given(method("POST"))
++                    .and(path("/graphql"))
++                    .and(body_json(json!({"query": RELEASE_QUERY})))
++                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                        "data": {"repository": {"releases": {"nodes": []}}}
++                    })))
++                    .expect(1)
++                    .mount(&server)
++                    .await;
++            }
++            assert!(client(&server).releases("github-token").await.is_err());
++        }
++    }
++}
++
++#[tokio::test]
++async fn release_queries_preserve_absent_stable_and_reject_invalid_channel_tags() {
++    for stable in [
++        Value::Null,
++        json!({"tagName": "rust-v9.0.0", "url": "stable", "isDraft": true}),
++        json!({"tagName": "rust-v9.1.0-alpha.1", "url": "alpha", "isDraft": false}),
++        json!({"tagName": "other-v9.0.0", "url": "other", "isDraft": false}),
++        json!({"tagName": "rust-vinvalid", "url": "invalid", "isDraft": false}),
++    ] {
++        let server = MockServer::start().await;
++        Mock::given(method("POST"))
++            .and(path("/graphql"))
++            .and(body_json(json!({"query": RELEASE_QUERY})))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "data": {"repository": {"releases": {"nodes": [
++                    {"tagName": "rust-v10.0.0-alpha.1", "url": "draft", "isDraft": true},
++                    {"tagName": "other-v11.0.0-alpha.1", "url": "other", "isDraft": false},
++                    {"tagName": "rust-vinvalid", "url": "invalid", "isDraft": false},
++                    {"tagName": "rust-v9.0.0", "url": "stable", "isDraft": false},
++                    {"tagName": "rust-v9.1.0-alpha.1", "url": "alpha", "isDraft": false}
++                ]}}}
++            })))
++            .expect(1)
++            .mount(&server)
++            .await;
++        Mock::given(method("POST"))
++            .and(path("/graphql"))
++            .and(body_json(json!({"query": STABLE_RELEASE_QUERY})))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "data": {"repository": {"latestRelease": stable}}
++            })))
++            .expect(1)
++            .mount(&server)
++            .await;
++        let status = client(&server).releases("github-token").await.unwrap();
++        assert_eq!(status.latest_release, None);
++        assert_eq!(status.latest_prerelease.unwrap().version, "9.1.0-alpha.1");
++        assert_eq!(status.remaining, None);
++    }
++}
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -139,6 +139,7 @@ mod filters;
+ mod fs_watch;
+ mod fuzzy_file_search;
+ mod gateway_oauth_notifications;
++mod github_http;
+ mod image_url;
+ pub mod in_process;
+ mod integrations;

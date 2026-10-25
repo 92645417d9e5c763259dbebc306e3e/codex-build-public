@@ -1,0 +1,1385 @@
+freeze-trust-policy-at-server-start
+
+Lane: mixed
+
+Unit: configure-trust-bypasses-at-server-start
+
+ChildPatch: freeze-trust-policy-at-server-start
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+Purpose: Choose independent project and hook trust bypasses only at App Server startup, including daemon launches, and preserve that immutable policy throughout each server lifetime.
+
+Requires: none
+
+Provides: Publish startup policy through initialize, persist managed launch choices under the existing daemon operation lock, reject conflicting client assertions without restarting or replacing the server, admit project sources and enabled hooks under independent startup bypasses, and make TUI consent and all configuration reloads consume the same policy.
+
+Boundary: Persisted project and hook trust entries, explicit hook enablement, sandbox and managed restrictions, existing daemon feature recovery and remote-control enrollment remain independently owned; no live daemon restart or user configuration edit is part of this change.
+
+Verification: Focused configuration and hook tests cover effective admission, unchanged trust and permissions, plugin runtime review bypass and reload stability; protocol, daemon and TUI tests cover omitted and matching assertions, conflicts on start/resume/fork, no shared-server mutation or fallback, and CLI true/false parsing.
+
+
+diff --git a/codex-rs/app-server-client/src/lib.rs b/codex-rs/app-server-client/src/lib.rs
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -760,6 +760,14 @@ impl AppServerClient {
+         }
+     }
+ 
++    /// Immutable startup policy reported by a connected app server.
++    pub fn trust_policy(&self) -> Option<codex_app_server_protocol::TrustPolicy> {
++        match self {
++            Self::Remote(client) => Some(client.trust_policy()),
++            Self::InProcess(_) | Self::Cloud(_) => None,
++        }
++    }
++
+     /// App-server operating system as reported at initialization, including unknown values.
+     pub fn platform_os(&self) -> Option<&str> {
+         match self {
+@@ -1038,6 +1046,7 @@ mod tests {
+             websocket,
+             serde_json::json!({
+                 "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
++                "trustPolicy": {"bypassProjectTrust": false, "bypassHookTrust": false},
+                 "codexHome": "/server/.codex",
+             }),
+         )
+@@ -1046,7 +1055,7 @@ mod tests {
+ 
+     async fn expect_remote_initialize_with_metadata<S>(
+         websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+-        metadata: serde_json::Value,
++        mut metadata: serde_json::Value,
+     ) where
+         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+     {
+@@ -1054,6 +1063,13 @@ mod tests {
+             panic!("expected initialize request");
+         };
+         assert_eq!(request.method, "initialize");
++        metadata
++            .as_object_mut()
++            .expect("initialize metadata")
++            .entry("trustPolicy")
++            .or_insert_with(
++                || serde_json::json!({"bypassProjectTrust": false, "bypassHookTrust": false}),
++            );
+         write_websocket_message(
+             websocket,
+             JSONRPCMessage::Response(JSONRPCResponse {
+@@ -2008,7 +2024,9 @@ mod tests {
+                 &mut websocket,
+                 JSONRPCMessage::Response(JSONRPCResponse {
+                     id: request.id,
+-                    result: serde_json::json!({}),
++                    result: serde_json::json!({
++                        "trustPolicy": codex_protocol::config_types::TrustPolicy::default(),
++                    }),
+                 }),
+             )
+             .await;
+diff --git a/codex-rs/app-server-client/src/remote.rs b/codex-rs/app-server-client/src/remote.rs
+--- a/codex-rs/app-server-client/src/remote.rs
++++ b/codex-rs/app-server-client/src/remote.rs
+@@ -152,6 +152,7 @@ enum RemoteClientCommand {
+ 
+ #[derive(Default)]
+ struct RemoteServerMetadata {
++    trust_policy: codex_app_server_protocol::TrustPolicy,
+     server_version: Option<String>,
+     codex_home: Option<String>,
+     platform_family: Option<String>,
+@@ -178,6 +179,10 @@ enum SocketPeerPolicy {
+ }
+ 
+ impl RemoteAppServerClient {
++    pub fn trust_policy(&self) -> codex_app_server_protocol::TrustPolicy {
++        self.metadata.trust_policy
++    }
++
+     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
+         Self::connect_with_policy(args, SocketPeerPolicy::ExplicitEndpoint).await
+     }
+@@ -873,6 +878,8 @@ where
+                     })?;
+                     match message {
+                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
++                            metadata.trust_policy = serde_json::from_value(response.result["trustPolicy"].clone())
++                                .map_err(|error| IoError::new(ErrorKind::InvalidData, format!("invalid app-server trust policy: {error}")))?;
+                             metadata.server_version = response
+                                 .result
+                                 .get("userAgent")
+diff --git a/codex-rs/app-server-daemon/src/backend/mod.rs b/codex-rs/app-server-daemon/src/backend/mod.rs
+--- a/codex-rs/app-server-daemon/src/backend/mod.rs
++++ b/codex-rs/app-server-daemon/src/backend/mod.rs
+@@ -19,6 +19,7 @@ pub enum BackendKind {
+ 
+ #[derive(Debug, Clone)]
+ pub(crate) struct BackendPaths {
++    pub(crate) trust_policy: codex_app_server_protocol::TrustPolicy,
+     pub(crate) codex_bin: PathBuf,
+     pub(crate) pid_file: PathBuf,
+     pub(crate) update_pid_file: PathBuf,
+@@ -33,6 +34,7 @@ pub(crate) fn pid_backend(paths: BackendPaths) -> PidBackend {
+         paths.remote_control_enabled,
+     );
+     backend.feature_overrides = paths.feature_overrides;
++    backend.trust_policy = paths.trust_policy;
+     backend
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -37,6 +37,7 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
+ #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+ pub(crate) struct PidBackend {
+     pub(super) feature_overrides: BTreeMap<String, bool>,
++    pub(super) trust_policy: codex_app_server_protocol::TrustPolicy,
+     codex_bin: PathBuf,
+     pid_file: PathBuf,
+     lock_file: PathBuf,
+@@ -112,6 +113,7 @@ impl PidBackend {
+         let lock_file = pid_file.with_extension("pid.lock");
+         Self {
+             feature_overrides: BTreeMap::new(),
++            trust_policy: Default::default(),
+             codex_bin,
+             pid_file,
+             lock_file,
+@@ -129,6 +131,7 @@ impl PidBackend {
+         let lock_file = pid_file.with_extension("pid.lock");
+         Self {
+             feature_overrides: BTreeMap::new(),
++            trust_policy: Default::default(),
+             codex_bin,
+             pid_file,
+             lock_file,
+@@ -416,6 +419,20 @@ impl PidBackend {
+             }
+         };
+         if matches!(self.command_kind, PidCommandKind::AppServer { .. }) {
++            args.push(
++                format!(
++                    "--dangerously-bypass-project-trust={}",
++                    self.trust_policy.bypass_project_trust
++                )
++                .into(),
++            );
++            args.push(
++                format!(
++                    "--dangerously-bypass-hook-trust={}",
++                    self.trust_policy.bypass_hook_trust
++                )
++                .into(),
++            );
+             // Match first-party clients' default while preserving explicit analytics opt-outs.
+             args.push("--analytics-default-enabled".into());
+             for (name, enabled) in &self.feature_overrides {
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+--- a/codex-rs/app-server-daemon/src/backend/pid_tests.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+@@ -572,6 +572,7 @@ async fn exited_unreaped_updater_is_reaped() {
+ fn update_loop_uses_hidden_app_server_subcommand() {
+     let backend = PidBackend {
+         feature_overrides: Default::default(),
++        trust_policy: Default::default(),
+         codex_bin: "codex".into(),
+         pid_file: "updater.pid".into(),
+         lock_file: "updater.pid.lock".into(),
+@@ -601,6 +602,8 @@ fn app_server_remote_control_uses_runtime_flag() {
+             "--remote-control",
+             "--listen",
+             "unix://",
++            "--dangerously-bypass-project-trust=false",
++            "--dangerously-bypass-hook-trust=false",
+             "--analytics-default-enabled"
+         ]
+     );
+@@ -608,11 +611,13 @@ fn app_server_remote_control_uses_runtime_flag() {
+ 
+ #[test]
+ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
+-    let backend = PidBackend::new(
++    let mut backend = PidBackend::new(
+         "codex".into(),
+         "app-server.pid".into(),
+         /*remote_control_enabled*/ false,
+     );
++    backend.trust_policy.bypass_project_trust = true;
++    backend.trust_policy.bypass_hook_trust = true;
+ 
+     assert_eq!(
+         backend.command_args(),
+@@ -620,6 +625,8 @@ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
+             "app-server",
+             "--listen",
+             "unix://",
++            "--dangerously-bypass-project-trust=true",
++            "--dangerously-bypass-hook-trust=true",
+             "--analytics-default-enabled"
+         ]
+     );
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -29,6 +29,7 @@ const INITIALIZE_REQUEST_ID: RequestId = RequestId::Integer(1);
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ProbeInfo {
+     pub(crate) app_server_version: String,
++    pub(crate) trust_policy: codex_app_server_protocol::TrustPolicy,
+ }
+ 
+ pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
+@@ -57,6 +58,7 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
+ 
+     Ok(ProbeInfo {
+         app_server_version: parse_version_from_user_agent(&initialize_response.user_agent)?,
++        trust_policy: initialize_response.trust_policy,
+     })
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/launch.rs b/codex-rs/app-server-daemon/src/launch.rs
+--- a/codex-rs/app-server-daemon/src/launch.rs
++++ b/codex-rs/app-server-daemon/src/launch.rs
+@@ -12,7 +12,11 @@ use std::collections::BTreeMap;
+ /// or leave a running daemon unchanged.
+ /// Callers must check the running server's configuration before using it.
+ /// Startup diagnostics go to tracing, so a caller with a live TUI can keep rendering.
+-pub async fn start_with_features(features: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
++pub async fn start_with_features(
++    features: &BTreeMap<String, bool>,
++    bypass_project_trust: Option<bool>,
++    bypass_hook_trust: Option<bool>,
++) -> Result<LifecycleOutput> {
+     let mut daemon = Daemon::from_environment()?;
+     daemon.log_diagnostics = true;
+     let _operation_lock = daemon.acquire_operation_lock().await?;
+@@ -24,7 +28,13 @@ pub async fn start_with_features(features: &BTreeMap<String, bool>) -> Result<Li
+     overrides.extend(features.clone());
+     // A fresh managed daemon owns remote startup. Attaching to an existing
+     // daemon must leave its remote-control policy unchanged.
+-    Box::pin(selected.start(&overrides, StartIntent::ManagedAutoStart)).await
++    Box::pin(selected.start(
++        &overrides,
++        StartIntent::ManagedAutoStart,
++        bypass_project_trust,
++        bypass_hook_trust,
++    ))
++    .await
+ }
+ 
+ /// Apply confirmed feature settings to an existing managed daemon and restart it.
+@@ -66,7 +76,9 @@ impl Daemon {
+         let previous = settings.feature_overrides.clone();
+         settings.feature_overrides.extend(features.clone());
+         if settings.feature_overrides == previous {
+-            return self.start(&previous, StartIntent::Internal).await;
++            return self
++                .start(&previous, StartIntent::Internal, None, None)
++                .await;
+         }
+         self.restart_with_settings(settings).await
+     }
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -69,7 +69,10 @@ const STATE_DIR_NAME: &str = "app-server-daemon";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum LifecycleCommand {
+-    Start,
++    Start {
++        bypass_project_trust: Option<bool>,
++        bypass_hook_trust: Option<bool>,
++    },
+     Restart {
+         feature_overrides: BTreeMap<String, bool>,
+     },
+@@ -427,9 +430,17 @@ impl Daemon {
+         let _operation_lock = self.acquire_operation_lock().await?;
+         let selected = self.current_installation();
+         match command {
+-            LifecycleCommand::Start => {
++            LifecycleCommand::Start {
++                bypass_project_trust,
++                bypass_hook_trust,
++            } => {
+                 selected
+-                    .start(&BTreeMap::new(), StartIntent::LocalEnrollment)
++                    .start(
++                        &BTreeMap::new(),
++                        StartIntent::LocalEnrollment,
++                        bypass_project_trust,
++                        bypass_hook_trust,
++                    )
+                     .await
+             }
+             LifecycleCommand::Restart { feature_overrides } => {
+@@ -450,6 +461,8 @@ impl Daemon {
+         &self,
+         feature_overrides: &BTreeMap<String, bool>,
+         intent: StartIntent,
++        bypass_project_trust: Option<bool>,
++        bypass_hook_trust: Option<bool>,
+     ) -> Result<LifecycleOutput> {
+         let mut managed = self.clone();
+         let mut settings = self.load_settings_for_operation().await?;
+@@ -475,6 +488,12 @@ impl Daemon {
+                 self.wait_until_ready().await?,
+             )
+         } else {
++            if let Some(value) = bypass_project_trust {
++                settings.trust_policy.bypass_project_trust = value;
++            }
++            if let Some(value) = bypass_hook_trust {
++                settings.trust_policy.bypass_hook_trust = value;
++            }
+             // Auto-start changes remote policy only when launching a fresh daemon.
+             let auto_start_remote_control =
+                 matches!(intent, StartIntent::ManagedAutoStart) && !settings.remote_control_enabled;
+@@ -492,13 +511,8 @@ impl Daemon {
+             managed.ensure_managed_codex_bin()?;
+             // Only a fresh launch may replace feature overrides, without changing
+             // the config or remote policy of an already-running daemon.
+-            if settings.feature_overrides != *feature_overrides
+-                || remote_control_setting_changed
+-                || auto_start_remote_control
+-            {
+-                settings.feature_overrides = feature_overrides.clone();
+-                settings.save(&self.settings_file).await?;
+-            }
++            settings.feature_overrides = feature_overrides.clone();
++            settings.save(&self.settings_file).await?;
+             let pid = managed.start_managed_backend(&settings).await?;
+             (
+                 LifecycleStatus::Started,
+@@ -507,6 +521,9 @@ impl Daemon {
+                 self.wait_until_ready().await?,
+             )
+         };
++        info.trust_policy
++            .check_request(bypass_project_trust, bypass_hook_trust)
++            .map_err(anyhow::Error::msg)?;
+         if backend.is_some()
+             && let Err(err) = managed.ensure_managed_updater(&settings).await
+         {
+@@ -806,7 +823,7 @@ impl Daemon {
+                 .set_remote_control_locked(RemoteControlMode::Enabled)
+                 .await?;
+             let output = selected
+-                .start(&BTreeMap::new(), StartIntent::Internal)
++                .start(&BTreeMap::new(), StartIntent::Internal, None, None)
+                 .await?;
+             return Ok(RemoteControlStartOutput::Start(output));
+         }
+@@ -1144,6 +1161,7 @@ impl Daemon {
+         managed_codex_bin: &Path,
+     ) -> BackendPaths {
+         BackendPaths {
++            trust_policy: settings.trust_policy,
+             codex_bin: managed_codex_bin.to_path_buf(),
+             pid_file: self.pid_file.clone(),
+             update_pid_file: self.update_pid_file.clone(),
+@@ -1386,6 +1404,7 @@ mod tests {
+     fn restart_decision_preserves_forced_refreshes() {
+         let current_info = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
++            trust_policy: Default::default(),
+         };
+ 
+         assert_eq!(
+@@ -1554,7 +1573,10 @@ mod tests {
+         )
+         .expect("legacy saved threads");
+         daemon
+-            .run(super::LifecycleCommand::Start)
++            .run(super::LifecycleCommand::Start {
++                bypass_project_trust: None,
++                bypass_hook_trust: None,
++            })
+             .await
+             .expect_err("missing backend binary");
+         assert!(!daemon.recovery_file().expect("recovery path").exists());
+diff --git a/codex-rs/app-server-daemon/src/remote_control_client.rs b/codex-rs/app-server-daemon/src/remote_control_client.rs
+--- a/codex-rs/app-server-daemon/src/remote_control_client.rs
++++ b/codex-rs/app-server-daemon/src/remote_control_client.rs
+@@ -723,6 +723,7 @@ mod tests {
+                 id: INITIALIZE_REQUEST_ID,
+                 result: serde_json::json!({
+                     "userAgent": "codex_app_server/1.2.3",
++                    "trustPolicy": {"bypassProjectTrust": false, "bypassHookTrust": false},
+                     "codexHome": TEST_CODEX_HOME,
+                     "platformFamily": "unix",
+                     "platformOs": "macos",
+diff --git a/codex-rs/app-server-daemon/src/settings.rs b/codex-rs/app-server-daemon/src/settings.rs
+--- a/codex-rs/app-server-daemon/src/settings.rs
++++ b/codex-rs/app-server-daemon/src/settings.rs
+@@ -22,6 +22,7 @@ const MANUAL_PAIRING_SETTING: &str = "manualPairing";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct DaemonSettings {
++    pub(crate) trust_policy: codex_app_server_protocol::TrustPolicy,
+     pub(crate) remote_control_enabled: bool,
+     pub(crate) feature_overrides: BTreeMap<String, bool>,
+     pub(crate) auto_update_enabled: bool,
+@@ -32,6 +33,7 @@ pub(crate) struct DaemonSettings {
+ impl Default for DaemonSettings {
+     fn default() -> Self {
+         Self {
++            trust_policy: Default::default(),
+             remote_control_enabled: false,
+             feature_overrides: BTreeMap::new(),
+             auto_update_enabled: true,
+@@ -50,6 +52,8 @@ struct StopSettings {
+ #[derive(Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ struct StoredSettings {
++    #[serde(default)]
++    trust_policy: codex_app_server_protocol::TrustPolicy,
+     #[serde(default)]
+     remote_control_enabled: bool,
+     #[serde(default)]
+@@ -63,6 +67,7 @@ struct StoredSettings {
+ impl Default for StoredSettings {
+     fn default() -> Self {
+         Self {
++            trust_policy: Default::default(),
+             remote_control_enabled: false,
+             feature_overrides: BTreeMap::new(),
+             shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
+@@ -137,6 +142,7 @@ impl DaemonSettings {
+         settings.updater.validate()?;
+         validate_shutdown_grace(settings.shutdown_grace_seconds)?;
+         Ok(Self {
++            trust_policy: settings.trust_policy,
+             remote_control_enabled: settings.remote_control_enabled,
+             feature_overrides: settings.feature_overrides,
+             auto_update_enabled: settings.updater.auto_update_enabled,
+@@ -161,6 +167,10 @@ impl DaemonSettings {
+ 
+     pub(crate) async fn save(&self, path: &Path) -> Result<()> {
+         let mut settings: Map<String, Value> = read_settings(path).await?;
++        settings.insert(
++            "trustPolicy".to_string(),
++            serde_json::to_value(self.trust_policy)?,
++        );
+         settings.insert(
+             "remoteControlEnabled".to_string(),
+             Value::Bool(self.remote_control_enabled),
+diff --git a/codex-rs/app-server-daemon/src/settings_tests.rs b/codex-rs/app-server-daemon/src/settings_tests.rs
+--- a/codex-rs/app-server-daemon/src/settings_tests.rs
++++ b/codex-rs/app-server-daemon/src/settings_tests.rs
+@@ -33,11 +33,19 @@ async fn remote_control_save_preserves_updater_settings() {
+     .expect("write settings");
+     let updated = DaemonSettings {
+         remote_control_enabled: false,
++        trust_policy: codex_app_server_protocol::TrustPolicy {
++            bypass_project_trust: true,
++            bypass_hook_trust: false,
++        },
+         ..DaemonSettings::load(&path)
+             .await
+             .expect("load updater settings")
+     };
+     updated.save(&path).await.expect("save remote control");
++    assert_eq!(
++        DaemonSettings::load(&path).await.expect("reload settings"),
++        updated
++    );
+     assert_eq!(
+         serde_json::from_slice::<serde_json::Value>(
+             &tokio::fs::read(&path).await.expect("read settings")
+@@ -45,6 +53,7 @@ async fn remote_control_save_preserves_updater_settings() {
+         .expect("parse settings"),
+         serde_json::json!({
+             "remoteControlEnabled": false,
++            "trustPolicy": {"bypassProjectTrust": true, "bypassHookTrust": false},
+             "shutdownGraceSeconds": 25,
+             "updater": {"autoUpdateEnabled": false, "updateIntervalMinutes": 17},
+             "featureOverrides": {"api_key_model_discovery": true, "code_mode_host": false},
+diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+--- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
++++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+@@ -699,6 +699,7 @@ async fn test_control_server(
+             websocket.send(tokio_tungstenite::tungstenite::Message::Text(
+                 serde_json::json!({"id": 1, "result": {
+                     "userAgent": format!("codex_app_server_daemon/{version}"),
++                    "trustPolicy": {"bypassProjectTrust": false, "bypassHookTrust": false},
+                     "codexHome": codex_home, "platformFamily": "unix", "platformOs": std::env::consts::OS,
+                 }}).to_string().into(),
+             )).await.expect("initialize response");
+@@ -890,7 +891,7 @@ async fn daemon_start_and_restart_preserve_launch_features() {
+                 .abort_handle()
+         };
+         let (started, server) = tokio::join!(
+-            daemon.start(&features, crate::StartIntent::ManagedAutoStart),
++            daemon.start(&features, crate::StartIntent::ManagedAutoStart, None, None),
+             control
+         );
+         assert_eq!(started.unwrap().status, crate::LifecycleStatus::Started);
+@@ -899,15 +900,17 @@ async fn daemon_start_and_restart_preserve_launch_features() {
+             features
+         );
+         let expected = if features.is_empty() {
+-            "app-server\n--remote-control\n--listen\nunix://\n--analytics-default-enabled\n--managed-daemon\n"
++            "app-server\n--remote-control\n--listen\nunix://\n--dangerously-bypass-project-trust=false\n--dangerously-bypass-hook-trust=false\n--analytics-default-enabled\n--managed-daemon\n"
+         } else {
+-            "app-server\n--remote-control\n--listen\nunix://\n--analytics-default-enabled\n-c\nfeatures.api_key_model_discovery=true\n-c\nfeatures.code_mode_host=false\n--managed-daemon\n"
++            "app-server\n--remote-control\n--listen\nunix://\n--dangerously-bypass-project-trust=false\n--dangerously-bypass-hook-trust=false\n--analytics-default-enabled\n-c\nfeatures.api_key_model_discovery=true\n-c\nfeatures.code_mode_host=false\n--managed-daemon\n"
+         };
+         assert_eq!(std::fs::read_to_string(&args_path).unwrap(), expected);
+         let reused = daemon
+             .start(
+                 &std::collections::BTreeMap::from([("api_key_model_discovery".to_string(), false)]),
+                 crate::StartIntent::ManagedAutoStart,
++                None,
++                None,
+             )
+             .await
+             .unwrap();
+@@ -966,22 +969,64 @@ async fn managed_auto_start_leaves_existing_daemon_remote_policy_unchanged() {
+     };
+     let features = std::collections::BTreeMap::new();
+     let (started, server) = tokio::join!(
+-        daemon.start(&features, crate::StartIntent::Internal),
++        daemon.start(&features, crate::StartIntent::Internal, None, None),
+         control
+     );
+     assert_eq!(started.unwrap().status, crate::LifecycleStatus::Started);
+     let original_args = std::fs::read_to_string(&args_path).unwrap();
+     assert!(!original_args.contains("--remote-control"));
+ 
++    let settings_before = std::fs::read(&daemon.settings_file).unwrap();
++    for (project, hooks) in [(Some(true), None), (None, Some(true))] {
++        let error = daemon
++            .start(
++                &features,
++                crate::StartIntent::LocalEnrollment,
++                project,
++                hooks,
++            )
++            .await
++            .unwrap_err();
++        assert!(
++            error
++                .to_string()
++                .contains("conflicts with the app server startup value false")
++        );
++        assert_eq!(
++            std::fs::read(&daemon.settings_file).unwrap(),
++            settings_before
++        );
++        assert_eq!(std::fs::read_to_string(&args_path).unwrap(), original_args);
++    }
++    assert_eq!(
++        daemon
++            .start(
++                &features,
++                crate::StartIntent::Internal,
++                Some(false),
++                Some(false)
++            )
++            .await
++            .unwrap()
++            .status,
++        crate::LifecycleStatus::AlreadyRunning
++    );
++
+     let reused = daemon
+-        .start(&features, crate::StartIntent::ManagedAutoStart)
++        .start(&features, crate::StartIntent::ManagedAutoStart, None, None)
+         .await
+         .unwrap();
+     assert_eq!(reused.status, crate::LifecycleStatus::AlreadyRunning);
+     assert!(!daemon.load_settings().await.unwrap().remote_control_enabled);
+     assert_eq!(std::fs::read_to_string(&args_path).unwrap(), original_args);
+ 
+-    let enrolled = daemon.run(crate::LifecycleCommand::Start).await.unwrap();
++    let enrolled = daemon
++        .run(crate::LifecycleCommand::Start {
++            bypass_project_trust: None,
++            bypass_hook_trust: None,
++        })
++        .await
++        .unwrap();
+     assert_eq!(enrolled.status, crate::LifecycleStatus::AlreadyRunning);
+     let settings: serde_json::Value =
+         serde_json::from_slice(&std::fs::read(&daemon.settings_file).unwrap()).unwrap();
+diff --git a/codex-rs/app-server-protocol/src/lib.rs b/codex-rs/app-server-protocol/src/lib.rs
+--- a/codex-rs/app-server-protocol/src/lib.rs
++++ b/codex-rs/app-server-protocol/src/lib.rs
+@@ -37,6 +37,7 @@ pub use protocol::v1::InterruptConversationResponse;
+ pub use protocol::v1::LoginApiKeyParams;
+ pub use protocol::v1::SandboxSettings;
+ pub use protocol::v1::Tools;
++pub use protocol::v1::TrustPolicy;
+ pub use protocol::v1::UserSavedConfig;
+ pub use protocol::v2::*;
+ pub use rpc::*;
+diff --git a/codex-rs/app-server-protocol/src/protocol/v1.rs b/codex-rs/app-server-protocol/src/protocol/v1.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v1.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v1.rs
+@@ -7,6 +7,7 @@ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::ForcedLoginMethod;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::SandboxMode;
++pub use codex_protocol::config_types::TrustPolicy;
+ use codex_protocol::config_types::Verbosity;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::parse_command::ParsedCommand;
+@@ -72,6 +73,8 @@ pub struct InitializeCapabilities {
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ pub struct InitializeResponse {
++    /// Process-wide trust policy selected at server startup, never a session override.
++    pub trust_policy: TrustPolicy,
+     pub user_agent: String,
+     /// Absolute path to the server's $CODEX_HOME directory.
+     pub codex_home: AbsolutePathBuf,
+diff --git a/codex-rs/app-server-transport/src/transport/mod.rs b/codex-rs/app-server-transport/src/transport/mod.rs
+--- a/codex-rs/app-server-transport/src/transport/mod.rs
++++ b/codex-rs/app-server-transport/src/transport/mod.rs
+@@ -382,6 +382,7 @@ mod tests {
+             id: RequestId::Integer(7),
+             result: Box::new(ClientResponsePayload::Initialize(
+                 codex_app_server_protocol::InitializeResponse {
++                    trust_policy: Default::default(),
+                     user_agent: "codex-test-agent".to_string(),
+                     codex_home,
+                     platform_family: "unix".to_string(),
+diff --git a/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs b/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
+--- a/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
++++ b/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
+@@ -136,6 +136,7 @@ fn invalid_response_becomes_remote_control_jsonrpc_error() {
+             message: Box::new(OutgoingMessage::Response(OutgoingResponse {
+                 id: RequestId::Integer(7),
+                 result: Box::new(ClientResponsePayload::Initialize(InitializeResponse {
++                    trust_policy: Default::default(),
+                     user_agent: "codex-test-agent".to_string(),
+                     codex_home,
+                     platform_family: "unix".to_string(),
+diff --git a/codex-rs/app-server-transport/src/transport/remote_control/tests.rs b/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
+--- a/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
++++ b/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
+@@ -1890,6 +1890,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
+                 result: Box::new(
+                     codex_app_server_protocol::ClientResponsePayload::Initialize(
+                         codex_app_server_protocol::InitializeResponse {
++                            trust_policy: Default::default(),
+                             user_agent: "codex-test-agent".to_string(),
+                             codex_home: codex_home.path().abs(),
+                             platform_family: "test-family".to_string(),
+@@ -1911,6 +1912,7 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
+                 "id": 11,
+                 "result": {
+                     "userAgent": "codex-test-agent",
++                    "trustPolicy": {"bypassProjectTrust": false, "bypassHookTrust": false},
+                     "codexHome": codex_home.path(),
+                     "platformFamily": "test-family",
+                     "platformOs": "test-os",
+diff --git a/codex-rs/app-server/src/config_manager.rs b/codex-rs/app-server/src/config_manager.rs
+--- a/codex-rs/app-server/src/config_manager.rs
++++ b/codex-rs/app-server/src/config_manager.rs
+@@ -50,6 +50,7 @@ pub(crate) struct ConfigManager {
+     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
+     loader_overrides: LoaderOverrides,
+     strict_config: bool,
++    trust_policy: codex_protocol::config_types::TrustPolicy,
+     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
+     arg0_paths: Arg0DispatchPaths,
+     thread_config_loader: Arc<dyn ThreadConfigLoader>,
+@@ -111,6 +112,7 @@ impl ConfigManager {
+             runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
+             loader_overrides,
+             strict_config,
++            trust_policy: Default::default(),
+             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
+             arg0_paths,
+             thread_config_loader,
+@@ -126,6 +128,53 @@ impl ConfigManager {
+         self.codex_home.as_path()
+     }
+ 
++    pub(crate) fn with_trust_policy(
++        mut self,
++        policy: codex_protocol::config_types::TrustPolicy,
++    ) -> Self {
++        self.loader_overrides.bypass_project_trust = policy.bypass_project_trust;
++        self.trust_policy = policy;
++        self
++    }
++
++    /// Validate startup-policy assertions before loading or reusing a thread.
++    /// These runtime-only keys must not enter configuration layers.
++    pub(crate) fn consume_trust_overrides(
++        &self,
++        overrides: &mut Option<HashMap<String, serde_json::Value>>,
++    ) -> std::io::Result<()> {
++        let Some(overrides) = overrides.as_mut() else {
++            return Ok(());
++        };
++        let read = |key: &str| {
++            overrides
++                .get(key)
++                .map(|value| {
++                    value.as_bool().ok_or_else(|| {
++                        std::io::Error::new(
++                            std::io::ErrorKind::InvalidInput,
++                            format!("`{key}` override must be a boolean"),
++                        )
++                    })
++                })
++                .transpose()
++        };
++        self.trust_policy
++            .check_request(read("bypass_project_trust")?, read("bypass_hook_trust")?)
++            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
++        overrides.remove("bypass_project_trust");
++        overrides.remove("bypass_hook_trust");
++        Ok(())
++    }
++
++    fn trust_overrides(&self) -> ConfigOverrides {
++        ConfigOverrides {
++            bypass_project_trust: Some(self.trust_policy.bypass_project_trust),
++            bypass_hook_trust: Some(self.trust_policy.bypass_hook_trust),
++            ..Default::default()
++        }
++    }
++
+     /// Explicit account, policy-owner, and enterprise-login changes revoke cached access.
+     pub(crate) fn revoke_mcp_ema(&self) {
+         let mut current = self
+@@ -276,6 +325,7 @@ impl ConfigManager {
+             .cloud_config_bundle(policy_load.cloud_config.clone())
+             .thread_config_loader(Arc::clone(&self.thread_config_loader))
+             .without_project_context()
++            .harness_overrides(self.trust_overrides())
+             .build()
+             .await?;
+         self.check_application_policy_load(&policy_load)?;
+@@ -306,6 +356,8 @@ impl ConfigManager {
+             AbsolutePathBuf::from_absolute_path(&self.codex_harness)?,
+         )
+         .await?;
++        config.bypass_project_trust = self.trust_policy.bypass_project_trust;
++        config.bypass_hook_trust = self.trust_policy.bypass_hook_trust;
+         self.apply_network_policy(&mut config);
+         self.apply_runtime_feature_enablement(&mut config);
+         self.apply_arg0_paths(&mut config);
+@@ -336,6 +388,8 @@ impl ConfigManager {
+             AbsolutePathBuf::from_absolute_path(&self.codex_harness)?,
+         )
+         .await?;
++        config.bypass_project_trust = self.trust_policy.bypass_project_trust;
++        config.bypass_hook_trust = self.trust_policy.bypass_hook_trust;
+         self.apply_network_policy(&mut config);
+         self.apply_runtime_feature_enablement(&mut config);
+         self.apply_arg0_paths(&mut config);
+@@ -464,6 +518,7 @@ impl ConfigManager {
+             .loader_overrides(loader_overrides)
+             .fallback_cwd(Some(self.codex_home.clone()))
+             .cloud_config_bundle(CloudConfigBundleLoader::default())
++            .harness_overrides(self.trust_overrides())
+             .build()
+             .await?;
+         self.apply_network_policy(&mut config);
+@@ -554,21 +609,16 @@ impl ConfigManager {
+     pub(crate) async fn load_with_cli_overrides(
+         &self,
+         cli_overrides: &[(String, TomlValue)],
+-        request_overrides: Option<HashMap<String, serde_json::Value>>,
++        mut request_overrides: Option<HashMap<String, serde_json::Value>>,
+         mut typesafe_overrides: ConfigOverrides,
+         fallback_cwd: Option<PathBuf>,
+     ) -> std::io::Result<Config> {
++        self.consume_trust_overrides(&mut request_overrides)?;
+         let mcp_ema_cancellation = self.capture_mcp_ema_cancellation();
+         let policy_load = self.refresh_application_network_policy().await?;
+-        let mut request_overrides = request_overrides.unwrap_or_default();
+-        if let Some(value) = request_overrides.remove("bypass_hook_trust") {
+-            typesafe_overrides.bypass_hook_trust = Some(value.as_bool().ok_or_else(|| {
+-                std::io::Error::new(
+-                    std::io::ErrorKind::InvalidData,
+-                    "`bypass_hook_trust` override must be a boolean",
+-                )
+-            })?);
+-        }
++        let request_overrides = request_overrides.unwrap_or_default();
++        typesafe_overrides.bypass_project_trust = Some(self.trust_policy.bypass_project_trust);
++        typesafe_overrides.bypass_hook_trust = Some(self.trust_policy.bypass_hook_trust);
+         let merged_cli_overrides = cli_overrides
+             .iter()
+             .cloned()
+diff --git a/codex-rs/app-server/src/config_manager_provider_tests.rs b/codex-rs/app-server/src/config_manager_provider_tests.rs
+--- a/codex-rs/app-server/src/config_manager_provider_tests.rs
++++ b/codex-rs/app-server/src/config_manager_provider_tests.rs
+@@ -40,6 +40,51 @@ async fn config_manager_preserves_the_selected_process_roots() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn startup_trust_policy_survives_all_config_reload_paths() -> Result<()> {
++    let home = tempdir()?;
++    let policy = codex_protocol::config_types::TrustPolicy {
++        bypass_project_trust: true,
++        bypass_hook_trust: true,
++    };
++    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf())
++        .with_trust_policy(policy);
++    let config = manager.load_latest_config(None).await?;
++    for reloaded in [
++        config.clone(),
++        manager
++            .load_for_cwd(
++                None,
++                ConfigOverrides::default(),
++                Some(home.path().to_path_buf()),
++            )
++            .await?,
++        manager.load_default_config().await?,
++        manager
++            .load_latest_config_with_session_layers(&config.config_layer_stack, &config.cwd)
++            .await?,
++        manager
++            .load_retained_session_config(&config.config_layer_stack, &config.cwd)
++            .await?,
++    ] {
++        assert!(reloaded.bypass_project_trust);
++        assert!(reloaded.bypass_hook_trust);
++    }
++    for key in ["bypass_project_trust", "bypass_hook_trust"] {
++        let error = manager
++            .load_with_overrides(
++                Some(HashMap::from([(key.to_string(), serde_json::json!(false))])),
++                ConfigOverrides::default(),
++            )
++            .await
++            .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
++    }
++    let inherited = manager.load_latest_config(None).await?;
++    assert!(inherited.bypass_project_trust && inherited.bypass_hook_trust);
++    Ok(())
++}
++
+ #[test_case(AMAZON_BEDROCK_PROVIDER_ID; "bedrock")]
+ #[test_case(AMAZON_BEDROCK_RUNTIME_PROVIDER_ID; "bedrock_runtime")]
+ #[tokio::test]
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -438,7 +438,11 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
+         args.arg0_paths.clone(),
+         args.thread_config_loader,
+     )
+-    .with_embedded_network_policy(args.embedded_network_policy);
++    .with_embedded_network_policy(args.embedded_network_policy)
++    .with_trust_policy(codex_protocol::config_types::TrustPolicy {
++        bypass_project_trust: args.config.bypass_project_trust,
++        bypass_hook_trust: args.config.bypass_hook_trust,
++    });
+     // Keep the caller's project context independent of any fallback policy config.
+     let startup_cwd =
+         (!args.config.config_layer_stack.is_projectless()).then(|| args.config.cwd.to_path_buf());
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -483,6 +483,7 @@ pub enum PluginStartupTasks {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct AppServerRuntimeOptions {
++    pub trust_policy: codex_protocol::config_types::TrustPolicy,
+     /// Optional host-owned frozen cloud skill catalog and resources, loaded once at startup.
+     pub cloud_skills_snapshot: Option<std::path::PathBuf>,
+     pub code_mode_host_transport: CodeModeHostTransport,
+@@ -496,6 +497,7 @@ impl Default for AppServerRuntimeOptions {
+     fn default() -> Self {
+         Self {
+             cloud_skills_snapshot: None,
++            trust_policy: Default::default(),
+             code_mode_host_transport: CodeModeHostTransport::Local,
+             plugin_startup_tasks: PluginStartupTasks::Start,
+             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
+@@ -570,7 +572,8 @@ pub async fn run_main_with_transport_options(
+         Default::default(),
+         arg0_paths.clone(),
+         Arc::new(NoopThreadConfigLoader),
+-    );
++    )
++    .with_trust_policy(runtime_options.trust_policy);
+     let startup = config_manager
+         .load_cloud_startup_config(startup_cwd.clone())
+         .await?;
+diff --git a/codex-rs/app-server/src/main.rs b/codex-rs/app-server/src/main.rs
+--- a/codex-rs/app-server/src/main.rs
++++ b/codex-rs/app-server/src/main.rs
+@@ -30,6 +30,12 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
+ #[derive(Debug, Parser)]
+ #[command(version)]
+ struct AppServerArgs {
++    /// Fix project trust bypass for this server's lifetime.
++    #[arg(long = "dangerously-bypass-project-trust", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    bypass_project_trust: Option<bool>,
++    /// Fix hook trust bypass for this server's lifetime.
++    #[arg(long = "dangerously-bypass-hook-trust", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    bypass_hook_trust: Option<bool>,
+     /// Load frozen cloud skills from a JSON snapshot instead of a live skill service.
+     #[arg(long, value_name = "PATH")]
+     cloud_skills_snapshot: Option<PathBuf>,
+@@ -83,6 +89,8 @@ fn main() -> anyhow::Result<()> {
+     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+         let AppServerArgs {
++            bypass_project_trust,
++            bypass_hook_trust,
+             cloud_skills_snapshot,
+             config_overrides,
+             code_mode_host,
+@@ -105,6 +113,10 @@ fn main() -> anyhow::Result<()> {
+         let transport = listen;
+         let auth = auth.try_into_settings()?;
+         let mut runtime_options = AppServerRuntimeOptions {
++            trust_policy: codex_protocol::config_types::TrustPolicy {
++                bypass_project_trust: bypass_project_trust.unwrap_or_default(),
++                bypass_hook_trust: bypass_hook_trust.unwrap_or_default(),
++            },
+             cloud_skills_snapshot,
+             code_mode_host_transport: code_mode_host.into(),
+             managed_daemon,
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -211,6 +211,10 @@ impl InitializeRequestProcessor {
+ 
+         let user_agent = get_codex_user_agent();
+         let response = InitializeResponse {
++            trust_policy: codex_protocol::config_types::TrustPolicy {
++                bypass_project_trust: self.config.bypass_project_trust,
++                bypass_hook_trust: self.config.bypass_hook_trust,
++            },
+             user_agent,
+             codex_home,
+             platform_family: std::env::consts::FAMILY.to_string(),
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -558,12 +558,15 @@ impl ThreadRequestProcessor {
+     pub(crate) async fn thread_start(
+         &self,
+         request_id: ConnectionRequestId,
+-        params: ThreadStartParams,
++        mut params: ThreadStartParams,
+         app_server_client_name: Option<String>,
+         app_server_client_version: Option<String>,
+         client_mcp_extensions: ClientMcpExtensions,
+         request_context: RequestContext,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        self.config_manager
++            .consume_trust_overrides(&mut params.config)
++            .map_err(|error| invalid_request(error.to_string()))?;
+         self.thread_start_inner(
+             request_id,
+             params,
+@@ -589,11 +592,14 @@ impl ThreadRequestProcessor {
+     pub(crate) async fn thread_resume(
+         &self,
+         target: ThreadResumeTarget,
+-        params: ThreadResumeParams,
++        mut params: ThreadResumeParams,
+         app_server_client_name: Option<String>,
+         app_server_client_version: Option<String>,
+         client_mcp_extensions: ClientMcpExtensions,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        self.config_manager
++            .consume_trust_overrides(&mut params.config)
++            .map_err(|error| invalid_request(error.to_string()))?;
+         let mut prepared_config = None;
+         // Keep the resume future off the request handler's stack.
+         while Box::pin(self.thread_resume_inner(
+@@ -613,11 +619,14 @@ impl ThreadRequestProcessor {
+     pub(crate) async fn thread_fork(
+         &self,
+         request_id: ConnectionRequestId,
+-        params: ThreadForkParams,
++        mut params: ThreadForkParams,
+         app_server_client_name: Option<String>,
+         app_server_client_version: Option<String>,
+         client_mcp_extensions: ClientMcpExtensions,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        self.config_manager
++            .consume_trust_overrides(&mut params.config)
++            .map_err(|error| invalid_request(error.to_string()))?;
+         // Keep the large fork future out of the shared request dispatcher's stack frame.
+         Box::pin(self.thread_fork_inner(
+             request_id,
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -698,7 +698,11 @@ mod thread_processor_behavior_tests {
+                     features: BTreeMap::from([("plugins".to_string(), false)]),
+                 }),
+             ])),
+-        );
++        )
++        .with_trust_policy(codex_protocol::config_types::TrustPolicy {
++            bypass_hook_trust: true,
++            ..Default::default()
++        });
+         let config = config_manager
+             .load_with_overrides(
+                 Some(HashMap::from([
+diff --git a/codex-rs/app-server/src/startup_config.rs b/codex-rs/app-server/src/startup_config.rs
+--- a/codex-rs/app-server/src/startup_config.rs
++++ b/codex-rs/app-server/src/startup_config.rs
+@@ -55,6 +55,7 @@ pub async fn print_startup_config(
+     loader_overrides: LoaderOverrides,
+     strict_config: bool,
+     startup: StartupConfigArgs,
++    trust_policy: codex_protocol::config_types::TrustPolicy,
+ ) -> io::Result<()> {
+     let result = read_startup_config(
+         arg0_paths,
+@@ -62,6 +63,7 @@ pub async fn print_startup_config(
+         loader_overrides,
+         strict_config,
+         startup,
++        trust_policy,
+     )
+     .await;
+     let output = match &result {
+@@ -83,6 +85,7 @@ async fn read_startup_config(
+     loader_overrides: LoaderOverrides,
+     strict_config: bool,
+     startup: StartupConfigArgs,
++    trust_policy: codex_protocol::config_types::TrustPolicy,
+ ) -> Result<StartupConfig, JSONRPCErrorError> {
+     if startup.startup_sign_out
+         && (is_workload_identity_selected() || read_codex_access_token_from_env().is_some())
+@@ -119,7 +122,8 @@ async fn read_startup_config(
+         Default::default(),
+         arg0_paths,
+         Arc::new(NoopThreadConfigLoader),
+-    );
++    )
++    .with_trust_policy(trust_policy);
+     let cwd = std::env::current_dir().ok();
+     let loaded = manager
+         .load_cloud_startup_config(cwd.clone())
+diff --git a/codex-rs/app-server/tests/suite/v2/initialize.rs b/codex-rs/app-server/tests/suite/v2/initialize.rs
+--- a/codex-rs/app-server/tests/suite/v2/initialize.rs
++++ b/codex-rs/app-server/tests/suite/v2/initialize.rs
+@@ -59,12 +59,163 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        trust_policy,
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_vscode/"));
+     assert_eq!(response_codex_home, expected_codex_home);
+     assert_eq!(platform_family, std::env::consts::FAMILY);
+     assert_eq!(platform_os, std::env::consts::OS);
++    assert_eq!(trust_policy, Default::default());
++    Ok(())
++}
++
++#[tokio::test]
++async fn startup_trust_policy_is_reported_and_cannot_change_for_threads() -> Result<()> {
++    use codex_app_server_protocol::ThreadForkParams;
++    use codex_app_server_protocol::ThreadForkResponse;
++    use codex_app_server_protocol::ThreadResumeParams;
++    use codex_app_server_protocol::ThreadResumeResponse;
++    use codex_app_server_protocol::TrustPolicy;
++    use serde_json::json;
++    use std::collections::HashMap;
++
++    let server = create_mock_responses_server_sequence_unchecked(vec![
++        create_final_assistant_message_sse_response("Done")?,
++    ])
++    .await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(home.path())?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .with_args(&[
++            "--dangerously-bypass-project-trust",
++            "--dangerously-bypass-hook-trust=false",
++        ])
++        .build()
++        .await?;
++    let JSONRPCMessage::Response(response) = app
++        .initialize_with_client_info(ClientInfo {
++            name: "trust-policy-test".to_string(),
++            title: None,
++            version: "1".to_string(),
++        })
++        .await?
++    else {
++        anyhow::bail!("initialize response")
++    };
++    assert_eq!(
++        to_response::<InitializeResponse>(response)?.trust_policy,
++        TrustPolicy {
++            bypass_project_trust: true,
++            bypass_hook_trust: false,
++        }
++    );
++    let matching = HashMap::from([
++        ("bypass_project_trust".to_string(), json!(true)),
++        ("bypass_hook_trust".to_string(), json!(false)),
++    ]);
++    for (key, value) in [("bypass_project_trust", false), ("bypass_hook_trust", true)] {
++        let id = app
++            .send_thread_start_request_with_auto_env(ThreadStartParams {
++                config: Some(HashMap::from([(key.to_string(), json!(value))])),
++                ..Default::default()
++            })
++            .await?;
++        let error = timeout(
++            DEFAULT_READ_TIMEOUT,
++            app.read_stream_until_error_message(RequestId::Integer(id)),
++        )
++        .await??;
++        assert!(
++            error
++                .error
++                .message
++                .contains("conflicts with the app server startup value")
++        );
++    }
++    let id = app
++        .send_thread_start_request_with_auto_env(ThreadStartParams {
++            config: Some(matching.clone()),
++            ..Default::default()
++        })
++        .await?;
++    let started: ThreadStartResponse =
++        timeout(DEFAULT_READ_TIMEOUT, app.read_response(id)).await??;
++    app.start_turn_and_wait_for_completion(TurnStartParams {
++        thread_id: started.thread.id.clone(),
++        input: vec![V2UserInput::Text {
++            text: "materialize rollout".to_string(),
++            text_elements: Vec::new(),
++        }],
++        ..Default::default()
++    })
++    .await?;
++    let mismatch = Some(HashMap::from([(
++        "bypass_hook_trust".to_string(),
++        json!(true),
++    )]));
++    let id = app
++        .send_thread_resume_request(ThreadResumeParams {
++            thread_id: started.thread.id.clone(),
++            config: mismatch.clone(),
++            ..Default::default()
++        })
++        .await?;
++    let error = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app.read_stream_until_error_message(RequestId::Integer(id)),
++    )
++    .await??;
++    assert!(
++        error
++            .error
++            .message
++            .contains("--dangerously-bypass-hook-trust=true")
++    );
++    let id = app
++        .send_thread_fork_request(ThreadForkParams {
++            thread_id: started.thread.id.clone(),
++            config: mismatch,
++            ..Default::default()
++        })
++        .await?;
++    let error = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app.read_stream_until_error_message(RequestId::Integer(id)),
++    )
++    .await??;
++    assert!(
++        error
++            .error
++            .message
++            .contains("--dangerously-bypass-hook-trust=true")
++    );
++    for config in [None, Some(matching)] {
++        let id = app
++            .send_thread_resume_request(ThreadResumeParams {
++                thread_id: started.thread.id.clone(),
++                config: config.clone(),
++                ..Default::default()
++            })
++            .await?;
++        let resumed: ThreadResumeResponse =
++            timeout(DEFAULT_READ_TIMEOUT, app.read_response(id)).await??;
++        assert_eq!(resumed.thread.id, started.thread.id);
++        let id = app
++            .send_thread_fork_request(ThreadForkParams {
++                thread_id: started.thread.id.clone(),
++                config,
++                ..Default::default()
++            })
++            .await?;
++        let forked: ThreadForkResponse =
++            timeout(DEFAULT_READ_TIMEOUT, app.read_response(id)).await??;
++        assert_eq!(
++            forked.thread.forked_from_id,
++            Some(started.thread.id.clone())
++        );
++    }
+     Ok(())
+ }
+ 
+@@ -171,9 +322,11 @@ async fn initialize_respects_originator_override_env_var() -> Result<()> {
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        trust_policy,
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_originator_via_env_var/"));
++    assert_eq!(trust_policy, Default::default());
+     assert_eq!(response_codex_home, expected_codex_home);
+     assert_eq!(platform_family, std::env::consts::FAMILY);
+     assert_eq!(platform_os, std::env::consts::OS);
+diff --git a/codex-rs/config/src/state.rs b/codex-rs/config/src/state.rs
+--- a/codex-rs/config/src/state.rs
++++ b/codex-rs/config/src/state.rs
+@@ -54,6 +54,8 @@ pub struct LoaderOverrides {
+     pub ignore_user_config: bool,
+     /// Skip project-root discovery and all project configuration layers.
+     pub ignore_project_config: bool,
++    /// Admit project-local configuration without a persisted directory trust decision.
++    pub bypass_project_trust: bool,
+     pub ignore_user_and_project_exec_policy_rules: bool,
+     //TODO(gt): Add a macos_ prefix to this field and remove the target_os check.
+     #[cfg(target_os = "macos")]
+@@ -78,6 +80,7 @@ impl LoaderOverrides {
+             ignore_login_requirements: false,
+             ignore_user_config: false,
+             ignore_project_config: false,
++            bypass_project_trust: false,
+             ignore_user_and_project_exec_policy_rules: false,
+             #[cfg(target_os = "macos")]
+             managed_preferences_base64: Some(String::new()),
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1018,11 +1018,12 @@ pub struct Config {
+     /// Optional extra configuration fields for the thread.
+     pub extra_config: Option<ExtraConfig>,
+ 
+-    /// Whether enabled hooks should run without requiring persisted hook trust for this session.
+-    ///
+-    /// This is a runtime-only knob populated from invocation overrides, not from config files.
++    /// Runtime-only hook trust policy, fixed for an app-server lifetime.
+     pub bypass_hook_trust: bool,
+ 
++    /// Runtime-only project trust policy, fixed for an app-server lifetime.
++    pub bypass_project_trust: bool,
++
+     /// Optional URI-based file opener. If set, citations to files in the model
+     /// output will be hyperlinked using the specified URI scheme.
+     pub file_opener: UriBasedFileOpener,
+@@ -1584,7 +1585,11 @@ impl ConfigBuilder {
+         };
+         let cli_overrides = cli_overrides.unwrap_or_default();
+         let mut harness_overrides = harness_overrides.unwrap_or_default();
+-        let loader_overrides = loader_overrides.unwrap_or_default();
++        let mut loader_overrides = loader_overrides.unwrap_or_default();
++        if let Some(bypass) = harness_overrides.bypass_project_trust {
++            loader_overrides.bypass_project_trust = bypass;
++        }
++        harness_overrides.bypass_project_trust = Some(loader_overrides.bypass_project_trust);
+         let cwd_override = harness_overrides.cwd.as_deref().or(fallback_cwd.as_deref());
+         let cwd = match cwd_override {
+             Some(path) => AbsolutePathBuf::relative_to_current_dir(path)?,
+@@ -2748,6 +2753,7 @@ pub struct ConfigOverrides {
+     pub tools_web_search_request: Option<bool>,
+     pub ephemeral: Option<bool>,
+     pub bypass_hook_trust: Option<bool>,
++    pub bypass_project_trust: Option<bool>,
+     /// Additional directories that should be treated as writable roots for this session.
+     pub additional_writable_roots: Vec<PathBuf>,
+     /// Explicit absolute runtime workspace roots for this session. When set,
+@@ -3498,14 +3504,16 @@ impl Config {
+             tools_web_search_request: override_tools_web_search_request,
+             ephemeral,
+             bypass_hook_trust,
++            bypass_project_trust,
+             additional_writable_roots,
+             workspace_roots: workspace_roots_override,
+         } = overrides;
+         let bypass_hook_trust = bypass_hook_trust.unwrap_or_default();
++        let bypass_project_trust = bypass_project_trust.unwrap_or_default();
+ 
+         if bypass_hook_trust {
+             startup_warnings.push(
+-                "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."
++                "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this app server's lifetime."
+                     .to_string(),
+             );
+         }
+@@ -4639,6 +4647,7 @@ impl Config {
+             ephemeral: ephemeral.unwrap_or_default(),
+             extra_config: None,
+             bypass_hook_trust,
++            bypass_project_trust,
+             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
+             codex_self_exe,
+             codex_linux_sandbox_exe,
+diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs
+--- a/codex-rs/protocol/src/config_types.rs
++++ b/codex-rs/protocol/src/config_types.rs
+@@ -22,6 +22,33 @@ use wildmatch::WildMatchPattern;
+ 
+ use crate::openai_models::ReasoningEffort;
+ 
++/// Immutable trust bypasses selected when the app server starts.
++#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++pub struct TrustPolicy {
++    pub bypass_project_trust: bool,
++    pub bypass_hook_trust: bool,
++}
++
++impl TrustPolicy {
++    /// Omitted client values inherit the server policy; explicit values only assert it.
++    pub fn check_request(self, project: Option<bool>, hooks: Option<bool>) -> Result<(), String> {
++        for (flag, requested, running) in [
++            ("project", project, self.bypass_project_trust),
++            ("hook", hooks, self.bypass_hook_trust),
++        ] {
++            if let Some(requested) = requested
++                && requested != running
++            {
++                return Err(format!(
++                    "--dangerously-bypass-{flag}-trust={requested} conflicts with the app server startup value {running}. Stop the server and start it with the desired policy; the running server was not changed."
++                ));
++            }
++        }
++        Ok(())
++    }
++}
++
+ /// Limit for the text included in `codex.tool_result` log records.
+ /// This does not affect model-visible output. Raising it can expose more tool data to logs.
+ #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, JsonSchema)]
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -244,6 +244,7 @@ async fn new_config(
+         plugins: Default::default(),
+         startup_warnings: Vec::new(),
+         bypass_hook_trust: false,
++        bypass_project_trust: false,
+         model,
+         daybreak_enabled: false,
+         service_tier: None,

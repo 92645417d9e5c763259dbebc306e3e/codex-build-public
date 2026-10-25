@@ -1,0 +1,239 @@
+bypass-project-trust-through-config-loader
+
+Lane: mixed
+
+Unit: configure-trust-bypasses-at-server-start
+
+ChildPatch: bypass-project-trust-through-config-loader
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/config/src/loader/local.rs b/codex-rs/config/src/loader/local.rs
+--- a/codex-rs/config/src/loader/local.rs
++++ b/codex-rs/config/src/loader/local.rs
+@@ -147,6 +147,7 @@ pub(super) async fn load_local_config_layers_with_overrides(
+         &project_root_markers,
+         codex_home.as_path(),
+         &user_file,
++        overrides.bypass_project_trust,
+     )
+     .await?;
+     let broker_requirements = requirements.clone().project(&[
+diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
+--- a/codex-rs/config/src/loader/mod.rs
++++ b/codex-rs/config/src/loader/mod.rs
+@@ -382,6 +382,7 @@ pub async fn load_config_layers_state(
+             &project_root_markers,
+             codex_home,
+             &active_user_file,
++            overrides.bypass_project_trust,
+         )
+         .await
+         {
+@@ -1047,6 +1048,7 @@ fn apply_credential_broker_requirements(
+ }
+ 
+ struct ProjectTrustContext {
++    bypass_project_trust: bool,
+     project_root: AbsolutePathBuf,
+     has_project_root_marker: bool,
+     project_root_key: String,
+@@ -1079,6 +1081,12 @@ impl ProjectTrustDecision {
+ 
+ impl ProjectTrustContext {
+     fn decision_for_dir(&self, dir: &AbsolutePathBuf) -> ProjectTrustDecision {
++        if self.bypass_project_trust {
++            return ProjectTrustDecision {
++                trust_level: Some(TrustLevel::Trusted),
++                trust_key: self.project_root_key.clone(),
++            };
++        }
+         for dir_key in normalized_project_trust_keys(dir.as_path()) {
+             if let Some((trust_key, trust_level)) =
+                 project_trust_for_lookup_key(&self.projects_trust, &dir_key)
+@@ -1453,6 +1461,7 @@ async fn project_trust_context(
+     project_root_markers: &[String],
+     config_base_dir: &Path,
+     user_config_file: &AbsolutePathBuf,
++    bypass_project_trust: bool,
+ ) -> io::Result<ProjectTrustContext> {
+     let project_trust_config: ProjectTrustConfigToml = {
+         let _guard = AbsolutePathBufGuard::new(config_base_dir);
+@@ -1528,6 +1537,7 @@ async fn project_trust_context(
+         .collect::<Vec<_>>();
+ 
+     Ok(ProjectTrustContext {
++        bypass_project_trust,
+         project_root,
+         has_project_root_marker,
+         project_root_key,
+diff --git a/codex-rs/config/src/loader/tests.rs b/codex-rs/config/src/loader/tests.rs
+--- a/codex-rs/config/src/loader/tests.rs
++++ b/codex-rs/config/src/loader/tests.rs
+@@ -1191,6 +1191,66 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
+     );
+ }
+ 
++#[tokio::test]
++async fn project_trust_bypass_loads_local_layers_without_persisting_trust() {
++    let tmp = tempdir().expect("tempdir");
++    let home = tmp.path().join("home");
++    let project = tmp.path().join("project");
++    std::fs::create_dir_all(&home).expect("home");
++    std::fs::create_dir_all(project.join(".codex")).expect("project config");
++    std::fs::write(project.join(".project-root"), "").expect("marker");
++    let project_key = TomlValue::String(project_trust_key(&project)).to_string();
++    let user = format!(
++        "project_root_markers=['.project-root']\n[projects.{project_key}]\ntrust_level='untrusted'\n"
++    );
++    let user_path = home.join(CONFIG_TOML_FILE);
++    std::fs::write(&user_path, &user).expect("user config");
++    std::fs::write(project.join(".codex/config.toml"), "model='project-model'")
++        .expect("project config");
++    let cwd = AbsolutePathBuf::from_absolute_path(&project).expect("absolute cwd");
++    for bypass in [false, true] {
++        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
++        overrides.bypass_project_trust = bypass;
++        let local = local::load_local_config_layers_with_overrides(
++            &TestFileSystem,
++            &home,
++            &cwd,
++            &overrides,
++        )
++        .await
++        .expect("local layers");
++        assert_eq!(
++            local
++                .config
++                .layers
++                .iter()
++                .any(|layer| matches!(layer.source, ConfigLayerSource::Project { .. })),
++            bypass
++        );
++        let stack = load_config_layers_state(
++            &TestFileSystem,
++            &home,
++            Some(cwd.clone()),
++            &[],
++            overrides,
++            &crate::NoopThreadConfigLoader,
++        )
++        .await
++        .expect("effective layers");
++        assert_eq!(
++            stack
++                .effective_config()
++                .get("model")
++                .and_then(TomlValue::as_str),
++            bypass.then_some("project-model")
++        );
++        assert_eq!(
++            std::fs::read_to_string(&user_path).expect("unchanged trust"),
++            user
++        );
++    }
++}
++
+ #[test]
+ fn project_config_cannot_change_system_proxy_routing_or_credential_masking() {
+     for key in [
+diff --git a/codex-rs/core/src/agents_md.rs b/codex-rs/core/src/agents_md.rs
+--- a/codex-rs/core/src/agents_md.rs
++++ b/codex-rs/core/src/agents_md.rs
+@@ -61,7 +61,7 @@ pub(crate) async fn load_project_instructions(
+     environments: &TurnEnvironmentSnapshot,
+ ) -> io::Result<Option<LoadedAgentsMd>> {
+     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
+-    if config.active_project.is_untrusted() {
++    if config.active_project.is_untrusted() && !config.bypass_project_trust {
+         return Ok((!loaded.is_empty()).then_some(loaded));
+     }
+ 
+diff --git a/codex-rs/core/src/agents_md_tests.rs b/codex-rs/core/src/agents_md_tests.rs
+--- a/codex-rs/core/src/agents_md_tests.rs
++++ b/codex-rs/core/src/agents_md_tests.rs
+@@ -1131,6 +1131,24 @@ async fn merges_existing_instructions_with_agents_md() {
+     assert_eq!(res, expected);
+ }
+ 
++#[tokio::test]
++async fn project_trust_bypass_loads_instructions_without_changing_recorded_trust() {
++    let project = tempfile::tempdir().expect("project");
++    fs::create_dir(project.path().join(".git")).unwrap();
++    fs::write(project.path().join("AGENTS.md"), "project instructions").unwrap();
++    let mut config = make_config(&project, 4096, Some("global instructions")).await;
++    config.active_project.trust_level = Some(codex_protocol::config_types::TrustLevel::Untrusted);
++    for bypass in [false, true] {
++        config.bypass_project_trust = bypass;
++        let text = get_user_instructions(&config)
++            .await
++            .expect("global instructions");
++        assert!(text.contains("global instructions"));
++        assert_eq!(text.contains("project instructions"), bypass);
++        assert!(config.active_project.is_untrusted());
++    }
++}
++
+ #[tokio::test]
+ async fn multiple_environment_docs_use_labeled_layout_and_preserve_source_order() {
+     let primary = tempfile::tempdir().expect("primary tempdir");
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -11835,13 +11835,52 @@ async fn bypass_hook_trust_adds_startup_warning() -> std::io::Result<()> {
+ 
+     assert!(
+         config.startup_warnings.iter().any(|warning| warning
+-            == "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."),
++            == "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this app server's lifetime."),
+         "{:?}",
+         config.startup_warnings
+     );
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn project_trust_bypass_preserves_recorded_trust_and_permissions() -> std::io::Result<()> {
++    let home = TempDir::new()?;
++    let project = home.path().join("project");
++    std::fs::create_dir_all(project.join(".codex"))?;
++    std::fs::write(project.join(".codex/config.toml"), "model='project-model'")?;
++    let key = toml::Value::String(project.to_string_lossy().into_owned());
++    let user = format!("[projects.{key}]\ntrust_level='untrusted'\n");
++    std::fs::write(home.path().join("config.toml"), &user)?;
++    let load = |bypass| {
++        ConfigBuilder::without_managed_config_for_tests()
++            .codex_home(home.path().to_path_buf())
++            .harness_overrides(ConfigOverrides {
++                cwd: Some(project.clone()),
++                bypass_project_trust: Some(bypass),
++                ..Default::default()
++            })
++            .build()
++    };
++    let restricted = load(false).await?;
++    let bypassed = load(true).await?;
++    assert_eq!(bypassed.model.as_deref(), Some("project-model"));
++    assert!(bypassed.active_project.is_untrusted());
++    assert!(!bypassed.bypass_hook_trust);
++    assert_eq!(
++        bypassed.permissions.effective_permission_profile(),
++        restricted.permissions.effective_permission_profile()
++    );
++    assert_eq!(
++        bypassed.permissions.approval_policy.value(),
++        restricted.permissions.approval_policy.value()
++    );
++    assert_eq!(
++        std::fs::read_to_string(home.path().join("config.toml"))?,
++        user
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn permission_profile_override_preserves_split_write_roots() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;

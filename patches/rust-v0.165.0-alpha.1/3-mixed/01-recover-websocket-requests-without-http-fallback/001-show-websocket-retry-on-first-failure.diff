@@ -1,0 +1,74 @@
+show-websocket-retry-on-first-failure
+
+Lane: mixed
+
+Unit: recover-websocket-requests-without-http-fallback
+
+ChildPatch: show-websocket-retry-on-first-failure
+
+Form: GitDiff
+
+Segment: snapshot
+
+Purpose: Keep official personal ChatGPT WebSocket recovery visible and persistent without silently switching to HTTP.
+
+Requires: none
+
+Provides: For Plus, Pro and ProLite on the unmodified official endpoint, show the first retry and retain WebSocket transport; with the default five-retry budget, sampling capacity failures wait for the next five-minute boundary and exhausted connection failures restart their cycle there until cancellation, with visible TUI warning records.
+
+Boundary: Other plans, API keys, endpoint overrides, custom budgets and remote compaction retain native retry timing. Atomic response admission, response-progress deadline integration, usage observations, hard cancellation and input preemption retain their own responsibilities; this recovery feature does not require response collection.
+
+Verification: Client account and fallback tests, response-retry clock and cancellation tests, and TUI overload-warning tests verify eligibility, strict boundary timing, cycle reset, compaction exclusion, and one visible diagnostic with native retry status.
+
+
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -83,6 +83,7 @@ use codex_otel::SessionTelemetry;
+ use codex_otel::WEBSOCKET_CONTINUATION_COUNT_METRIC;
+ use codex_otel::current_span_w3c_trace_context;
+ use codex_protocol::ResponseItemId;
++use codex_protocol::account::PlanType;
+ use codex_protocol::auth::AuthMode;
+ 
+ use codex_protocol::ThreadId;
+@@ -1464,6 +1465,26 @@ impl Drop for ModelClientSession {
+ }
+ 
+ impl ModelClientSession {
++    /// Private WebSocket recovery applies only to signed-in personal accounts
++    /// using the official provider, with no configured endpoint override.
++    pub(crate) fn personal_chatgpt_websocket_enabled(&self) -> bool {
++        let provider = self.client.state.provider.info();
++        self.client.responses_websocket_enabled()
++            && provider.is_openai()
++            && provider.base_url.is_none()
++            && self
++                .client
++                .auth_manager()
++                .and_then(|manager| manager.auth_cached())
++                .is_some_and(|auth| {
++                    auth.auth_mode() == AuthMode::Chatgpt
++                        && matches!(
++                            auth.account_plan_type(),
++                            Some(PlanType::Plus | PlanType::Pro | PlanType::ProLite)
++                        )
++                })
++    }
++
+     pub(crate) fn inference_tools_changed(&self, tools: &Arc<[ToolSpec]>) -> bool {
+         let previous = self
+             .client
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -146,7 +146,8 @@ pub(crate) async fn handle_response_stream_error(
+         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
+         let report_error = retry_count > 1
+             || cfg!(debug_assertions)
+-            || !sess.services.model_client.responses_websocket_enabled();
++            || !sess.services.model_client.responses_websocket_enabled()
++            || client_session.personal_chatgpt_websocket_enabled();
+         if report_error {
+             // Surface retry information to any UI/front-end so the user understands what is
+             // happening instead of staring at a seemingly frozen screen.

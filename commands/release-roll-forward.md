@@ -31,7 +31,7 @@ LocalResponsibilityRollOwner
 `-- Terminal: SelectedPatchAuthorityTerminal
 ```
 
-- Root and lane note changes retain separate exact current-user approval; Roll execution never grants it.
+- Version-note changes retain separate exact current-user approval; Roll execution never grants it.
 - Unless the user limits scope or selects an interactive pause, Roll migrates the sole task's complete declared Patch set across Units and Lanes.
 - Continue unchanged transport, in-scope reconstruction, checks and interrupted work without repeating established approval.
 - New or unsupported scope, material contract or requirement-cost choices, and structural changes consume OriginalPatchPurposeOwner's existing approval decision before dependent effects.
@@ -90,7 +90,7 @@ LocalResponsibilityRollOwner
 ReleaseBaselineOwner
 +-- Consumer: NewReleaseRequestConsumer
 +-- TaskIndex: sole selected tag task explicit source prefixes canonical global Git roles and origin
-+-- Inherit: predecessor Established remains unchanged while the current tag stays absent until Pass
++-- Inherit: predecessor Established remains unchanged while the current tag stays absent until Pass on the selected shared bugfix source
 +-- First: exact zero coverage without baseline execution evidence
 +-- Failure: remove only resources created by this invocation and retain the same tag continuation
 +-- Fetch: one CargoLock before baseline or zero discovery
@@ -99,7 +99,11 @@ ReleaseBaselineOwner
 ```
 
 ```
-OfficialOneParentTag->ParentMainWorktree->EmptyUpstreamMarker
+OfficialOneParentTag
+`-- OfficialParent
+    `-- StandaloneBugfixPrefix
+        +-- UpstreamBaseline empty marker
+        `-- Product normalization and private suffix
 ```
 
 - Before baseline, the product agent publishes the sole canonical task and TaskIndex through TaskWorkspace.
@@ -107,9 +111,37 @@ OfficialOneParentTag->ParentMainWorktree->EmptyUpstreamMarker
 - Any second indexed task or any registered topology other than the selected tag or its primary predecessor blocks.
 - Main, UpstreamBaseline, and fork worktrees use TaskWorkspace's canonical global paths. Native registration must match those exact paths and one admitted tag; tag-scoped, mixed, duplicate, or unrelated roles block before mutation.
 - When private history exists, require the exact primary prefix directory and canonical Unit bytes without a release-completion receipt. When the prefix is absent, require an Established predecessor and Main exactly at that tag's official parent; an empty directory or any private Patch still blocks.
-- New preparation validates that predecessor evidence, fetches and retains the official one-parent target tag, and converges the canonical global paths from the remaining exact predecessor roles to Main at the target parent and its empty upstream marker. Reentry consumes that same forward transition, retires remaining predecessor roles at their observed tips, and completes missing target roles without selecting the predecessor topology as current again.
-- Once the target topology is complete, bounded Cargo fetch and the same tag's retained Plan, Stage, Result, and process chain remain its only baseline continuation. The predecessor Established stays immutable input evidence until zero bootstrap or a passing Baseline atomically publishes the target Established, retains that primary predecessor, and retires any older baseline generation; an existing target Established may only finish owned cleanup.
+- New preparation validates predecessor evidence, fetches and retains the official one-parent target tag, and converges the canonical global paths to Main at the target parent and its empty upstream marker.
+- When known bugfixes require authoring before measurement, use release-baseline --prepare on that same task and topology.
+- Preparation stops without establishing coverage or executing tests; it is an intermediate Baseline handoff, not Baseline completion or permission for a private feature.
+- Reentry retires remaining predecessor roles at their observed tips and completes missing target roles without selecting predecessor topology as current again.
+- Accept each known bugfix through OriginalPatchPurposeOwner and author or transport its canonical Flat Patch on the target bugfix-only prefix.
+- Before measurement, use native Git to put UpstreamBaseline at that exact prefix plus its empty baseline marker, preserving the official tag and every retained product suffix.
+- Reentry admits the same canonical bugfix-only prefix rather than requiring Main to return to the unpatched parent.
+- Bounded Cargo fetch and the same tag's retained Plan, Stage, Result and process chain own initial measurement and continuation.
+- The predecessor Established stays immutable until zero bootstrap or a passing Baseline publishes the target Established, retains that predecessor and retires an older generation.
+- An existing target Established may finish owned cleanup only when its measured bugfix source still matches; a changed shared prefix uses FullSuiteAudit's affected-coverage successor.
 - Release-baseline emits startup guidance before work and bounded progress at phase changes and completed test rounds. Every line repeats the same-handle maximum-wait instruction. Continue that handle through cleanup and terminal JSON; progress is not completion or a request for caller commentary.
+
+## Shared Bugfix Source Changes
+
+- Classification follows the defect's cause, not the time or private test that exposed it.
+- Demonstrate the upstream defect on the official parent with only its earlier required bugfixes before proposing bugfix placement.
+- A failure caused only by private Patch composition stays in the corresponding original Unit or Flat Patch.
+- New bugfix structure still requires OriginalPatchPurposeOwner's ordinary authority decision.
+- A late upstream fix returns through the existing committed-history Fork boundary before normalization and retains every later accepted or unfinished responsibility as its suffix source.
+- Rewrite the complete affected bugfix responsibility and preserve the order and contracts of other bugfixes.
+- Verify the regression on the standalone bugfix prefix without borrowing normalization, private implementation or private fixture behavior.
+- Synchronize UpstreamBaseline to the corrected prefix with native Git and its empty marker before selecting baseline coverage.
+- Adding, changing or removing any bugfix invalidates affected baseline measurements even when CoveredPackages is unchanged.
+- Select affected packages and required regression tests through FullSuiteAudit, including affected consumers rather than only directly edited packages.
+- Preserve unaffected outcomes only when source and dependency evidence establishes that they remain applicable.
+- Uncertain impact selects all established coverage rather than asserting that an unexamined package is unaffected.
+- Complete the baseline measurement and publication before reusing its comparison, then replay the retained normalization and private suffix through their existing owners.
+- Regenerate executable transforms from the corrected prefix rather than replaying stale generated bytes.
+- Private-combination corrections encountered during suffix replay remain in their original Units.
+- Convergence compares the product and Baseline bugfix prefixes directly through Git before closing this source change.
+- This route selects no complete product suite, auxiliary progress record, source fingerprint or new integration responsibility.
 
 ## Purpose And Causal Reconstruction
 
@@ -254,11 +286,14 @@ OriginalPatchPurposeOwner
 - Keep this comparison in native List and Git evidence and unresolved task scope, without a parallel manifest, progress ledger or completion record.
 - Publish only unresolved responsibilities and continuation details in the task.
 - Preserve boundaries unless exact redistribution is approved.
-- Prepare absent root and lane notes from the corresponding current publication, selected sources, or an empty file. Copy inherited entries exactly; preserve existing drafts, including empty files.
+- Prepare an absent version-root notes.md from the current publication, selected source notes, or an empty file.
+- Copy inherited entries exactly and preserve existing drafts, including empty files.
 - Prepare an absent cross diagram from the current canonical publication or selected predecessor diagram before cross work; when neither exists, author the approved relationships from source in the same working lane directory.
 - Preserve an existing working diagram on resume, reconcile it with current user decisions and source, and update it with authorized relationship changes before dependent work or export.
-- Before every new or resumed Patch analysis, read root notes then the selected lane's notes and applicable source guards. Current user decisions govern; conflicting guards require resolution before dependent edits.
-- Notes are not summaries. Put shared critical cross-Patch guards at the root and only lane-specific additions in lane files. Self-contained behavior stays with its native owners. Present exact additions, rewrites, moves, or removals for explicit current-user approval; task edits, Patch completion, tests, and agent importance grant none. Notes contain no Patch identity, topology, history, workflow, progress, or test transition.
+- Before every new or resumed Patch analysis, read the current version-root notes and applicable source guards.
+- Current user decisions govern; conflicting guards require resolution before dependent edits.
+- Notes contain only approved critical cross-Patch guards; self-contained behavior stays with its native owners.
+- PatchExport owns exact note-entry approval and format.
 - Before choosing transport, consume OriginalPatchPurposeOwner's supported assignment and the draft-independent prefix.
 - Preserve the approved relative order; expand source review only for a changed obligation or unresolved interaction.
 - An interactive pause requested with exploration consumes OriginalPatchPurposeOwner for the next Patch on clean Current. Present its implementation, retained responsibilities, owners, dependents, focused checks and unresolved decisions before stopping; transport and task topology stay unchanged.
@@ -269,7 +304,7 @@ OriginalPatchPurposeOwner
 - When Apply or an ExecutableTransform publishes the complete formatted source tip, consume it without a duplicate commit. A focused schema consumer uses transient Finalize on current cumulative source, its affected test, then Prepare; package identity alone does not require generation.
 - When the current Flat Patch or Unit requires config.schema.json regeneration, use config-schema on its clean source tip, then fold the fixture into the same Flat Patch or Child Patch through Revise. The postimage is no new structure or lane terminal.
 - A selected snapshot-producing focused check retains private generated bytes without publishing them. A selected complete codex-tui package test supplies private external and inline renderer evidence; the script's character projection alone does not establish snapshot geometry.
-- For a selected failed test, compare exact outcomes with Established and diagnose any novel failure through lang's [Rust Diagnostic triage](/codex/skills/lang/references/rust/diagnostic-triage.md) and the purpose reconstruction above. That continuation is read-only until the unchanged approved boundary is confirmed or a changed boundary receives new approval. Preserve missing or incomparable evidence as such; do not infer a Pass or require a complete-suite rerun.
+- For a selected failed test, compare exact outcomes with Established and diagnose any novel failure through rust's [Diagnostic triage](/codex/skills/rust/references/rust/diagnostic-triage.md) and the purpose reconstruction above. That continuation is read-only until the unchanged approved boundary is confirmed or a changed boundary receives new approval. Preserve missing or incomparable evidence as such; do not infer a Pass or require a complete-suite rerun.
 - Forward advancement and committed-history edits select no full suite. A user-selected full Finalize runs on actual Current without an extra tag or acceptance seal.
 - A normalization platform-audit finding follows the existing Flat Patch or Unit boundary: correct the terminal structure in place, or Fork and rebuild an earlier one before replaying the retained suffix.
 - Verification retains its RouteEntry handle. An interrupted full Finalize resumes through --resume on the same source and selection within its original round deadline; never omit that flag merely because the handle was lost. Baseline reentry uses release-baseline. Findings return to the owning Patch for freely selected focused diagnosis without changing topology or demanding a fresh full run.

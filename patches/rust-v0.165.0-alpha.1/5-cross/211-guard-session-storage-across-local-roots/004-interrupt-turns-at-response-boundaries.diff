@@ -1,0 +1,1358 @@
+interrupt-turns-at-response-boundaries
+
+Lane: cross
+
+Unit: guard-session-storage-across-local-roots
+
+ChildPatch: interrupt-turns-at-response-boundaries
+
+Form: GitDiff
+
+Segment: schema
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/dynamic_tools.rs b/codex-rs/app-server/tests/suite/v2/dynamic_tools.rs
+--- a/codex-rs/app-server/tests/suite/v2/dynamic_tools.rs
++++ b/codex-rs/app-server/tests/suite/v2/dynamic_tools.rs
+@@ -579,6 +579,7 @@ struct PendingDynamicToolCall {
+     server: MockServer,
+     request_id: RequestId,
+     params: DynamicToolCallParams,
++    _codex_home: TempDir,
+ }
+ 
+ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynamicToolCall> {
+@@ -686,6 +687,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
+         server,
+         request_id,
+         params,
++        _codex_home: codex_home,
+     })
+ }
+ 
+@@ -698,6 +700,7 @@ async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
+         server,
+         request_id,
+         params,
++        _codex_home,
+     } = start_function_dynamic_tool_call(call_id).await?;
+ 
+     let response_content_items = vec![
+@@ -816,6 +819,7 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
+         server,
+         request_id,
+         params,
++        _codex_home,
+     } = start_function_dynamic_tool_call(call_id).await?;
+ 
+     let response = DynamicToolCallResponse {
+@@ -872,6 +876,7 @@ async fn dynamic_tool_remote_audio_response_becomes_model_visible_error() -> Res
+         server,
+         request_id,
+         params,
++        _codex_home,
+     } = start_function_dynamic_tool_call(call_id).await?;
+ 
+     let response = DynamicToolCallResponse {
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -832,6 +832,7 @@ async fn drain_to_completed(
+ ) -> CodexResult<CompactionResponse> {
+     sess.set_server_reasoning_included(turn_context.model_info().use_responses_lite)
+         .await;
++    let _storage_response = sess.begin_storage_response(&turn_context.config).await?;
+     let mut stream = client_session
+         .stream(
+             prompt,
+@@ -898,6 +899,9 @@ async fn drain_to_completed(
+                 .await;
+                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                     .await?;
++                if sess.storage_failure().is_some() {
++                    return Err(CodexErr::TurnAborted);
++                }
+                 return Ok(CompactionResponse {
+                     response_id,
+                     output,
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -302,6 +302,7 @@ async fn run_remote_compaction_request_v2(
+             // Replay the routing token without letting this request change foreground routing.
+             let turn_state = Arc::new(turn_state.map(OnceLock::from).unwrap_or_default());
+             let http_executor = ResponsesHttpExecutor::new(&sess.services.model_client);
++            let _storage_response = sess.begin_storage_response(&turn_context.config).await?;
+             let stream = tokio::select! {
+                 biased;
+                 _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
+@@ -311,13 +312,18 @@ async fn run_remote_compaction_request_v2(
+                     &trace,
+                 ) => stream?,
+             };
+-            return collect_compaction_output(
++            let result = collect_compaction_output(
+                 sess,
+                 turn_context,
+                 stream,
+                 CompactionRequestKind::Background(&cancellation),
+             )
+             .await;
++            return if sess.storage_failure().is_some() {
++                Err(CodexErr::TurnAborted)
++            } else {
++                result
++            };
+         }
+         CompactionRequestTransport::Foreground(client_session) => client_session,
+     };
+@@ -329,6 +335,7 @@ async fn run_remote_compaction_request_v2(
+         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+     let mut retry_state = ResponsesStreamRetryState::default();
+     loop {
++        let storage_response = sess.begin_storage_response(&turn_context.config).await?;
+         let result = match client_session
+             .stream(
+                 prompt,
+@@ -354,6 +361,10 @@ async fn run_remote_compaction_request_v2(
+             }
+             Err(err) => Err(err),
+         };
++        drop(storage_response);
++        if sess.storage_failure().is_some() {
++            return Err(CodexErr::TurnAborted);
++        }
+         match result {
+             Ok(compaction_output) => return Ok(compaction_output),
+             Err(err) => {
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -335,7 +335,9 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+ 
+     sess.drain_code_mode_messages().await;
+ 
+-    crate::hook_runtime::run_session_end_hooks(sess).await;
++    if sess.storage_failure().is_none() {
++        crate::hook_runtime::run_session_end_hooks(sess).await;
++    }
+     emit_thread_stop_lifecycle(sess).await;
+ }
+ 
+@@ -378,15 +380,17 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
+             ),
+         );
+         warn!("failed to shutdown thread persistence: {e}");
+-        let event = Event {
+-            id: sub_id.clone(),
+-            msg: EventMsg::Error(ErrorEvent {
+-                misalignment: None,
+-                message: "Failed to shutdown thread persistence".to_string(),
+-                codex_error_info: Some(CodexErrorInfo::Other),
+-            }),
+-        };
+-        sess.send_event_raw(event).await;
++        if sess.storage_failure().is_none() {
++            let event = Event {
++                id: sub_id.clone(),
++                msg: EventMsg::Error(ErrorEvent {
++                    misalignment: None,
++                    message: "Failed to shutdown thread persistence".to_string(),
++                    codex_error_info: Some(CodexErrorInfo::Other),
++                }),
++            };
++            sess.send_event_raw(event).await;
++        }
+     }
+ 
+     let event = Event {
+@@ -454,6 +458,23 @@ pub(super) async fn submission_loop(
+     loop {
+         let sub = tokio::select! {
+             biased;
++            _ = sess.wait_for_storage_stop() => {
++                // This task owns teardown, not the task whose append failed. In particular,
++                // never wait for ActiveTurn or abort the current task from inside a write.
++                let sub_id = {
++                    let mut state = sess.state.lock().await;
++                    state.shutting_down = true;
++                    state.last_started_turn_id.clone().unwrap_or_else(super::new_submission_id)
++                };
++                if let Some(error) = sess.storage_failure() {
++                    sess.deliver_event_raw(Event {
++                        id: sub_id.clone(),
++                        msg: EventMsg::Error(error),
++                    }).await;
++                }
++                shutdown_received = shutdown(&sess, sub_id).await;
++                break;
++            }
+             _ = sess.services.local_agent_runtime.shutdown.cancelled() => {
+                 shutdown_received = shutdown(&sess, super::new_submission_id()).await;
+                 break;
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -143,6 +143,7 @@ use codex_protocol::openai_models::ModelPreset;
+ use codex_protocol::permissions::FileSystemSandboxPolicy;
+ use codex_protocol::permissions::FileSystemSandboxPolicyContext;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
++use codex_protocol::protocol::ErrorEvent;
+ use codex_protocol::protocol::FileChange;
+ use codex_protocol::protocol::HasLegacyEvent;
+ use codex_protocol::protocol::HistoryPosition;
+@@ -277,6 +278,7 @@ pub(crate) mod startup_prewarm;
+ mod step_activation;
+ pub(crate) mod step_context;
+ pub(crate) mod step_settings;
++mod storage_guard;
+ pub(crate) mod stored_thread_settings;
+ mod thread_settings;
+ pub(crate) mod time_reminder;
+@@ -1544,6 +1546,21 @@ impl Session {
+         self.services.live_thread.as_ref()
+     }
+ 
++    pub(crate) fn rollout_failure(&self) -> Option<ErrorEvent> {
++        let error = self.live_thread()?.persistence_failure()?;
++        Some(storage_guard::storage_error(format!(
++            "Failed to save the conversation. Error: {error}"
++        )))
++    }
++
++    pub(crate) async fn wait_for_rollout_failure(&self) {
++        if let Some(live_thread) = self.live_thread() {
++            live_thread.wait_for_persistence_failure().await;
++        } else {
++            std::future::pending::<()>().await;
++        }
++    }
++
+     pub(crate) async fn set_thread_memory_mode(
+         self: &Arc<Self>,
+         mode: ThreadMemoryMode,
+@@ -2564,12 +2581,17 @@ impl Session {
+                 .track_guardian_session_event(self.thread_id, &event);
+         }
+         self.send_event_raw(event).await;
++        if let Some(error) = self.storage_failure() {
++            turn_context.terminal_error.lock().await.replace(error);
++        }
+         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+             .await;
+-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
+-            .await;
+-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
+-            .await;
++        if self.rollout_failure().is_none() {
++            self.maybe_mirror_event_text_to_realtime(&legacy_source)
++                .await;
++            self.maybe_clear_realtime_handoff_for_event(&legacy_source)
++                .await;
++        }
+ 
+         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+@@ -2734,6 +2756,10 @@ impl Session {
+     }
+ 
+     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
++        if self.rollout_failure().is_some() {
++            self.deliver_event_raw(event).await;
++            return;
++        }
+         let flush_guardian_completion = persist
+             && matches!(event.msg, EventMsg::TurnComplete(_))
+             && self.is_private_guardian_reviewer().await;
+@@ -2784,7 +2810,19 @@ impl Session {
+         self.deliver_event_raw(event).await;
+     }
+ 
+-    async fn deliver_event_raw(&self, event: Event) {
++    async fn deliver_event_raw(&self, mut event: Event) {
++        if let Some(error) = self.storage_failure() {
++            match &mut event.msg {
++                EventMsg::TurnComplete(complete) => {
++                    complete.last_agent_message = None;
++                    complete.error = Some(error);
++                }
++                EventMsg::TurnAborted(aborted) => aborted.error = Some(error),
++                EventMsg::Error(_) | EventMsg::Warning(_) | EventMsg::ShutdownComplete => {}
++                _ if self.storage_guard.has_active_responses() => {}
++                _ => return,
++            }
++        }
+         if let Some(parent_tx) = self.parent_observer_event_tx.get() {
+             let forwarded = match &event.msg {
+                 EventMsg::RawResponseItem(item) => {
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -65,6 +65,7 @@ pub(crate) struct Session {
+     /// transferring ownership of the private session's event receiver.
+     pub(crate) parent_observer_event_tx: OnceLock<Sender<Event>>,
+     pub(super) agent_status: watch::Sender<AgentStatus>,
++    pub(super) storage_guard: super::storage_guard::StorageGuard,
+     pub(super) state: Mutex<SessionState>,
+     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
+     /// Keep this separate from `state` so storage I/O does not block runtime state access.
+@@ -1941,6 +1942,7 @@ impl Session {
+                 tx_event: tx_event.clone(),
+                 parent_observer_event_tx: OnceLock::new(),
+                 agent_status,
++                storage_guard: Default::default(),
+                 state: Mutex::new(state),
+                 thread_settings_persistence: Semaphore::new(/*permits*/ 1),
+                 code_mode_message_tasks: CodeModeMessageTasks::default(),
+diff --git a/codex-rs/core/src/session/storage_guard.rs b/codex-rs/core/src/session/storage_guard.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/session/storage_guard.rs
+@@ -0,0 +1,210 @@
++//! Storage failures close admission immediately and cancel the session after active responses drain.
++
++use super::Session;
++use crate::config::Config;
++use crate::disk_capacity::LocalStorageCapacity;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result as CodexResult;
++use codex_protocol::protocol::CodexErrorInfo;
++use codex_protocol::protocol::ErrorEvent;
++use codex_protocol::protocol::Event;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::WarningEvent;
++use std::time::Duration;
++use tokio::sync::watch;
++
++const MIN_AVAILABLE_BYTES: u64 = 1024 * 1024 * 1024;
++
++#[derive(Default)]
++struct StorageState {
++    error: Option<ErrorEvent>,
++    active_responses: usize,
++}
++
++pub(super) struct StorageGuard {
++    state: watch::Sender<StorageState>,
++}
++
++impl Default for StorageGuard {
++    fn default() -> Self {
++        Self {
++            state: watch::channel(StorageState::default()).0,
++        }
++    }
++}
++
++impl StorageGuard {
++    pub(super) fn failure(&self) -> Option<ErrorEvent> {
++        self.state.borrow().error.clone()
++    }
++
++    pub(super) fn has_active_responses(&self) -> bool {
++        self.state.borrow().active_responses != 0
++    }
++
++    fn request_stop(&self, error: ErrorEvent) -> bool {
++        self.state.send_if_modified(|state| {
++            if state.error.is_some() {
++                return false;
++            }
++            state.error = Some(error);
++            true
++        })
++    }
++
++    fn begin_response(&self) -> Option<StorageResponseGuard> {
++        self.state
++            .send_if_modified(|state| {
++                if state.error.is_some() {
++                    return false;
++                }
++                state.active_responses += 1;
++                true
++            })
++            .then(|| StorageResponseGuard {
++                state: self.state.clone(),
++            })
++    }
++
++    async fn wait_for_failure(&self) {
++        let mut state = self.state.subscribe();
++        let _failure = state
++            .wait_for(|state| state.error.is_some())
++            .await
++            .expect("storage guard retains its sender");
++    }
++
++    async fn wait_for_responses(&self) {
++        let mut state = self.state.subscribe();
++        let _idle = state
++            .wait_for(|state| state.active_responses == 0)
++            .await
++            .expect("storage guard retains its sender");
++    }
++}
++
++/// Covers one request through its terminal response and accounting, but not subsequent tools.
++#[must_use]
++pub(crate) struct StorageResponseGuard {
++    state: watch::Sender<StorageState>,
++}
++
++impl Drop for StorageResponseGuard {
++    fn drop(&mut self) {
++        self.state.send_modify(|state| state.active_responses -= 1);
++    }
++}
++
++pub(super) fn storage_error(cause: String) -> ErrorEvent {
++    ErrorEvent {
++        misalignment: None,
++        message: format!(
++            "{cause} This session cannot continue. Fix the storage problem and reopen the session."
++        ),
++        codex_error_info: Some(CodexErrorInfo::Other),
++    }
++}
++
++fn capacity_failure(capacity: LocalStorageCapacity) -> Option<ErrorEvent> {
++    let mut insufficient = Vec::new();
++    for (root, available) in [
++        ("CODEX_HOME", capacity.home_available_bytes),
++        ("CODEX_HARNESS", capacity.harness_available_bytes),
++    ] {
++        if available < MIN_AVAILABLE_BYTES {
++            insufficient.push(format!(
++                "{root} has {available} bytes available, below 1 GiB"
++            ));
++        }
++    }
++    (!insufficient.is_empty()).then(|| storage_error(format!("{}.", insufficient.join("; "))))
++}
++
++impl Session {
++    pub(crate) fn storage_failure(&self) -> Option<ErrorEvent> {
++        self.storage_guard
++            .failure()
++            .or_else(|| self.rollout_failure())
++    }
++
++    async fn request_storage_stop(&self, error: ErrorEvent) {
++        if self.storage_guard.request_stop(error.clone())
++            && self.storage_guard.has_active_responses()
++        {
++            let id = self
++                .state
++                .lock()
++                .await
++                .last_started_turn_id
++                .clone()
++                .unwrap_or_else(super::new_submission_id);
++            self.deliver_event_raw(Event {
++                id,
++                msg: EventMsg::Warning(WarningEvent {
++                    message: format!(
++                        "{} Waiting for the current response to finish before stopping.",
++                        error.message
++                    ),
++                }),
++            })
++            .await;
++        }
++    }
++
++    async fn check_storage_capacity(&self, config: &Config) {
++        let failure = match LocalStorageCapacity::read(&config.codex_home, &config.codex_harness) {
++            Ok(capacity) => capacity_failure(capacity),
++            Err(error) => Some(storage_error(error.to_string())),
++        };
++        if let Some(error) = failure {
++            self.request_storage_stop(error).await;
++        }
++    }
++
++    pub(crate) async fn begin_storage_response(
++        &self,
++        config: &Config,
++    ) -> CodexResult<StorageResponseGuard> {
++        if let Some(error) = self.storage_failure() {
++            self.request_storage_stop(error).await;
++            return Err(CodexErr::TurnAborted);
++        }
++        self.check_storage_capacity(config).await;
++        self.storage_guard
++            .begin_response()
++            .ok_or(CodexErr::TurnAborted)
++    }
++
++    pub(crate) async fn wait_for_storage_stop(&self) {
++        if self.storage_guard.failure().is_none() {
++            tokio::select! {
++                _ = self.storage_guard.wait_for_failure() => {}
++                _ = self.wait_for_rollout_failure() => {
++                    let error = self.rollout_failure().expect("writer failure retains its error");
++                    self.request_storage_stop(error).await;
++                }
++            }
++        }
++        self.storage_guard.wait_for_responses().await;
++    }
++
++    pub(crate) async fn monitor_storage_for_turn(&self, config: &Config) {
++        let mut interval = tokio::time::interval(Duration::from_secs(1));
++        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        loop {
++            tokio::select! {
++                biased;
++                _ = self.wait_for_storage_stop() => return,
++                _ = interval.tick() => {
++                    if self.storage_failure().is_none() {
++                        self.check_storage_capacity(config).await;
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "storage_guard_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/session/storage_guard_tests.rs b/codex-rs/core/src/session/storage_guard_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/session/storage_guard_tests.rs
+@@ -0,0 +1,263 @@
++use super::*;
++use crate::session::TurnInput;
++use crate::session::handlers::submission_loop;
++use crate::session::tests::attach_thread_persistence;
++use crate::session::tests::make_session_and_context_with_auth_config_home_and_rx;
++use crate::tasks::RegularTask;
++use codex_login::CodexAuth;
++use codex_protocol::protocol::Op;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses;
++use futures::FutureExt;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++
++#[test]
++fn capacity_threshold_checks_each_root_without_rounding() {
++    for (home, harness, expected) in [
++        (MIN_AVAILABLE_BYTES, MIN_AVAILABLE_BYTES, None),
++        (MIN_AVAILABLE_BYTES + 1, MIN_AVAILABLE_BYTES, None),
++        (
++            MIN_AVAILABLE_BYTES - 1,
++            MIN_AVAILABLE_BYTES,
++            Some("CODEX_HOME"),
++        ),
++        (
++            MIN_AVAILABLE_BYTES,
++            MIN_AVAILABLE_BYTES - 1,
++            Some("CODEX_HARNESS"),
++        ),
++        (0, MIN_AVAILABLE_BYTES, Some("CODEX_HOME")),
++        (MIN_AVAILABLE_BYTES, 0, Some("CODEX_HARNESS")),
++    ] {
++        let failure = capacity_failure(LocalStorageCapacity {
++            home_available_bytes: home,
++            harness_available_bytes: harness,
++        });
++        match expected {
++            Some(root) => assert!(failure.unwrap().message.contains(root)),
++            None => assert!(failure.is_none()),
++        }
++    }
++    let failure = capacity_failure(LocalStorageCapacity {
++        home_available_bytes: 0,
++        harness_available_bytes: 0,
++    })
++    .unwrap();
++    assert!(failure.message.contains("CODEX_HOME"));
++    assert!(failure.message.contains("CODEX_HARNESS"));
++}
++
++#[test]
++fn capacity_read_failures_identify_the_unreadable_root() {
++    let root = tempfile::tempdir().unwrap();
++    let missing = root.path().join("missing");
++    for (home, harness, label) in [
++        (missing.as_path(), root.path(), "Codex home"),
++        (root.path(), missing.as_path(), "Codex harness"),
++    ] {
++        let error = LocalStorageCapacity::read(home, harness).unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
++        assert!(error.to_string().contains(label));
++    }
++}
++
++#[tokio::test]
++async fn stopping_closes_admission_but_waits_for_all_existing_responses() {
++    let guard = StorageGuard::default();
++    let first = guard.begin_response().unwrap();
++    let second = guard.begin_response().unwrap();
++    let error = storage_error("storage failure".into());
++    assert!(guard.request_stop(error.clone()));
++    assert!(!guard.request_stop(storage_error("later failure".into())));
++    assert_eq!(guard.failure(), Some(error));
++    assert!(guard.begin_response().is_none());
++    assert!(guard.wait_for_responses().now_or_never().is_none());
++    drop(first);
++    assert!(guard.wait_for_responses().now_or_never().is_none());
++    drop(second);
++    assert!(guard.wait_for_responses().now_or_never().is_some());
++    assert!(guard.begin_response().is_none());
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn storage_failures_finish_the_response_unless_the_user_interrupts() {
++    for failure in ["writer", "home", "harness"] {
++        for interrupt in [false, true] {
++            let after = responses::ev_assistant_message("msg_after", "after storage failure");
++            let mut completed = responses::ev_completed_with_tokens("resp_storage", 7);
++            completed["response"]["end_turn"] = serde_json::json!(false);
++            let server = responses::start_websocket_server(vec![vec![vec![
++                responses::ev_response_created("resp_storage"),
++                responses::ev_assistant_message("msg_before", "before storage failure"),
++                after.clone(),
++                completed,
++            ]]])
++            .await;
++            let release_response = server.gate_response_event(&after);
++            let home = tempfile::tempdir().unwrap();
++            let base_url = format!("{}/v1", server.uri());
++            let (mut session, context, events) =
++                make_session_and_context_with_auth_config_home_and_rx(
++                    CodexAuth::from_api_key("test-api-key"),
++                    Vec::new(),
++                    home.path(),
++                    |config| {
++                        config.model_provider.base_url = Some(base_url);
++                        config.model_provider.supports_websockets = true;
++                        config.model_provider.stream_max_retries = Some(0);
++                        config.analytics_enabled = Some(false);
++                    },
++                )
++                .await;
++            let rollout = attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
++            let (submissions, rx_sub) = async_channel::bounded(1);
++            let loop_task = tokio::spawn(submission_loop(
++                Arc::clone(&session),
++                Arc::clone(&context.config),
++                rx_sub,
++            ));
++            session
++                .spawn_task(
++                    Arc::clone(&context),
++                    vec![TurnInput::UserInput {
++                        metadata: Default::default(),
++                        content: vec![UserInput::Text {
++                            text: "finish this response".into(),
++                            text_elements: Vec::new(),
++                        }],
++                        client_id: None,
++                    }],
++                    RegularTask::new(),
++                )
++                .await;
++            tokio::time::timeout(Duration::from_secs(10), async {
++                loop {
++                    match events.recv().await.unwrap().msg {
++                        EventMsg::AgentMessage(message)
++                            if message.message == "before storage failure" =>
++                        {
++                            break;
++                        }
++                        EventMsg::Error(error) => panic!("response startup failed: {error:?}"),
++                        _ => {}
++                    }
++                }
++            })
++            .await
++            .expect("first response item");
++
++            if failure == "writer" {
++                tokio::fs::remove_file(&rollout).await.unwrap();
++                assert!(session.flush_rollout().await.is_err());
++            } else {
++                let capacity = LocalStorageCapacity {
++                    home_available_bytes: if failure == "home" {
++                        0
++                    } else {
++                        MIN_AVAILABLE_BYTES
++                    },
++                    harness_available_bytes: if failure == "harness" {
++                        0
++                    } else {
++                        MIN_AVAILABLE_BYTES
++                    },
++                };
++                session
++                    .request_storage_stop(capacity_failure(capacity).unwrap())
++                    .await;
++            }
++            tokio::time::timeout(Duration::from_secs(5), async {
++                loop {
++                    match events.recv().await.unwrap().msg {
++                        EventMsg::Warning(warning)
++                            if warning.message.contains("Waiting for the current response") =>
++                        {
++                            break;
++                        }
++                        EventMsg::TurnComplete(_)
++                        | EventMsg::TurnAborted(_)
++                        | EventMsg::ShutdownComplete => {
++                            panic!("storage failure truncated an active response");
++                        }
++                        _ => {}
++                    }
++                }
++            })
++            .await
++            .expect("deferred stop warning");
++            assert!(!loop_task.is_finished());
++            assert!(session.storage_guard.has_active_responses());
++            assert!(
++                session
++                    .begin_storage_response(&context.config)
++                    .await
++                    .is_err()
++            );
++
++            let mut release_response = Some(release_response);
++            if interrupt {
++                submissions
++                    .send(super::super::Submission {
++                        turn_extension_init: None,
++                        id: "interrupt-storage-wait".into(),
++                        op: Op::Interrupt,
++                        parent_turn_id: None,
++                        root_turn_id: None,
++                        residency_guard: None,
++                        message_delivery: None,
++                        dispatch_complete: None,
++                        trace: None,
++                    })
++                    .await
++                    .unwrap();
++            } else {
++                release_response.take().unwrap().send(()).unwrap();
++            }
++            let mut errors = Vec::new();
++            let mut aborted = Vec::new();
++            let mut saw_after = false;
++            tokio::time::timeout(Duration::from_secs(10), async {
++                loop {
++                    match events.recv().await.unwrap().msg {
++                        EventMsg::AgentMessage(message)
++                            if message.message == "after storage failure" =>
++                        {
++                            saw_after = true
++                        }
++                        EventMsg::Error(error) => errors.push(error),
++                        EventMsg::TurnAborted(event) => aborted.push(event),
++                        EventMsg::TurnComplete(_) => {
++                            panic!("failed storage must not complete the turn")
++                        }
++                        EventMsg::ShutdownComplete => break,
++                        _ => {}
++                    }
++                }
++            })
++            .await
++            .expect("response boundary stops the session");
++            loop_task.await.unwrap();
++            assert_eq!(saw_after, !interrupt);
++            assert_eq!(errors.len(), 1);
++            assert_eq!(aborted.len(), 1);
++            assert_eq!(aborted[0].error.as_ref(), Some(&errors[0]));
++            assert!(submissions.is_closed());
++            assert!(!session.storage_guard.has_active_responses());
++            assert_eq!(server.single_connection().len(), 1);
++            if failure == "writer" {
++                assert!(!rollout.exists());
++            } else if !interrupt {
++                assert!(
++                    tokio::fs::read_to_string(&rollout)
++                        .await
++                        .unwrap()
++                        .contains("after storage failure")
++                );
++            }
++            if let Some(release) = release_response {
++                let _ = release.send(());
++            }
++        }
++    }
++}
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5004,7 +5004,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+         .expect("thread should have rollout path")
+ }
+ 
+-async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
++pub(super) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
+     let rollout_path = open_thread_persistence(session).await;
+     session
+         .ensure_rollout_materialized(PersistContext::Standard)
+@@ -7158,6 +7158,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         tx_event,
+         parent_observer_event_tx: OnceLock::new(),
+         agent_status: agent_status_tx,
++        storage_guard: Default::default(),
+         state: Mutex::new(state),
+         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
+         code_mode_message_tasks: Default::default(),
+@@ -7236,6 +7237,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+     );
+     session.mark_mcp_runtime_dirty();
+     crate::guardian::test_host::install(&session, &turn_context.config);
++    session.services.thread_extension_data.insert(codex_home);
+     (session, turn_context)
+ }
+ 
+@@ -7389,6 +7391,7 @@ async fn make_session_with_config_and_rx(
+     )
+     .await?;
+ 
++    session.services.thread_extension_data.insert(codex_home);
+     Ok((session, rx_event))
+ }
+ 
+@@ -7535,6 +7538,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
+     )
+     .await?;
+ 
++    session.services.thread_extension_data.insert(codex_home);
+     Ok((session, rx_event))
+ }
+ 
+@@ -9187,6 +9191,195 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
+         .expect("second shutdown waiter");
+ }
+ 
++#[tokio::test]
++async fn rollout_failure_stops_waiting_turn_and_closes_session() {
++    struct WaitingTask {
++        started: Arc<Notify>,
++        write: Arc<Notify>,
++        stopped: CancellationToken,
++    }
++
++    impl SessionTask for WaitingTask {
++        fn kind(&self) -> TaskKind {
++            TaskKind::Regular
++        }
++
++        fn span_name(&self) -> &'static str {
++            "session_task.persistence_failure"
++        }
++
++        async fn run(
++            self: Arc<Self>,
++            session: Arc<Session>,
++            _ctx: Arc<TurnContext>,
++            _input: Vec<TurnInput>,
++            _cancellation_token: CancellationToken,
++        ) -> SessionTaskResult {
++            let _stopped = self.stopped.clone().drop_guard();
++            self.started.notify_one();
++            self.write.notified().await;
++            // The same failure must stop a task whether it originates inside the task or in
++            // a concurrent producer while this task is waiting for a tool or user response.
++            let _ = session.flush_rollout().await;
++            std::future::pending().await
++        }
++    }
++
++    for write_from_task in [false, true] {
++        let home = tempfile::tempdir().expect("session home");
++        let (mut session, turn_context, events) =
++            make_session_and_context_with_auth_config_home_and_rx(
++                CodexAuth::from_api_key("Test API Key"),
++                Vec::new(),
++                home.path(),
++                |_config| {},
++            )
++            .await;
++        let path =
++            attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
++        let started = Arc::new(Notify::new());
++        let write = Arc::new(Notify::new());
++        let stopped = CancellationToken::new();
++        session
++            .spawn_task(
++                Arc::clone(&turn_context),
++                Vec::new(),
++                WaitingTask {
++                    started: Arc::clone(&started),
++                    write: Arc::clone(&write),
++                    stopped: stopped.clone(),
++                },
++            )
++            .await;
++        tokio::time::timeout(StdDuration::from_secs(2), started.notified())
++            .await
++            .expect("task started");
++        let (submissions, rx_sub) = async_channel::bounded(1);
++        let loop_task = tokio::spawn(submission_loop(
++            Arc::clone(&session),
++            Arc::clone(&turn_context.config),
++            rx_sub,
++        ));
++
++        let original = tokio::fs::read(&path).await.expect("original rollout");
++        let replacement = home.path().join("replacement.jsonl");
++        tokio::fs::write(&replacement, &original)
++            .await
++            .expect("replacement rollout");
++        tokio::fs::rename(&replacement, &path)
++            .await
++            .expect("replace outside writer lock");
++        if write_from_task {
++            write.notify_one();
++        } else {
++            assert!(session.flush_rollout().await.is_err());
++        }
++
++        let mut errors = Vec::new();
++        let mut aborted = Vec::new();
++        tokio::time::timeout(StdDuration::from_secs(5), async {
++            loop {
++                let event = events.recv().await.expect("session event");
++                match event.msg {
++                    EventMsg::Error(error) => errors.push(error),
++                    EventMsg::TurnAborted(event) => aborted.push(event),
++                    EventMsg::TurnComplete(_) => {
++                        panic!("failed persistence must not complete the turn")
++                    }
++                    EventMsg::ShutdownComplete => break,
++                    _ => {}
++                }
++            }
++        })
++        .await
++        .expect("persistence failure must stop a waiting turn immediately");
++        tokio::time::timeout(StdDuration::from_secs(2), loop_task)
++            .await
++            .expect("submission loop stopped")
++            .expect("submission loop joined");
++
++        assert_eq!(errors.len(), 1);
++        assert!(
++            errors[0]
++                .message
++                .contains("Failed to save the conversation")
++        );
++        assert!(errors[0].message.contains("outside its writer"));
++        assert_eq!(aborted.len(), 1);
++        assert_eq!(
++            aborted[0].turn_id.as_deref(),
++            Some(turn_context.sub_id.as_str())
++        );
++        assert_eq!(aborted[0].error.as_ref(), Some(&errors[0]));
++        assert!(
++            stopped.is_cancelled(),
++            "the pending task future must be dropped"
++        );
++        assert!(session.active_turn.lock().await.is_none());
++        assert!(session.state.lock().await.shutting_down);
++        assert!(
++            submissions.is_closed(),
++            "failed session must reject further submissions"
++        );
++        let coordinator = Arc::new(codex_rollout::WriterLockCoordinator::new(
++            &turn_context.config.codex_harness,
++        ));
++        let _writer = coordinator
++            .acquire(session.thread_id)
++            .expect("failed writer released");
++        assert_eq!(
++            tokio::fs::read(&path)
++                .await
++                .expect("replacement remains intact"),
++            original
++        );
++    }
++}
++
++#[tokio::test]
++async fn terminal_event_write_failure_is_delivered_as_failure() {
++    let home = tempfile::tempdir().expect("session home");
++    let (mut session, turn_context, events) =
++        make_session_and_context_with_auth_config_home_and_rx(
++            CodexAuth::from_api_key("Test API Key"),
++            Vec::new(),
++            home.path(),
++            |_config| {},
++        )
++        .await;
++    let path = attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
++    tokio::fs::remove_file(&path)
++        .await
++        .expect("remove outside writer lock");
++    session
++        .send_event(
++            turn_context.as_ref(),
++            EventMsg::TurnComplete(TurnCompleteEvent {
++                root_turn_id: Some(turn_context.root_turn_id()),
++                turn_id: turn_context.sub_id.clone(),
++                last_agent_message: Some("must not report success".into()),
++                error: None,
++                started_at: None,
++                completed_at: None,
++                duration_ms: None,
++                time_to_first_token_ms: None,
++            }),
++        )
++        .await;
++    let event = events.recv().await.expect("terminal event");
++    let EventMsg::TurnComplete(complete) = event.msg else {
++        panic!("expected terminal event");
++    };
++    assert!(complete.last_agent_message.is_none());
++    assert!(complete.error.is_some());
++    assert_eq!(*turn_context.terminal_error.lock().await, complete.error);
++    assert!(
++        !path.exists(),
++        "failed writer must not recreate the removed file"
++    );
++    let _ = session.live_thread().unwrap().shutdown().await;
++}
++
+ #[tokio::test]
+ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
+     let (_session, _turn_context) = make_session_and_context().await;
+@@ -9235,13 +9428,15 @@ where
+     F: FnOnce(&mut Config),
+ {
+     let codex_home = tempfile::tempdir().expect("create temp dir");
+-    make_session_and_context_with_auth_config_home_and_rx(
++    let result = make_session_and_context_with_auth_config_home_and_rx(
+         auth,
+         dynamic_tools,
+         codex_home.path(),
+         configure_config,
+     )
+-    .await
++    .await;
++    result.0.services.thread_extension_data.insert(codex_home);
++    result
+ }
+ 
+ pub(crate) async fn make_session_and_context_with_auth_config_home_and_rx<F>(
+@@ -9480,6 +9675,7 @@ where
+         tx_event,
+         parent_observer_event_tx: OnceLock::new(),
+         agent_status: agent_status_tx,
++        storage_guard: Default::default(),
+         state: Mutex::new(state),
+         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
+         code_mode_message_tasks: Default::default(),
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2744,6 +2744,7 @@ async fn try_run_sampling_request(
+     let mut request_token_usage = None;
+     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
+         .await;
++    let storage_response = sess.begin_storage_response(&turn_context.config).await?;
+     let mut stream = match client_session
+         .stream(
+             prompt,
+@@ -2761,6 +2762,10 @@ async fn try_run_sampling_request(
+     {
+         Ok(stream) => stream,
+         Err(error) => {
++            drop(storage_response);
++            if sess.storage_failure().is_some() {
++                cancellation_token.cancel();
++            }
+             if let Some(finish_post_request) = finish_post_request {
+                 finish_post_request(PostModelRequest {
+                     status: ModelRequestStatus::Failed,
+@@ -2831,6 +2836,10 @@ async fn try_run_sampling_request(
+         let event = match event {
+             Ok(Ok(event)) => event,
+             Ok(Err(_)) => {
++                if sess.storage_failure().is_some() {
++                    preempt = CancellationToken::new();
++                    continue;
++                }
+                 if *draining_for_mailbox {
+                     preempt = CancellationToken::new();
+                     continue;
+@@ -3022,6 +3031,7 @@ async fn try_run_sampling_request(
+                 // Hosts can keep the current response intact and deliver mail before the next
+                 // model request instead of cutting off its remaining tool calls.
+                 if preempt_for_mailbox_mail
++                    && sess.storage_failure().is_none()
+                     && !*draining_for_mailbox
+                     && !turn_context
+                         .config
+@@ -3398,6 +3408,25 @@ async fn try_run_sampling_request(
+     };
+     drop(sampling_span);
+     drop(sampling_timing_guard);
++    if should_emit_token_count && sess.storage_failure().is_some() {
++        sess.send_token_count_event(&turn_context).await;
++        should_emit_token_count = false;
++    }
++    if sess.storage_failure().is_some() {
++        flush_assistant_text_segments_all(
++            &sess,
++            &turn_context,
++            plan_mode_state.as_mut(),
++            &mut assistant_message_stream_parsers,
++        )
++        .await;
++    }
++    // The response and its accounting are complete. Storage protection must not wait for
++    // tools or post-request hooks, nor let their completion start another model request.
++    drop(storage_response);
++    if sess.storage_failure().is_some() {
++        cancellation_token.cancel();
++    }
+     if let Some(finish_post_request) = finish_post_request {
+         let (status, error) = match (response_completed, &outcome) {
+             (true, _) => (ModelRequestStatus::Completed, None),
+@@ -3421,6 +3450,10 @@ async fn try_run_sampling_request(
+     )
+     .await;
+ 
++    if sess.storage_failure().is_some() {
++        return Err(CodexErr::TurnAborted);
++    }
++
+     if !in_flight.is_empty() {
+         let _tool_blocking_timing_guard = turn_context.turn_timing_state.begin_tool_blocking();
+         let _tool_blocking_span = trace_span!(
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -291,6 +291,9 @@ impl Session {
+         input: Vec<TurnInput>,
+         task: T,
+     ) {
++        if self.storage_failure().is_some() {
++            return;
++        }
+         // Replace the cache; in-flight acquisitions retain their previous Arc.
+         self.services
+             .thread_extension_data
+@@ -384,15 +387,20 @@ impl Session {
+         let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+         let task_future = async move {
+             let ctx_for_finish = Arc::clone(&ctx);
+-            let task_result = task_for_run
+-                .run(
++            let task_result = tokio::select! {
++                biased;
++                _ = session.monitor_storage_for_turn(&ctx_for_finish.config) => {
++                    task_cancellation_token.cancel();
++                    done_clone.notify_one();
++                    return;
++                }
++                result = task_for_run.run(
+                     Arc::clone(&session),
+                     ctx,
+                     task_input,
+                     task_cancellation_token.child_token(),
+-                )
+-                .instrument(trace_span!("session_task.run"))
+-                .await;
++                ).instrument(trace_span!("session_task.run")) => result,
++            };
+             let sess = Arc::clone(&session);
+             // Private reviewers save their transcript together with the terminal event.
+             // Errors and cancellation retain their existing save path.
+@@ -400,6 +408,7 @@ impl Session {
+                 || task_cancellation_token.is_cancelled()
+                 || task_result.is_err())
+                 && let Err(err) = sess.flush_rollout().await
++                && sess.storage_failure().is_none()
+             {
+                 warn!("failed to flush rollout before completing turn: {err}");
+                 sess.send_event(
+@@ -412,6 +421,11 @@ impl Session {
+                 )
+                 .await;
+             }
++            if sess.storage_failure().is_some() {
++                task_cancellation_token.cancel();
++                done_clone.notify_one();
++                return;
++            }
+             if !task_cancellation_token.is_cancelled() {
+                 // Finish uniformly from the spawn site so all tasks share the same lifecycle.
+                 sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
+@@ -471,6 +485,9 @@ impl Session {
+         self: &Arc<Self>,
+         sub_id: String,
+     ) {
++        if self.storage_failure().is_some() {
++            return;
++        }
+         if !self.input_queue.has_pending_mailbox_items().await {
+             return;
+         }
+@@ -581,7 +598,7 @@ impl Session {
+                     task,
+                     reason.clone(),
+                     &active_turn.turn_state,
+-                    /*error*/ None,
++                    self.storage_failure(),
+                 )
+                 .await;
+             }
+@@ -715,14 +732,16 @@ impl Session {
+                 std::mem::take(&mut ts.token_usage_by_model),
+             )
+         };
+-        run_hooks_and_record_inputs(
+-            self,
+-            &turn_context,
+-            &turn_context.capture_current_model_info(),
+-            &pending_input,
+-            PersistContext::Standard,
+-        )
+-        .await;
++        if self.storage_failure().is_none() {
++            run_hooks_and_record_inputs(
++                self,
++                &turn_context,
++                &turn_context.capture_current_model_info(),
++                &pending_input,
++                PersistContext::Standard,
++            )
++            .await;
++        }
+         drop(finish_recording);
+         let turn_telemetry = &turn_context.session_telemetry;
+         // Emit token usage metrics.
+@@ -850,7 +869,7 @@ impl Session {
+             ThreadIdleCause::Completed
+         };
+         let event = if let Some(reason) = abort_reason {
+-            if reason == TurnAbortReason::Interrupted {
++            if reason == TurnAbortReason::Interrupted && self.storage_failure().is_none() {
+                 run_turn_interrupt_hooks(self, &turn_context, &turn_state).await;
+             }
+             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+@@ -1002,6 +1021,7 @@ impl Session {
+             .await;
+ 
+         if reason == TurnAbortReason::Interrupted
++            && self.storage_failure().is_none()
+             && let Some(marker) = interrupted_turn_history_marker(
+                 InterruptedTurnHistoryMarker::from_config_and_version(
+                     task.turn_context.config.as_ref(),
+@@ -1022,7 +1042,7 @@ impl Session {
+             }
+         }
+ 
+-        if reason == TurnAbortReason::Interrupted {
++        if reason == TurnAbortReason::Interrupted && self.storage_failure().is_none() {
+             run_turn_interrupt_hooks(self, &task.turn_context, turn_state).await;
+         }
+ 
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -2629,8 +2629,9 @@ async fn send_input_interrupts_before_prompt() {
+         .await
+         .expect("start thread");
+     let agent_id = thread.thread_id;
++    let session = Arc::new(session);
+     let invocation = invocation(
+-        Arc::new(session),
++        Arc::clone(&session),
+         Arc::new(turn),
+         "send_input",
+         function_payload(json!({
+@@ -2678,8 +2679,9 @@ async fn send_input_accepts_structured_items() {
+         .await
+         .expect("start thread");
+     let agent_id = thread.thread_id;
++    let session = Arc::new(session);
+     let invocation = invocation(
+-        Arc::new(session),
++        Arc::clone(&session),
+         Arc::new(turn),
+         "send_input",
+         function_payload(json!({
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -693,6 +693,9 @@ impl ToolRegistry {
+         mut invocation: ToolInvocation,
+         call_state: Option<Arc<ToolCallState>>,
+     ) -> Result<AnyToolResult, FunctionCallError> {
++        if let Some(error) = invocation.session.storage_failure() {
++            return Err(FunctionCallError::Fatal(error.message));
++        }
+         let cancellation_token = invocation.cancellation_token.clone();
+         let tool_name = invocation.tool_name.clone();
+         let call_id_owned = invocation.call_id.clone();
+@@ -1001,6 +1004,10 @@ async fn handle_any_tool(
+     invocation: ToolInvocation,
+     call_state: Option<&ToolCallState>,
+ ) -> Result<AnyToolResult, FunctionCallError> {
++    // Tool-start events are persisted after admission and can themselves fail.
++    if let Some(error) = invocation.session.storage_failure() {
++        return Err(FunctionCallError::Fatal(error.message));
++    }
+     let call_id = invocation.call_id.clone();
+     let payload = invocation.payload.clone();
+     let output = tool.handle(invocation.clone()).await?;
+diff --git a/codex-rs/core/tests/common/test_codex.rs b/codex-rs/core/tests/common/test_codex.rs
+--- a/codex-rs/core/tests/common/test_codex.rs
++++ b/codex-rs/core/tests/common/test_codex.rs
+@@ -961,6 +961,12 @@ impl TestCodexBuilder {
+             }
+         };
+ 
++        // Tests may keep only the thread, so its directories must share that lifetime.
++        new_conversation
++            .thread
++            .thread_extension_data()
++            .insert((Arc::clone(&home), Arc::clone(&cwd)));
++
+         Ok(TestCodex {
+             home,
+             cwd,
+diff --git a/codex-rs/core/tests/suite/otel.rs b/codex-rs/core/tests/suite/otel.rs
+--- a/codex-rs/core/tests/suite/otel.rs
++++ b/codex-rs/core/tests/suite/otel.rs
+@@ -992,11 +992,17 @@ async fn handle_response_item_records_tool_result_for_function_call() {
+ #[traced_test]
+ async fn handle_response_item_records_tool_result_for_exec_command_call() {
+     let server = start_mock_server().await;
++    // The failure must be explicit now that the thread retains its fixture directories.
++    let arguments = serde_json::json!({
++        "cmd": "echo shell",
++        "workdir": "missing-work-directory",
++    })
++    .to_string();
+ 
+     mount_sse_once(
+         &server,
+         sse(vec![
+-            exec_command_call("shell-call", "echo shell"),
++            ev_function_call("shell-call", "exec_command", &arguments),
+             ev_completed("done"),
+         ]),
+     )
+@@ -1042,7 +1048,7 @@ async fn handle_response_item_records_tool_result_for_exec_command_call() {
+         if !line.contains("tool_name=exec_command") {
+             return Err("missing tool_name field".to_string());
+         }
+-        if !line.contains("arguments={\"cmd\":\"echo shell\"}") {
++        if !line.contains(&format!("arguments={arguments}")) {
+             return Err("missing arguments field".to_string());
+         }
+         let output_idx = line

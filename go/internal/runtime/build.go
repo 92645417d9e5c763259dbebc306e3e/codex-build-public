@@ -92,6 +92,9 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 	}
 	dist := filepath.Join(options.WorkingRoot, "build", "dist")
 	result.FailureDomain = failureDomainHelper
+	if err := runBuildSelection(dist, options, &result, "prepare"); err != nil {
+		return result, err
+	}
 	preparation, preparedAssets, err := prepareBuildInspectionTools(options)
 	if err != nil {
 		return result, err
@@ -200,7 +203,7 @@ func RunBuildInstall(options BuildInstallOptions) (result BuildInstallResult, re
 		}
 	}
 	if options.InstallRequested {
-		if err := publishBuildSelection(dist, options, &result); err != nil {
+		if err := runBuildSelection(dist, options, &result, "install"); err != nil {
 			return result, err
 		}
 	}
@@ -285,7 +288,7 @@ func prepareBuildInspectionTools(options BuildInstallOptions) (preparation build
 	}
 	output := filepath.Join(attempt, "output")
 	metadataPath := filepath.Join(output, "metadata.json")
-	_, stderr, err := runNativeProcess(attempt, script, "prepare", []string{filepath.Join(toolchain.Path, "rust", "bin", "cargo"), cache.CargoHome, output, filepath.Join(options.ScratchRoot, "tool-sources"), options.source}, nativeEnvironment(attempt), 32<<20, metadataPath, core.StageDeadline(), options.Cancellation, options.OnLive)
+	_, stderr, err := runNativeProcess(attempt, script, "prepare", []string{filepath.Join(toolchain.Path, "rust", "bin", "cargo"), cache.CargoHome, output, filepath.Join(options.ScratchRoot, "tool-sources"), options.source}, nativeEnvironment(attempt), 32<<20, metadataPath, core.StageDeadline(), options.Cancellation, options.OnLive, nil)
 	if err != nil {
 		if message := strings.TrimSpace(stderr); message != "" {
 			err = errors.Join(err, errors.New(message))
@@ -323,7 +326,7 @@ func validateBuildInstall(options BuildInstallOptions) error {
 	if options.ReplaceDraft && !options.InstallRequested {
 		return errors.New("BuildInstall --replace-draft requires --install")
 	}
-	for _, path := range []string{options.SkillRoot, options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, options.RecordRoot, options.CodexHome, filepath.Join(options.WorkingRoot, "build", "dist")} {
+	for _, path := range []string{options.SkillRoot, options.WorkingRoot, options.ScratchRoot, options.RuntimeRoot, options.RecordRoot, options.CodexHome, filepath.Join(options.WorkingRoot, "build", "dist"), exportRepositoryRoot(options.WorkingRoot)} {
 		if noFollowPath("build-install path", path) != nil {
 			return errors.New("invalid BuildInstall path")
 		}
@@ -388,7 +391,7 @@ func completedBuildPostimage(dist string, options BuildInstallOptions, preparati
 		return true, nil
 	}
 	result.Terminal, result.FailureDomain = "Fail", failureDomainHelper
-	if err := publishBuildSelection(dist, options, result); err != nil {
+	if err := runBuildSelection(dist, options, result, "install"); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -604,10 +607,9 @@ func validateBuildSequence(dist, release string, sequence uint64) error {
 	return nil
 }
 
-func publishBuildSelection(dist string, options BuildInstallOptions, result *BuildInstallResult) (resultError error) {
-	mode := "install"
+func runBuildSelection(dist string, options BuildInstallOptions, result *BuildInstallResult, mode string) (resultError error) {
 	var stageInfo os.FileInfo
-	if options.ReplaceDraft {
+	if mode == "install" && options.ReplaceDraft {
 		mode = "replace-draft"
 		var err error
 		stageInfo, err = os.Lstat(filepath.Join(dist, "."+options.BuildVersion+".stage"))
@@ -631,7 +633,13 @@ func publishBuildSelection(dist string, options BuildInstallOptions, result *Bui
 	if writeError := writeRuntimeAsset(script, assets.BuildSelect(), 0o700); writeError != nil {
 		return writeError
 	}
-	_, diagnostic, runError := runNativeProcess(attempt, script, mode, []string{dist, options.BuildVersion}, nativeEnvironment(attempt), 1<<20, "", options.Deadline, options.Cancellation, options.OnLive)
+	_, diagnostic, runError := runNativeProcess(attempt, script, mode, []string{dist, options.BuildVersion, options.Tag}, nativeEnvironment(attempt), 1<<20, "", options.Deadline, options.Cancellation, options.OnLive, nil)
+	if message := strings.TrimSpace(diagnostic); runError != nil && message != "" {
+		runError = errors.Join(runError, errors.New(message))
+	}
+	if mode == "prepare" {
+		return runError
+	}
 	if options.ReplaceDraft {
 		final := filepath.Join(dist, options.BuildVersion)
 		finalInfo, observationError := os.Lstat(final)
@@ -652,9 +660,6 @@ func publishBuildSelection(dist string, options BuildInstallOptions, result *Bui
 		}
 	} else {
 		runError = errors.Join(runError, selectionError, errors.New("build-install current selection differs"))
-	}
-	if message := strings.TrimSpace(diagnostic); runError != nil && message != "" {
-		runError = errors.Join(runError, errors.New(message))
 	}
 	return runError
 }

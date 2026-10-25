@@ -1,0 +1,183 @@
+define-integration-settings-in-shared-types
+
+Lane: cross
+
+Unit: configure-integrations-through-shared-file
+
+ChildPatch: define-integration-settings-in-shared-types
+
+Form: GitDiff
+
+Segment: schema
+
+Purpose: Configure Proxy, GitHub and Telegram independently through one private integrations.json document.
+
+Requires: none
+
+Provides: Own shared proxy configuration and Telegram subscription types, separate service settings, redacted diagnostics, validated startup loading, and serialized atomic section updates that preserve other services and the last valid state on failure.
+
+Boundary: Proxy validation and activation, GitHub querying and monitoring, Telegram delivery and dialogs remain with their service owners; missing configuration disables services, invalid configuration fails explicitly, and legacy files have no reader or migration route.
+
+Verification: integrations tests cover independent settings, private file permissions, concurrent section preservation, failed writes, symlink rejection and secret-free errors; service tests cover startup activation and configuration consumers.
+
+CrossGroup: control-center
+
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/integrations.rs b/codex-rs/app-server-protocol/src/protocol/v2/integrations.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/integrations.rs
+@@ -0,0 +1,48 @@
++use std::fmt;
++
++use crate::JsonSchema;
++use crate::TS;
++use serde::Deserialize;
++use serde::Serialize;
++
++/// One named application proxy, independent of shell and sandbox network settings.
++#[derive(Clone, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct ProxyDefinition {
++    pub alias: String,
++    pub url: String,
++}
++
++impl fmt::Debug for ProxyDefinition {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("ProxyDefinition")
++            .field("alias", &self.alias)
++            .field("url", &"<redacted>")
++            .finish()
++    }
++}
++
++#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct ProxyConfig {
++    pub enabled: bool,
++    pub selected: Option<String>,
++    pub entries: Vec<ProxyDefinition>,
++}
++
++/// Independently selectable Telegram notification sources.
++#[derive(
++    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, TS,
++)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum TelegramNotificationKind {
++    TurnCompletion,
++    NeedsInput,
++    CodexPrerelease,
++    CodexRelease,
++    ModelChanges,
++}
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -17,6 +17,7 @@ mod experimental_feature;
+ mod feedback;
+ mod fs;
+ mod hook;
++mod integrations;
+ mod item;
+ mod mcp;
+ mod memory;
+@@ -58,6 +59,7 @@ pub use experimental_feature::*;
+ pub use feedback::*;
+ pub use fs::*;
+ pub use hook::*;
++pub use integrations::*;
+ pub use item::*;
+ pub use mcp::*;
+ pub use memory::*;
+diff --git a/codex-rs/app-server/src/integrations.rs b/codex-rs/app-server/src/integrations.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/app-server/src/integrations.rs
+@@ -0,0 +1,70 @@
++use std::collections::BTreeSet;
++use std::fmt;
++
++use codex_app_server_protocol::ProxyConfig;
++use codex_app_server_protocol::TelegramNotificationKind;
++use serde::Deserialize;
++use serde::Serialize;
++
++pub(crate) const DEFAULT_GITHUB_CHECK_INTERVAL_HOURS: u16 = 20;
++pub(crate) const MIN_GITHUB_CHECK_INTERVAL_HOURS: u16 = 1;
++pub(crate) const MAX_GITHUB_CHECK_INTERVAL_HOURS: u16 = 168;
++
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++#[serde(default, deny_unknown_fields)]
++pub(crate) struct IntegrationsConfig {
++    pub(crate) proxy: ProxyConfig,
++    pub(crate) github: Option<GithubConfig>,
++    pub(crate) telegram: Option<TelegramConfig>,
++}
++
++#[derive(Clone, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct GithubConfig {
++    pub(crate) token: String,
++    #[serde(default = "default_github_check_interval_hours")]
++    pub(crate) check_interval_hours: u16,
++}
++
++impl fmt::Debug for GithubConfig {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("GithubConfig")
++            .field("token", &"<redacted>")
++            .field("check_interval_hours", &self.check_interval_hours)
++            .finish()
++    }
++}
++
++#[derive(Clone, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct TelegramConfig {
++    pub(crate) bot_token: String,
++    pub(crate) chat_id: String,
++    pub(crate) notifications: BTreeSet<TelegramNotificationKind>,
++    #[serde(default = "default_completion_min_duration_ms")]
++    pub(crate) completion_min_duration_ms: u64,
++}
++
++impl fmt::Debug for TelegramConfig {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("TelegramConfig")
++            .field("bot_token", &"<redacted>")
++            .field("chat_id", &"<redacted>")
++            .field("notifications", &self.notifications)
++            .field(
++                "completion_min_duration_ms",
++                &self.completion_min_duration_ms,
++            )
++            .finish()
++    }
++}
++
++fn default_github_check_interval_hours() -> u16 {
++    DEFAULT_GITHUB_CHECK_INTERVAL_HOURS
++}
++
++pub(crate) fn default_completion_min_duration_ms() -> u64 {
++    30_000
++}
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -129,6 +129,7 @@ mod fuzzy_file_search;
+ mod gateway_oauth_notifications;
+ mod image_url;
+ pub mod in_process;
++mod integrations;
+ mod log_write_warning;
+ #[cfg(unix)]
+ mod managed_daemon;

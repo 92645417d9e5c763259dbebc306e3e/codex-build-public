@@ -1,0 +1,111 @@
+extend-clock-sleep-to-sixteen-hours
+
+Lane: backend
+
+FlatPatch: extend-clock-sleep-to-sixteen-hours
+
+Form: GitDiff
+
+Segment: none
+
+Purpose: Allow clock.sleep to wait for up to sixteen hours in one call.
+
+Requires: none
+
+Provides: Set the shared tool declaration and duration validation maximum to 57600000 milliseconds, preserving the one-millisecond minimum and native interruptible sleep execution.
+
+Boundary: Clock registration, time providers, input interruption, turn cancellation, clock failure policy, item notifications and analytics remain native owners.
+
+Verification: Controlled current_time_reminder tests verify the advertised maximum, full-duration provider dispatch and rejection above the limit; App Server sleep tests verify maximum-duration interruption, analytics and external-clock failure handling without a real sixteen-hour wait.
+
+
+diff --git a/codex-rs/app-server/tests/suite/v2/sleep.rs b/codex-rs/app-server/tests/suite/v2/sleep.rs
+--- a/codex-rs/app-server/tests/suite/v2/sleep.rs
++++ b/codex-rs/app-server/tests/suite/v2/sleep.rs
+@@ -44,7 +44,7 @@ async fn clock_tools_emit_control_tool_analytics() -> Result<()> {
+             json!({"duration_ms": "PRIVATE_INVALID_DURATION"}),
+             "failed",
+         ),
+-        ("sleep", json!({"duration_ms": 43_200_000}), "interrupted"),
++        ("sleep", json!({"duration_ms": 57_600_000}), "interrupted"),
+     ];
+     let server = responses::start_mock_server().await;
+     let response_mock = responses::mount_sse_sequence(
+diff --git a/codex-rs/core/src/tools/handlers/sleep.rs b/codex-rs/core/src/tools/handlers/sleep.rs
+--- a/codex-rs/core/src/tools/handlers/sleep.rs
++++ b/codex-rs/core/src/tools/handlers/sleep.rs
+@@ -25,7 +25,7 @@ use std::time::Instant;
+ 
+ const NAMESPACE: &str = "clock";
+ const TOOL_NAME: &str = "sleep";
+-const MAX_SLEEP_DURATION_MS: u64 = 12 * 60 * 60 * 1000;
++const MAX_SLEEP_DURATION_MS: u64 = 16 * 60 * 60 * 1000;
+ 
+ pub struct SleepHandler;
+ 
+diff --git a/codex-rs/core/tests/suite/current_time_reminder.rs b/codex-rs/core/tests/suite/current_time_reminder.rs
+--- a/codex-rs/core/tests/suite/current_time_reminder.rs
++++ b/codex-rs/core/tests/suite/current_time_reminder.rs
+@@ -882,12 +882,13 @@ async fn current_time_tool_returns_the_latest_time() -> Result<()> {
+     Ok(())
+ }
+ 
++#[test_case(57_600_000, true; "sixteen_hours")]
++#[test_case(57_600_001, false; "above_sixteen_hours")]
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
++async fn sleep_tool_uses_configured_time_provider(duration_ms: u64, accepted: bool) -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     const CALL_ID: &str = "sleep";
+-    const DURATION_MS: u64 = 12 * 60 * 60 * 1000;
+ 
+     let server = start_mock_server().await;
+     let responses = mount_sse_sequence(
+@@ -899,7 +900,7 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
+                     CALL_ID,
+                     "clock",
+                     "sleep",
+-                    &json!({ "duration_ms": DURATION_MS }).to_string(),
++                    &json!({ "duration_ms": duration_ms }).to_string(),
+                 ),
+                 ev_completed("resp-1"),
+             ]),
+@@ -931,17 +932,30 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
+ 
+     test.submit_turn("sleep").await?;
+ 
+-    assert_eq!(
+-        time_provider.sleep_seconds.load(Ordering::Relaxed),
+-        DURATION_MS / 1_000
+-    );
+     let requests = responses.requests();
+     assert_eq!(requests.len(), 2);
++    let tool = requests[0]
++        .tool_by_name("clock", "sleep")
++        .expect("clock.sleep should be registered");
+     assert!(
+-        requests[1]
+-            .function_call_output_text(CALL_ID)
+-            .is_some_and(|output| output.ends_with("Sleep completed."))
++        tool["parameters"]["properties"]["duration_ms"]["description"]
++            .as_str()
++            .is_some_and(|description| description.contains("between 1 and 57600000"))
+     );
++    let output = requests[1].function_call_output_text(CALL_ID);
++    if accepted {
++        assert_eq!(
++            time_provider.sleep_seconds.load(Ordering::Relaxed),
++            duration_ms / 1_000
++        );
++        assert!(output.is_some_and(|output| output.ends_with("Sleep completed.")));
++    } else {
++        assert_eq!(time_provider.sleep_seconds.load(Ordering::Relaxed), 0);
++        assert_eq!(
++            output.as_deref(),
++            Some("duration_ms must be between 1 and 57600000")
++        );
++    }
+ 
+     Ok(())
+ }

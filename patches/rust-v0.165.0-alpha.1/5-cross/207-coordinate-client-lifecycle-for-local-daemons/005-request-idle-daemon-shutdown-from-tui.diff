@@ -1,0 +1,417 @@
+request-idle-daemon-shutdown-from-tui
+
+Lane: cross
+
+Unit: coordinate-client-lifecycle-for-local-daemons
+
+ChildPatch: request-idle-daemon-shutdown-from-tui
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -793,6 +793,7 @@ fn handle_app_exit(
+             true
+         }
+         ExitReason::UserRequested
++        | ExitReason::DaemonShutdownAccepted
+         | ExitReason::Archived(_)
+         | ExitReason::TurnInterrupted
+         | ExitReason::ThreadRemoved => false,
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -222,6 +222,7 @@ mod composer_hints;
+ mod config_panel;
+ mod config_persistence;
+ mod connector_mentions;
++mod daemon_control;
+ mod daemon_menu;
+ mod daybreak;
+ mod empty_state_policy;
+@@ -494,6 +495,8 @@ pub(crate) enum AppRunControl {
+ #[derive(Debug, Clone)]
+ pub enum ExitReason {
+     UserRequested,
++    /// The local daemon confirmed a manual idle shutdown.
++    DaemonShutdownAccepted,
+     Archived(ThreadId),
+     TurnInterrupted,
+     /// The current thread was deleted, rather than disconnected.
+diff --git a/codex-rs/tui/src/app/daemon_control.rs b/codex-rs/tui/src/app/daemon_control.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/tui/src/app/daemon_control.rs
+@@ -0,0 +1,56 @@
++//! Guarded daemon shutdown for the control center, independent of client-exit shortcuts.
++
++use super::App;
++use super::AppServerTarget;
++use super::ExitReason;
++use crate::app_server_session::AppServerSession;
++use codex_app_server_protocol::DaemonShutdownStatus;
++
++impl App {
++    /// Check eligibility without reserving it or stopping the daemon.
++    pub(super) async fn check_idle_daemon_shutdown(
++        &self,
++        app_server: &mut AppServerSession,
++    ) -> Result<(), String> {
++        self.idle_daemon_shutdown(app_server, true).await
++    }
++
++    /// Return acceptance or a message for the caller, retaining the interface and connection on refusal.
++    pub(super) async fn request_idle_daemon_shutdown(
++        &self,
++        app_server: &mut AppServerSession,
++    ) -> Result<ExitReason, String> {
++        self.idle_daemon_shutdown(app_server, false).await?;
++        Ok(ExitReason::DaemonShutdownAccepted)
++    }
++
++    async fn idle_daemon_shutdown(
++        &self,
++        app_server: &mut AppServerSession,
++        check_only: bool,
++    ) -> Result<(), String> {
++        if !matches!(self.app_server_target, AppServerTarget::LocalDaemon { .. }) {
++            return Err("Quit requires a connection to the local background server.".to_string());
++        }
++        let response = app_server
++            .request_daemon_shutdown(check_only)
++            .await
++            .map_err(|error| {
++                let action = if check_only {
++                    "check shutdown eligibility"
++                } else {
++                    "stop the app server"
++                };
++                format!("Could not {action}: {error:#}")
++            })?;
++        match response.status {
++            DaemonShutdownStatus::Accepted => Ok(()),
++            DaemonShutdownStatus::OtherClients => Err(
++                "Other clients are connected. Quit requires this to be the last client. This client and the app server are still running.".to_string(),
++            ),
++            DaemonShutdownStatus::Busy => Err(
++                "All sessions must be idle before quitting. This client and the app server are still running.".to_string(),
++            ),
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/app/exit_summary.rs b/codex-rs/tui/src/app/exit_summary.rs
+--- a/codex-rs/tui/src/app/exit_summary.rs
++++ b/codex-rs/tui/src/app/exit_summary.rs
+@@ -25,9 +25,10 @@ impl App {
+     pub(super) fn exit_info(&self, exit_reason: ExitReason) -> AppExitInfo {
+         let thread_id = match exit_reason {
+             ExitReason::Archived(_) | ExitReason::ThreadRemoved => None,
+-            ExitReason::UserRequested | ExitReason::TurnInterrupted | ExitReason::Fatal(_) => {
+-                self.chat_widget.thread_id().or(self.primary_thread_id)
+-            }
++            ExitReason::UserRequested
++            | ExitReason::DaemonShutdownAccepted
++            | ExitReason::TurnInterrupted
++            | ExitReason::Fatal(_) => self.chat_widget.thread_id().or(self.primary_thread_id),
+         };
+         let disconnect_info = thread_id.and_then(|_| {
+             let command = match &self.app_server_target {
+@@ -88,6 +89,25 @@ impl AppExitInfo {
+             }
+         };
+         let mut lines = Vec::new();
++        if matches!(&self.exit_reason, ExitReason::DaemonShutdownAccepted) {
++            if let Some(disconnect) = self.disconnect_info
++                && let Some(thread_id) = self.thread_id
++            {
++                lines.push("App server is shutting down. This session can be resumed.".to_string());
++                let mut resume_command = disconnect.command;
++                resume_command.extend(["resume".to_string(), thread_id.to_string()]);
++                lines.push(format!(
++                    "Resume: {}",
++                    color_command(escape_command(&resume_command)),
++                ));
++            } else {
++                lines.push("App server is shutting down.".to_string());
++            }
++            if !self.token_usage.is_zero() {
++                lines.push(self.token_usage.to_string());
++            }
++            return lines;
++        }
+         if let Some(disconnect) = self.disconnect_info
+             && let Some(thread_id) = self.thread_id
+         {
+@@ -96,6 +116,7 @@ impl AppExitInfo {
+                 ExitReason::UserRequested | ExitReason::Archived(_) | ExitReason::ThreadRemoved => {
+                     "Disconnected from this task. Any running work continues."
+                 }
++                ExitReason::DaemonShutdownAccepted => unreachable!("handled above"),
+                 ExitReason::Fatal(_) => "Disconnected from this task. Work may still be running.",
+                 ExitReason::TurnInterrupted => {
+                     "Disconnected from this task. The current turn was stopped."
+diff --git a/codex-rs/tui/src/app/tests/background_exit_tests.rs b/codex-rs/tui/src/app/tests/background_exit_tests.rs
+--- a/codex-rs/tui/src/app/tests/background_exit_tests.rs
++++ b/codex-rs/tui/src/app/tests/background_exit_tests.rs
+@@ -1,6 +1,182 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
+ 
++#[tokio::test]
++async fn control_center_shutdown_returns_refusals_without_history_or_disconnect() -> Result<()> {
++    use codex_app_server_protocol::ClientRequest;
++    use codex_app_server_protocol::DaemonShutdownStatus;
++    use codex_app_server_protocol::JSONRPCMessage;
++    use codex_app_server_protocol::RequestId;
++    use futures::SinkExt;
++    use futures::StreamExt;
++    use tokio_tungstenite::tungstenite::Message;
++
++    for status in [
++        Some(DaemonShutdownStatus::OtherClients),
++        Some(DaemonShutdownStatus::Busy),
++        None,
++        Some(DaemonShutdownStatus::Accepted),
++    ] {
++        let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
++        prepare_local_daemon_thread(&mut app)?;
++        app.chat_widget.insert_str("Keep this draft on refusal");
++        while events.try_recv().is_ok() {}
++        while ops.try_recv().is_ok() {}
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let websocket_url = format!("ws://{}", listener.local_addr()?);
++        let codex_home = app.config.codex_home.display().to_string();
++        let server: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
++            let (stream, _) = listener.accept().await?;
++            let mut websocket = tokio_tungstenite::accept_async(stream).await?;
++            let mut received_check = false;
++            let mut received_shutdown = false;
++            let mut received_followup = false;
++            while let Some(Ok(Message::Text(text))) = websocket.next().await {
++                let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
++                    continue;
++                };
++                let response = match request.method.as_str() {
++                    "initialize" => {
++                        serde_json::json!({"id": request.id, "result": {"userAgent": "codex-tui-test", "codexHome": codex_home, "trustPolicy": codex_protocol::config_types::TrustPolicy::default()}})
++                    }
++                    "daemon/shutdown" => {
++                        assert!(!received_shutdown);
++                        if request
++                            .params
++                            .as_ref()
++                            .is_some_and(|params| params["checkOnly"] == true)
++                        {
++                            assert!(!received_check);
++                            received_check = true;
++                        } else {
++                            assert!(received_check);
++                            received_shutdown = true;
++                        }
++                        if let Some(status) = status {
++                            serde_json::json!({"id": request.id, "result": {"status": status}})
++                        } else {
++                            serde_json::json!({"id": request.id, "error": {"code": -32600, "message": "Shutdown unavailable"}})
++                        }
++                    }
++                    "thread/list" => {
++                        assert!(received_shutdown);
++                        received_followup = true;
++                        serde_json::json!({"id": request.id, "result": {}})
++                    }
++                    method => panic!("unexpected request: {method}"),
++                };
++                websocket
++                    .send(Message::Text(response.to_string().into()))
++                    .await?;
++            }
++            assert!(received_check && received_shutdown);
++            assert_eq!(
++                received_followup,
++                status != Some(DaemonShutdownStatus::Accepted)
++            );
++            Ok(())
++        });
++        let client = crate::connect_remote_app_server(crate::RemoteAppServerEndpoint::WebSocket {
++            websocket_url,
++            auth_token: None,
++        })
++        .await?;
++        let mut app_server = AppServerSession::new(
++            crate::backend_id::BackendId::new(),
++            client,
++            crate::app_server_session::ThreadParamsMode::Remote,
++        );
++        let eligibility = app.check_idle_daemon_shutdown(&mut app_server).await;
++        assert_eq!(
++            eligibility.is_ok(),
++            status == Some(DaemonShutdownStatus::Accepted)
++        );
++        assert!(ops.try_recv().is_err());
++        assert!(events.try_recv().is_err());
++        assert_eq!(
++            app.chat_widget.composer_text_with_pending(),
++            "Keep this draft on refusal"
++        );
++        let decision = app.request_idle_daemon_shutdown(&mut app_server).await;
++        assert!(
++            ops.try_recv().is_err(),
++            "quit must not shut down or interrupt an individual thread"
++        );
++        assert!(
++            events.try_recv().is_err(),
++            "shutdown decisions do not add chat history"
++        );
++        if status == Some(DaemonShutdownStatus::Accepted) {
++            assert_matches!(decision, Ok(ExitReason::DaemonShutdownAccepted));
++        } else {
++            assert_eq!(
++                app.chat_widget.composer_text_with_pending(),
++                "Keep this draft on refusal"
++            );
++            let text = decision.expect_err("shutdown refusal for the control center");
++            match status {
++                Some(DaemonShutdownStatus::OtherClients) => {
++                    assert!(text.contains("last client"), "{text}")
++                }
++                Some(DaemonShutdownStatus::Busy) => {
++                    assert!(text.contains("All sessions must be idle"), "{text}")
++                }
++                None => assert!(text.contains("Shutdown unavailable"), "{text}"),
++                Some(DaemonShutdownStatus::Accepted) => unreachable!(),
++            }
++            assert!(
++                app_server
++                    .request_handle()
++                    .request(ClientRequest::ThreadList {
++                        request_id: RequestId::Integer(999),
++                        params: serde_json::from_value(serde_json::json!({}))?,
++                    })
++                    .await?
++                    .is_ok()
++            );
++        }
++        app_server.shutdown().await?;
++        server.await??;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn control_center_shutdown_preserves_embedded_and_remote_servers() -> Result<()> {
++    let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
++    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
++    for target in [
++        AppServerTarget::Embedded,
++        AppServerTarget::Remote {
++            endpoint: crate::RemoteAppServerEndpoint::WebSocket {
++                websocket_url: "wss://example.com/".to_string(),
++                auth_token: None,
++            },
++        },
++    ] {
++        app.app_server_target = target;
++        while events.try_recv().is_ok() {}
++        while ops.try_recv().is_ok() {}
++        assert_eq!(
++            app.check_idle_daemon_shutdown(&mut server)
++                .await
++                .unwrap_err(),
++            "Quit requires a connection to the local background server."
++        );
++        assert_eq!(
++            app.request_idle_daemon_shutdown(&mut server)
++                .await
++                .unwrap_err(),
++            "Quit requires a connection to the local background server."
++        );
++        assert!(events.try_recv().is_err());
++        assert!(ops.try_recv().is_err());
++    }
++    server.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn external_writer_view_quits_with_escape_ctrl_c_or_q() -> Result<()> {
+     let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+@@ -208,6 +384,39 @@ async fn daemon_disconnect_exit_summary_includes_reconnect_and_stop_instructions
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn manual_idle_daemon_exit_summary_reports_stopped_server() -> Result<()> {
++    let (mut app, _, _) = make_test_app_with_channels().await;
++    let thread_id = prepare_local_daemon_thread(&mut app)?;
++    let lines = app
++        .exit_info(ExitReason::DaemonShutdownAccepted)
++        .format_exit_messages(/*color_enabled*/ false);
++    assert_eq!(
++        lines[0],
++        "App server is shutting down. This session can be resumed."
++    );
++    assert_eq!(lines[1], format!("Resume: codex resume {thread_id}"));
++    assert_eq!(lines.len(), 2);
++    Ok(())
++}
++
++#[tokio::test]
++async fn manual_idle_daemon_exit_without_thread_reports_shutdown() -> Result<()> {
++    let (mut app, _, _) = make_test_app_with_channels().await;
++    app.app_server_target = AppServerTarget::LocalDaemon {
++        allow_embedded_fallback: true,
++        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
++            socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
++        },
++    };
++    assert_eq!(
++        app.exit_info(ExitReason::DaemonShutdownAccepted)
++            .format_exit_messages(/*color_enabled*/ false),
++        vec!["App server is shutting down.".to_string()]
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn remote_disconnect_exit_summary_does_not_require_a_local_rollout_or_print_credentials() {
+     let (mut app, _, _) = make_test_app_with_channels().await;
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -1830,6 +1830,20 @@ impl AppServerSession {
+         self.client.resolve_server_request(request_id, result).await
+     }
+ 
++    pub(crate) async fn request_daemon_shutdown(
++        &mut self,
++        check_only: bool,
++    ) -> Result<codex_app_server_protocol::DaemonShutdownResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::DaemonShutdown {
++                request_id,
++                params: codex_app_server_protocol::DaemonShutdownParams { check_only },
++            })
++            .await
++            .wrap_err("daemon/shutdown failed in TUI")
++    }
++
+     pub(crate) async fn shutdown(self) -> std::io::Result<()> {
+         self.client.shutdown().await
+     }
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -44,6 +44,7 @@ fn main() -> anyhow::Result<()> {
+                 true
+             }
+             ExitReason::UserRequested
++            | ExitReason::DaemonShutdownAccepted
+             | ExitReason::Archived(_)
+             | ExitReason::TurnInterrupted
+             | ExitReason::ThreadRemoved => false,

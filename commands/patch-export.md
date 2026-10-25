@@ -34,27 +34,29 @@ ClosedPrefixExportOwner
 - The declared Segment survives export and replay without path-based responsibility inference or an external metadata file.
 - CrossGroup survives in the same first-commit contract; the shared native projection derives each cross artifact's three-digit group/member ordinal.
 - Export readers compare every artifact path with that same projection after validating the complete source layout, rather than maintaining a separate ordinal interpretation.
-- Pass replaces canonical <ProjectWorkingRoot>/build/patches/private/<Tag> with every included Patch projected from its distinct Git commit and the selected version documents below. Every invocation commits only that tag in private main; the artifact commit is not a release-completion claim. Another task may explicitly select that prefix while unfinished responsibility remains in the sole task.
+- Pass replaces canonical <ProjectWorkingRoot>/build/patches/private/<Tag> with every included Patch projected from its distinct Git commit and the selected version documents below.
+- Every invocation commits the current tag and tracked obsolete-tag deletions in private main; the artifact commit is not a release-completion claim.
+- Another task may explicitly select that prefix while unfinished responsibility remains in the sole task.
 - Artifact inspection lists only immediate canonical tag directories and the selected tag, never private `.git` or recursive storage. Requested projection uses this same export route.
 
-## Version And Lane Notes
+## Version Notes
 
-```
-LaneNotesOwner
-+-- Consumer: CurrentLaneNotesConsumer
-+-- Input: version-root notes and selected lane notes from the independent working set
-+-- Successor: InheritedLaneNotesProjectionSuccessor
-`-- Terminal: ReviewedLaneNotesPublicationTerminal
-```
-
-- Every emitted tag root and lane contains one regular 0644 notes.md, empty when no guard applies. Shared constraints appear only at the root; lane files contain only their specific additions. Nonempty bytes are exact current-user-approved critical cross-Patch guards, never progress, history, results, reviewer data, or Patch inventory.
+- Every canonical tag has one regular 0644 notes.md at its root, empty when no guard applies.
+- Its entries are exact current-user-approved critical cross-Patch guards, never progress, history, results, reviewer data, or Patch inventory.
+- Patch identity, topology, workflow, and test transitions remain with their existing owners rather than notes.
 - Nonempty notes are UTF-8 text with a final newline and consecutive unindented `- ` lines, one concise reminder per line. Blank lines, headings, numbered or nested lists, paragraphs, tables, fences, and front matter are invalid.
-- TaskWorkspace owns the editable two-level set independently of worktrees and exports. ReleaseRollForward owns copying and approved mutation; export only reads it.
-- Preserve exact inherited entries. Adding, rewriting, moving, or removing one requires presenting the exact flat line and explicit current-user approval. Task edits, Patch completion, tests, and agent importance grant none. Keep initialized empty files. Notes never move Patch responsibility; resolve contradictory guards with the user before dependent edits.
-- The helper requires root notes and every emitted lane's notes, validates their format, captures exact bytes, and rechecks them immediately before atomic publication. It copies them without export-time inheritance or fallback. Missing or changed drafts reject publication. Export never modifies the working set.
-- Export always reads root notes and only emitted lanes, preserving other drafts for later work. No notes-only lane is emitted. Cleanup requires all remaining nonempty notes at either level to match publication before retirement.
+- TaskWorkspace owns the editable file independently of worktrees and exports.
+- ReleaseRollForward owns copying and approved mutation; export only reads it.
+- Preserve exact inherited entries and initialized empty files.
+- Adding, rewriting, or removing an entry requires presenting its exact flat line and explicit current-user approval.
+- Task edits, Patch completion, tests, and agent importance grant no note-entry authority.
+- Notes never move Patch responsibility; resolve contradictory guards before dependent edits.
+- Every export requires the working root notes, validates its format, and freezes its bytes through atomic publication.
+- Missing or changed notes reject publication without export-time inheritance, fallback, or draft mutation.
+- Cleanup requires the remaining nonempty notes to match publication before retirement.
 - The next Established Baseline retires its predecessor's published working copy, not its exported notes. Roll inherits from the canonical source prefix; it never needs retired working copies as a second source of truth.
-- Historical prefixes missing either notes level remain readable. Present notes share syntax validation and exact byte-and-mode source custody. Unit enumeration and application consume only GitDiffs. Private Git includes both levels; product-source comparison validates notes without treating them as source or Patch rows.
+- Prefix admission requires the same root notes and exact byte-and-mode custody.
+- Unit enumeration and application consume only GitDiffs, never notes as source or Patch rows.
 
 ## Cross Relationship Diagram
 
@@ -78,10 +80,21 @@ LaneNotesOwner
 
 - Existing private storage uses ProjectWorkingRoot only as a locator. Initial cloning freezes committed main; unrelated project checkout bytes are neither admission inputs nor mutation targets.
 - Export replaces the complete tag directory in one staging transaction. Remove staged Tag-prev, move staged Tag to Tag-prev when present, then generate the entire diff and selected-document projection into absent Tag. Preserve the selected document bytes through this regeneration without merging stale destination diffs or keeping retired lanes.
-- One sibling private.pending preserves the repository and other tag bytes. Linux atomic directory exchange publishes the complete pair and prepared Git commit together. Initial publication renames the absent root. Unsupported exchange and unexplained residue block.
-- Private main must have no staged changes or sequencer. Uncommitted changes under canonical tag directories are normal prefix data. Bind exact tag bytes and modes, private HEAD, and the selected pair before staging and immediately before exchange; reject unrelated dirty paths. Never commit, reset, or remove another tag's prefix.
-- Tag-prev is the sole previous generation, excluded from private Git and replay. It belongs to user cleanup; the next export replaces only that generation.
+- Retain at most three immediate canonical directories: Tag, Tag-prev when a prior Tag exists, and the task's first SourcePrefixes entry as the previous release.
+- The primary predecessor comes from the existing task, never directory mtime, lexical version order or a new retention record.
+- Before staging, reject a task that still declares another source tag outside the retained current tag and primary predecessor; deleting a live source cannot satisfy source coverage.
+- Within private.pending, remove every other inventoried canonical tag directory, including older tag-prev generations.
+- One sibling private.pending preserves the repository, the retained predecessor's exact bytes and every unrelated path.
+- Linux atomic directory exchange publishes the retained directories and prepared Git commit together; initial publication renames the absent root.
+- Unsupported exchange and unexplained residue block.
+- Private main must have no staged changes or sequencer; uncommitted changes under canonical tag directories remain normal prefix data.
+- Bind every canonical tag's exact bytes and modes, private HEAD and refs before staging and immediately before exchange; reject unrelated dirty paths.
+- Stage only the regenerated Tag and tracked deletions under obsolete canonical tags; never stage or reset the retained predecessor's changes.
+- Tag-prev is the sole previous generation, excluded from private Git and replay; the next export replaces it, and BuildInstall removes it before compilation.
+- Existing ignored tag-prev bytes are not retroactively tracked merely to create a deletion commit.
 - Failure before exchange removes only this transaction's stage. Failure after publication reports the completed effect and retains the new pair without automatic re-execution.
 - The internal repository copy is publication machinery, not an inspection route. No migration, receipt, recovery ref, or replacement product worktree is introduced.
 
-- One nobody commit stages only this tag and advances private main. Publication validation uses this tag's own last changing commit and exact tracked directory bytes; unrelated later commits or another tag's uncommitted prefix do not invalidate it.
+- One nobody commit stages the current tag and tracked obsolete-tag deletions and advances private main.
+- Publication validation admits only current-tag changes and canonical old-tag deletions in that commit.
+- Validation still uses this tag's own last changing commit and exact tracked directory bytes; unrelated later commits or the retained predecessor's uncommitted prefix do not invalidate it.

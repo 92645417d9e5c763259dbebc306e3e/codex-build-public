@@ -1,0 +1,1271 @@
+enforce-server-trust-policy-in-tui
+
+Lane: mixed
+
+Unit: configure-trust-bypasses-at-server-start
+
+ChildPatch: enforce-server-trust-policy-in-tui
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -584,6 +584,14 @@ struct LogoutCommand {
+ 
+ #[derive(Debug, Parser)]
+ struct AppServerCommand {
++    /// Fix project trust bypass for this server's lifetime.
++    #[arg(long = "dangerously-bypass-project-trust", global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    bypass_project_trust: Option<bool>,
++
++    /// Fix hook trust bypass for this server's lifetime.
++    #[arg(long = "dangerously-bypass-hook-trust", global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    bypass_hook_trust: Option<bool>,
++
+     #[command(flatten)]
+     startup_config: codex_app_server::StartupConfigArgs,
+ 
+@@ -1267,6 +1275,8 @@ async fn cli_main(
+         }
+         Some(Subcommand::AppServer(app_server_cli)) => {
+             let AppServerCommand {
++                bypass_project_trust,
++                bypass_hook_trust,
+                 startup_config,
+                 cloud_skills_snapshot,
+                 subcommand,
+@@ -1279,6 +1289,18 @@ async fn cli_main(
+                 analytics_default_enabled,
+                 auth,
+             } = app_server_cli;
++            let bypass_project_trust = bypass_project_trust.or(interactive.bypass_project_trust);
++            let bypass_hook_trust = bypass_hook_trust.or(interactive.bypass_hook_trust);
++            anyhow::ensure!(
++                (bypass_project_trust.is_none() && bypass_hook_trust.is_none())
++                    || matches!(
++                        subcommand.as_ref(),
++                        None | Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
++                            subcommand: AppServerDaemonSubcommand::Start
++                        }))
++                    ),
++                "trust bypass flags apply only to app-server startup or app-server daemon start"
++            );
+             let strict_config = app_server_strict_config || root_strict_config;
+             reject_strict_config_for_app_server_subcommand(strict_config, subcommand.as_ref())?;
+             reject_remote_mode_for_app_server_subcommand(
+@@ -1297,6 +1319,10 @@ async fn cli_main(
+                     LoaderOverrides::default(),
+                     strict_config,
+                     startup_config,
++                    codex_protocol::config_types::TrustPolicy {
++                        bypass_project_trust: bypass_project_trust.unwrap_or_default(),
++                        bypass_hook_trust: bypass_hook_trust.unwrap_or_default(),
++                    },
+                 )
+                 .await
+                 .map_err(Into::into);
+@@ -1318,6 +1344,10 @@ async fn cli_main(
+                         let _ = codex_app_server_daemon::maintain_stderr_log();
+                     }
+                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
++                        trust_policy: codex_protocol::config_types::TrustPolicy {
++                            bypass_project_trust: bypass_project_trust.unwrap_or_default(),
++                            bypass_hook_trust: bypass_hook_trust.unwrap_or_default(),
++                        },
+                         cloud_skills_snapshot,
+                         code_mode_host_transport: code_mode_host.into(),
+                         managed_daemon,
+@@ -1354,7 +1384,11 @@ async fn cli_main(
+                 }
+                 Some(AppServerSubcommand::Daemon(daemon_cli)) => match daemon_cli.subcommand {
+                     AppServerDaemonSubcommand::Start => {
+-                        print_app_server_daemon_output(AppServerLifecycleCommand::Start).await?;
++                        print_app_server_daemon_output(AppServerLifecycleCommand::Start {
++                            bypass_project_trust,
++                            bypass_hook_trust,
++                        })
++                        .await?;
+                     }
+                     AppServerDaemonSubcommand::Bootstrap(bootstrap_cli) => {
+                         let output =
+@@ -2165,7 +2199,8 @@ async fn run_debug_prompt_input_command(
+         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
+         show_raw_agent_reasoning: shared.oss.then_some(true),
+         ephemeral: Some(true),
+-        bypass_hook_trust: shared.bypass_hook_trust.then_some(true),
++        bypass_hook_trust: shared.bypass_hook_trust,
++        bypass_project_trust: shared.bypass_project_trust,
+         additional_writable_roots: shared.add_dir,
+         ..Default::default()
+     };
+@@ -2590,7 +2625,10 @@ async fn run_interactive_tui(
+         cloud_config::load_config(&interactive.config_overrides, LoaderOverrides::default())
+             .await
+             .map_err(std::io::Error::other)?;
+-        let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
++        let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start {
++            bypass_project_trust: interactive.bypass_project_trust,
++            bypass_hook_trust: interactive.bypass_hook_trust,
++        })
+             .await
+             .map_err(|err| std::io::Error::other(format!(
+                 "{err:#}\nThe agents overview requires a shared server. Use codex --no-daemon to work without it."
+@@ -3748,7 +3786,7 @@ enabled = true
+             Some(std::path::Path::new("/archive"))
+         );
+         assert!(interactive.strict_config);
+-        assert!(interactive.bypass_hook_trust);
++        assert_eq!(interactive.bypass_hook_trust, Some(true));
+     }
+ 
+     #[test]
+@@ -4300,12 +4338,42 @@ enabled = true
+             ["codex", "resume", "--dangerously-bypass-hook-trust"].as_ref(),
+         );
+ 
+-        assert!(interactive.bypass_hook_trust);
++        assert_eq!(interactive.bypass_hook_trust, Some(true));
+         assert!(interactive.resume_picker);
+         assert!(!interactive.resume_last);
+         assert_eq!(interactive.resume_session_id, None);
+     }
+ 
++    #[test]
++    fn trust_flags_preserve_omission_bare_values_and_explicit_false() {
++        let cli = MultitoolCli::try_parse_from(["codex"]).expect("default CLI");
++        assert_eq!(cli.interactive.bypass_project_trust, None);
++        assert_eq!(cli.interactive.bypass_hook_trust, None);
++        let interactive = finalize_resume_from_args(&[
++            "codex",
++            "--dangerously-bypass-hook-trust",
++            "resume",
++            "--dangerously-bypass-project-trust",
++            "--dangerously-bypass-hook-trust=false",
++        ]);
++        assert_eq!(interactive.bypass_project_trust, Some(true));
++        assert_eq!(interactive.bypass_hook_trust, Some(false));
++        let cli = MultitoolCli::try_parse_from([
++            "codex",
++            "app-server",
++            "daemon",
++            "start",
++            "--dangerously-bypass-project-trust=false",
++            "--dangerously-bypass-hook-trust",
++        ])
++        .expect("daemon flags");
++        let Some(Subcommand::AppServer(server)) = cli.subcommand else {
++            panic!("app server")
++        };
++        assert_eq!(server.bypass_project_trust, Some(false));
++        assert_eq!(server.bypass_hook_trust, Some(true));
++    }
++
+     #[test]
+     fn fork_picker_logic_none_and_not_last() {
+         let interactive = finalize_fork_from_args(["codex", "fork"].as_ref());
+diff --git a/codex-rs/cli/src/remote_control_cmd.rs b/codex-rs/cli/src/remote_control_cmd.rs
+--- a/codex-rs/cli/src/remote_control_cmd.rs
++++ b/codex-rs/cli/src/remote_control_cmd.rs
+@@ -84,21 +84,24 @@ pub(crate) async fn run(
+                 command.json,
+                 "Starting app-server daemon with remote control enabled...",
+             )?;
+-            let daemon = match codex_app_server_daemon::start_with_features(&Default::default())
+-                .await
+-            {
+-                Ok(daemon) => daemon,
+-                #[cfg(windows)]
+-                Err(error) if error.is::<codex_app_server_daemon::DetachedLaunchRestricted>() => {
+-                    return run_foreground_remote_control(
+-                        command.json,
+-                        arg0_paths,
+-                        root_config_overrides,
+-                    )
+-                    .await;
+-                }
+-                Err(error) => return Err(error),
+-            };
++            let daemon =
++                match codex_app_server_daemon::start_with_features(&Default::default(), None, None)
++                    .await
++                {
++                    Ok(daemon) => daemon,
++                    #[cfg(windows)]
++                    Err(error)
++                        if error.is::<codex_app_server_daemon::DetachedLaunchRestricted>() =>
++                    {
++                        return run_foreground_remote_control(
++                            command.json,
++                            arg0_paths,
++                            root_config_overrides,
++                        )
++                        .await;
++                    }
++                    Err(error) => return Err(error),
++                };
+             if daemon.backend.is_none() {
+                 return run_foreground_remote_control(
+                     command.json,
+diff --git a/codex-rs/cli/tests/queue.rs b/codex-rs/cli/tests/queue.rs
+--- a/codex-rs/cli/tests/queue.rs
++++ b/codex-rs/cli/tests/queue.rs
+@@ -55,6 +55,7 @@ where
+         "id": initialize["id"],
+         "result": {
+             "userAgent": "codex_cli_rs/0.0.0-test",
++            "trustPolicy": codex_app_server_protocol::TrustPolicy::default(),
+             "codexHome": codex_home,
+         },
+     });
+diff --git a/codex-rs/exec/src/cli.rs b/codex-rs/exec/src/cli.rs
+--- a/codex-rs/exec/src/cli.rs
++++ b/codex-rs/exec/src/cli.rs
+@@ -166,6 +166,7 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
+             arg.global(true)
+         })
+         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
++        .mut_arg("bypass_project_trust", |arg| arg.global(true))
+         .mut_arg("worktree", |arg| arg.global(true))
+ }
+ 
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -155,7 +155,6 @@ pub use exec_events::TurnStartedEvent;
+ pub use exec_events::Usage;
+ pub use exec_events::WebSearchItem;
+ use serde_json::Value;
+-use std::collections::HashMap;
+ use std::future::Future;
+ use std::io::IsTerminal;
+ use std::io::Read;
+@@ -309,6 +308,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+         auto_review: _,
+         dangerously_bypass_approvals_and_sandbox,
+         bypass_hook_trust,
++        bypass_project_trust,
+         cwd,
+         mut add_dir,
+         worktree,
+@@ -609,7 +609,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+         show_raw_agent_reasoning: oss.then_some(true),
+         tools_web_search_request: None,
+         ephemeral: ephemeral.then_some(true),
+-        bypass_hook_trust: bypass_hook_trust.then_some(true),
++        bypass_hook_trust,
++        bypass_project_trust,
+         additional_writable_roots: add_dir,
+     };
+ 
+@@ -1114,7 +1115,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+                     approvals_reviewer: resume_approvals_reviewer_override,
+                     sandbox: sandbox.flatten(),
+                     permissions,
+-                    config: thread_config_overrides_from_config(&config),
+                     ephemeral: config.ephemeral,
+                     thread_source: Some(thread_source.clone()),
+                     exclude_turns: true,
+@@ -1457,7 +1457,6 @@ fn thread_start_params_from_config(
+         approvals_reviewer: Some(config.approvals_reviewer.into()),
+         sandbox: sandbox.flatten(),
+         permissions,
+-        config: thread_config_overrides_from_config(config),
+         ephemeral: Some(config.ephemeral),
+         daybreak_enabled: (config.daybreak_enabled && !config.ephemeral).then_some(true),
+         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
+@@ -1488,18 +1487,11 @@ fn thread_resume_params_from_config(
+         approvals_reviewer: approvals_reviewer_override,
+         sandbox: sandbox.flatten(),
+         permissions,
+-        config: thread_config_overrides_from_config(config),
+         exclude_turns: true,
+         ..ThreadResumeParams::default()
+     }
+ }
+ 
+-fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
+-    config
+-        .bypass_hook_trust
+-        .then(|| HashMap::from([("bypass_hook_trust".to_string(), Value::Bool(true))]))
+-}
+-
+ fn permissions_selection_from_config(config: &Config) -> Option<String> {
+     config
+         .permissions
+diff --git a/codex-rs/exec/src/lib_tests.rs b/codex-rs/exec/src/lib_tests.rs
+--- a/codex-rs/exec/src/lib_tests.rs
++++ b/codex-rs/exec/src/lib_tests.rs
+@@ -688,23 +688,20 @@ async fn thread_start_params_match_history_to_persistence() {
+ }
+ 
+ #[tokio::test]
+-async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
++async fn thread_lifecycle_params_do_not_override_startup_trust_policy() {
+     let codex_home = tempdir().expect("create temp codex home");
+     let cwd = tempdir().expect("create temp cwd");
+     let config = ConfigBuilder::default()
+         .codex_home(codex_home.path().to_path_buf())
+         .harness_overrides(ConfigOverrides {
++            bypass_project_trust: Some(true),
+             bypass_hook_trust: Some(true),
+             ..Default::default()
+         })
+         .fallback_cwd(Some(cwd.path().to_path_buf()))
+         .build()
+         .await
+-        .expect("build config with hook trust bypass");
+-    let expected_config = Some(HashMap::from([(
+-        "bypass_hook_trust".to_string(),
+-        serde_json::Value::Bool(true),
+-    )]));
++        .expect("build config with startup trust bypasses");
+ 
+     let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
+     let resume_params = thread_resume_params_from_config(
+@@ -713,8 +710,8 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
+         /*approvals_reviewer_override*/ None,
+     );
+ 
+-    assert_eq!(start_params.config, expected_config);
+-    assert_eq!(resume_params.config, expected_config);
++    assert_eq!(start_params.config, None);
++    assert_eq!(resume_params.config, None);
+ }
+ 
+ #[test]
+diff --git a/codex-rs/exec/tests/suite/hooks.rs b/codex-rs/exec/tests/suite/hooks.rs
+--- a/codex-rs/exec/tests/suite/hooks.rs
++++ b/codex-rs/exec/tests/suite/hooks.rs
+@@ -5,7 +5,8 @@ use core_test_support::test_codex_exec::test_codex_exec;
+ use serde_json::json;
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn exec_hook_trust_bypass_runs_session_start_hook() -> anyhow::Result<()> {
++async fn exec_hook_trust_bypass_runs_session_start_hook_on_start_and_resume() -> anyhow::Result<()>
++{
+     let test = test_codex_exec();
+     let marker_path = test.home_path().join("session-start-ran");
+     let command = format!("touch {}", marker_path.display());
+@@ -39,5 +40,27 @@ async fn exec_hook_trust_bypass_runs_session_start_hook() -> anyhow::Result<()>
+         .success();
+ 
+     assert!(marker_path.exists(), "session start hook did not run");
++    std::fs::remove_file(&marker_path)?;
++
++    let body = responses::sse(vec![
++        responses::ev_response_created("response_2"),
++        responses::ev_assistant_message("response_2", "resumed"),
++        responses::ev_completed("response_2"),
++    ]);
++    responses::mount_sse_once(&server, body).await;
++
++    test.cmd_with_server(&server)
++        .arg("--skip-git-repo-check")
++        .arg("--dangerously-bypass-hook-trust")
++        .arg("run the resumed session start hook")
++        .arg("resume")
++        .arg("--last")
++        .assert()
++        .success();
++
++    assert!(
++        marker_path.exists(),
++        "resumed session start hook did not run"
++    );
+     Ok(())
+ }
+diff --git a/codex-rs/tui/src/analytics/chats_tests.rs b/codex-rs/tui/src/analytics/chats_tests.rs
+--- a/codex-rs/tui/src/analytics/chats_tests.rs
++++ b/codex-rs/tui/src/analytics/chats_tests.rs
+@@ -63,7 +63,7 @@ async fn slow_repairing_chat_listing_keeps_estimate_budget_and_ranks_across_page
+             let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+             let result = match request["method"].as_str() {
+                 Some("initialize") => {
+-                    json!({"userAgent": "analytics-test", "codexHome": "/unused"})
++                    json!({"userAgent": "analytics-test", "codexHome": "/unused", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
+                 }
+                 Some("thread/list") => {
+                     let params = &request["params"];
+diff --git a/codex-rs/tui/src/analytics/connection_tests.rs b/codex-rs/tui/src/analytics/connection_tests.rs
+--- a/codex-rs/tui/src/analytics/connection_tests.rs
++++ b/codex-rs/tui/src/analytics/connection_tests.rs
+@@ -37,6 +37,7 @@ async fn remote() -> (RemoteAppServerClient, tokio::task::JoinHandle<()>) {
+             .send(Message::Text(
+                 json!({"id": initialize["id"], "result": {
+                     "userAgent": "analytics-test", "codexHome": "/server/.codex",
++                    "trustPolicy": codex_app_server_protocol::TrustPolicy::default(),
+                 }})
+                 .to_string()
+                 .into(),
+diff --git a/codex-rs/tui/src/analytics/tasks_tests.rs b/codex-rs/tui/src/analytics/tasks_tests.rs
+--- a/codex-rs/tui/src/analytics/tasks_tests.rs
++++ b/codex-rs/tui/src/analytics/tasks_tests.rs
+@@ -38,7 +38,7 @@ async fn consumer_roots_include_paginated_archived_descendants_and_keep_missing_
+                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                 let result = match request["method"].as_str() {
+                     Some("initialize") => {
+-                        json!({"userAgent":"analytics-test", "codexHome":"/unused"})
++                        json!({"userAgent":"analytics-test", "codexHome":"/unused", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
+                     }
+                     Some("thread/list") => {
+                         pages += 1;
+diff --git a/codex-rs/tui/src/app/agents_overview_discovery_tests.rs b/codex-rs/tui/src/app/agents_overview_discovery_tests.rs
+--- a/codex-rs/tui/src/app/agents_overview_discovery_tests.rs
++++ b/codex-rs/tui/src/app/agents_overview_discovery_tests.rs
+@@ -75,7 +75,9 @@ async fn check_discovery(mixed_sources: bool) -> Result<()> {
+             };
+             let params = request.params.unwrap_or_default();
+             let result = match request.method.as_str() {
+-                "initialize" => json!({"userAgent": "overview-test/1.0"}),
++                "initialize" => {
++                    json!({"userAgent": "overview-test/1.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
++                }
+                 "thread/loaded/list" => json!({"data": [], "nextCursor": null}),
+                 "thread/list" => {
+                     if params["sortKey"] == "section_position" {
+diff --git a/codex-rs/tui/src/app/connector_mentions_tests.rs b/codex-rs/tui/src/app/connector_mentions_tests.rs
+--- a/codex-rs/tui/src/app/connector_mentions_tests.rs
++++ b/codex-rs/tui/src/app/connector_mentions_tests.rs
+@@ -33,7 +33,7 @@ async fn load_mock_mentions(responses: MockResponses) -> Result<(ConnectorsSnaps
+             let request_id = request.id.clone();
+             let response = match request.method.as_str() {
+                 "initialize" => {
+-                    json!({ "id": request_id, "result": { "userAgent": "codex-tui-test" } })
++                    json!({ "id": request_id, "result": { "userAgent": "codex-tui-test", "trustPolicy": codex_app_server_protocol::TrustPolicy::default() } })
+                 }
+                 "app/installed" => {
+                     assert_eq!(
+diff --git a/codex-rs/tui/src/app/retained_reply_tests.rs b/codex-rs/tui/src/app/retained_reply_tests.rs
+--- a/codex-rs/tui/src/app/retained_reply_tests.rs
++++ b/codex-rs/tui/src/app/retained_reply_tests.rs
+@@ -44,6 +44,7 @@ async fn connection() -> color_eyre::Result<(
+                         .send(Message::Text(
+                             json!({"id":request.id,"result":{
+                                 "userAgent":"retained-reply-test","codexHome":std::env::temp_dir(),
++                                "trustPolicy": codex_app_server_protocol::TrustPolicy::default(),
+                                 "platformFamily":std::env::consts::FAMILY,
+                                 "platformOs":std::env::consts::OS
+                             }})
+diff --git a/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs b/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
+--- a/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
++++ b/codex-rs/tui/src/app/tests/backend_banner_fallback_tests.rs
+@@ -302,7 +302,7 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
+                     continue;
+                 }
+                 let response = if request["method"] == "initialize" {
+-                    json!({"id": request["id"], "result": {"userAgent": "test", "codexHome": codex_home}})
++                    json!({"id": request["id"], "result": {"userAgent": "test", "codexHome": codex_home, "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
+                 } else {
+                     assert_eq!(request["method"], "thread/settings/update");
+                     settings_requests += 1;
+diff --git a/codex-rs/tui/src/app/tests/disconnect_tests.rs b/codex-rs/tui/src/app/tests/disconnect_tests.rs
+--- a/codex-rs/tui/src/app/tests/disconnect_tests.rs
++++ b/codex-rs/tui/src/app/tests/disconnect_tests.rs
+@@ -392,7 +392,9 @@ where
+         methods.push(request.method.clone());
+         let request_id = request.id.clone();
+         let response = match request.method.as_str() {
+-            "initialize" => Some(json!({"result": {"userAgent": "reconnect-test/2.0.0"}})),
++            "initialize" => Some(
++                json!({"result": {"userAgent": "reconnect-test/2.0.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}}),
++            ),
+             "account/read" => {
+                 Some(json!({"result": {"account": null, "requiresOpenaiAuth": false}}))
+             }
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -561,6 +561,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
+                                 id: request.id,
+                                 result: serde_json::json!({
+                                     "userAgent": "codex-tui-test",
++                                    "trustPolicy": codex_app_server_protocol::TrustPolicy::default(),
+                                     "codexHome": codex_home,
+                                 }),
+                             }))?
+@@ -996,6 +997,7 @@ async fn in_app_remote_resume_picker_preserves_remote_cwd_filter() -> Result<()>
+                         id: request.id,
+                         result: serde_json::json!({
+                             "userAgent": "codex-tui-test",
++                            "trustPolicy": codex_app_server_protocol::TrustPolicy::default(),
+                             "codexHome": codex_home,
+                         }),
+                     });
+diff --git a/codex-rs/tui/src/app/user_verification_tests.rs b/codex-rs/tui/src/app/user_verification_tests.rs
+--- a/codex-rs/tui/src/app/user_verification_tests.rs
++++ b/codex-rs/tui/src/app/user_verification_tests.rs
+@@ -115,7 +115,7 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
+                 JSONRPCMessage::Request(request) => {
+                     let response = match request.method.as_str() {
+                         "initialize" => {
+-                            serde_json::json!({ "id": request.id, "result": { "userAgent": "codex-tui-test", "codexHome": std::env::temp_dir(), "platformFamily": std::env::consts::FAMILY, "platformOs": std::env::consts::OS } })
++                            serde_json::json!({ "id": request.id, "result": { "userAgent": "codex-tui-test", "trustPolicy": codex_app_server_protocol::TrustPolicy::default(), "codexHome": std::env::temp_dir(), "platformFamily": std::env::consts::FAMILY, "platformOs": std::env::consts::OS } })
+                         }
+                         "userVerification/verify" => {
+                             assert_eq!(request.params, Some(expected_params.clone()));
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -437,6 +437,10 @@ impl AppServerSession {
+         self.client.platform_family()
+     }
+ 
++    pub(crate) fn trust_policy(&self) -> Option<codex_protocol::config_types::TrustPolicy> {
++        self.client.trust_policy()
++    }
++
+     pub(crate) fn app_server_platform_os(&self) -> Option<&str> {
+         self.client.platform_os()
+     }
+@@ -2044,9 +2048,6 @@ fn config_request_overrides_from_config(
+             .or_insert_with(|| serde_json::json!({}))["concurrent_reasoning_summaries"] =
+             serde_json::json!(effective["features"]["concurrent_reasoning_summaries"]);
+     }
+-    if config.bypass_hook_trust {
+-        overrides.insert("bypass_hook_trust".to_string(), true.into());
+-    }
+     Some(overrides)
+ }
+ 
+@@ -3625,10 +3626,8 @@ mod tests {
+         assert_eq!(resume.service_tier, expected_service_tier);
+         assert_eq!(fork.service_tier, expected_service_tier);
+         let string = |value: &str| serde_json::Value::String(value.to_string());
+-        let expected_config = HashMap::from([
+-            ("model_reasoning_effort".to_string(), string("high")),
+-            ("bypass_hook_trust".to_string(), true.into()),
+-        ]);
++        let expected_config =
++            HashMap::from([("model_reasoning_effort".to_string(), string("high"))]);
+         assert_eq!(start.config, Some(expected_config.clone()));
+         assert_eq!(resume.config, Some(expected_config.clone()));
+         assert_eq!(fork.config, Some(expected_config));
+diff --git a/codex-rs/tui/src/app_server_session/collaboration_catalog_tests.rs b/codex-rs/tui/src/app_server_session/collaboration_catalog_tests.rs
+--- a/codex-rs/tui/src/app_server_session/collaboration_catalog_tests.rs
++++ b/codex-rs/tui/src/app_server_session/collaboration_catalog_tests.rs
+@@ -40,7 +40,9 @@ async fn collaboration_catalog_is_optional_and_refetched_on_bootstrap() -> Resul
+                     continue;
+                 };
+                 let mut reply = match request.method.as_str() {
+-                    "initialize" => json!({"result": {"userAgent": "catalog-test/1.0.0"}}),
++                    "initialize" => {
++                        json!({"result": {"userAgent": "catalog-test/1.0.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
++                    }
+                     "account/read" => {
+                         json!({"result": {"account": null, "requiresOpenaiAuth": false}})
+                     }
+diff --git a/codex-rs/tui/src/app_server_session/external_agent_config_tests.rs b/codex-rs/tui/src/app_server_session/external_agent_config_tests.rs
+--- a/codex-rs/tui/src/app_server_session/external_agent_config_tests.rs
++++ b/codex-rs/tui/src/app_server_session/external_agent_config_tests.rs
+@@ -28,7 +28,9 @@ async fn external_agent_config_migration_over_shared_transport() -> Result<()> {
+                     continue;
+                 };
+                 let mut reply = match request.method.as_str() {
+-                    "initialize" => json!({"result": {"userAgent": "import-test/1.0"}}),
++                    "initialize" => {
++                        json!({"result": {"userAgent": "import-test/1.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
++                    }
+                     "externalAgentConfig/detect" => {
+                         requests.push((request.method, request.params.unwrap()));
+                         json!({"result": {"items": [], "connectors": []}})
+diff --git a/codex-rs/tui/src/app_server_session/thread_list_tests.rs b/codex-rs/tui/src/app_server_session/thread_list_tests.rs
+--- a/codex-rs/tui/src/app_server_session/thread_list_tests.rs
++++ b/codex-rs/tui/src/app_server_session/thread_list_tests.rs
+@@ -30,7 +30,9 @@ async fn thread_list_preserves_filters_and_retries_only_legacy_cwd_errors() -> R
+                     continue;
+                 };
+                 let mut reply = match request.method.as_str() {
+-                    "initialize" => json!({"result": {"userAgent": "thread-list-test/1.0"}}),
++                    "initialize" => {
++                        json!({"result": {"userAgent": "thread-list-test/1.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
++                    }
+                     "thread/list" => {
+                         requests.push(request.params.unwrap());
+                         if code != 0 && requests.len() == 1 {
+diff --git a/codex-rs/tui/src/daemon_recovery.rs b/codex-rs/tui/src/daemon_recovery.rs
+--- a/codex-rs/tui/src/daemon_recovery.rs
++++ b/codex-rs/tui/src/daemon_recovery.rs
+@@ -33,17 +33,22 @@ pub(super) async fn check(
+     config: &Config,
+     cli_kv_overrides: &[(String, toml::Value)],
+     mut managed_daemon: bool,
++    bypass_project_trust: Option<bool>,
++    bypass_hook_trust: Option<bool>,
+ ) -> io::Result<Option<String>> {
+     let issue = match startup
+         .run_until(daemon_startup::compatibility_warning(
+             target,
+             config,
+             cli_kv_overrides,
++            bypass_project_trust,
++            bypass_hook_trust,
+         ))
+         .await?
+     {
+         Ok(warning) => return Ok(warning),
+-        Err(issue) => issue,
++        Err(daemon_startup::StartupError::Recoverable(issue)) => issue,
++        Err(error) => return Err(io::Error::other(error)),
+     };
+     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+         return Err(io::Error::other(issue));
+@@ -128,6 +133,8 @@ pub(super) async fn check(
+                     target,
+                     config,
+                     cli_kv_overrides,
++                    bypass_project_trust,
++                    bypass_hook_trust,
+                 ))
+                 .await?
+                 .map_err(io::Error::other)
+diff --git a/codex-rs/tui/src/daemon_startup.rs b/codex-rs/tui/src/daemon_startup.rs
+--- a/codex-rs/tui/src/daemon_startup.rs
++++ b/codex-rs/tui/src/daemon_startup.rs
+@@ -58,6 +58,14 @@ pub(super) struct CompatibilityError {
+     pub restart_features: Option<BTreeMap<String, bool>>,
+ }
+ 
++#[derive(Debug, thiserror::Error)]
++pub(super) enum StartupError {
++    #[error("{0}")]
++    TrustPolicy(String),
++    #[error(transparent)]
++    Recoverable(#[from] CompatibilityError),
++}
++
+ pub(super) fn exclusion(
+     cli: &Cli,
+     cli_kv_overrides: &[(String, toml::Value)],
+@@ -78,12 +86,7 @@ pub(super) fn exclusion(
+     } else if cli.config_profile_v2.is_some() {
+         Some("--profile")
+     } else {
+-        config_exclusion(
+-            cli_kv_overrides,
+-            loader_overrides,
+-            cli.strict_config,
+-            cli.bypass_hook_trust,
+-        )
++        config_exclusion(cli_kv_overrides, loader_overrides, cli.strict_config)
+     }
+ }
+ 
+@@ -91,7 +94,6 @@ pub(super) fn config_exclusion(
+     cli_kv_overrides: &[(String, toml::Value)],
+     loader_overrides: &LoaderOverrides,
+     strict_config: bool,
+-    bypass_hook_trust: bool,
+ ) -> Option<&'static str> {
+     if !cli_kv_overrides
+         .iter()
+@@ -118,8 +120,6 @@ pub(super) fn config_exclusion(
+         Some("custom configuration loader")
+     } else if strict_config {
+         Some("--strict-config")
+-    } else if bypass_hook_trust {
+-        Some("--dangerously-bypass-hook-trust")
+     } else {
+         None
+     }
+@@ -130,7 +130,9 @@ pub(super) async fn compatibility_warning(
+     target: &AppServerTarget,
+     config: &Config,
+     cli_kv_overrides: &[(String, toml::Value)],
+-) -> Result<Option<String>, CompatibilityError> {
++    bypass_project_trust: Option<bool>,
++    bypass_hook_trust: Option<bool>,
++) -> Result<Option<String>, StartupError> {
+     let AppServerTarget::LocalDaemon {
+         allow_embedded_fallback,
+         ..
+@@ -155,10 +157,17 @@ pub(super) async fn compatibility_warning(
+         })
+         .collect();
+     let mut restart_features = None;
++    let connection = app_server_connection::connect(target).await;
++    if let Ok(client) = &connection
++        && let Some(policy) = client.trust_policy()
++    {
++        policy
++            .check_request(bypass_project_trust, bypass_hook_trust)
++            .map_err(StartupError::TrustPolicy)?;
++    }
+     let check = async {
+         // Connect even without overrides so startup can recover from an unreachable daemon.
+-        let client = app_server_connection::connect(target)
+-            .await
++        let client = connection
+             .map_err(|_| "could not connect to check daemon feature settings".to_string())?;
+         if requested.is_empty() {
+             let _ = client.shutdown().await;
+@@ -245,6 +254,7 @@ pub(super) async fn compatibility_warning(
+         Err(reason) => Err(CompatibilityError {
+             reason,
+             restart_features,
+-        }),
++        }
++        .into()),
+     }
+ }
+diff --git a/codex-rs/tui/src/daemon_startup_tests.rs b/codex-rs/tui/src/daemon_startup_tests.rs
+--- a/codex-rs/tui/src/daemon_startup_tests.rs
++++ b/codex-rs/tui/src/daemon_startup_tests.rs
+@@ -35,7 +35,6 @@ fn feature_overrides_allow_daemon_without_allowing_arbitrary_config() {
+                 &overrides,
+                 &LoaderOverrides::default(),
+                 /*strict_config*/ false,
+-                /*bypass_hook_trust*/ false,
+             )
+             .is_none(),
+             eligible,
+@@ -44,6 +43,66 @@ fn feature_overrides_allow_daemon_without_allowing_arbitrary_config() {
+     }
+ }
+ 
++#[tokio::test]
++async fn trust_mismatch_never_enters_daemon_recovery_or_fallback() -> anyhow::Result<()> {
++    use futures::SinkExt;
++    use futures::StreamExt;
++    use tokio_tungstenite::tungstenite::Message;
++    let home = TempDir::new()?;
++    let config = ConfigBuilder::default()
++        .codex_home(home.path().to_path_buf())
++        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
++        .build()
++        .await?;
++    for allow_embedded_fallback in [false, true] {
++        for (project, hooks, matches) in [
++            (None, None, true),
++            (Some(true), Some(false), true),
++            (Some(false), None, false),
++            (None, Some(true), false),
++        ] {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++            let target = AppServerTarget::LocalDaemon {
++                endpoint: RemoteAppServerEndpoint::WebSocket {
++                    websocket_url: format!("ws://{}", listener.local_addr()?),
++                    auth_token: None,
++                },
++                allow_embedded_fallback,
++            };
++            let server = tokio::spawn(async move {
++                let (stream, _) = listener.accept().await.unwrap();
++                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
++                while let Some(Ok(Message::Text(text))) = socket.next().await {
++                    let message: codex_app_server_protocol::JSONRPCMessage =
++                        serde_json::from_str(&text).unwrap();
++                    if let codex_app_server_protocol::JSONRPCMessage::Request(request) = message {
++                        assert_eq!(request.method, "initialize");
++                        let response = serde_json::json!({"id": request.id, "result": {
++                            "trustPolicy": {"bypassProjectTrust": true, "bypassHookTrust": false}
++                        }});
++                        socket
++                            .send(Message::Text(response.to_string().into()))
++                            .await
++                            .unwrap();
++                    }
++                }
++            });
++            let result =
++                daemon_startup::compatibility_warning(&target, &config, &[], project, hooks).await;
++            if matches {
++                assert_eq!(result?, None);
++            } else {
++                assert!(matches!(
++                    result,
++                    Err(daemon_startup::StartupError::TrustPolicy(_))
++                ));
++            }
++            server.await?;
++        }
++    }
++    Ok(())
++}
++
+ #[test]
+ fn daemon_launch_telemetry_records_once_on_connection_or_early_return() {
+     for connected in [false, true] {
+@@ -135,8 +194,14 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
+             };
+             if cli_overrides.is_empty() {
+                 drop(listener);
+-                let result =
+-                    daemon_startup::compatibility_warning(&target, &config, &cli_overrides).await;
++                let result = daemon_startup::compatibility_warning(
++                    &target,
++                    &config,
++                    &cli_overrides,
++                    None,
++                    None,
++                )
++                .await;
+                 assert!(matches!(
+                     (allow_embedded_fallback, result),
+                     (true, Ok(Some(_))) | (false, Err(_))
+@@ -153,7 +218,7 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
+                     };
+                     let response = match request.method.as_str() {
+                         "initialize" => {
+-                            json!({"id": request.id, "result": {"userAgent": "daemon-test"}})
++                            json!({"id": request.id, "result": {"userAgent": "daemon-test", "trustPolicy": {"bypassProjectTrust": false, "bypassHookTrust": false}}})
+                         }
+                         "config/read" => {
+                             json!({"id": request.id, "result": {"config": {}, "layers": [{
+@@ -187,7 +252,8 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
+                 }
+             });
+             let result =
+-                daemon_startup::compatibility_warning(&target, &config, &cli_overrides).await;
++                daemon_startup::compatibility_warning(&target, &config, &cli_overrides, None, None)
++                    .await;
+             server.await?;
+             if matches!(scenario, "matching" | "managed" | "legacy managed") {
+                 assert_eq!(result?, None);
+@@ -210,7 +276,9 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
+                     format!("Running without the shared background server: {reason}.")
+                 );
+             } else {
+-                let error = result.unwrap_err();
++                let daemon_startup::StartupError::Recoverable(error) = result.unwrap_err() else {
++                    panic!("expected recoverable feature mismatch");
++                };
+                 assert_eq!(error.restart_features.is_some(), restartable);
+                 if scenario == "mixed flags" {
+                     assert_eq!(
+@@ -346,10 +414,8 @@ fn daemon_eligibility_preserves_launch_options_and_explains_exclusions() {
+         ("--oss", Some("--oss")),
+         ("--profile test", Some("--profile")),
+         ("--strict-config", Some("--strict-config")),
+-        (
+-            "--dangerously-bypass-hook-trust",
+-            Some("--dangerously-bypass-hook-trust"),
+-        ),
++        ("--dangerously-bypass-hook-trust", None),
++        ("--dangerously-bypass-project-trust", None),
+         (
+             "-m test --cd /tmp -i image.png -a never -s workspace-write --add-dir /tmp --no-alt-screen hello",
+             None,
+diff --git a/codex-rs/tui/src/experimental_features_tests.rs b/codex-rs/tui/src/experimental_features_tests.rs
+--- a/codex-rs/tui/src/experimental_features_tests.rs
++++ b/codex-rs/tui/src/experimental_features_tests.rs
+@@ -24,7 +24,7 @@ async fn experimental_features_rpc_paginates_thread_config_and_bounds_bad_server
+                     continue;
+                 };
+                 let result = if request.method == "initialize" {
+-                    json!({"userAgent": "experimental-test"})
++                    json!({"userAgent": "experimental-test", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
+                 } else {
+                     assert_eq!(request.method, "experimentalFeature/list");
+                     assert_eq!(
+@@ -177,7 +177,9 @@ async fn experimental_feature_writes_use_server_defaults_and_refresh_configured_
+                     continue;
+                 }
+                 let result = match request.method.as_str() {
+-                    "initialize" => json!({"userAgent": "experimental-test"}),
++                    "initialize" => {
++                        json!({"userAgent": "experimental-test", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
++                    }
+                     "experimentalFeature/list" => {
+                         json!({"data": [
+                             {"name": "daemon_auto_start", "stage": "beta", "displayName": null, "description": null, "announcement": null, "enabled": !wrote || scenario == "overridden", "defaultEnabled": false},
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -1118,6 +1118,7 @@ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
+         && loader_overrides.system_requirements_path.is_none()
+         && !loader_overrides.ignore_managed_requirements
+         && !loader_overrides.ignore_user_config
++        && !loader_overrides.bypass_project_trust
+         && !loader_overrides.ignore_user_and_project_exec_policy_rules
+         && loader_overrides
+             .macos_managed_config_requirements_base64
+@@ -1184,9 +1185,9 @@ async fn run_ratatui_app(
+     strict_config: bool,
+     mut app_server_target: AppServerTarget,
+     remote_cwd_override: Option<PathBuf>,
+-    initial_config: Config,
++    mut initial_config: Config,
+     manually_selected_oss_provider: Option<String>,
+-    overrides: ConfigOverrides,
++    mut overrides: ConfigOverrides,
+     cli_kv_overrides: Vec<(String, toml::Value)>,
+     mut cloud_config_bundle: CloudConfigBundleLoader,
+     feedback: codex_feedback::CodexFeedback,
+@@ -1288,6 +1289,30 @@ async fn run_ratatui_app(
+         }
+     }
+     .with_remote_cwd_override(remote_cwd_override.clone());
++    if let Some(policy) = app_server_session.trust_policy() {
++        if let Err(error) = policy.check_request(cli.bypass_project_trust, cli.bypass_hook_trust) {
++            shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard).await;
++            return Err(color_eyre::eyre::eyre!(error));
++        }
++        overrides.bypass_project_trust = Some(policy.bypass_project_trust);
++        overrides.bypass_hook_trust = Some(policy.bypass_hook_trust);
++        if initial_config.bypass_project_trust != policy.bypass_project_trust
++            || initial_config.bypass_hook_trust != policy.bypass_hook_trust
++        {
++            initial_config = startup_draft
++                .run_until(
++                    &mut tui,
++                    load_config_or_exit(
++                        cli_kv_overrides.clone(),
++                        overrides.clone(),
++                        loader_overrides.clone(),
++                        cloud_config_bundle.clone(),
++                        strict_config,
++                    ),
++                )
++                .await?;
++        }
++    }
+     if let Some(provider) = manually_selected_oss_provider.as_deref() {
+         match startup_draft
+             .run_until(
+@@ -2073,14 +2098,7 @@ async fn run_ratatui_app(
+     } = cli;
+     let images = shared.into_inner().images;
+ 
+-    // Persistent app-server resumes may attach to an already-running thread,
+-    // where resume config overrides are ignored.
+-    let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
+-        && matches!(
+-            &session_selection,
+-            resume_picker::SessionSelection::Resume(_)
+-        );
+-    let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
++    let bypass_hook_trust_for_startup_review = config.bypass_hook_trust;
+     let hooks_request_handle = app_server.request_handle();
+     let hooks_cwd = config.cwd.to_path_buf();
+     let server_owned_fresh_bootstrap = app::startup_bootstrap::uses_server_owned_fresh_bootstrap(
+diff --git a/codex-rs/tui/src/named_session_lookup_tests.rs b/codex-rs/tui/src/named_session_lookup_tests.rs
+--- a/codex-rs/tui/src/named_session_lookup_tests.rs
++++ b/codex-rs/tui/src/named_session_lookup_tests.rs
+@@ -482,7 +482,7 @@ async fn verifies_name_uniqueness_across_server_pages() -> color_eyre::Result<()
+                         .is_some_and(|params| params["cursor"].is_string());
+                 let response = match request.method.as_str() {
+                     "initialize" => {
+-                        json!({"id": request.id, "result": {"userAgent": "lookup-test"}})
++                        json!({"id": request.id, "result": {"userAgent": "lookup-test", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
+                     }
+                     "thread/list" => {
+                         assert_eq!(
+diff --git a/codex-rs/tui/src/onboarding/directory_trust.rs b/codex-rs/tui/src/onboarding/directory_trust.rs
+--- a/codex-rs/tui/src/onboarding/directory_trust.rs
++++ b/codex-rs/tui/src/onboarding/directory_trust.rs
+@@ -42,6 +42,9 @@ pub(crate) async fn check_directory_trust(
+     options: DirectoryTrustOptions<'_>,
+     mut startup_draft: Option<&mut StartupDraftPump>,
+ ) -> Result<OnboardingResult> {
++    if config.bypass_project_trust {
++        return Ok(OnboardingResult::default());
++    }
+     let DirectoryTrustOptions {
+         resumed_thread,
+         cancel,
+diff --git a/codex-rs/tui/src/permission_discovery_tests.rs b/codex-rs/tui/src/permission_discovery_tests.rs
+--- a/codex-rs/tui/src/permission_discovery_tests.rs
++++ b/codex-rs/tui/src/permission_discovery_tests.rs
+@@ -92,7 +92,7 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
+                     continue;
+                 }
+                 let mut response = if request["method"] == "initialize" {
+-                    json!({"result": {"userAgent": "permission-discovery-test", "platformFamily": "unix", "platformOs": "linux"}})
++                    json!({"result": {"userAgent": "permission-discovery-test", "platformFamily": "unix", "platformOs": "linux", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
+                 } else {
+                     requests.push(request.clone());
+                     replies.next().expect("unexpected discovery request")
+diff --git a/codex-rs/tui/src/resume_picker/message_count_tests.rs b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+--- a/codex-rs/tui/src/resume_picker/message_count_tests.rs
++++ b/codex-rs/tui/src/resume_picker/message_count_tests.rs
+@@ -390,7 +390,7 @@ async fn pending_count_rpc_leaves_other_requests_available_and_cancellation_stop
+             let method = request["method"].as_str().unwrap();
+             let result = match method {
+                 "initialize" => {
+-                    json!({"userAgent":"message-count-test","codexHome":"/server/.codex"})
++                    json!({"userAgent":"message-count-test","codexHome":"/server/.codex", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
+                 }
+                 "initialized" => continue,
+                 "thread/messageCount/read" => {
+diff --git a/codex-rs/tui/src/resume_picker/profile_tests.rs b/codex-rs/tui/src/resume_picker/profile_tests.rs
+--- a/codex-rs/tui/src/resume_picker/profile_tests.rs
++++ b/codex-rs/tui/src/resume_picker/profile_tests.rs
+@@ -561,7 +561,7 @@ async fn pending_profile_allows_page_loading_and_finishes_after_picker_close() -
+                 let request: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                 let method = request["method"].as_str().unwrap();
+                 let result = match method {
+-                    "initialize" => json!({"userAgent":"profile-test","codexHome":"/server/.codex"}),
++                    "initialize" => json!({"userAgent":"profile-test","codexHome":"/server/.codex", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}),
+                     "initialized" => continue,
+                     "thread/settings/update" => {
+                         requests_tx.send(request.clone()).unwrap();
+diff --git a/codex-rs/tui/src/session_archive_commands.rs b/codex-rs/tui/src/session_archive_commands.rs
+--- a/codex-rs/tui/src/session_archive_commands.rs
++++ b/codex-rs/tui/src/session_archive_commands.rs
+@@ -263,9 +263,15 @@ pub(super) async fn start_app_server_for_session_command(
+             .build()
+             .await
+             .wrap_err("failed to load config.toml")?;
++        let client = super::connect_remote_app_server(endpoint).await?;
++        if let Some(policy) = client.trust_policy() {
++            policy
++                .check_request(cli.bypass_project_trust, cli.bypass_hook_trust)
++                .map_err(|error| eyre!(error))?;
++        }
+         return Ok(AppServerSession::new(
+             crate::backend_id::BackendId::new(),
+-            super::connect_remote_app_server(endpoint).await?,
++            client,
+             ThreadParamsMode::Remote,
+         )
+         .with_remote_cwd_override(cli.cwd.clone()));
+@@ -278,7 +284,6 @@ pub(super) async fn start_app_server_for_session_command(
+             &cli_kv_overrides,
+             &launch_loader_overrides,
+             strict_config,
+-            cli.bypass_hook_trust,
+         )
+         .is_none();
+     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
+@@ -372,7 +377,8 @@ pub(super) async fn start_app_server_for_session_command(
+             codex_self_exe: arg0_paths.codex_self_exe.clone(),
+             codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
+             show_raw_agent_reasoning: cli.oss.then_some(true),
+-            bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
++            bypass_hook_trust: cli.bypass_hook_trust,
++            bypass_project_trust: cli.bypass_project_trust,
+             ..Default::default()
+         })
+         .loader_overrides(loader_overrides.clone())
+@@ -408,6 +414,11 @@ pub(super) async fn start_app_server_for_session_command(
+         embedded_network_policy,
+     )
+     .await?;
++    if let Some(policy) = app_server.trust_policy() {
++        policy
++            .check_request(cli.bypass_project_trust, cli.bypass_hook_trust)
++            .map_err(|error| eyre!(error))?;
++    }
+     Ok(AppServerSession::new(
+         crate::backend_id::BackendId::new(),
+         app_server,
+diff --git a/codex-rs/tui/src/startup_orchestration.rs b/codex-rs/tui/src/startup_orchestration.rs
+--- a/codex-rs/tui/src/startup_orchestration.rs
++++ b/codex-rs/tui/src/startup_orchestration.rs
+@@ -211,7 +211,8 @@ pub(super) async fn run_main_inner(
+                         )
+                     })
+                     .flatten(),
+-                bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
++                bypass_hook_trust: cli.bypass_hook_trust,
++                bypass_project_trust: cli.bypass_project_trust,
+                 additional_writable_roots: cli.add_dir.clone(),
+                 ..Default::default()
+             },
+@@ -234,8 +235,7 @@ pub(super) async fn run_main_inner(
+         && cli.web_search
+         && startup_preflight::has_only_search_config_override(&cli_kv_overrides)
+         && loader_overrides_are_default(&launch_loader_overrides)
+-        && !strict_config
+-        && !cli.bypass_hook_trust;
++        && !strict_config;
+     let initial_screen = if cli.resume_picker || cli.fork_picker || cli.agents_overview {
+         startup_draft::StartupDraftInitialScreen::SessionPicker
+     } else if !cli.oss
+@@ -492,7 +492,8 @@ pub(super) async fn run_main_inner(
+         codex_self_exe: arg0_paths.codex_self_exe.clone(),
+         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
+         show_raw_agent_reasoning: cli.oss.then_some(true),
+-        bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
++        bypass_hook_trust: cli.bypass_hook_trust,
++        bypass_project_trust: cli.bypass_project_trust,
+         additional_writable_roots: additional_dirs,
+         ..Default::default()
+     };
+@@ -597,8 +598,12 @@ pub(super) async fn run_main_inner(
+                 // Daemon startup needs no terminal input. Keep the composer visible and
+                 // responsive while it checks the running server or prepares an installation.
+                 // Preserve saved daemon settings until any mismatch is confirmed in recovery.
+-                let result =
+-                    codex_app_server_daemon::start_with_features(&Default::default()).await;
++                let result = codex_app_server_daemon::start_with_features(
++                    &Default::default(),
++                    cli.bypass_project_trust,
++                    cli.bypass_hook_trust,
++                )
++                .await;
+                 daemon_telemetry::record_start(&config, &result).await;
+                 match result {
+                     Ok(output) => Ok(Some(output)),
+@@ -636,6 +641,8 @@ pub(super) async fn run_main_inner(
+             &config,
+             &cli_kv_overrides,
+             managed_daemon,
++            cli.bypass_project_trust,
++            cli.bypass_hook_trust,
+         )
+         .await?
+     };
+diff --git a/codex-rs/tui/src/temporary_structured_request_tests.rs b/codex-rs/tui/src/temporary_structured_request_tests.rs
+--- a/codex-rs/tui/src/temporary_structured_request_tests.rs
++++ b/codex-rs/tui/src/temporary_structured_request_tests.rs
+@@ -373,7 +373,7 @@ async fn check_structured_turn_wait(timeout: Option<Duration>, cancel: bool, rep
+             }
+             let result = match method {
+                 "initialize" => {
+-                    json!({"userAgent":"structured-turn-test","codexHome":"/server/.codex"})
++                    json!({"userAgent":"structured-turn-test","codexHome":"/server/.codex", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
+                 }
+                 "initialized" => continue,
+                 "turn/start" if !reply_to_start => continue,
+diff --git a/codex-rs/tui/tests/suite/daemon_compatibility.rs b/codex-rs/tui/tests/suite/daemon_compatibility.rs
+--- a/codex-rs/tui/tests/suite/daemon_compatibility.rs
++++ b/codex-rs/tui/tests/suite/daemon_compatibility.rs
+@@ -35,7 +35,7 @@ async fn incompatible_daemon_can_run_embedded_for_explicit_features() -> Result<
+                 };
+                 let response = match request.method.as_str() {
+                     "initialize" => {
+-                        json!({"id": request.id, "result": {"userAgent": "daemon-test/0.0.0"}})
++                        json!({"id": request.id, "result": {"userAgent": "daemon-test/0.0.0", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}})
+                     }
+                     "config/read" => {
+                         json!({"id": request.id, "result": {"config": {}, "layers": []}})
+diff --git a/codex-rs/tui/tests/suite/directory_trust.rs b/codex-rs/tui/tests/suite/directory_trust.rs
+--- a/codex-rs/tui/tests/suite/directory_trust.rs
++++ b/codex-rs/tui/tests/suite/directory_trust.rs
+@@ -75,7 +75,7 @@ async fn connected_trust_cancellation_and_acceptance_control_task_creation() ->
+                         };
+                         methods.lock().unwrap().push(request.method.clone());
+                         let result = match request.method.as_str() {
+-                            "initialize" => json!({"userAgent": "trust-pty"}),
++                            "initialize" => json!({"userAgent": "trust-pty", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()}),
+                             "experimentalFeature/list" => json!({"data": (["api_key_model_discovery", "code_mode_host", "auth_elicitation"].map(|name| json!({
+                                 "name": name, "stage": "stable", "displayName": null,
+                                 "description": null, "announcement": null,
+diff --git a/codex-rs/tui/tests/suite/reconnect.rs b/codex-rs/tui/tests/suite/reconnect.rs
+--- a/codex-rs/tui/tests/suite/reconnect.rs
++++ b/codex-rs/tui/tests/suite/reconnect.rs
+@@ -105,7 +105,9 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
+                     continue;
+                 }
+                 let result = match request.method.as_str() {
+-                    "initialize" => json!({"userAgent": "reconnect-pty"}),
++                    "initialize" => {
++                        json!({"userAgent": "reconnect-pty", "trustPolicy": codex_app_server_protocol::TrustPolicy::default()})
++                    }
+                     // An older daemon can omit the client's default-disabled features.
+                     "experimentalFeature/list" => {
+                         json!({"data": (["api_key_model_discovery", "code_mode_host", "auth_elicitation"].map(|name| json!({
+diff --git a/codex-rs/utils/cli/src/shared_options.rs b/codex-rs/utils/cli/src/shared_options.rs
+--- a/codex-rs/utils/cli/src/shared_options.rs
++++ b/codex-rs/utils/cli/src/shared_options.rs
+@@ -58,10 +58,14 @@ pub struct SharedCliOptions {
+     )]
+     pub dangerously_bypass_approvals_and_sandbox: bool,
+ 
+-    /// Run enabled hooks without requiring persisted hook trust for this invocation.
++    /// Set hook trust bypass when starting the app server; inherit it when omitted.
+     /// DANGEROUS. Intended only for automation that already vets hook sources.
+-    #[arg(long = "dangerously-bypass-hook-trust", default_value_t = false)]
+-    pub bypass_hook_trust: bool,
++    #[arg(long = "dangerously-bypass-hook-trust", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    pub bypass_hook_trust: Option<bool>,
++
++    /// Set project trust bypass when starting the app server; inherit it when omitted.
++    #[arg(long = "dangerously-bypass-project-trust", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
++    pub bypass_project_trust: Option<bool>,
+ 
+     /// Tell the agent to use the specified directory as its working root.
+     #[clap(long = "cd", short = 'C', value_name = "DIR")]
+@@ -106,6 +110,7 @@ impl SharedCliOptions {
+             auto_review,
+             dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust,
++            bypass_project_trust,
+             cwd,
+             worktree,
+             add_dir,
+@@ -120,6 +125,7 @@ impl SharedCliOptions {
+             auto_review: root_auto_review,
+             dangerously_bypass_approvals_and_sandbox: root_dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust: root_bypass_hook_trust,
++            bypass_project_trust: root_bypass_project_trust,
+             cwd: root_cwd,
+             worktree: root_worktree,
+             add_dir: root_add_dir,
+@@ -143,9 +149,12 @@ impl SharedCliOptions {
+             *dangerously_bypass_approvals_and_sandbox =
+                 *root_dangerously_bypass_approvals_and_sandbox;
+         }
+-        if !*bypass_hook_trust {
++        if bypass_hook_trust.is_none() {
+             *bypass_hook_trust = *root_bypass_hook_trust;
+         }
++        if bypass_project_trust.is_none() {
++            *bypass_project_trust = *root_bypass_project_trust;
++        }
+         if cwd.is_none() {
+             cwd.clone_from(root_cwd);
+         }
+@@ -176,6 +185,7 @@ impl SharedCliOptions {
+             auto_review,
+             dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust,
++            bypass_project_trust,
+             cwd,
+             worktree,
+             add_dir,
+@@ -199,8 +209,11 @@ impl SharedCliOptions {
+             self.dangerously_bypass_approvals_and_sandbox =
+                 dangerously_bypass_approvals_and_sandbox;
+         }
+-        if bypass_hook_trust {
+-            self.bypass_hook_trust = true;
++        if bypass_hook_trust.is_some() {
++            self.bypass_hook_trust = bypass_hook_trust;
++        }
++        if bypass_project_trust.is_some() {
++            self.bypass_project_trust = bypass_project_trust;
+         }
+         if let Some(cwd) = cwd {
+             self.cwd = Some(cwd);
+diff --git a/codex-rs/utils/cli/src/shared_options_tests.rs b/codex-rs/utils/cli/src/shared_options_tests.rs
+--- a/codex-rs/utils/cli/src/shared_options_tests.rs
++++ b/codex-rs/utils/cli/src/shared_options_tests.rs
+@@ -2,6 +2,32 @@
+ 
+ use super::SharedCliOptions;
+ 
++#[test]
++fn explicit_trust_choices_override_inheritance_in_both_directions() {
++    let root = SharedCliOptions {
++        bypass_project_trust: Some(true),
++        bypass_hook_trust: Some(false),
++        ..Default::default()
++    };
++    let mut inherited = SharedCliOptions::default();
++    inherited.inherit_exec_root_options(&root);
++    assert_eq!(inherited.bypass_project_trust, Some(true));
++    assert_eq!(inherited.bypass_hook_trust, Some(false));
++    let explicit = SharedCliOptions {
++        bypass_project_trust: Some(false),
++        bypass_hook_trust: Some(true),
++        ..Default::default()
++    };
++    let mut child = explicit.clone();
++    child.inherit_exec_root_options(&root);
++    assert_eq!(child.bypass_project_trust, Some(false));
++    assert_eq!(child.bypass_hook_trust, Some(true));
++    inherited.apply_subcommand_overrides(explicit);
++    inherited.apply_subcommand_overrides(SharedCliOptions::default());
++    assert_eq!(inherited.bypass_project_trust, Some(false));
++    assert_eq!(inherited.bypass_hook_trust, Some(true));
++}
++
+ #[test]
+ fn inherits_worktree_from_root_without_clearing_subcommand_choice() {
+     let mut options = SharedCliOptions::default();

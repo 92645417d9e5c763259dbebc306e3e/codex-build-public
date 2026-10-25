@@ -1,0 +1,70 @@
+acknowledge-durable-live-thread-settings
+
+Lane: mixed
+
+Unit: manage-sessions-in-resume-picker
+
+ChildPatch: acknowledge-durable-live-thread-settings
+
+Form: GitDiff
+
+Segment: schema-snapshot
+
+
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -977,16 +977,28 @@ impl TurnRequestProcessor {
+             .await?;
+ 
+         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
++            let (reply, applied) = oneshot::channel();
+             self.submit_core_op(
+                 request_id,
+                 thread.as_ref(),
+                 Op::ThreadSettings {
+                     thread_settings,
+-                    reply: None,
++                    reply: Some(reply),
+                 },
+             )
+             .await
+             .map_err(|err| internal_error(format!("failed to update thread settings: {err}")))?;
++            applied
++                .await
++                .map_err(|_| internal_error("thread settings operation ended before replying"))?
++                .map_err(|err| {
++                    internal_error(format!("failed to update thread settings: {err}"))
++                })?;
++            // The change-only notification cannot acknowledge an unchanged update.
++            // Checkpoint under Core's persistence permit before reporting success.
++            thread.checkpoint_thread_settings().await.map_err(|err| {
++                internal_error(format!("failed to persist thread settings: {err}"))
++            })?;
+         }
+ 
+         Ok(ThreadSettingsUpdateResponse {})
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -837,7 +837,7 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
+     let expected_roots = vec![initial_cwd.clone(), extra_root.abs()];
+     let (items, _, _) =
+         RolloutRecorder::load_rollout_items(thread.path.as_ref().expect("rollout path")).await?;
+-    let snapshot_roots: Vec<_> = items
++    let mut snapshot_roots: Vec<_> = items
+         .into_iter()
+         .rev()
+         .filter_map(|item| match item {
+@@ -846,8 +846,10 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
+             }
+             _ => None,
+         })
+-        .take(/*n*/ 3)
+         .collect();
++    // Synchronous settings acknowledgements can add an identical durable checkpoint.
++    snapshot_roots.dedup();
++    snapshot_roots.truncate(3);
+     assert_eq!(
+         snapshot_roots,
+         vec![
